@@ -1,0 +1,11 @@
+/portico
+/flare
+/tmp/
+*.db
+*.db-wal
+*.db-shm
+__debug_bin
+.idea/
+.vscode/
+*.test
+*.db.backup-*
