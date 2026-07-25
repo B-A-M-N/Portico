@@ -19,7 +19,7 @@
 | `./portico supervisor run` | Start supervisor daemon |
 | `./portico list` | CLI list connections |
 
-**Gotcha:** Makefile is stale — builds `flare` binary with old ldflags. Use `go build -o portico .` directly.
+**Note:** `make build` builds the `portico` binary with version ldflags; `go build -o portico .` also works.
 
 ## Structure
 
@@ -51,8 +51,8 @@ internal/
 
 ## Non-obvious gotchas
 
-1. **Makefile outputs `flare`, not `portico`.** Use `go build -o portico .` directly.
-2. **No git history.** Repo was cloned from `paoloanzn/flare-cli` then renamed; `.git` is gone.
+1. **`make build` outputs `portico`** with version ldflags; `go build -o portico .` also works.
+2. **Git history starts at the Portico baseline commit.** Repo originated from `paoloanzn/flare-cli`; pre-rename history is gone.
 3. **`portico legacy ...` still active.** Old flare-cli commands preserved in `cmd/`, hidden from help.
 4. **Only Cloudflare + mock providers exist.** Ngrok, Tailscale, zrok directories are SPEC-only stubs.
 5. **Tunnel logs use `~/.config/flare-cli/logs`.** Legacy path not yet migrated to XDG state dir.
@@ -70,7 +70,9 @@ internal/
 ## Testing
 
 - **Mock provider** (`provider/mock/`) implements `core.Provider` in-memory — used in controller tests and CLI handler.
-- **Controller tests** use `newTestController()` + `testProfile()` + `awaitOp()` patterns.
+- **Controller tests** use `newTestController()` + `testProfile()` + `awaitOp()` patterns; `executor_failure_test.go` injects step-commit and terminal-commit failures with fake committers.
+- **Store tests** cover atomic step commits (`commit_test.go`) and migration-8 duplicate-ownership fixtures (`migration_test.go`).
+- **Also covered:** process manager (adoption, backoff, rotation), IPC SSE journal (replay across restart, monotonic sequences), TUI state machine (fake client, no socket), discovery/diagnostics (fake enumerators/probers), core deep-copy isolation.
 - **No integration/e2e tests yet** — directories exist but empty.
 - **No import-boundary tests yet** — SPEC requires them but not implemented.
 

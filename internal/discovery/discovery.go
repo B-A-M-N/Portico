@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -116,15 +115,6 @@ func parseSSLine(line string) (ListeningSocket, error) {
 	return sock, nil
 }
 
-// ProbeResult is the result of probing a discovered service.
-type ProbeResult struct {
-	Address    string
-	Protocol   string
-	Framework  string
-	Confidence Confidence
-	Evidence   []string
-}
-
 // Confidence describes how confident we are about a discovery.
 type Confidence string
 
@@ -136,64 +126,3 @@ const (
 
 // MaxCandidates is the max number of discovery candidates.
 const MaxCandidates = 128
-
-// Discover probes discovered listening sockets and classifies them.
-func Discover(ctx context.Context, maxConcurrent int) ([]ProbeResult, error) {
-	enum := NewSSEnumerator()
-	sockets, err := enum.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(sockets) > MaxCandidates {
-		sockets = sockets[:MaxCandidates]
-	}
-
-	if maxConcurrent <= 0 {
-		maxConcurrent = 16
-	}
-
-	var results []ProbeResult
-	var mu sync.Mutex
-	sem := make(chan struct{}, maxConcurrent)
-	var wg sync.WaitGroup
-
-	for _, sock := range sockets {
-		if sock.Port == 0 {
-			continue
-		}
-		if sock.Address != "127.0.0.1" && sock.Address != "::1" &&
-			sock.Address != "0.0.0.0" && sock.Address != "*" && sock.Address != "::" {
-			continue
-		}
-
-		sock := sock
-		wg.Add(1)
-		sem <- struct{}{}
-
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			result := ProbeResult{
-				Address:  fmt.Sprintf("localhost:%d", sock.Port),
-				Protocol: sock.Protocol,
-			}
-
-			if sock.Process != "" {
-				result.Confidence = ConfidenceLikely
-				result.Evidence = append(result.Evidence,
-					fmt.Sprintf("Process: %s (PID %d)", sock.Process, sock.PID))
-			} else {
-				result.Confidence = ConfidencePossible
-			}
-
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
-		}()
-	}
-
-	wg.Wait()
-	return results, nil
-}

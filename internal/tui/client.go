@@ -16,6 +16,7 @@ type SupervisorClient interface {
 	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
 	CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error)
 	ConnectEventStream(ctx context.Context, lastSeq int64) (*ipc.EventStream, error)
+	Diagnostics(ctx context.Context, connID string) ([]ipc.DiagnosticDTO, error)
 }
 
 // Ensure the real client satisfies the interface.

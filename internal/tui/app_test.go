@@ -83,6 +83,10 @@ func (f *fakeClient) ConnectEventStream(ctx context.Context, lastSeq int64) (*ip
 	return nil, errors.New("no event stream in tests")
 }
 
+func (f *fakeClient) Diagnostics(ctx context.Context, connID string) ([]ipc.DiagnosticDTO, error) {
+	return []ipc.DiagnosticDTO{}, nil
+}
+
 // --------------- helpers ---------------
 
 func keyMsg(key string) tea.KeyPressMsg {

@@ -51,8 +51,20 @@ func (r *ConnectionRuntime) DeepCopy() *ConnectionRuntime {
 	cr := *r
 	if r.Diagnostics != nil {
 		diags := make([]DiagnosticFinding, len(r.Diagnostics))
-		copy(diags, r.Diagnostics)
+		for i := range r.Diagnostics {
+			diags[i] = r.Diagnostics[i].Clone()
+		}
 		cr.Diagnostics = diags
+	}
+	if r.Provider.Resources != nil {
+		resources := make([]ProviderResource, len(r.Provider.Resources))
+		for i := range r.Provider.Resources {
+			resources[i] = r.Provider.Resources[i].Clone()
+		}
+		cr.Provider.Resources = resources
+	}
+	if r.Provider.AccountInfo != nil {
+		cr.Provider.AccountInfo = maps.Clone(r.Provider.AccountInfo)
 	}
 	if r.ActiveOperation != nil {
 		opID := *r.ActiveOperation

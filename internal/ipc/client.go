@@ -473,6 +473,25 @@ func (c *Client) Discovery(ctx context.Context) (*DiscoveryDTO, error) {
 	return &result, nil
 }
 
+// Diagnostics returns diagnostic findings for a connection.
+func (c *Client) Diagnostics(ctx context.Context, connID string) ([]DiagnosticDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/diagnostics/"+connID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var result []DiagnosticDTO
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // Snapshot returns the current snapshot of all connections.
 func (c *Client) Snapshot(ctx context.Context) (*SnapshotDTO, error) {
 	resp, err := c.doRequest(ctx, "GET", "/v1/snapshot", nil)

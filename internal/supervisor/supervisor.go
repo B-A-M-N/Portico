@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +39,8 @@ type Supervisor struct {
 	shutdownOnce sync.Once      // guards idempotent shutdown
 
 	// Discovery, diagnostics, and origins
-	listenerEnum discovery.ListenerEnumerator
-	diagEngine   *diagnostics.Engine
+	discoverer discovery.Discoverer
+	diagEngine *diagnostics.Engine
 }
 
 // New creates a new supervisor.
@@ -722,6 +723,33 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 	})
 }
 
+// observeConnectorStatus backs the diagnostics engine's ConnectorObserver.
+// A connector tracked by the process manager is running; otherwise the
+// controller runtime's last observed status is used.
+func (s *Supervisor) observeConnectorStatus(ctx context.Context, connID core.ConnectionID) (core.ConnectorStatus, bool) {
+	if _, ok := s.procMgr.Observe(connID); ok {
+		return core.ConnectorStatusRunning, true
+	}
+	if rt, ok := s.controller.GetRuntime(connID); ok {
+		return rt.Connector.Status, true
+	}
+	return core.ConnectorStatusUnknown, false
+}
+
+// observeProviderState backs the diagnostics engine's ProviderObserver
+// using the provider registry's observation.
+func (s *Supervisor) observeProviderState(ctx context.Context, connID core.ConnectionID) (*core.ObservedConnection, error) {
+	p, ok := s.controller.GetProfile(connID)
+	if !ok {
+		return nil, fmt.Errorf("connection not found: %s", connID)
+	}
+	prov := s.registry.Get(p.Provider.ProviderID)
+	if prov == nil {
+		return nil, fmt.Errorf("provider not available: %s", p.Provider.ProviderID)
+	}
+	return prov.Observe(ctx, connID)
+}
+
 // persistCanonicalPlan canonicalizes a plan through persistence first,
 // installs the canonical plan into the controller, and returns it.
 // This is the single path for all plan persistence to ensure consistency.
@@ -789,20 +817,74 @@ func (h *supervisorHandler) HandleGetOperationEvents(id string) ([]ipc.EventDTO,
 }
 
 func (h *supervisorHandler) HandleDiscovery() (*ipc.DiscoveryDTO, error) {
-	// TODO: integrate with discovery package
-	return &ipc.DiscoveryDTO{Services: []ipc.DiscoveredServiceDTO{}}, nil
+	return h.runDiscovery(false)
 }
 
 func (h *supervisorHandler) HandleRefreshDiscovery() (*ipc.DiscoveryDTO, error) {
-	// TODO: integrate with discovery package
-	return &ipc.DiscoveryDTO{Services: []ipc.DiscoveredServiceDTO{}}, nil
+	return h.runDiscovery(true)
+}
+
+// runDiscovery runs the discovery pipeline. When refresh is false the
+// cached result is returned if still fresh; refresh forces a re-scan.
+func (h *supervisorHandler) runDiscovery(refresh bool) (*ipc.DiscoveryDTO, error) {
+	if h.sup.discoverer == nil {
+		return &ipc.DiscoveryDTO{Services: []ipc.DiscoveredServiceDTO{}}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var result *discovery.Result
+	var err error
+	if refresh {
+		result, err = h.sup.discoverer.Refresh(ctx)
+	} else {
+		result, err = h.sup.discoverer.Discover(ctx)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("discovery: %w", err)
+	}
+
+	dto := &ipc.DiscoveryDTO{Services: make([]ipc.DiscoveredServiceDTO, 0, len(result.Services))}
+	for _, svc := range result.Services {
+		dto.Services = append(dto.Services, ipc.DiscoveredServiceDTO{
+			Address:    svc.Address,
+			Port:       svc.Port,
+			Protocol:   svc.Protocol,
+			Confidence: string(svc.Confidence),
+			PID:        svc.PID,
+			Process:    svc.Process,
+			Evidence:   strings.Join(svc.Evidence, "; "),
+		})
+	}
+	return dto, nil
 }
 
 func (h *supervisorHandler) HandleDiagnostics(connID string) ([]ipc.DiagnosticDTO, error) {
 	cid := core.ConnectionID(connID)
-	findings, err := h.sup.controller.Diagnose(context.Background(), cid)
-	if err != nil {
-		return nil, err
+
+	var findings []core.DiagnosticFinding
+	if h.sup.diagEngine != nil {
+		profile, ok := h.sup.controller.GetProfile(cid)
+		if !ok {
+			return nil, fmt.Errorf("connection not found: %s", connID)
+		}
+		rt, _ := h.sup.controller.GetRuntime(cid)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		fs, err := h.sup.diagEngine.Diagnose(ctx, profile, rt)
+		if err != nil {
+			return nil, err
+		}
+		findings = fs
+	} else {
+		fs, err := h.sup.controller.Diagnose(context.Background(), cid)
+		if err != nil {
+			return nil, err
+		}
+		findings = fs
 	}
 
 	dtos := make([]ipc.DiagnosticDTO, len(findings))

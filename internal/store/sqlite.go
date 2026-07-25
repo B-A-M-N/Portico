@@ -2566,14 +2566,16 @@ func (s *Store) GetStepResults(ctx context.Context, opID core.OperationID) ([]co
 	var results []core.StepExecutionResult
 	for rows.Next() {
 		var r core.StepExecutionResult
-		var stepKind, status, recoveryStatus string
+		var stepKind, status string
+		var providerRequestID, recoveryStatus sql.NullString
 		var resultJSON []byte
-		if err := rows.Scan(&r.StepID, &stepKind, &status, &r.ProviderRequestID, &resultJSON, &recoveryStatus); err != nil {
+		if err := rows.Scan(&r.StepID, &stepKind, &status, &providerRequestID, &resultJSON, &recoveryStatus); err != nil {
 			return nil, err
 		}
 		r.StepKind = core.StepKind(stepKind)
-		r.Status = string(status)
-		r.RecoveryRequired = recoveryStatus == "recovery_required"
+		r.Status = status
+		r.ProviderRequestID = providerRequestID.String
+		r.RecoveryRequired = recoveryStatus.String == "recovery_required"
 		if len(resultJSON) > 0 {
 			_ = json.Unmarshal(resultJSON, &r.Result)
 		}
@@ -2604,6 +2606,186 @@ func (s *Store) ListIncompleteOperations(ctx context.Context) ([]core.OperationI
 		ops = append(ops, opID)
 	}
 	return ops, rows.Err()
+}
+
+// IncompleteOperation describes an operation left in a non-terminal state,
+// together with any recorded step results. Used by startup recovery.
+type IncompleteOperation struct {
+	ID           core.OperationID
+	PlanID       core.PlanID
+	ConnectionID core.ConnectionID
+	State        string
+	StartedAt    string
+	StepResults  []core.StepExecutionResult
+}
+
+// ListNonTerminalOperations returns operations whose state is neither
+// completed nor failed (e.g. "running", "pending"), together with their
+// recorded step results from operation_step_results.
+func (s *Store) ListNonTerminalOperations(ctx context.Context) ([]IncompleteOperation, error) {
+	ops, err := s.listNonTerminalOperationRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range ops {
+		results, err := s.GetStepResults(ctx, ops[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		ops[i].StepResults = results
+	}
+	return ops, nil
+}
+
+// listNonTerminalOperationRows reads the operations table under the read
+// lock. Step results are attached by the caller outside the lock.
+func (s *Store) listNonTerminalOperationRows(ctx context.Context) ([]IncompleteOperation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, plan_id, connection_id, state, started_at
+		FROM operations
+		WHERE state NOT IN ('completed', 'failed')
+		ORDER BY started_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ops []IncompleteOperation
+	for rows.Next() {
+		var op IncompleteOperation
+		if err := rows.Scan(&op.ID, &op.PlanID, &op.ConnectionID, &op.State, &op.StartedAt); err != nil {
+			return nil, err
+		}
+		ops = append(ops, op)
+	}
+	return ops, rows.Err()
+}
+
+// UpsertStepResultStatus records the status of a step result, inserting the
+// row when no start was ever recorded for it (e.g. when startup recovery
+// classifies an interrupted operation from the journal alone).
+func (s *Store) UpsertStepResultStatus(ctx context.Context, opID core.OperationID, stepID string, stepKind core.StepKind, status StepResultStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE operation_step_results SET status = ?, updated_at = ?
+		WHERE operation_id = ? AND step_id = ?`,
+		string(status), now, opID, stepID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO operation_step_results (operation_id, step_id, step_kind, status, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			opID, stepID, string(stepKind), string(status), now, now)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// OperationJournalEvent is one persisted operation journal entry from
+// operation_events, used to reconstruct interrupted operations.
+type OperationJournalEvent struct {
+	StepID    string
+	EventType string
+	Stage     string
+	Summary   string
+	Error     string
+	Timestamp string
+}
+
+// GetOperationEvents returns the journal events for an operation in
+// insertion order.
+func (s *Store) GetOperationEvents(ctx context.Context, opID core.OperationID) ([]OperationJournalEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT step_id, event_type, stage, summary, error, timestamp
+		FROM operation_events WHERE operation_id = ? ORDER BY id`, opID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []OperationJournalEvent
+	for rows.Next() {
+		var e OperationJournalEvent
+		var stepID, summary, errMsg sql.NullString
+		if err := rows.Scan(&stepID, &e.EventType, &e.Stage, &summary, &errMsg, &e.Timestamp); err != nil {
+			return nil, err
+		}
+		e.StepID = stepID.String
+		e.Summary = summary.String
+		e.Error = errMsg.String
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+// CommitOperationRecoveryRequired marks an interrupted operation as failed
+// with recovery-required semantics: the operation transitions to 'failed'
+// and the runtime records a PTO-OP-RECOVERY-REQUIRED error, so repair and
+// reconcile workflows must resolve the uncertain provider state before
+// further mutations. Not retryable: blindly re-running is unsafe.
+func (s *Store) CommitOperationRecoveryRequired(ctx context.Context, connID core.ConnectionID, opID core.OperationID, errMsg string, provider core.ProviderID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
+		"UPDATE operations SET state = 'failed', completed_at = ? WHERE id = ?",
+		now, opID)
+	if err != nil {
+		return fmt.Errorf("complete operation: %w", err)
+	}
+
+	errorJSON, err := json.Marshal(&core.PorticoError{
+		Code:      "PTO-OP-RECOVERY-REQUIRED",
+		Message:   errMsg,
+		Retryable: false,
+		Provider:  provider,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal error: %w", err)
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		UPDATE connection_runtime SET
+			runtime_state = ?,
+			active_operation_id = NULL,
+			last_transition = ?,
+			error_json = ?
+		WHERE connection_id = ?`,
+		string(core.RuntimeError), now, errorJSON, connID)
+	if err != nil {
+		return fmt.Errorf("update runtime: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // AppendOperationEvent appends an operation event to the journal.

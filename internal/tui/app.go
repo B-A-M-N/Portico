@@ -39,10 +39,11 @@ type Model struct {
 	screen     ScreenID
 	selectedID int
 
-	snapshot  ipc.SnapshotDTO
-	plan      *ipc.PlanDTO
-	operation *ipc.OperationDTO
-	opEvents  []string
+	snapshot    ipc.SnapshotDTO
+	plan        *ipc.PlanDTO
+	operation   *ipc.OperationDTO
+	diagnostics []ipc.DiagnosticDTO
+	opEvents    []string
 
 	lastEventSeq int64
 	stream       *ipc.EventStream
@@ -133,6 +134,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.plan = nil
 		m.screen = ScreenOperationProgress
 		return m, m.requestSnapshot()
+
+	case diagnosticsMsg:
+		if msg.Err != nil {
+			m.status = fmt.Sprintf("diagnostics failed: %v", msg.Err)
+			return m, nil
+		}
+		m.status = ""
+		m.diagnostics = msg.Findings
+		return m, nil
 
 	case screens.ConnectionCreatedMsg:
 		if m.wizard != nil {
@@ -245,10 +255,26 @@ type resyncMsg struct {
 	Reason string
 }
 
+type diagnosticsMsg struct {
+	Findings []ipc.DiagnosticDTO
+	Err      error
+}
+
 // --------------- commands ---------------
 //
 // Commands capture what they need before returning the closure so that
 // nothing running off the update loop reads or mutates the model.
+
+func (m *Model) diagnosticsCmd(connID string) tea.Cmd {
+	client := m.client
+	return func() tea.Msg {
+		if client == nil {
+			return diagnosticsMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		findings, err := client.Diagnostics(context.Background(), connID)
+		return diagnosticsMsg{Findings: findings, Err: err}
+	}
+}
 
 func (m *Model) requestSnapshot() tea.Cmd {
 	client := m.client
@@ -409,6 +435,13 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case "r":
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
 			m.screen = ScreenRepair
+			m.diagnostics = nil
+			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+		}
+		if m.screen == ScreenRepair && m.SelectedConnection() != nil {
+			// Re-run diagnostics.
+			m.diagnostics = nil
+			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
 		}
 
 	case "p":
@@ -650,7 +683,18 @@ func (m *Model) renderRepair() string {
 	var b strings.Builder
 	b.WriteString(HeaderStyle.Render(fmt.Sprintf(" REPAIR: %s ", conn.Name)))
 	b.WriteString("\n\n")
-	b.WriteString("Diagnostics and repair for this connection.\n")
+	if m.diagnostics == nil {
+		b.WriteString("Running diagnostics...\n")
+	} else if len(m.diagnostics) == 0 {
+		b.WriteString("No findings — connection looks healthy.\n")
+	} else {
+		for _, d := range m.diagnostics {
+			b.WriteString(fmt.Sprintf("[%s] %s: %s\n", d.Severity, d.Segment, d.Summary))
+			if d.Explanation != "" {
+				b.WriteString("      " + d.Explanation + "\n")
+			}
+		}
+	}
 	b.WriteString("\n[esc] cancel    [r] run diagnostics    [q] quit\n")
 	return b.String()
 }

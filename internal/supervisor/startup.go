@@ -239,8 +239,14 @@ func (s *Supervisor) startup(ctx context.Context) error {
 	}
 
 	// Phase 5b: Initialize discovery, diagnostics, and origin services.
-	s.listenerEnum = discovery.NewSSEnumerator()
-	s.diagEngine = diagnostics.New(nil) // Will be updated with real provider
+	s.discoverer = discovery.NewDiscoverer(discovery.Options{})
+	s.diagEngine = diagnostics.New(diagnostics.Deps{
+		Origin:    diagnostics.NewHTTPOriginProber(2 * time.Second),
+		Connector: diagnostics.ConnectorObserverFunc(s.observeConnectorStatus),
+		Provider:  diagnostics.ProviderObserverFunc(s.observeProviderState),
+		DNS:       diagnostics.NewNetDNSProber(),
+		Endpoint:  diagnostics.NewHTTPSEndpointProber(4 * time.Second),
+	})
 	slog.Info("startup: discovery and diagnostics initialized")
 
 	// Phase 6: Load connection profiles WITHOUT changing them.
@@ -557,57 +563,388 @@ func (s *Supervisor) loadIncompleteOperations(ctx context.Context) error {
 	return nil
 }
 
+// --------------- incomplete operation recovery (SPEC §10.3) ---------------
+
+// stepRecoveryClass classifies one plan step of an interrupted operation
+// from durable evidence (operation journal + persisted provider resources).
+type stepRecoveryClass string
+
+const (
+	stepRecoveryNotStarted stepRecoveryClass = "not_started"
+	stepRecoveryCommitted  stepRecoveryClass = "committed"
+	stepRecoveryFailed     stepRecoveryClass = "failed"
+	stepRecoveryUnknown    stepRecoveryClass = "provider_outcome_unknown"
+)
+
+// recoveryOutcome is the operation-level recovery decision.
+type recoveryOutcome string
+
+const (
+	// recoveryComplete: every step committed durably — the operation can
+	// be finished with the normal terminal success commit.
+	recoveryComplete recoveryOutcome = "complete"
+	// recoveryFailSafe: no step committed and no step has an uncertain
+	// provider outcome — safe to mark the operation failed.
+	recoveryFailSafe recoveryOutcome = "fail_safe"
+	// recoveryRequired: partially committed or provider outcome unknown —
+	// the operation must be failed with recovery-required semantics and a
+	// diagnostic finding preserving the evidence.
+	recoveryRequired recoveryOutcome = "recovery_required"
+)
+
+// stepRecoveryState pairs a plan step with its recovery classification.
+type stepRecoveryState struct {
+	StepID string
+	Kind   core.StepKind
+	Class  stepRecoveryClass
+}
+
+// recoveryDecision is the full classification of an interrupted operation.
+type recoveryDecision struct {
+	Outcome           recoveryOutcome
+	Steps             []stepRecoveryState
+	LastStartedStepID string
+	// KnownResourceIDs lists persisted provider resources ("type/external_id").
+	KnownResourceIDs []string
+	// PossiblyUnpersisted lists observed provider resources with no
+	// persisted record ("type/external_id") — candidates created by an
+	// interrupted step whose commit never landed. Without durable
+	// provenance they must NOT be marked orphaned; they are preserved as
+	// finding evidence for repair/reconcile.
+	PossiblyUnpersisted []string
+}
+
+// producedResourceType maps a creation step kind to the resource type it
+// persists on success. Steps that persist no resource return "".
+func producedResourceType(kind core.StepKind) core.ResourceType {
+	switch kind {
+	case core.StepCreateTunnel, core.StepRecreateTunnel:
+		return core.ResourceTunnel
+	case core.StepCreateDNSRecord:
+		return core.ResourceDNSRecord
+	case core.StepCreateAccessApp:
+		return core.ResourceAccessApp
+	case core.StepCreateAccessPolicy:
+		return core.ResourceAccessPolicy
+	}
+	return ""
+}
+
+// classifyOperationRecovery classifies an interrupted operation from durable
+// evidence only. It is a pure function: no I/O, no clock reads beyond the
+// inputs, so it is unit-testable without a Supervisor.
+//
+// Per step: a terminal succeeded journal event means the step committed
+// (the terminal event is written atomically with its resources). A started
+// event with no terminal event and no attributable persisted resource means
+// the provider outcome is unknown. No events means the step never started.
+func classifyOperationRecovery(plan *core.OperationPlan, events []store.OperationJournalEvent,
+	resources []core.ProviderResource, observed *core.ObservedConnection) recoveryDecision {
+
+	var d recoveryDecision
+
+	// Index journal evidence per plan step ID.
+	started := make(map[string]bool)
+	succeeded := make(map[string]bool)
+	failed := make(map[string]bool)
+	for _, e := range events {
+		if e.StepID == "" {
+			continue
+		}
+		switch core.EventStage(e.Stage) {
+		case core.StageStarted:
+			started[e.StepID] = true
+		case core.StageSucceeded:
+			succeeded[e.StepID] = true
+		case core.StageFailed, core.StageCompensated:
+			// Compensated means rolled back — the forward step did not
+			// remain committed.
+			failed[e.StepID] = true
+		}
+	}
+
+	// Persisted resources are commit evidence. Count live resources per
+	// type and pre-attribute those belonging to journal-committed steps so
+	// resource-existence evidence is never double counted.
+	liveByType := make(map[core.ResourceType]int)
+	for _, r := range resources {
+		d.KnownResourceIDs = append(d.KnownResourceIDs, fmt.Sprintf("%s/%s", r.Type, r.ExternalID))
+		if r.Lifecycle == "" || r.Lifecycle == core.LifecyclePresent {
+			liveByType[r.Type]++
+		}
+	}
+	attributed := make(map[core.ResourceType]int)
+	for _, step := range plan.Steps {
+		if succeeded[step.ID] && !failed[step.ID] {
+			if rt := producedResourceType(step.Kind); rt != "" {
+				attributed[rt]++
+			}
+		}
+	}
+
+	committedCount := 0
+	anyUnknown := false
+	for _, step := range plan.Steps {
+		class := stepRecoveryNotStarted
+		switch {
+		case succeeded[step.ID] && !failed[step.ID]:
+			class = stepRecoveryCommitted
+		case failed[step.ID]:
+			class = stepRecoveryFailed
+		case started[step.ID]:
+			// Started with no terminal journal event. A persisted live
+			// resource of the produced type beyond those attributed to
+			// committed steps proves the commit landed (defensive: the
+			// commit is normally atomic with the terminal event).
+			rt := producedResourceType(step.Kind)
+			if rt != "" && liveByType[rt] > attributed[rt] {
+				attributed[rt]++
+				class = stepRecoveryCommitted
+			} else {
+				class = stepRecoveryUnknown
+			}
+		}
+		if class != stepRecoveryNotStarted {
+			d.LastStartedStepID = step.ID
+		}
+		if class == stepRecoveryCommitted {
+			committedCount++
+		}
+		if class == stepRecoveryUnknown {
+			anyUnknown = true
+		}
+		d.Steps = append(d.Steps, stepRecoveryState{StepID: step.ID, Kind: step.Kind, Class: class})
+	}
+
+	// Observed provider resources without a persisted record are evidence
+	// of possibly-created-but-unpersisted state.
+	if observed != nil {
+		persisted := make(map[string]bool, len(resources))
+		for _, r := range resources {
+			persisted[fmt.Sprintf("%s/%s", r.Type, r.ExternalID)] = true
+		}
+		var obs []string
+		if observed.Tunnel != nil {
+			obs = append(obs, fmt.Sprintf("%s/%s", core.ResourceTunnel, observed.Tunnel.ID))
+		}
+		for _, rec := range observed.DNSRecords {
+			obs = append(obs, fmt.Sprintf("%s/%s", core.ResourceDNSRecord, rec.ID))
+		}
+		for _, app := range observed.AccessApps {
+			obs = append(obs, fmt.Sprintf("%s/%s", core.ResourceAccessApp, app.ID))
+		}
+		for _, id := range obs {
+			if !persisted[id] {
+				d.PossiblyUnpersisted = append(d.PossiblyUnpersisted, id)
+			}
+		}
+	}
+
+	switch {
+	case len(plan.Steps) > 0 && committedCount == len(plan.Steps):
+		d.Outcome = recoveryComplete
+	case committedCount == 0 && !anyUnknown && len(d.PossiblyUnpersisted) == 0:
+		// Nothing committed, no uncertain provider outcome, and nothing
+		// observed beyond durable records: safe to fail the operation.
+		d.Outcome = recoveryFailSafe
+	default:
+		d.Outcome = recoveryRequired
+	}
+	return d
+}
+
+// recoveryStore is the subset of store operations needed to apply a
+// recovery decision. *store.Store satisfies it; tests use a real temp store.
+type recoveryStore interface {
+	CommitOpenSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID, startedAt time.Time) (*core.RuntimeCommitResult, error)
+	CommitCloseSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error)
+	CommitRepairSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error)
+	CommitDeleteSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) error
+	CommitOperationFailure(ctx context.Context, connID core.ConnectionID, opID core.OperationID, errMsg string, provider core.ProviderID, retryable bool) error
+	CommitOperationRecoveryRequired(ctx context.Context, connID core.ConnectionID, opID core.OperationID, errMsg string, provider core.ProviderID) error
+	UpsertStepResultStatus(ctx context.Context, opID core.OperationID, stepID string, stepKind core.StepKind, status store.StepResultStatus) error
+	MarkStepRecoveryRequired(ctx context.Context, opID core.OperationID, stepID string) error
+	SaveFinding(ctx context.Context, f *core.DiagnosticFinding) error
+}
+
+// applyRecoveryDecision durably applies a recovery decision for one
+// interrupted operation.
+func applyRecoveryDecision(ctx context.Context, st recoveryStore, op store.IncompleteOperation,
+	plan *core.OperationPlan, d recoveryDecision) error {
+
+	switch d.Outcome {
+	case recoveryComplete:
+		var err error
+		switch plan.Intent {
+		case core.IntentOpen:
+			startedAt, pErr := time.Parse(time.RFC3339, op.StartedAt)
+			if pErr != nil {
+				startedAt = time.Now().UTC()
+			}
+			_, err = st.CommitOpenSuccess(ctx, op.ConnectionID, op.ID, startedAt)
+		case core.IntentClose:
+			_, err = st.CommitCloseSuccess(ctx, op.ConnectionID, op.ID)
+		case core.IntentRepair:
+			_, err = st.CommitRepairSuccess(ctx, op.ConnectionID, op.ID)
+		case core.IntentDelete:
+			err = st.CommitDeleteSuccess(ctx, op.ConnectionID, op.ID)
+		default:
+			err = fmt.Errorf("unknown plan intent %q", plan.Intent)
+		}
+		if err == nil {
+			slog.Info("recovery: completed interrupted operation",
+				"operation", op.ID, "connection", op.ConnectionID, "intent", plan.Intent)
+			return nil
+		}
+		// The terminal commit itself failed: degrade to recovery-required
+		// rather than leaving the operation dangling or guessing.
+		slog.Warn("recovery: terminal success commit failed, marking recovery required",
+			"operation", op.ID, "err", err)
+		return markOperationRecoveryRequired(ctx, st, op, plan, d,
+			fmt.Sprintf("all steps committed but the terminal success commit failed during recovery: %v", err))
+
+	case recoveryFailSafe:
+		msg := "operation interrupted before any provider mutation was committed; marked failed during startup recovery"
+		if err := st.CommitOperationFailure(ctx, op.ConnectionID, op.ID, msg, plan.Provider, true); err != nil {
+			return fmt.Errorf("commit fail-safe failure: %w", err)
+		}
+		slog.Info("recovery: safely failed interrupted operation",
+			"operation", op.ID, "connection", op.ConnectionID)
+		return nil
+
+	default: // recoveryRequired
+		return markOperationRecoveryRequired(ctx, st, op, plan, d,
+			"supervisor interrupted mid-operation with partially committed or unknown provider state")
+	}
+}
+
+// markOperationRecoveryRequired records the recovery-required outcome:
+// uncertain steps are durably marked outcome_unknown + recovery_required,
+// a diagnostic finding preserves the operation, last started step, and the
+// exact known external IDs, and the runtime records PTO-OP-RECOVERY-REQUIRED.
+// The finding is written before the operation is converted to a failure so
+// the evidence is never lost (never blindly convert to ordinary failure).
+func markOperationRecoveryRequired(ctx context.Context, st recoveryStore, op store.IncompleteOperation,
+	plan *core.OperationPlan, d recoveryDecision, reason string) error {
+
+	var firstErr error
+	keep := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	var unknownSteps []string
+	for _, sc := range d.Steps {
+		if sc.Class != stepRecoveryUnknown {
+			continue
+		}
+		unknownSteps = append(unknownSteps, sc.StepID)
+		keep(st.UpsertStepResultStatus(ctx, op.ID, sc.StepID, sc.Kind, store.StepOutcomeUnknown))
+		keep(st.MarkStepRecoveryRequired(ctx, op.ID, sc.StepID))
+	}
+
+	finding := &core.DiagnosticFinding{
+		ID:           core.FindingID(fmt.Sprintf("recovery-%s", op.ID)),
+		ConnectionID: op.ConnectionID,
+		Segment:      core.SegmentConnector,
+		Severity:     core.SeverityError,
+		Summary:      fmt.Sprintf("Operation %s was interrupted and requires recovery", op.ID),
+		Explanation: fmt.Sprintf(
+			"%s. Last started step: %s. Repair must re-observe provider state before further mutations.",
+			reason, orNone(d.LastStartedStepID)),
+		Evidence: []core.Evidence{{
+			Type:    "operation_recovery",
+			Source:  "supervisor.startup",
+			Message: reason,
+			Data: map[string]string{
+				"operation_id":         string(op.ID),
+				"plan_id":              string(op.PlanID),
+				"intent":               string(plan.Intent),
+				"last_started_step":    d.LastStartedStepID,
+				"unknown_steps":        strings.Join(unknownSteps, ","),
+				"known_resources":      strings.Join(d.KnownResourceIDs, ","),
+				"possibly_unpersisted": strings.Join(d.PossiblyUnpersisted, ","),
+			},
+		}},
+		ObservedAt: time.Now().UTC(),
+	}
+	keep(st.SaveFinding(ctx, finding))
+
+	msg := fmt.Sprintf("%s (last started step: %s)", reason, orNone(d.LastStartedStepID))
+	keep(st.CommitOperationRecoveryRequired(ctx, op.ConnectionID, op.ID, msg, plan.Provider))
+
+	slog.Warn("recovery: operation marked recovery-required",
+		"operation", op.ID, "connection", op.ConnectionID,
+		"last_started_step", d.LastStartedStepID, "unknown_steps", len(unknownSteps))
+	return firstErr
+}
+
+// orNone substitutes "none" for empty evidence strings in messages.
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// recoverOperationJournals recovers operations that were interrupted
+// mid-execution (SPEC §10.3 "Recover incomplete operations"). Evidence is
+// the operation journal (operation_events), persisted provider resources,
+// and a best-effort provider re-observation.
 func (s *Supervisor) recoverOperationJournals(ctx context.Context) error {
-	// Load operations that were interrupted mid-execution.
-	incompleteOps, err := s.store.ListIncompleteOperations(ctx)
+	incompleteOps, err := s.store.ListNonTerminalOperations(ctx)
 	if err != nil {
 		return err
 	}
 
-	for _, opID := range incompleteOps {
-		results, err := s.store.GetStepResults(ctx, opID)
+	for _, op := range incompleteOps {
+		plan, err := s.store.LoadPlan(ctx, op.PlanID)
 		if err != nil {
-			slog.Warn("failed to load step results", "operation", opID, "err", err)
+			// Without the plan the steps cannot be classified. Preserve a
+			// finding and fail with recovery-required semantics.
+			slog.Warn("recovery: plan unavailable for interrupted operation",
+				"operation", op.ID, "plan", op.PlanID, "err", err)
+			stub := &core.OperationPlan{ID: op.PlanID, ConnectionID: op.ConnectionID}
+			if aErr := markOperationRecoveryRequired(ctx, s.store, op, stub,
+				recoveryDecision{Outcome: recoveryRequired},
+				"interrupted operation has no loadable plan"); aErr != nil {
+				slog.Warn("recovery: failed to mark recovery required", "operation", op.ID, "err", aErr)
+			}
 			continue
 		}
 
-		// Classify each step and determine recovery action.
-		needsRecovery := false
-		for _, r := range results {
-			switch r.Status {
-			case string(store.StepStarted), string(store.StepOutcomeUnknown):
-				// Step started but outcome unknown - needs compensation.
-				needsRecovery = true
-				if err := s.store.MarkStepRecoveryRequired(ctx, opID, r.StepID); err != nil {
-					slog.Warn("failed to mark step recovery", "operation", opID, "step", r.StepID, "err", err)
-				}
-				slog.Warn("operation has uncertain step outcome - recovery required",
-					"operation", opID, "step", r.StepID, "kind", r.StepKind)
-			case string(store.StepCompensationPending):
-				// Compensation was in progress - needs retry.
-				needsRecovery = true
-				slog.Warn("operation has pending compensation - recovery required",
-					"operation", opID, "step", r.StepID)
+		events, err := s.store.GetOperationEvents(ctx, op.ID)
+		if err != nil {
+			slog.Warn("recovery: journal unavailable, leaving operation for next startup",
+				"operation", op.ID, "err", err)
+			continue
+		}
+		resources, err := s.store.ListResourcesByConnection(ctx, op.ConnectionID)
+		if err != nil {
+			slog.Warn("recovery: resources unavailable, leaving operation for next startup",
+				"operation", op.ID, "err", err)
+			continue
+		}
+
+		// Best-effort provider re-observation for additional evidence.
+		var observed *core.ObservedConnection
+		if prov := s.registry.Get(plan.Provider); prov != nil {
+			if obs, oErr := prov.Observe(ctx, op.ConnectionID); oErr == nil {
+				observed = obs
+			} else {
+				slog.Warn("recovery: provider observation failed",
+					"operation", op.ID, "provider", plan.Provider, "err", oErr)
 			}
 		}
 
-		if needsRecovery {
-			slog.Error("operation requires recovery",
-				"operation", opID, "steps", len(results))
-			// Create a diagnostic finding for operator attention.
-			finding := &core.DiagnosticFinding{
-				ID:          core.FindingID(fmt.Sprintf("recovery-%s", opID)),
-				Segment:     core.SegmentConnector,
-				Severity:    core.SeverityError,
-				Summary:     fmt.Sprintf("Operation %s was interrupted and requires recovery", opID),
-				Explanation: "The supervisor was interrupted during operation execution. Some steps may need compensation.",
-				ObservedAt:  time.Now().UTC(),
-			}
-			if err := s.store.SaveFinding(ctx, finding); err != nil {
-				slog.Warn("failed to save recovery finding", "err", err)
-			}
-		} else {
-			slog.Info("incomplete operation found but all steps resolved", "operation", opID)
+		decision := classifyOperationRecovery(plan, events, resources, observed)
+		slog.Info("recovery: classified interrupted operation",
+			"operation", op.ID, "connection", op.ConnectionID,
+			"intent", plan.Intent, "outcome", decision.Outcome)
+
+		if err := applyRecoveryDecision(ctx, s.store, op, plan, decision); err != nil {
+			slog.Warn("recovery: applying decision failed", "operation", op.ID, "err", err)
 		}
 	}
 
