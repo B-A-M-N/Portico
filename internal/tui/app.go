@@ -781,6 +781,9 @@ func (m *Model) renderInspect() string {
 	b.WriteString(fmt.Sprintf("ID:       %s\n", conn.ID))
 	b.WriteString(fmt.Sprintf("State:    %s\n", conn.UserState))
 	b.WriteString(fmt.Sprintf("Provider: %s\n", conn.ProviderID))
+	if conn.ProviderAccountID != "" {
+		b.WriteString(fmt.Sprintf("Account:  %s\n", conn.ProviderAccountID))
+	}
 	if conn.PublicAddress != "" {
 		b.WriteString(fmt.Sprintf("Address:  %s\n", conn.PublicAddress))
 	}
@@ -859,6 +862,17 @@ func (m *Model) renderProviders() string {
 			status = "✗"
 		}
 		b.WriteString(fmt.Sprintf("  %s %s (%s)\n", status, p.DisplayName, p.ID))
+		for _, account := range p.Accounts {
+			label := account.Label
+			if label == "" {
+				label = account.ID
+			}
+			accountStatus := account.Status
+			if accountStatus == "" {
+				accountStatus = "configured"
+			}
+			b.WriteString(fmt.Sprintf("      • %s — %s\n", label, accountStatus))
+		}
 	}
 	b.WriteString("\n[esc] back    [q] quit\n")
 	return b.String()

@@ -175,6 +175,25 @@ func TestPressNShowsNewConnectionScreen(t *testing.T) {
 	}
 }
 
+func TestProviderAndInspectViewsShowSelectedAccount(t *testing.T) {
+	snap := testSnapshot()
+	snap.Connections[0].ProviderID = "cloudflare"
+	snap.Connections[0].ProviderAccountID = "account-work"
+	snap.Providers = []ipc.ProviderDTO{{
+		ID: "cloudflare", DisplayName: "Cloudflare", Authenticated: true,
+		Accounts: []ipc.ProviderAccountDTO{{ID: "account-work", Label: "Work", Status: "authenticated"}},
+	}}
+	m := readyModel(&fakeClient{}, snap)
+	m.screen = ScreenInspect
+	if view := m.View().Content; !strings.Contains(view, "Account:  account-work") {
+		t.Fatalf("inspect view omits selected account:\n%s", view)
+	}
+	m.screen = ScreenProviders
+	if view := m.View().Content; !strings.Contains(view, "Work — authenticated") {
+		t.Fatalf("provider view omits account summary:\n%s", view)
+	}
+}
+
 func TestPlanLoadingIsAsync(t *testing.T) {
 	tests := []struct {
 		name      string

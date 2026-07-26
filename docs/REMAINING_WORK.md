@@ -44,8 +44,8 @@ treated as an implementation defect.
 2. Replace environment-token login with stdin/protected-file-descriptor input
    where practical, while keeping secrets out of command arguments, logs,
    events, and responses.
-3. Show account labels and lifecycle controls in the provider-management screen
-   (inspect already shows the selected account ID).
+3. Add account lifecycle controls to the provider-management screen; it already
+   lists account labels/statuses, and inspect shows the selected account ID.
 4. Migrate the one-account config bootstrap into the account repository once.
    Do not keep a permanent config-file token fallback after successful
    migration. Retain the old read path only behind an explicit migration action

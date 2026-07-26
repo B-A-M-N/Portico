@@ -597,6 +597,17 @@ func handleProviderList(cmd *cobra.Command) error {
 			status = "✗"
 		}
 		fmt.Printf("%s %s (%s)\n", status, p.DisplayName, p.ID)
+		for _, account := range p.Accounts {
+			label := account.Label
+			if label == "" {
+				label = account.ID
+			}
+			state := account.Status
+			if state == "" {
+				state = "configured"
+			}
+			fmt.Printf("  - %s (%s)\n", label, state)
+		}
 	}
 	return nil
 }
