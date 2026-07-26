@@ -75,6 +75,13 @@ func (r *testRegistry) Snapshot() []provider.ProviderSnapshot { return nil }
 func (r *testRegistry) SetAccounts(id core.ProviderID, accounts []core.ProviderAccountID) {
 	r.accounts[id] = append([]core.ProviderAccountID(nil), accounts...)
 }
+func (r *testRegistry) SetAccountInfo(id core.ProviderID, accounts []provider.AccountInfo) {
+	ids := make([]core.ProviderAccountID, 0, len(accounts))
+	for _, account := range accounts {
+		ids = append(ids, account.ID)
+	}
+	r.SetAccounts(id, ids)
+}
 func (r *testRegistry) GetAccounts(id core.ProviderID) []core.ProviderAccountID {
 	return append([]core.ProviderAccountID(nil), r.accounts[id]...)
 }

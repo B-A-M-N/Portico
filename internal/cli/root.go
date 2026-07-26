@@ -296,6 +296,7 @@ func newProviderCmd() *cobra.Command {
 	}
 	loginCmd.Flags().String("account-id", "", "Cloudflare account ID")
 	loginCmd.Flags().String("zone-id", "", "Cloudflare zone ID")
+	loginCmd.Flags().String("label", "", "Friendly account label")
 	cmd.AddCommand(loginCmd)
 	return cmd
 }

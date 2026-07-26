@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -327,6 +328,28 @@ func (c *Client) ListProviders(ctx context.Context) ([]ProviderDTO, error) {
 		return nil, err
 	}
 	return providers, nil
+}
+
+// ConfigureProviderAccount persists a provider account through the local
+// supervisor. The response never contains the supplied credential.
+func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal provider account configuration: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/providers/"+url.PathEscape(providerID)+"/accounts", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result ConfigureProviderAccountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // --------------- Event stream ---------------

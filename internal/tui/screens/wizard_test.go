@@ -2,7 +2,10 @@ package screens
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 func TestExistingServiceAddressPreservesPortsAndFormatsIPv6(t *testing.T) {
@@ -50,7 +53,7 @@ func TestEmailOTPProtectionRulesAreValidatedAndIncludedInRequest(t *testing.T) {
 		t.Fatalf("domains = %#v, want %#v", domains, want)
 	}
 
-	m := NewWizard(nil, true)
+	m := NewWizard(nil, true, nil)
 	m.state = WizardState{
 		Name:           "Protected service",
 		SourceType:     "existing_service",
@@ -79,12 +82,47 @@ func TestEmailOTPProtectionRulesRejectEmptyAndMalformedValues(t *testing.T) {
 }
 
 func TestProtectionChoicesFollowConfiguredCapabilities(t *testing.T) {
-	if got := NewWizard(nil, false).protections(); !reflect.DeepEqual(got, []string{"none"}) {
+	if got := NewWizard(nil, false, nil).protections(); !reflect.DeepEqual(got, []string{"none"}) {
 		t.Fatalf("limited choices = %#v", got)
 	}
-	full := NewWizard(nil, true)
+	full := NewWizard(nil, true, nil)
 	full.state.ExposureMode = "permanent_public"
 	if got := full.protections(); !reflect.DeepEqual(got, []string{"none", "email_otp"}) {
 		t.Fatalf("full choices = %#v", got)
+	}
+}
+
+func TestWizardSelectsConfiguredCloudflareAccount(t *testing.T) {
+	m := NewWizard(nil, true, []ipc.ProviderAccountDTO{
+		{ID: "account-a", Label: "Personal"},
+		{ID: "account-b", Label: "Work"},
+	})
+	m.state = WizardState{
+		Step: WizardStepProvider, Name: "Service", SourceType: "existing_service",
+		SourceAddress: "127.0.0.1", SourceProtocol: "http", Port: "8080",
+		ExposureMode: "permanent_public", Hostname: "service.example.com", Protection: "none",
+	}
+	m.HandleKey("enter")
+	if m.Step() != WizardStepAccount {
+		t.Fatalf("step = %d, want account selection", m.Step())
+	}
+	m.HandleKey("down")
+	m.HandleKey("enter")
+	if m.Step() != WizardStepReview || m.state.AccountID != "account-b" {
+		t.Fatalf("selected state = %#v", m.state)
+	}
+	if got := m.buildRequest().Provider.AccountID; got != "account-b" {
+		t.Fatalf("request account ID = %q, want account-b", got)
+	}
+}
+
+func TestWizardDoesNotOfferUnsupportedProtectionOrExposure(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	if view := m.renderExposure(); !strings.Contains(view, "Permanently") {
+		t.Fatalf("full Cloudflare exposure options omit permanent exposure: %s", view)
+	}
+	m.state.ExposureMode = "temporary_public"
+	if view := m.renderProtection(); strings.Contains(view, "one-time passcode") {
+		t.Fatalf("quick-tunnel protection options include unsupported email OTP: %s", view)
 	}
 }

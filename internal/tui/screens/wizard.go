@@ -34,6 +34,7 @@ type WizardModel struct {
 	input          string
 	err            error
 	fullCloudflare bool
+	accounts       []ipc.ProviderAccountDTO
 }
 
 // WizardState holds the state for the new connection wizard.
@@ -50,6 +51,7 @@ type WizardState struct {
 	AllowedEmails  []string
 	AllowedDomains []string
 	Provider       string
+	AccountID      string
 }
 
 // Wizard step constants
@@ -63,6 +65,7 @@ const (
 	WizardStepProtection
 	WizardStepProtectionRules
 	WizardStepProvider
+	WizardStepAccount
 	WizardStepReview
 	WizardStepCreating
 	WizardStepComplete
@@ -75,18 +78,19 @@ var (
 )
 
 // NewWizard creates a new wizard model.
-func NewWizard(client ConnectionCreator, fullCloudflare bool) *WizardModel {
+func NewWizard(client ConnectionCreator, fullCloudflare bool, accounts []ipc.ProviderAccountDTO) *WizardModel {
 	return &WizardModel{
 		client:         client,
 		fullCloudflare: fullCloudflare,
+		accounts:       append([]ipc.ProviderAccountDTO(nil), accounts...),
 		state:          WizardState{Step: WizardStepIntent, Provider: wizardProviders[0]},
 	}
 }
 
 // NewWizardForService starts the normal wizard with a discovery result already
 // selected, so a user never has to retype a port discovered by Portico.
-func NewWizardForService(client ConnectionCreator, fullCloudflare bool, address, protocol string) *WizardModel {
-	m := NewWizard(client, fullCloudflare)
+func NewWizardForService(client ConnectionCreator, fullCloudflare bool, accounts []ipc.ProviderAccountDTO, address, protocol string) *WizardModel {
+	m := NewWizard(client, fullCloudflare, accounts)
 	m.state.SourceType = "existing_service"
 	m.state.SourceAddress = address
 	m.state.SourceProtocol = protocol
@@ -325,7 +329,16 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 		case "enter":
 			m.state.Provider = wizardProviders[m.selected]
-			m.state.Step = WizardStepReview
+			switch len(m.accounts) {
+			case 0:
+				m.state.AccountID = ""
+				m.state.Step = WizardStepReview
+			case 1:
+				m.state.AccountID = m.accounts[0].ID
+				m.state.Step = WizardStepReview
+			default:
+				m.state.Step = WizardStepAccount
+			}
 			m.selected = 0
 		case "esc":
 			if m.state.Protection == "email_otp" {
@@ -335,6 +348,25 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepProtection
 				m.selected = protectionIndex(m.protections(), m.state.Protection)
 			}
+		}
+
+	case WizardStepAccount:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < len(m.accounts)-1 {
+				m.selected++
+			}
+		case "enter":
+			m.state.AccountID = m.accounts[m.selected].ID
+			m.state.Step = WizardStepReview
+			m.selected = 0
+		case "esc":
+			m.state.Step = WizardStepProvider
+			m.selected = 0
 		}
 
 	case WizardStepReview:
@@ -402,6 +434,7 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 		},
 		Provider: ipc.ProviderSelectionDTO{
 			ProviderID: s.Provider,
+			AccountID:  s.AccountID,
 		},
 	}
 }
@@ -487,6 +520,8 @@ func (m *WizardModel) View() string {
 		return m.withError(renderInput("Allow emails or domains (comma-separated; @example.com permits a domain):", m.input))
 	case WizardStepProvider:
 		return m.renderProvider()
+	case WizardStepAccount:
+		return m.renderAccount()
 	case WizardStepReview:
 		return m.renderReview()
 	case WizardStepCreating:
@@ -529,7 +564,7 @@ func (m *WizardModel) renderIntent() string {
 
 func (m *WizardModel) renderExposure() string {
 	options := []string{"Temporarily, with a generated address"}
-	if m.fullCloudflare && m.state.ExposureMode == "permanent_public" {
+	if m.fullCloudflare {
 		options = append(options, "Permanently, with my own hostname")
 	}
 	return renderMenu("How should it be reachable?", options, m.selected)
@@ -537,7 +572,7 @@ func (m *WizardModel) renderExposure() string {
 
 func (m *WizardModel) renderProtection() string {
 	options := []string{"Anyone with the address"}
-	if m.fullCloudflare {
+	if m.fullCloudflare && m.state.ExposureMode == "permanent_public" {
 		options = append(options, "Email one-time passcode (limit who can sign in)")
 	}
 	return renderMenu("Who should be able to reach it?", options, m.selected)
@@ -548,6 +583,20 @@ func (m *WizardModel) renderProvider() string {
 		"Cloudflare (default)",
 	}
 	return renderMenu("Which provider should carry the connection?", options, m.selected)
+}
+
+func (m *WizardModel) renderAccount() string {
+	options := make([]string, 0, len(m.accounts))
+	for _, account := range m.accounts {
+		label := account.Label
+		if label == "" || label == account.ID {
+			label = account.ID
+		} else {
+			label += " (" + account.ID + ")"
+		}
+		options = append(options, label)
+	}
+	return renderMenu("Which Cloudflare account should own this connection?", options, m.selected)
 }
 
 func (m *WizardModel) renderReview() string {
@@ -571,6 +620,9 @@ func (m *WizardModel) renderReview() string {
 	if len(m.state.AllowedDomains) > 0 {
 		lines = append(lines, fmt.Sprintf("Allowed domains: %s", strings.Join(m.state.AllowedDomains, ", ")))
 	}
+	if m.state.AccountID != "" {
+		lines = append(lines, fmt.Sprintf("Account:    %s", m.accountLabel(m.state.AccountID)))
+	}
 	lines = append(lines,
 		fmt.Sprintf("Protection: %s", m.state.Protection),
 		fmt.Sprintf("Provider:   %s", m.state.Provider),
@@ -585,6 +637,15 @@ func (m *WizardModel) renderReview() string {
 	}
 	lines = append(lines, "", "Enter Create  Esc Back")
 	return strings.Join(lines, "\n")
+}
+
+func (m *WizardModel) accountLabel(id string) string {
+	for _, account := range m.accounts {
+		if account.ID == id && account.Label != "" {
+			return account.Label
+		}
+	}
+	return id
 }
 
 func renderMenu(title string, options []string, selected int) string {

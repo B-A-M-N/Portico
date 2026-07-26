@@ -9,7 +9,9 @@ import (
 
 	"github.com/B-A-M-N/portico/internal/controller"
 	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/mock"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -132,6 +134,59 @@ func openSteps() []core.PlanStep {
 	return []core.PlanStep{
 		{ID: "step-1", Kind: core.StepCreateTunnel, Summary: "Create tunnel"},
 		{ID: "step-2", Kind: core.StepCreateDNSRecord, Summary: "Create DNS record"},
+	}
+}
+
+func TestSnapshotIncludesNonSecretProviderAccountSummaries(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	profile := recoveryTestProfile("conn-account-summary")
+	profile.Provider.AccountID = "account-a"
+	if err := st.SaveProfile(context.Background(), profile); err != nil {
+		t.Fatalf("save profile: %v", err)
+	}
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock provider: %v", err)
+	}
+	registry.SetAccountInfo("mock", []provider.AccountInfo{
+		{ID: "account-a", Label: "Personal", Status: "authenticated"},
+		{ID: "account-b", Label: "Work", Status: "authenticated"},
+	})
+
+	snapshot, err := (&supervisorHandler{sup: &Supervisor{store: st, registry: registry}}).HandleSnapshot()
+	if err != nil {
+		t.Fatalf("HandleSnapshot: %v", err)
+	}
+	if len(snapshot.Providers) != 1 || len(snapshot.Providers[0].Accounts) != 2 {
+		t.Fatalf("provider snapshot = %#v", snapshot.Providers)
+	}
+	if got := snapshot.Providers[0].Accounts[1]; got.ID != "account-b" || got.Label != "Work" || got.Status != "authenticated" {
+		t.Fatalf("account summary = %#v", got)
+	}
+	if len(snapshot.Connections) != 1 || snapshot.Connections[0].ProviderAccountID != "account-a" {
+		t.Fatalf("connection snapshot = %#v", snapshot.Connections)
+	}
+}
+
+func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	handler := &supervisorHandler{sup: &Supervisor{store: st}}
+	response, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
+		AccountID: "account-a", Label: "Personal", ZoneID: "zone-a", Credential: "secret-token",
+	})
+	if err != nil {
+		t.Fatalf("HandleConfigureProviderAccount: %v", err)
+	}
+	if !response.RestartRequired {
+		t.Fatal("account configuration must require adapter reconstruction")
+	}
+	accounts, err := st.ListProviderAccounts(context.Background())
+	if err != nil || len(accounts) != 1 || accounts[0].ID != "account-a" || accounts[0].Metadata["zone_id"] != "zone-a" {
+		t.Fatalf("ListProviderAccounts = %#v, %v", accounts, err)
+	}
+	credential, err := st.LoadProviderCredential(context.Background(), "cloudflare", "cloudflare:account-a:api-token")
+	if err != nil || credential != "secret-token" {
+		t.Fatalf("LoadProviderCredential = %q, %v", credential, err)
 	}
 }
 

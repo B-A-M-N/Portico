@@ -323,6 +323,26 @@ func TestProviderCredentialIsEncryptedBoundAndRotated(t *testing.T) {
 	}
 }
 
+func TestUpsertProviderAccountCredentialPersistsAnAtomicAccountBinding(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	account := core.ProviderAccount{
+		ID: "account-a", Provider: "cloudflare", Label: "Personal", CredentialRef: "cloudflare:account-a:api-token",
+		Metadata: map[string]string{"zone_id": "zone-a"}, Status: core.AccountAuthenticated,
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, account, []byte("token-a")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+	accounts, err := s.ListProviderAccounts(ctx)
+	if err != nil || len(accounts) != 1 || accounts[0].Label != "Personal" {
+		t.Fatalf("ListProviderAccounts = %#v, %v", accounts, err)
+	}
+	credential, err := s.LoadProviderCredential(ctx, "cloudflare", account.CredentialRef)
+	if err != nil || credential != "token-a" {
+		t.Fatalf("LoadProviderCredential = %q, %v", credential, err)
+	}
+}
+
 func TestReadSnapshotIncludesStateAndEventHighWater(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

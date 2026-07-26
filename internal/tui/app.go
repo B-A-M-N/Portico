@@ -573,14 +573,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.planRepairCmd(m.SelectedConnection().ID)
 		} else if m.screen == ScreenDiscovery && len(m.discovery) > 0 {
 			svc := m.discovery[m.discoverySelected]
-			m.wizard = screens.NewWizardForService(m.client, m.hasFullCloudflare(), svc.Address, svc.Protocol)
+			m.wizard = screens.NewWizardForService(m.client, m.hasFullCloudflare(), m.cloudflareAccounts(), svc.Address, svc.Protocol)
 			m.status = ""
 			m.screen = ScreenNewConnection
 		}
 
 	case "n":
 		if m.screen == ScreenHome {
-			m.wizard = screens.NewWizard(m.client, m.hasFullCloudflare())
+			m.wizard = screens.NewWizard(m.client, m.hasFullCloudflare(), m.cloudflareAccounts())
 			m.status = ""
 			m.screen = ScreenNewConnection
 		}
@@ -635,6 +635,15 @@ func (m *Model) hasFullCloudflare() bool {
 		}
 	}
 	return false
+}
+
+func (m *Model) cloudflareAccounts() []ipc.ProviderAccountDTO {
+	for _, provider := range m.snapshot.Providers {
+		if provider.ID == "cloudflare" {
+			return append([]ipc.ProviderAccountDTO(nil), provider.Accounts...)
+		}
+	}
+	return nil
 }
 
 // handleWizardKey routes keys to the new-connection wizard.

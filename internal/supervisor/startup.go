@@ -22,6 +22,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/discovery"
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/lock"
+	"github.com/B-A-M-N/portico/internal/provider"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -398,15 +399,14 @@ func (s *Supervisor) loadProviderAccounts(ctx context.Context) error {
 	// (for example, the environment/configured Cloudflare account). A single
 	// adapter must not advertise arbitrary stored rows: it would execute against
 	// its own configured account while the profile claims another one.
-	groups := make(map[core.ProviderID]map[core.ProviderAccountID]struct{})
+	groups := make(map[core.ProviderID]map[core.ProviderAccountID]provider.AccountInfo)
 	for _, snapshot := range s.registry.List() {
-		ids := s.registry.GetAccounts(snapshot.ID)
-		if len(ids) == 0 {
+		if len(snapshot.Accounts) == 0 {
 			continue
 		}
-		group := make(map[core.ProviderAccountID]struct{}, len(ids))
-		for _, id := range ids {
-			group[id] = struct{}{}
+		group := make(map[core.ProviderAccountID]provider.AccountInfo, len(snapshot.Accounts))
+		for _, account := range snapshot.Accounts {
+			group[account.ID] = account
 		}
 		groups[snapshot.ID] = group
 	}
@@ -431,9 +431,9 @@ func (s *Supervisor) loadProviderAccounts(ctx context.Context) error {
 			}
 		}
 		if groups[a.Provider] == nil {
-			groups[a.Provider] = make(map[core.ProviderAccountID]struct{})
+			groups[a.Provider] = make(map[core.ProviderAccountID]provider.AccountInfo)
 		}
-		groups[a.Provider][a.ID] = struct{}{}
+		groups[a.Provider][a.ID] = provider.AccountInfo{ID: a.ID, Label: a.Label, Status: string(a.Status)}
 	}
 
 	for providerID, group := range groups {
@@ -442,7 +442,11 @@ func (s *Supervisor) loadProviderAccounts(ctx context.Context) error {
 			ids = append(ids, id)
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		s.registry.SetAccounts(providerID, ids)
+		infos := make([]provider.AccountInfo, 0, len(ids))
+		for _, id := range ids {
+			infos = append(infos, group[id])
+		}
+		s.registry.SetAccountInfo(providerID, infos)
 		slog.Info("provider accounts loaded", "provider", providerID, "count", len(ids))
 	}
 

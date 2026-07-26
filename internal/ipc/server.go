@@ -52,6 +52,7 @@ type RequestHandler interface {
 	HandleApplyPlan(planID string) (*OperationDTO, error)
 	HandleListProviders() ([]ProviderDTO, error)
 	HandleAuthenticateProvider(id string) error
+	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
 	HandleDiscovery() (*DiscoveryDTO, error)
@@ -592,25 +593,46 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	// POST /v1/providers/{id}/authenticate
-	id := strings.TrimPrefix(r.URL.Path, "/v1/providers/")
-	id = strings.TrimSuffix(id, "/authenticate")
-
-	// Validate method
+	// POST /v1/providers/{id}/accounts
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/providers/"), "/"), "/")
+	if len(parts) != 2 || parts[0] == "" {
+		writeError(w, http.StatusNotFound, "PROV-001", "unknown provider endpoint")
+		return
+	}
+	id, action := parts[0], parts[1]
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "PROV-001", "method not allowed")
+		writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
 		return
 	}
 
-	// Use MaxBytesReader with reasonable limit
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<10) // 1KB limit
-
-	if err := s.handler.HandleAuthenticateProvider(id); err != nil {
-		writeHandlerError(w, "PROV-002", err)
-		return
+	switch action {
+	case "authenticate":
+		if err := s.handler.HandleAuthenticateProvider(id); err != nil {
+			writeHandlerError(w, "PROV-003", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "authenticated"})
+	case "accounts":
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		defer r.Body.Close()
+		var req ConfigureProviderAccountRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "PROV-004", "invalid account configuration")
+			return
+		}
+		response, err := s.handler.HandleConfigureProviderAccount(id, req)
+		if err != nil {
+			writeHandlerError(w, "PROV-005", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(response)
+	default:
+		writeError(w, http.StatusNotFound, "PROV-006", "unknown provider endpoint")
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "authenticated"})
 }
 
 func (s *Server) handleOperations(w http.ResponseWriter, r *http.Request) {

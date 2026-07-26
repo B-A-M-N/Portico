@@ -15,25 +15,51 @@ type SnapshotDTO struct {
 
 // ConnectionDTO is the view of a connection sent over IPC.
 type ConnectionDTO struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	DesiredState   string `json:"desired_state"`
-	RuntimeState   string `json:"runtime_state"`
-	UserState      string `json:"user_state"`
-	PublicAddress  string `json:"public_address,omitempty"`
-	PrivateAddress string `json:"private_address,omitempty"`
-	ProviderID     string `json:"provider_id"`
-	ConnectorPID   int    `json:"connector_pid,omitempty"`
-	ConnectorState string `json:"connector_state"`
-	Error          string `json:"error,omitempty"`
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	DesiredState      string `json:"desired_state"`
+	RuntimeState      string `json:"runtime_state"`
+	UserState         string `json:"user_state"`
+	PublicAddress     string `json:"public_address,omitempty"`
+	PrivateAddress    string `json:"private_address,omitempty"`
+	ProviderID        string `json:"provider_id"`
+	ProviderAccountID string `json:"provider_account_id,omitempty"`
+	ConnectorPID      int    `json:"connector_pid,omitempty"`
+	ConnectorState    string `json:"connector_state"`
+	Error             string `json:"error,omitempty"`
 }
 
 // ProviderDTO is the view of a provider sent over IPC.
 type ProviderDTO struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	DisplayName   string `json:"display_name"`
-	Authenticated bool   `json:"authenticated"`
+	ID            string               `json:"id"`
+	Name          string               `json:"name"`
+	DisplayName   string               `json:"display_name"`
+	Authenticated bool                 `json:"authenticated"`
+	Accounts      []ProviderAccountDTO `json:"accounts,omitempty"`
+}
+
+// ProviderAccountDTO is a selectable, non-secret provider account summary.
+type ProviderAccountDTO struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Status string `json:"status"`
+}
+
+// ConfigureProviderAccountRequest carries one provider credential over the
+// authenticated local Unix socket. Callers must obtain Credential from stdin,
+// an environment reference, or a protected file descriptor; never a command
+// argument. The value is not included in responses or durable events.
+type ConfigureProviderAccountRequest struct {
+	AccountID  string `json:"account_id"`
+	Label      string `json:"label,omitempty"`
+	ZoneID     string `json:"zone_id,omitempty"`
+	Credential string `json:"credential"`
+}
+
+// ConfigureProviderAccountResponse tells clients whether a supervisor restart
+// is needed before newly persisted account adapters become available.
+type ConfigureProviderAccountResponse struct {
+	RestartRequired bool `json:"restart_required"`
 }
 
 // --------------- events ---------------

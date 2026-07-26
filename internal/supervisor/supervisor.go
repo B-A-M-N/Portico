@@ -320,10 +320,11 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 	for _, p := range profiles {
 		rt := rtMap[p.ID]
 		dto := ipc.ConnectionDTO{
-			ID:           string(p.ID),
-			Name:         p.Name,
-			DesiredState: string(p.Desired),
-			ProviderID:   string(p.Provider.ProviderID),
+			ID:                string(p.ID),
+			Name:              p.Name,
+			DesiredState:      string(p.Desired),
+			ProviderID:        string(p.Provider.ProviderID),
+			ProviderAccountID: string(p.Provider.AccountID),
 		}
 		if rt != nil {
 			dto.RuntimeState = string(rt.State)
@@ -342,12 +343,18 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 	providers := h.sup.registry.List()
 	provDTOs := make([]ipc.ProviderDTO, 0, len(providers))
 	for _, p := range providers {
-		provDTOs = append(provDTOs, ipc.ProviderDTO{
+		dto := ipc.ProviderDTO{
 			ID:            string(p.ID),
 			Name:          p.Name,
 			DisplayName:   p.DisplayName,
 			Authenticated: p.Authenticated,
-		})
+		}
+		for _, account := range p.Accounts {
+			dto.Accounts = append(dto.Accounts, ipc.ProviderAccountDTO{
+				ID: string(account.ID), Label: account.Label, Status: account.Status,
+			})
+		}
+		provDTOs = append(provDTOs, dto)
 	}
 
 	return &ipc.SnapshotDTO{
@@ -374,10 +381,11 @@ func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, 
 	rt, _ := h.sup.controller.GetRuntime(cid)
 
 	dto := ipc.ConnectionDTO{
-		ID:           string(p.ID),
-		Name:         p.Name,
-		DesiredState: string(p.Desired),
-		ProviderID:   string(p.Provider.ProviderID),
+		ID:                string(p.ID),
+		Name:              p.Name,
+		DesiredState:      string(p.Desired),
+		ProviderID:        string(p.Provider.ProviderID),
+		ProviderAccountID: string(p.Provider.AccountID),
 	}
 	if rt != nil {
 		dto.RuntimeState = string(rt.State)
@@ -770,6 +778,47 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 	return prov.Authenticate(context.Background(), core.AuthRequest{
 		ProviderID: core.ProviderID(id),
 	})
+}
+
+// HandleConfigureProviderAccount stores one Cloudflare account through the
+// supervisor-owned secret store. Provider instances are built at supervisor
+// startup, so the caller must restart after a successful write before this
+// account becomes selectable for operations.
+func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
+	if id != "cloudflare" {
+		return nil, core.ErrProviderNotFound(core.ProviderID(id))
+	}
+	accountID := strings.TrimSpace(req.AccountID)
+	zoneID := strings.TrimSpace(req.ZoneID)
+	credential := strings.TrimSpace(req.Credential)
+	if accountID == "" || zoneID == "" || credential == "" {
+		return nil, core.ErrValidation("cloudflare account ID, zone ID, and credential are required")
+	}
+	label := strings.TrimSpace(req.Label)
+	if label == "" {
+		label = accountID
+	}
+	credentialRef := fmt.Sprintf("cloudflare:%s:api-token", accountID)
+	account := core.ProviderAccount{
+		ID:            core.ProviderAccountID(accountID),
+		Provider:      "cloudflare",
+		Label:         label,
+		CredentialRef: credentialRef,
+		Metadata:      map[string]string{"zone_id": zoneID},
+		Status:        core.AccountAuthenticated,
+	}
+	secret := []byte(credential)
+	defer zeroBytes(secret)
+	if err := h.sup.store.UpsertProviderAccountCredential(context.Background(), account, secret); err != nil {
+		return nil, fmt.Errorf("save Cloudflare account: %w", err)
+	}
+	return &ipc.ConfigureProviderAccountResponse{RestartRequired: true}, nil
+}
+
+func zeroBytes(value []byte) {
+	for i := range value {
+		value[i] = 0
+	}
 }
 
 // observeConnectorStatus backs the diagnostics engine's ConnectorObserver.

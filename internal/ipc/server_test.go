@@ -44,6 +44,9 @@ func (nullHandler) HandleApplyPlan(string) (*OperationDTO, error) {
 }
 func (nullHandler) HandleListProviders() ([]ProviderDTO, error) { return nil, nil }
 func (nullHandler) HandleAuthenticateProvider(string) error     { return nil }
+func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
+	return &ConfigureProviderAccountResponse{}, nil
+}
 func (nullHandler) HandleGetOperation(string) (*OperationDTO, error) {
 	return nil, nil
 }

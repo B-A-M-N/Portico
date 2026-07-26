@@ -15,7 +15,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/B-A-M-N/portico/internal/app"
-	"github.com/B-A-M-N/portico/internal/config"
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/supervisor"
 )
@@ -323,6 +322,9 @@ func handleInspect(cmd *cobra.Command, id string) error {
 	fmt.Printf("Name:     %s\n", conn.Name)
 	fmt.Printf("State:    %s\n", conn.UserState)
 	fmt.Printf("Provider: %s\n", conn.ProviderID)
+	if conn.ProviderAccountID != "" {
+		fmt.Printf("Account:  %s\n", conn.ProviderAccountID)
+	}
 	if conn.PublicAddress != "" {
 		fmt.Printf("Address:  %s\n", conn.PublicAddress)
 	}
@@ -608,17 +610,29 @@ func handleProviderLogin(cmd *cobra.Command, id string) error {
 	if accountID == "" || zoneID == "" {
 		return fmt.Errorf("cloudflare login requires --account-id and --zone-id")
 	}
-	if err := config.Init(); err != nil {
-		return fmt.Errorf("initialize config: %w", err)
-	}
-	token := config.APIToken()
+	token := strings.TrimSpace(os.Getenv("PORTICO_CLOUDFLARE_API_TOKEN"))
 	if token == "" {
-		return fmt.Errorf("set CLOUDFLARE_API_TOKEN in the environment before logging in; Portico never accepts provider tokens on the command line")
+		token = strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN"))
 	}
-	if err := config.SaveCloudflareSetup(accountID, zoneID, token); err != nil {
-		return fmt.Errorf("save Cloudflare setup: %w", err)
+	if token == "" {
+		return fmt.Errorf("set CLOUDFLARE_API_TOKEN or PORTICO_CLOUDFLARE_API_TOKEN before logging in; Portico never accepts provider tokens on the command line")
 	}
-	fmt.Println("Cloudflare credentials saved securely. Restart Portico's supervisor to activate full Cloudflare connections.")
+	label, _ := cmd.Flags().GetString("label")
+	client, err := getClient(cmd)
+	if err != nil {
+		return err
+	}
+	response, err := client.ConfigureProviderAccount(cmd.Context(), "cloudflare", ipc.ConfigureProviderAccountRequest{
+		AccountID: accountID, ZoneID: zoneID, Label: label, Credential: token,
+	})
+	if err != nil {
+		return fmt.Errorf("save Cloudflare account: %w", err)
+	}
+	if response.RestartRequired {
+		fmt.Println("Cloudflare account saved securely. Run 'portico supervisor stop' then 'portico supervisor start' to activate it.")
+		return nil
+	}
+	fmt.Println("Cloudflare account saved securely.")
 	return nil
 }
 

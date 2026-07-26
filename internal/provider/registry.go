@@ -17,6 +17,7 @@ type Registry interface {
 	Add(provider core.Provider) error
 	DiscoverIdentities(ctx context.Context) []ProviderSnapshot
 	SetAccounts(providerID core.ProviderID, accounts []core.ProviderAccountID)
+	SetAccountInfo(providerID core.ProviderID, accounts []AccountInfo)
 	GetAccounts(providerID core.ProviderID) []core.ProviderAccountID
 }
 
@@ -45,16 +46,18 @@ type FilteredProvider struct {
 
 // registry is the default in-memory registry
 type registry struct {
-	mu        sync.RWMutex
-	providers map[core.ProviderID]core.Provider
-	accounts  map[core.ProviderID][]core.ProviderAccountID
+	mu          sync.RWMutex
+	providers   map[core.ProviderID]core.Provider
+	accounts    map[core.ProviderID][]core.ProviderAccountID
+	accountInfo map[core.ProviderID][]AccountInfo
 }
 
 // NewRegistry creates a new provider registry
 func NewRegistry() *registry {
 	return &registry{
-		providers: make(map[core.ProviderID]core.Provider),
-		accounts:  make(map[core.ProviderID][]core.ProviderAccountID),
+		providers:   make(map[core.ProviderID]core.Provider),
+		accounts:    make(map[core.ProviderID][]core.ProviderAccountID),
+		accountInfo: make(map[core.ProviderID][]AccountInfo),
 	}
 }
 
@@ -93,13 +96,12 @@ func (r *registry) listInternalLocked() []ProviderSnapshot {
 		caps, _ := p.Capabilities(context.Background())
 
 		// Get account info
-		accountIDs := r.accounts[id]
-		accounts := make([]AccountInfo, len(accountIDs))
-		for i, accID := range accountIDs {
-			accounts[i] = AccountInfo{
-				ID:     accID,
-				Label:  string(accID),
-				Status: "configured",
+		accounts := append([]AccountInfo(nil), r.accountInfo[id]...)
+		if len(accounts) == 0 {
+			accountIDs := r.accounts[id]
+			accounts = make([]AccountInfo, len(accountIDs))
+			for i, accID := range accountIDs {
+				accounts[i] = AccountInfo{ID: accID, Label: string(accID), Status: "configured"}
 			}
 		}
 
@@ -142,7 +144,32 @@ func (r *registry) Add(provider core.Provider) error {
 func (r *registry) SetAccounts(providerID core.ProviderID, accounts []core.ProviderAccountID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.accounts[providerID] = accounts
+	r.accounts[providerID] = append([]core.ProviderAccountID(nil), accounts...)
+	infos := make([]AccountInfo, len(accounts))
+	for i, accountID := range accounts {
+		infos[i] = AccountInfo{ID: accountID, Label: string(accountID), Status: "configured"}
+	}
+	r.accountInfo[providerID] = infos
+}
+
+// SetAccountInfo associates non-secret display metadata with configured
+// accounts. It also replaces the account ID projection used for validation.
+func (r *registry) SetAccountInfo(providerID core.ProviderID, accounts []AccountInfo) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	infos := append([]AccountInfo(nil), accounts...)
+	ids := make([]core.ProviderAccountID, 0, len(infos))
+	for i := range infos {
+		if infos[i].Label == "" {
+			infos[i].Label = string(infos[i].ID)
+		}
+		if infos[i].Status == "" {
+			infos[i].Status = "configured"
+		}
+		ids = append(ids, infos[i].ID)
+	}
+	r.accounts[providerID] = ids
+	r.accountInfo[providerID] = infos
 }
 
 // GetAccounts returns the accounts associated with a provider

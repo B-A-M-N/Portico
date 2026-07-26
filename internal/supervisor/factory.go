@@ -157,6 +157,7 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 		accounts = nil
 	}
 	children := make(map[core.ProviderAccountID]*cloudflare.Provider)
+	accountDetails := make(map[core.ProviderAccountID]core.ProviderAccount)
 	for _, account := range accounts {
 		if account.Provider != "cloudflare" || account.Status != core.AccountAuthenticated {
 			continue
@@ -178,6 +179,7 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 		}
 		child.SetCredentialStore(st)
 		children[account.ID] = child
+		accountDetails[account.ID] = account
 	}
 	if len(children) > 0 {
 		accountsProvider, newErr := cloudflare.NewAccountsProvider(children)
@@ -194,7 +196,12 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 			accountIDs = append(accountIDs, id)
 		}
 		sort.Slice(accountIDs, func(i, j int) bool { return accountIDs[i] < accountIDs[j] })
-		reg.SetAccounts("cloudflare", accountIDs)
+		infos := make([]provider.AccountInfo, 0, len(accountIDs))
+		for _, id := range accountIDs {
+			account := accountDetails[id]
+			infos = append(infos, provider.AccountInfo{ID: id, Label: account.Label, Status: string(account.Status)})
+		}
+		reg.SetAccountInfo("cloudflare", infos)
 		slog.Info("Cloudflare provider registered", "accounts", len(accountIDs))
 		return true
 	}

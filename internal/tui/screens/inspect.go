@@ -98,6 +98,9 @@ func (m *InspectModel) renderOverview() []string {
 		fmt.Sprintf("Public:     %s", conn.PublicAddress),
 		fmt.Sprintf("Private:    %s", conn.PrivateAddress),
 	}
+	if conn.ProviderAccountID != "" {
+		lines = append(lines, fmt.Sprintf("Account:    %s", conn.ProviderAccountID))
+	}
 	if conn.ConnectorPID > 0 {
 		lines = append(lines, fmt.Sprintf("Connector:  PID %d (%s)", conn.ConnectorPID, conn.ConnectorState))
 	}
@@ -137,6 +140,9 @@ func (m *InspectModel) renderTechnical() []string {
 		fmt.Sprintf("Connection ID: %s", m.Connection.ID),
 		fmt.Sprintf("Desired state: %s", m.Connection.DesiredState),
 		fmt.Sprintf("Runtime state: %s", m.Connection.RuntimeState),
+	}
+	if m.Connection.ProviderAccountID != "" {
+		lines = append(lines, fmt.Sprintf("Provider account: %s", m.Connection.ProviderAccountID))
 	}
 	if len(m.Diagnostics) > 0 {
 		lines = append(lines, "", "Diagnostics:")

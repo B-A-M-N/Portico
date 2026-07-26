@@ -4372,6 +4372,61 @@ func (s *Store) UpsertProviderAccount(ctx context.Context, account core.Provider
 	return err
 }
 
+// UpsertProviderAccountCredential atomically updates an account's opaque
+// credential reference and the encrypted secret it resolves to. It is used by
+// supervisor account setup so a visible account can never reference a missing
+// credential, and a failed account write cannot leave a usable orphan secret.
+func (s *Store) UpsertProviderAccountCredential(ctx context.Context, account core.ProviderAccount, secret []byte) error {
+	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" || len(secret) == 0 {
+		return fmt.Errorf("provider account ID, provider, label, credential reference, and secret are required")
+	}
+	if account.Status == "" {
+		account.Status = core.AccountAuthenticated
+	}
+	metadata, err := json.Marshal(account.Metadata)
+	if err != nil {
+		return fmt.Errorf("marshal provider account metadata: %w", err)
+	}
+	encrypted, err := encryptCredential(s.secretStore, secret, providerCredentialContext(account.Provider, account.CredentialRef))
+	if err != nil {
+		return fmt.Errorf("encrypt provider credential: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin provider account transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO provider_credentials (credential_ref, provider_id, secret_encrypted, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(credential_ref) DO UPDATE SET
+			provider_id=excluded.provider_id,
+			secret_encrypted=excluded.secret_encrypted,
+			updated_at=excluded.updated_at`,
+		account.CredentialRef, string(account.Provider), encrypted, now, now); err != nil {
+		return fmt.Errorf("save provider credential: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO provider_accounts
+			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			provider_id=excluded.provider_id,
+			label=excluded.label,
+			credential_ref=excluded.credential_ref,
+			metadata_json=excluded.metadata_json,
+			status=excluded.status,
+			updated_at=excluded.updated_at`,
+		string(account.ID), string(account.Provider), account.Label, account.CredentialRef,
+		metadata, string(account.Status), now, now); err != nil {
+		return fmt.Errorf("save provider account: %w", err)
+	}
+	return tx.Commit()
+}
+
 // GetSequence returns the current event sequence number.
 func (s *Store) GetSequence(ctx context.Context) (int64, error) {
 	s.mu.RLock()

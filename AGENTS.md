@@ -34,7 +34,7 @@ internal/
   cli/               # New Portico CLI (talks to supervisor via IPC)
   tui/               # Bubble Tea TUI (talks to supervisor via IPC)
   provider/          # Provider interface + registry
-    cloudflare/      # Cloudflare adapter (adapter.go only — SPEC envisions split)
+    cloudflare/      # Cloudflare adapter and account-scoped provider router
     mock/            # Mock provider for controller tests
   store/             # SQLite (WAL mode, embedded migrations)
   process/           # Connector subprocess mgmt (identity-verified signaling)
@@ -56,7 +56,7 @@ internal/
 3. **`portico legacy ...` still active.** Old flare-cli commands preserved in `cmd/`, hidden from help.
 4. **Only Cloudflare + mock providers exist.** Ngrok, Tailscale, zrok directories are SPEC-only stubs.
 5. **Tunnel logs use Portico's XDG state log directory.** Legacy Flare paths are compatibility-read only.
-6. **Credentials never serialized** into plans, events, logs, runtimes, or UI. Resolved by reference at operation time; durable tunnel credentials are keyed by exact connection, provider, and tunnel identity.
+6. **Credentials never serialized** into plans, events, logs, runtimes, or UI. Resolved by reference at operation time; durable tunnel credentials are keyed by exact connection, provider, and tunnel identity. Provider account credentials are encrypted behind opaque references, and profiles bind an account explicitly when one is selected.
 7. **Plan fingerprints are SHA-256** of canonical JSON (`core/plan.go:ComputeFingerprint`).
 8. **Process identity uses 4 fields** (PID, StartTime, ExecutablePath, CommandHash) — never signal on PID alone.
 9. **Restart backoff:** 5 attempts in 10-min window (1s, 2s, 5s, 10s, 30s), then mark unstable.
@@ -73,8 +73,8 @@ internal/
 - **Controller tests** use `newTestController()` + `testProfile()` + `awaitOp()` patterns; `executor_failure_test.go` injects step-commit and terminal-commit failures with fake committers.
 - **Store tests** cover atomic step commits (`commit_test.go`) and migration-8 duplicate-ownership fixtures (`migration_test.go`).
 - **Also covered:** process manager (adoption, backoff, rotation), IPC SSE journal (replay across restart, monotonic sequences), TUI state machine (fake client, no socket), discovery/diagnostics (fake enumerators/probers), core deep-copy isolation.
-- **No integration/e2e tests yet** — directories exist but empty.
-- **No import-boundary tests yet** — SPEC requires them but not implemented.
+- **Integration:** `test/integration/supervisor_lifecycle_test.go` verifies supervisor lifecycle behavior.
+- **Architecture:** `test/architecture/import_boundaries_test.go` enforces core import boundaries.
 
 ## Key files to start with
 
