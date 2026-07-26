@@ -167,3 +167,23 @@ func TestDirectoryWizardMapsServingModeAndPermissions(t *testing.T) {
 		t.Fatalf("directory mode summary = %q", got)
 	}
 }
+
+func TestMCPWizardMapsTransportAndConstrainsSSEExposure(t *testing.T) {
+	limited := NewWizard(nil, false, nil)
+	if got := limited.mcpTransports(); !reflect.DeepEqual(got, []string{"http", "streamable_http"}) {
+		t.Fatalf("limited MCP transports = %#v", got)
+	}
+
+	m := NewWizard(nil, true, nil)
+	m.state = WizardState{
+		Name: "MCP service", SourceType: "mcp_server", SourceAddress: "http://127.0.0.1:3000/mcp",
+		MCPTransport: "sse", ExposureMode: "permanent_public", Protection: "none", Provider: "cloudflare",
+	}
+	if got := m.exposures(); !reflect.DeepEqual(got, []string{"permanent_public"}) {
+		t.Fatalf("SSE exposures = %#v", got)
+	}
+	req := m.buildRequest()
+	if req.Source.MCP == nil || req.Source.MCP.Transport != "sse" || req.Source.MCP.Endpoint != m.state.SourceAddress {
+		t.Fatalf("MCP request = %#v", req.Source.MCP)
+	}
+}

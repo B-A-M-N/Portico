@@ -51,6 +51,7 @@ type WizardState struct {
 	DirectorySPA   bool
 	AllowUpload    bool
 	AllowDelete    bool
+	MCPTransport   string
 	Hostname       string
 	ExposureMode   string
 	Protection     string
@@ -70,6 +71,7 @@ const (
 	WizardStepCommandWorkingDir
 	WizardStepDirectoryMode
 	WizardStepDirectorySPA
+	WizardStepMCPTransport
 	WizardStepExposure
 	WizardStepHostname
 	WizardStepProtection
@@ -122,10 +124,24 @@ func NewWizardForService(client ConnectionCreator, fullCloudflare bool, accounts
 }
 
 func (m *WizardModel) exposures() []string {
+	if m.state.SourceType == "mcp_server" && m.state.MCPTransport == "sse" {
+		if m.fullCloudflare {
+			return []string{"permanent_public"}
+		}
+		return nil
+	}
 	if m.fullCloudflare {
 		return []string{"temporary_public", "permanent_public"}
 	}
 	return []string{"temporary_public"}
+}
+
+func (m *WizardModel) mcpTransports() []string {
+	transports := []string{"http", "streamable_http"}
+	if m.fullCloudflare {
+		transports = append(transports, "sse")
+	}
+	return transports
 }
 
 // protections returns only choices that the selected, configured provider can
@@ -203,6 +219,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			} else if m.state.SourceType == "directory" {
 				m.state.Step = WizardStepDirectoryMode
 				m.selected = directoryModeIndex(m.state)
+			} else if m.state.SourceType == "mcp_server" {
+				m.state.Step = WizardStepMCPTransport
+				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
 			} else {
 				m.state.Step = WizardStepExposure
 				m.selected = 0
@@ -328,6 +347,25 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.selected = directoryModeIndex(m.state)
 		}
 
+	case WizardStepMCPTransport:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < len(m.mcpTransports())-1 {
+				m.selected++
+			}
+		case "enter":
+			m.state.MCPTransport = m.mcpTransports()[m.selected]
+			m.state.Step = WizardStepExposure
+			m.selected = 0
+		case "esc":
+			m.state.Step = WizardStepSource
+			m.input = m.state.SourceAddress
+		}
+
 	case WizardStepExposure:
 		switch key {
 		case "up", "k":
@@ -360,6 +398,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 					m.state.Step = WizardStepDirectoryMode
 					m.selected = directoryModeIndex(m.state)
 				}
+			} else if m.state.SourceType == "mcp_server" {
+				m.state.Step = WizardStepMCPTransport
+				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
 			} else if m.hasPortStep() {
 				m.state.Step = WizardStepPort
 				m.input = m.state.Port
@@ -550,7 +591,11 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 			Protocol:   "http",
 		}
 	case "mcp_server":
-		src.MCP = &ipc.MCPSourceDTO{Transport: "http", Endpoint: s.SourceAddress}
+		transport := s.MCPTransport
+		if transport == "" {
+			transport = "http"
+		}
+		src.MCP = &ipc.MCPSourceDTO{Transport: transport, Endpoint: s.SourceAddress}
 	}
 
 	return ipc.CreateConnectionRequest{
@@ -652,6 +697,8 @@ func (m *WizardModel) View() string {
 		return m.renderDirectoryMode()
 	case WizardStepDirectorySPA:
 		return renderMenu("Enable SPA fallback for unknown paths?", []string{"No", "Yes"}, m.selected)
+	case WizardStepMCPTransport:
+		return m.renderMCPTransport()
 	case WizardStepExposure:
 		return m.renderExposure()
 	case WizardStepHostname:
@@ -705,9 +752,14 @@ func (m *WizardModel) renderIntent() string {
 }
 
 func (m *WizardModel) renderExposure() string {
-	options := []string{"Temporarily, with a generated address"}
-	if m.fullCloudflare {
-		options = append(options, "Permanently, with my own hostname")
+	options := make([]string, 0, len(m.exposures()))
+	for _, exposure := range m.exposures() {
+		switch exposure {
+		case "temporary_public":
+			options = append(options, "Temporarily, with a generated address")
+		case "permanent_public":
+			options = append(options, "Permanently, with my own hostname")
+		}
 	}
 	return renderMenu("How should it be reachable?", options, m.selected)
 }
@@ -733,6 +785,21 @@ func (m *WizardModel) renderDirectoryMode() string {
 		options = append(options, choice.label)
 	}
 	return renderMenu("How should Portico serve this directory?", options, m.selected)
+}
+
+func (m *WizardModel) renderMCPTransport() string {
+	options := make([]string, 0, len(m.mcpTransports()))
+	for _, transport := range m.mcpTransports() {
+		switch transport {
+		case "http":
+			options = append(options, "HTTP")
+		case "streamable_http":
+			options = append(options, "Streamable HTTP")
+		case "sse":
+			options = append(options, "Server-Sent Events (requires permanent exposure)")
+		}
+	}
+	return renderMenu("Which MCP transport does the server use?", options, m.selected)
 }
 
 func (m *WizardModel) renderAccount() string {
@@ -771,6 +838,9 @@ func (m *WizardModel) renderReview() string {
 		if m.state.DirectorySPA {
 			lines = append(lines, "SPA fallback: enabled")
 		}
+	}
+	if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
+		lines = append(lines, fmt.Sprintf("MCP transport: %s", m.state.MCPTransport))
 	}
 	lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
 	if m.state.Hostname != "" {
@@ -872,6 +942,15 @@ func directoryModeSummary(state WizardState) string {
 		return "file browser with uploads"
 	}
 	return "read-only file browser"
+}
+
+func mcpTransportIndex(options []string, selected string) int {
+	for i, option := range options {
+		if option == selected {
+			return i
+		}
+	}
+	return 0
 }
 
 func boolIndex(value bool) int {
