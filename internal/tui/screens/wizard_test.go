@@ -151,3 +151,19 @@ func TestCommandArgsRejectEmptyEntries(t *testing.T) {
 		t.Fatal("expected empty command argument to be rejected")
 	}
 }
+
+func TestDirectoryWizardMapsServingModeAndPermissions(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	m.state = WizardState{
+		Name: "Files", SourceType: "directory", SourceAddress: "/srv/files",
+		DirectoryMode: "writes", AllowUpload: true, AllowDelete: true,
+		ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
+	}
+	req := m.buildRequest()
+	if req.Source.Directory == nil || req.Source.Directory.Mode != "writes" || !req.Source.Directory.AllowUpload || !req.Source.Directory.AllowDelete {
+		t.Fatalf("directory request = %#v", req.Source.Directory)
+	}
+	if got := directoryModeSummary(m.state); got != "file browser with uploads and deletes" {
+		t.Fatalf("directory mode summary = %q", got)
+	}
+}

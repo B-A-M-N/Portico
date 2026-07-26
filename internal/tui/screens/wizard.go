@@ -47,6 +47,10 @@ type WizardState struct {
 	Port           string
 	CommandArgs    []string
 	WorkingDir     string
+	DirectoryMode  string
+	DirectorySPA   bool
+	AllowUpload    bool
+	AllowDelete    bool
 	Hostname       string
 	ExposureMode   string
 	Protection     string
@@ -64,6 +68,8 @@ const (
 	WizardStepPort
 	WizardStepCommandArgs
 	WizardStepCommandWorkingDir
+	WizardStepDirectoryMode
+	WizardStepDirectorySPA
 	WizardStepExposure
 	WizardStepHostname
 	WizardStepProtection
@@ -77,9 +83,22 @@ const (
 
 // Valid enum values (see internal/core/connection.go).
 var (
-	wizardSourceKinds = []string{"existing_service", "directory", "command", "mcp_server"}
-	wizardProviders   = []string{"cloudflare"}
+	wizardSourceKinds    = []string{"existing_service", "directory", "command", "mcp_server"}
+	wizardProviders      = []string{"cloudflare"}
+	wizardDirectoryModes = []directoryModeChoice{
+		{mode: "read", label: "Read-only static site"},
+		{mode: "writes", label: "File browser (read only)"},
+		{mode: "writes", label: "File browser (allow uploads)", allowUpload: true},
+		{mode: "writes", label: "File browser (allow uploads and deletes)", allowUpload: true, allowDelete: true},
+	}
 )
+
+type directoryModeChoice struct {
+	mode        string
+	label       string
+	allowUpload bool
+	allowDelete bool
+}
 
 // NewWizard creates a new wizard model.
 func NewWizard(client ConnectionCreator, fullCloudflare bool, accounts []ipc.ProviderAccountDTO) *WizardModel {
@@ -181,6 +200,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			if m.hasPortStep() {
 				m.state.Step = WizardStepPort
 				m.input = m.state.Port
+			} else if m.state.SourceType == "directory" {
+				m.state.Step = WizardStepDirectoryMode
+				m.selected = directoryModeIndex(m.state)
 			} else {
 				m.state.Step = WizardStepExposure
 				m.selected = 0
@@ -259,6 +281,53 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.input = editInput(m.input, key)
 		}
 
+	case WizardStepDirectoryMode:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < len(wizardDirectoryModes)-1 {
+				m.selected++
+			}
+		case "enter":
+			choice := wizardDirectoryModes[m.selected]
+			m.state.DirectoryMode = choice.mode
+			m.state.AllowUpload = choice.allowUpload
+			m.state.AllowDelete = choice.allowDelete
+			if choice.mode == "read" {
+				m.state.Step = WizardStepDirectorySPA
+				m.selected = boolIndex(m.state.DirectorySPA)
+			} else {
+				m.state.DirectorySPA = false
+				m.state.Step = WizardStepExposure
+				m.selected = 0
+			}
+		case "esc":
+			m.state.Step = WizardStepSource
+			m.input = m.state.SourceAddress
+		}
+
+	case WizardStepDirectorySPA:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < 1 {
+				m.selected++
+			}
+		case "enter":
+			m.state.DirectorySPA = m.selected == 1
+			m.state.Step = WizardStepExposure
+			m.selected = 0
+		case "esc":
+			m.state.Step = WizardStepDirectoryMode
+			m.selected = directoryModeIndex(m.state)
+		}
+
 	case WizardStepExposure:
 		switch key {
 		case "up", "k":
@@ -283,6 +352,14 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			if m.state.SourceType == "command" {
 				m.state.Step = WizardStepCommandWorkingDir
 				m.input = m.state.WorkingDir
+			} else if m.state.SourceType == "directory" {
+				if m.state.DirectoryMode == "read" {
+					m.state.Step = WizardStepDirectorySPA
+					m.selected = boolIndex(m.state.DirectorySPA)
+				} else {
+					m.state.Step = WizardStepDirectoryMode
+					m.selected = directoryModeIndex(m.state)
+				}
 			} else if m.hasPortStep() {
 				m.state.Step = WizardStepPort
 				m.input = m.state.Port
@@ -456,7 +533,13 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 		}
 		src.Existing = &ipc.ExistingSourceDTO{Address: addr, Protocol: protocol}
 	case "directory":
-		src.Directory = &ipc.DirectorySourceDTO{Path: s.SourceAddress}
+		src.Directory = &ipc.DirectorySourceDTO{
+			Path:        s.SourceAddress,
+			Mode:        s.DirectoryMode,
+			SPAFallback: s.DirectorySPA,
+			AllowUpload: s.AllowUpload,
+			AllowDelete: s.AllowDelete,
+		}
 	case "command":
 		port, _ := strconv.Atoi(s.Port)
 		src.Command = &ipc.CommandSourceDTO{
@@ -565,6 +648,10 @@ func (m *WizardModel) View() string {
 		return m.withError(renderInput("Command arguments (comma-separated; empty to skip):", m.input))
 	case WizardStepCommandWorkingDir:
 		return m.withError(renderInput("Working directory (empty to use Portico's):", m.input))
+	case WizardStepDirectoryMode:
+		return m.renderDirectoryMode()
+	case WizardStepDirectorySPA:
+		return renderMenu("Enable SPA fallback for unknown paths?", []string{"No", "Yes"}, m.selected)
 	case WizardStepExposure:
 		return m.renderExposure()
 	case WizardStepHostname:
@@ -640,6 +727,14 @@ func (m *WizardModel) renderProvider() string {
 	return renderMenu("Which provider should carry the connection?", options, m.selected)
 }
 
+func (m *WizardModel) renderDirectoryMode() string {
+	options := make([]string, 0, len(wizardDirectoryModes))
+	for _, choice := range wizardDirectoryModes {
+		options = append(options, choice.label)
+	}
+	return renderMenu("How should Portico serve this directory?", options, m.selected)
+}
+
 func (m *WizardModel) renderAccount() string {
 	options := make([]string, 0, len(m.accounts))
 	for _, account := range m.accounts {
@@ -670,6 +765,12 @@ func (m *WizardModel) renderReview() string {
 	}
 	if m.state.WorkingDir != "" {
 		lines = append(lines, fmt.Sprintf("Working dir: %s", m.state.WorkingDir))
+	}
+	if m.state.SourceType == "directory" {
+		lines = append(lines, fmt.Sprintf("Directory:   %s", directoryModeSummary(m.state)))
+		if m.state.DirectorySPA {
+			lines = append(lines, "SPA fallback: enabled")
+		}
 	}
 	lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
 	if m.state.Hostname != "" {
@@ -749,6 +850,35 @@ func parseCommandArgs(input string) ([]string, error) {
 
 func commandArgsInput(args []string) string {
 	return strings.Join(args, ", ")
+}
+
+func directoryModeIndex(state WizardState) int {
+	for i, choice := range wizardDirectoryModes {
+		if choice.mode == state.DirectoryMode && choice.allowUpload == state.AllowUpload && choice.allowDelete == state.AllowDelete {
+			return i
+		}
+	}
+	return 0
+}
+
+func directoryModeSummary(state WizardState) string {
+	if state.DirectoryMode == "read" {
+		return "read-only static site"
+	}
+	if state.AllowDelete {
+		return "file browser with uploads and deletes"
+	}
+	if state.AllowUpload {
+		return "file browser with uploads"
+	}
+	return "read-only file browser"
+}
+
+func boolIndex(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // parseProtectionRules accepts explicit email addresses and domains. Domains
