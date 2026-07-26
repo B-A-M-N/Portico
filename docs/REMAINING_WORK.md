@@ -126,8 +126,8 @@ MCP profiles. Command sources collect an executable, port, comma-separated
 arguments, and working directory. Directory sources collect static-site versus
 file-browser mode, upload/delete permissions, and SPA fallback. Endpoint MCP
 sources collect HTTP, streamable HTTP, or (for permanent Cloudflare exposure)
-SSE transport. The wizard still lacks environment references, shell mode, and
-command-owned MCP source configuration.
+SSE transport. The wizard also supports command-owned MCP servers. It still
+lacks environment references and shell-mode configuration.
 
 **Implementation**
 
@@ -136,8 +136,8 @@ command-owned MCP source configuration.
 2. Add safe tokenized input for command arguments and environment *references*
    (not raw secrets). Validate every screen before advancing.
 3. Provide a directory mode chooser, file-browser permissions, and SPA option.
-4. Provide command-owned MCP source configuration and keep transport choices
-   constrained to combinations the selected provider can carry.
+4. Keep transport choices constrained to combinations the selected provider can
+   carry, including when an MCP command is owned by Portico.
 5. Add a final review that states owned-process behavior, chosen account,
    public/private exposure, protection, and destructive implications.
 

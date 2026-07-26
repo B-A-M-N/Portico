@@ -187,3 +187,29 @@ func TestMCPWizardMapsTransportAndConstrainsSSEExposure(t *testing.T) {
 		t.Fatalf("MCP request = %#v", req.Source.MCP)
 	}
 }
+
+func TestMCPCommandWizardMapsOwnedCommand(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	m.state = WizardState{
+		Name: "Managed MCP", SourceType: "mcp_server", MCPCommand: true, SourceAddress: "mcp-server",
+		Port: "3001", CommandArgs: []string{"--port", "3001"}, WorkingDir: "/work/mcp",
+		MCPTransport: "streamable_http", ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
+	}
+	req := m.buildRequest()
+	if req.Source.MCP == nil || req.Source.MCP.Endpoint != "" || req.Source.MCP.Command == nil {
+		t.Fatalf("MCP request = %#v", req.Source.MCP)
+	}
+	command := req.Source.MCP.Command
+	if command.Executable != "mcp-server" || command.Port != 3001 || command.WorkingDir != "/work/mcp" || !reflect.DeepEqual(command.Args, []string{"--port", "3001"}) {
+		t.Fatalf("MCP command = %#v", command)
+	}
+}
+
+func TestCommandOriginRequiresPortBeforeAdvancing(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	m.state = WizardState{Step: WizardStepPort, SourceType: "mcp_server", MCPCommand: true}
+	m.HandleKey("enter")
+	if m.Step() != WizardStepPort || m.err == nil || !strings.Contains(m.err.Error(), "requires a local port") {
+		t.Fatalf("state after empty MCP command port = %#v, err = %v", m.state, m.err)
+	}
+}

@@ -51,6 +51,7 @@ type WizardState struct {
 	DirectorySPA   bool
 	AllowUpload    bool
 	AllowDelete    bool
+	MCPCommand     bool
 	MCPTransport   string
 	Hostname       string
 	ExposureMode   string
@@ -65,6 +66,7 @@ type WizardState struct {
 const (
 	WizardStepIntent int = iota
 	WizardStepName
+	WizardStepMCPMode
 	WizardStepSource
 	WizardStepPort
 	WizardStepCommandArgs
@@ -159,7 +161,12 @@ func (m *WizardModel) Step() int { return m.state.Step }
 
 // hasPortStep reports whether the port step applies to the chosen source.
 func (m *WizardModel) hasPortStep() bool {
-	return m.state.SourceType == "existing_service" || m.state.SourceType == "command"
+	return m.state.SourceType == "existing_service" || m.isCommandOrigin()
+}
+
+func (m *WizardModel) isCommandOrigin() bool {
+	return m.state.SourceType == "command" ||
+		(m.state.SourceType == "mcp_server" && m.state.MCPCommand)
 }
 
 // HandleKey processes key input for the wizard. It never performs I/O
@@ -195,17 +202,46 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.Name = strings.TrimSpace(m.input)
-			m.state.Step = WizardStepSource
-			m.input = m.state.SourceAddress
+			if m.state.SourceType == "mcp_server" {
+				m.state.Step = WizardStepMCPMode
+				m.selected = boolIndex(m.state.MCPCommand)
+			} else {
+				m.state.Step = WizardStepSource
+				m.input = m.state.SourceAddress
+			}
 		default:
 			m.input = editInput(m.input, key)
+		}
+
+	case WizardStepMCPMode:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < 1 {
+				m.selected++
+			}
+		case "enter":
+			m.state.MCPCommand = m.selected == 1
+			m.state.Step = WizardStepSource
+			m.input = m.state.SourceAddress
+		case "esc":
+			m.state.Step = WizardStepName
+			m.input = m.state.Name
 		}
 
 	case WizardStepSource:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepName
-			m.input = m.state.Name
+			if m.state.SourceType == "mcp_server" {
+				m.state.Step = WizardStepMCPMode
+				m.selected = boolIndex(m.state.MCPCommand)
+			} else {
+				m.state.Step = WizardStepName
+				m.input = m.state.Name
+			}
 		case "enter":
 			if strings.TrimSpace(m.input) == "" && m.state.SourceType != "existing_service" {
 				m.err = fmt.Errorf("value is required")
@@ -237,6 +273,10 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.input = m.state.SourceAddress
 		case "enter":
 			port := strings.TrimSpace(m.input)
+			if port == "" && m.isCommandOrigin() {
+				m.err = fmt.Errorf("a command source requires a local port")
+				return nil
+			}
 			if port != "" {
 				n, err := strconv.Atoi(port)
 				if err != nil || n < 1 || n > 65535 {
@@ -256,7 +296,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.Port = port
-			if m.state.SourceType == "command" {
+			if m.isCommandOrigin() {
 				m.state.Step = WizardStepCommandArgs
 				m.input = commandArgsInput(m.state.CommandArgs)
 			} else {
@@ -294,8 +334,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "enter":
 			m.err = nil
 			m.state.WorkingDir = strings.TrimSpace(m.input)
-			m.state.Step = WizardStepExposure
-			m.selected = 0
+			if m.state.SourceType == "mcp_server" {
+				m.state.Step = WizardStepMCPTransport
+				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
+			} else {
+				m.state.Step = WizardStepExposure
+				m.selected = 0
+			}
 		default:
 			m.input = editInput(m.input, key)
 		}
@@ -387,7 +432,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = 0
 			}
 		case "esc":
-			if m.state.SourceType == "command" {
+			if m.isCommandOrigin() {
 				m.state.Step = WizardStepCommandWorkingDir
 				m.input = m.state.WorkingDir
 			} else if m.state.SourceType == "directory" {
@@ -595,7 +640,19 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 		if transport == "" {
 			transport = "http"
 		}
-		src.MCP = &ipc.MCPSourceDTO{Transport: transport, Endpoint: s.SourceAddress}
+		src.MCP = &ipc.MCPSourceDTO{Transport: transport}
+		if s.MCPCommand {
+			port, _ := strconv.Atoi(s.Port)
+			src.MCP.Command = &ipc.CommandSourceDTO{
+				Executable: s.SourceAddress,
+				Args:       append([]string(nil), s.CommandArgs...),
+				WorkingDir: s.WorkingDir,
+				Port:       port,
+				Protocol:   "http",
+			}
+		} else {
+			src.MCP.Endpoint = s.SourceAddress
+		}
 	}
 
 	return ipc.CreateConnectionRequest{
@@ -685,9 +742,14 @@ func (m *WizardModel) View() string {
 		return m.renderIntent()
 	case WizardStepName:
 		return m.withError(renderInput("Name this connection:", m.input))
+	case WizardStepMCPMode:
+		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
 	case WizardStepSource:
 		return m.withError(renderInput(m.sourcePrompt(), m.input))
 	case WizardStepPort:
+		if m.isCommandOrigin() {
+			return m.withError(renderInput("Local port for the command (required):", m.input))
+		}
 		return m.withError(renderInput("Local port (empty to skip):", m.input))
 	case WizardStepCommandArgs:
 		return m.withError(renderInput("Command arguments (comma-separated; empty to skip):", m.input))
@@ -735,6 +797,9 @@ func (m *WizardModel) sourcePrompt() string {
 	case "command":
 		return "Enter the command executable to run:"
 	case "mcp_server":
+		if m.state.MCPCommand {
+			return "Enter the MCP command executable to run:"
+		}
 		return "Enter the MCP server endpoint:"
 	default:
 		return "Enter the address of your service (host or host:port):"
@@ -840,6 +905,11 @@ func (m *WizardModel) renderReview() string {
 		}
 	}
 	if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
+		mode := "endpoint"
+		if m.state.MCPCommand {
+			mode = "command"
+		}
+		lines = append(lines, fmt.Sprintf("MCP mode:      %s", mode))
 		lines = append(lines, fmt.Sprintf("MCP transport: %s", m.state.MCPTransport))
 	}
 	lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
