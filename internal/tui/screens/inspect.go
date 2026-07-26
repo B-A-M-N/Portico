@@ -3,7 +3,7 @@ package screens
 import (
 	"fmt"
 
-	"github.com/paoloanzn/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 // InspectModel is the model for the inspect screen.

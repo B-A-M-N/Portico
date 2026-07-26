@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // CommitStepResult must persist the terminal event, resources, credentials,
@@ -23,6 +23,7 @@ func TestCommitStepResultAtomicPersist(t *testing.T) {
 	req := core.StepCommitRequest{
 		OperationID:  "op-1",
 		ConnectionID: p.ID,
+		Provider:     "mock",
 		Step:         core.PlanStep{ID: "step-1", Kind: core.StepCreateTunnel, Summary: "Create tunnel"},
 		Result: core.StepResult{
 			StepID:    "step-1",
@@ -37,7 +38,7 @@ func TestCommitStepResultAtomicPersist(t *testing.T) {
 				},
 			},
 			CredentialMutations: []core.CredentialMutation{
-				{TunnelID: "tun-123", Token: "secret-token"},
+				{TunnelID: "tun-123", Secret: []byte("secret-token")},
 			},
 		},
 	}
@@ -72,6 +73,238 @@ func TestCommitStepResultAtomicPersist(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("expected exactly one terminal step event, got %d", count)
 	}
+	durableEvents, err := s.GetDurableEventsSince(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("GetDurableEventsSince: %v", err)
+	}
+	if len(durableEvents) != 2 || durableEvents[0].Event.Type != "operation.created" || durableEvents[1].Event.Type != core.EventOperationStepSucceeded || durableEvents[1].OperationID != "op-1" || durableEvents[1].ConnectionID != p.ID {
+		t.Fatalf("unexpected unified durable event: %#v", durableEvents)
+	}
+	results, err := s.GetStepResults(ctx, "op-1")
+	if err != nil {
+		t.Fatalf("GetStepResults: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != string(StepSucceeded) || results[0].Result.StepID != "step-1" {
+		t.Fatalf("unexpected durable step result: %#v", results)
+	}
+	if len(results[0].Result.CredentialMutations) != 0 {
+		t.Fatal("recovery ledger must not serialize credential secret bytes")
+	}
+}
+
+func TestBeginStepAndOutcomeUseSingleRecoveryRow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	seedOperation(t, s, "op-ledger", "plan-ledger", p.ID)
+	step := core.PlanStep{ID: "step-ledger", Kind: core.StepVerifyEndpoint, Summary: "Verify endpoint"}
+	if err := s.BeginStep(ctx, "op-ledger", p.ID, step); err != nil {
+		t.Fatalf("BeginStep: %v", err)
+	}
+	if err := s.CommitStepOutcome(ctx, core.StepCommitRequest{
+		OperationID: "op-ledger", ConnectionID: p.ID, Provider: "mock", Step: step,
+		Result: core.StepResult{StepID: step.ID, Succeeded: false, Error: context.DeadlineExceeded},
+	}); err != nil {
+		t.Fatalf("CommitStepOutcome: %v", err)
+	}
+	results, err := s.GetStepResults(ctx, "op-ledger")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != string(StepFailed) || results[0].Result.Error == nil {
+		t.Fatalf("unexpected ledger result: %#v", results)
+	}
+	var count int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM operation_step_results WHERE operation_id = ? AND step_id = ?", "op-ledger", step.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("got %d recovery rows, want 1", count)
+	}
+}
+
+func TestCommitStepOutcomeCascadesEveryTrackedAccessPolicy(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	seedOperation(t, s, "op-access-delete", "plan-access-delete", p.ID)
+
+	app := &core.ProviderResource{
+		ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessApp,
+		ExternalID: "app-1", Ownership: core.OwnershipManaged,
+	}
+	policyOne := &core.ProviderResource{
+		ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessPolicy,
+		ExternalID: "policy-1", Ownership: core.OwnershipManaged,
+		Metadata: map[string]string{"app_id": "app-1"},
+	}
+	policyTwo := &core.ProviderResource{
+		ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessPolicy,
+		ExternalID: "policy-2", Ownership: core.OwnershipManaged,
+		Metadata: map[string]string{"app_id": "app-1"},
+	}
+	for _, resource := range []*core.ProviderResource{app, policyOne, policyTwo} {
+		if err := s.SaveResource(ctx, resource); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	step := core.PlanStep{ID: "delete-app", Kind: core.StepDeleteAccessApp, Summary: "Delete access app"}
+	if err := s.CommitStepOutcome(ctx, core.StepCommitRequest{
+		OperationID: "op-access-delete", ConnectionID: p.ID, Provider: "mock", Step: step,
+		Result: core.StepResult{StepID: step.ID, Succeeded: true},
+		Lifecycle: []core.LifecycleMark{{
+			ProviderID: "mock", ResourceType: core.ResourceAccessApp, ExternalID: "app-1", NewLifecycle: core.LifecycleRemoved,
+		}},
+		RemovedAccessApps: []string{"app-1"},
+	}); err != nil {
+		t.Fatalf("CommitStepOutcome: %v", err)
+	}
+	for _, id := range []string{"policy-1", "policy-2"} {
+		resource, err := s.LoadResource(ctx, "mock", core.ResourceAccessPolicy, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resource.Lifecycle != core.LifecycleRemoved {
+			t.Fatalf("policy %s lifecycle = %q, want removed", id, resource.Lifecycle)
+		}
+	}
+}
+
+func TestCreateManagedResourceRevivesOnlyManagedResource(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	managed := &core.ProviderResource{
+		ConnectionID: "conn-managed", ProviderID: "mock", Type: core.ResourceTunnel,
+		ExternalID: "tunnel-managed", Ownership: core.OwnershipManaged,
+	}
+	if err := s.SaveResource(ctx, managed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkResourceRemoved(ctx, managed.ConnectionID, managed.ProviderID, managed.Type, managed.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateManagedResource(ctx, managed); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadResource(ctx, managed.ProviderID, managed.Type, managed.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Lifecycle != core.LifecyclePresent {
+		t.Fatalf("managed resource lifecycle = %q, want present", got.Lifecycle)
+	}
+
+	external := &core.ProviderResource{
+		ConnectionID: "conn-external", ProviderID: "mock", Type: core.ResourceTunnel,
+		ExternalID: "tunnel-external", Ownership: core.OwnershipExternal,
+	}
+	if err := s.SaveResource(ctx, external); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkResourceRemoved(ctx, external.ConnectionID, external.ProviderID, external.Type, external.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateManagedResource(ctx, external); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.LoadResource(ctx, external.ProviderID, external.Type, external.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Ownership != core.OwnershipExternal || got.Lifecycle != core.LifecycleRemoved {
+		t.Fatalf("external resource changed unexpectedly: %#v", got)
+	}
+}
+
+func TestCommitStepOutcomeRevivesManagedResourceAfterRecreate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	seedOperation(t, s, "op-recreate", "plan-recreate", p.ID)
+	resource := &core.ProviderResource{
+		ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceTunnel,
+		ExternalID: "tunnel-recreated", Ownership: core.OwnershipManaged,
+	}
+	if err := s.SaveResource(ctx, resource); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkResourceRemoved(ctx, resource.ConnectionID, resource.ProviderID, resource.Type, resource.ExternalID); err != nil {
+		t.Fatal(err)
+	}
+	step := core.PlanStep{ID: "recreate-tunnel", Kind: core.StepRecreateTunnel, Summary: "Recreate tunnel"}
+	if err := s.CommitStepOutcome(ctx, core.StepCommitRequest{
+		OperationID: "op-recreate", ConnectionID: p.ID, Provider: "mock", Step: step,
+		Result: core.StepResult{StepID: step.ID, Succeeded: true, Resources: []core.ProviderResource{*resource}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadResource(ctx, resource.ProviderID, resource.Type, resource.ExternalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Lifecycle != core.LifecyclePresent {
+		t.Fatalf("recreated resource lifecycle = %q, want present", got.Lifecycle)
+	}
+}
+
+func TestCommitStepOutcomeAtomicallyReplacesExternallyRemovedAccessResources(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	seedOperation(t, s, "op-access-repair", "plan-access-repair", p.ID)
+	for _, resource := range []*core.ProviderResource{
+		{ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessApp, ExternalID: "old-app", Ownership: core.OwnershipManaged},
+		{ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessPolicy, ExternalID: "old-policy", Ownership: core.OwnershipManaged, Metadata: map[string]string{"app_id": "old-app"}},
+	} {
+		if err := s.SaveResource(ctx, resource); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step := core.PlanStep{ID: "repair-access", Kind: core.StepCreateAccessApp, Summary: "Recreate Access application"}
+	if err := s.CommitStepOutcome(ctx, core.StepCommitRequest{
+		OperationID: "op-access-repair", ConnectionID: p.ID, Provider: "mock", Step: step,
+		Result: core.StepResult{StepID: step.ID, Succeeded: true, Resources: []core.ProviderResource{
+			{ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessApp, ExternalID: "new-app", Ownership: core.OwnershipManaged},
+			{ConnectionID: p.ID, ProviderID: "mock", Type: core.ResourceAccessPolicy, ExternalID: "new-policy", Ownership: core.OwnershipManaged, Metadata: map[string]string{"app_id": "new-app"}},
+		}},
+		Lifecycle: []core.LifecycleMark{
+			{ProviderID: "mock", ResourceType: core.ResourceAccessApp, ExternalID: "old-app", NewLifecycle: core.LifecycleExternallyRemoved},
+			{ProviderID: "mock", ResourceType: core.ResourceAccessPolicy, ExternalID: "old-policy", NewLifecycle: core.LifecycleExternallyRemoved},
+		},
+	}); err != nil {
+		t.Fatalf("CommitStepOutcome: %v", err)
+	}
+	for _, check := range []struct {
+		typeID     core.ResourceType
+		externalID string
+		lifecycle  core.ResourceLifecycle
+	}{
+		{core.ResourceAccessApp, "old-app", core.LifecycleExternallyRemoved},
+		{core.ResourceAccessPolicy, "old-policy", core.LifecycleExternallyRemoved},
+		{core.ResourceAccessApp, "new-app", core.LifecyclePresent},
+		{core.ResourceAccessPolicy, "new-policy", core.LifecyclePresent},
+	} {
+		resource, err := s.LoadResource(ctx, "mock", check.typeID, check.externalID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resource.Lifecycle != check.lifecycle {
+			t.Fatalf("%s lifecycle = %q, want %q", check.externalID, resource.Lifecycle, check.lifecycle)
+		}
+	}
 }
 
 // A cross-connection resource conflict must roll back the entire commit:
@@ -96,6 +329,7 @@ func TestCommitStepResultConflictRollsBack(t *testing.T) {
 	req := core.StepCommitRequest{
 		OperationID:  "op-2",
 		ConnectionID: "test-conn-1",
+		Provider:     "mock",
 		Step:         core.PlanStep{ID: "step-2", Kind: core.StepCreateTunnel, Summary: "Create tunnel"},
 		Result: core.StepResult{
 			StepID:    "step-2",
@@ -110,7 +344,7 @@ func TestCommitStepResultConflictRollsBack(t *testing.T) {
 				},
 			},
 			CredentialMutations: []core.CredentialMutation{
-				{TunnelID: "tun-dup", Token: "secret"},
+				{TunnelID: "tun-dup", Secret: []byte("secret")},
 			},
 		},
 	}
@@ -131,6 +365,9 @@ func TestCommitStepResultConflictRollsBack(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected rollback of step event, found %d rows", count)
+	}
+	if durable, durableErr := s.GetDurableEventsSince(ctx, 0, 10); durableErr != nil || len(durable) != 1 || durable[0].Event.Type != "operation.created" {
+		t.Fatalf("unified journal must roll back with the step: events=%#v err=%v", durable, durableErr)
 	}
 	if tid, tok, err := s.LoadTunnelCredential(ctx, "test-conn-1"); err != nil || tid != "" || tok != "" {
 		t.Fatalf("expected no credential after rollback, got %q/%q err=%v", tid, tok, err)
@@ -196,7 +433,7 @@ func TestRuntimeCommitResults(t *testing.T) {
 func TestDecryptCredentialNoSilentDowngrade(t *testing.T) {
 	s := newTestStore(t)
 
-	blob, err := encryptCredential(s.secretStore, "topsecret", "conn:tun")
+	blob, err := encryptCredential(s.secretStore, []byte("topsecret"), "conn:tun")
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
@@ -241,5 +478,88 @@ func seedOperation(t *testing.T, s *Store, opID core.OperationID, planID core.Pl
 	}
 	if err := s.SaveOperation(ctx, opID, planID, connID, "running", time.Now().UTC().Format(time.RFC3339)); err != nil {
 		t.Fatalf("SaveOperation: %v", err)
+	}
+}
+
+func TestGetOperationAndEventsAreDurable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	opID := core.OperationID("operation-query")
+	seedOperation(t, s, opID, "plan-query", "connection-query")
+	if err := s.AppendOperationEvent(ctx, core.Event{
+		Type: core.EventOperationStepStarted,
+		Data: core.OperationEvent{StepID: "seed-step", Stage: core.StageStarted, Message: "seed"},
+	}, opID); err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+	if err := s.CompleteOperation(ctx, opID, "completed"); err != nil {
+		t.Fatalf("complete operation: %v", err)
+	}
+	op, err := s.GetOperation(ctx, opID)
+	if err != nil {
+		t.Fatalf("get operation: %v", err)
+	}
+	if op.State != "completed" || op.CompletedAt == "" {
+		t.Fatalf("unexpected durable operation: %+v", op)
+	}
+	events, err := s.GetOperationEvents(ctx, opID)
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	if len(events) != 1 || events[0].Sequence <= 0 || events[0].StepID != "seed-step" {
+		t.Fatalf("unexpected durable events: %+v", events)
+	}
+	unified, err := s.GetDurableEventsForOperation(ctx, opID)
+	if err != nil {
+		t.Fatalf("get unified operation events: %v", err)
+	}
+	if len(unified) != 3 || unified[1].Event.Sequence <= 0 || unified[1].Event.Type != core.EventOperationStepStarted || unified[1].ConnectionID != "connection-query" || unified[2].Event.Type != core.EventOperationCompleted {
+		t.Fatalf("unexpected unified operation events: %#v", unified)
+	}
+}
+
+func TestRecordCleanupItemSurvivesMissingResourceInventory(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	item := CleanupItem{
+		OperationID: "cleanup-operation", ConnectionID: "cleanup-connection", ProviderID: "mock",
+		ResourceType: core.ResourceTunnel, ExternalID: "external-tunnel", State: "outcome_unknown", LastError: "commit failed",
+	}
+	if err := s.RecordCleanupItem(ctx, item); err != nil {
+		t.Fatalf("record cleanup item: %v", err)
+	}
+	item.State = "compensation_failed"
+	if err := s.RecordCleanupItem(ctx, item); err != nil {
+		t.Fatalf("refresh cleanup item: %v", err)
+	}
+	var count int
+	var state string
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*), cleanup_state FROM resource_cleanup_items WHERE external_id = ?`, item.ExternalID).Scan(&count, &state); err != nil {
+		t.Fatalf("query cleanup item: %v", err)
+	}
+	if count != 1 || state != "compensation_failed" {
+		t.Fatalf("unexpected cleanup ledger state: count=%d state=%q", count, state)
+	}
+}
+
+func TestCompensationLedgerTransitions(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	opID := core.OperationID("compensation-operation")
+	seedOperation(t, s, opID, "compensation-plan", "compensation-connection")
+	step := core.PlanStep{ID: "rollback-tunnel", Kind: core.StepDeleteTunnel, Summary: "Rollback tunnel"}
+	if err := s.BeginCompensation(ctx, opID, "compensation-connection", step); err != nil {
+		t.Fatalf("begin compensation: %v", err)
+	}
+	results, err := s.GetStepResults(ctx, opID)
+	if err != nil || len(results) != 1 || results[0].Status != string(StepCompensationPending) {
+		t.Fatalf("unexpected pending ledger: results=%+v err=%v", results, err)
+	}
+	if err := s.CommitCompensationOutcome(ctx, opID, "compensation-connection", step, core.StepResult{StepID: step.ID, Succeeded: true}); err != nil {
+		t.Fatalf("commit compensation: %v", err)
+	}
+	results, err = s.GetStepResults(ctx, opID)
+	if err != nil || results[0].Status != string(StepCompensated) {
+		t.Fatalf("unexpected terminal ledger: results=%+v err=%v", results, err)
 	}
 }

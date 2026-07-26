@@ -8,7 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/paoloanzn/portico/internal/config"
+	"github.com/B-A-M-N/portico/internal/config"
 )
 
 // ctxKey is the context key for storing the app context.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/provider/mock"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider/mock"
 )
 
 // --------------- fakes ---------------
@@ -206,6 +206,36 @@ func TestExecutor_StepCommitCarriesAtomicPayload(t *testing.T) {
 		if !req.Result.Succeeded {
 			t.Errorf("commit request for step %s not marked succeeded", req.Step.ID)
 		}
+	}
+}
+
+func TestReplacementLifecycleMarksRecordOnlyExactMissingAccessResources(t *testing.T) {
+	marks := replacementLifecycleMarks("cloudflare", core.PlanStep{Technical: core.TechnicalOperation{Parameters: map[string]string{
+		"replaces_access_app_id":    "old-app",
+		"replaces_access_policy_id": "old-policy",
+	}}})
+	if len(marks) != 2 {
+		t.Fatalf("marks = %#v", marks)
+	}
+	if marks[0].ResourceType != core.ResourceAccessApp || marks[0].ExternalID != "old-app" || marks[0].NewLifecycle != core.LifecycleExternallyRemoved {
+		t.Fatalf("unexpected application mark: %#v", marks[0])
+	}
+	if marks[1].ResourceType != core.ResourceAccessPolicy || marks[1].ExternalID != "old-policy" || marks[1].NewLifecycle != core.LifecycleExternallyRemoved {
+		t.Fatalf("unexpected policy mark: %#v", marks[1])
+	}
+}
+
+func TestApplyResourceOutcomeRetiresReplacedResourceInMemory(t *testing.T) {
+	resources := applyResourceOutcome(
+		[]core.ProviderResource{{ProviderID: "cloudflare", Type: core.ResourceAccessPolicy, ExternalID: "old-policy", Lifecycle: core.LifecyclePresent}},
+		[]core.ProviderResource{{ProviderID: "cloudflare", Type: core.ResourceAccessPolicy, ExternalID: "new-policy", Ownership: core.OwnershipManaged}},
+		[]core.LifecycleMark{{ProviderID: "cloudflare", ResourceType: core.ResourceAccessPolicy, ExternalID: "old-policy", NewLifecycle: core.LifecycleExternallyRemoved}},
+	)
+	if len(resources) != 2 {
+		t.Fatalf("resources = %#v", resources)
+	}
+	if resources[0].Lifecycle != core.LifecycleExternallyRemoved || resources[1].Lifecycle != core.LifecyclePresent {
+		t.Fatalf("replacement inventory = %#v", resources)
 	}
 }
 

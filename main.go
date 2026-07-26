@@ -10,9 +10,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/paoloanzn/portico/cmd"
-	"github.com/paoloanzn/portico/internal/cli"
-	"github.com/paoloanzn/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/cmd"
+	"github.com/B-A-M-N/portico/internal/cli"
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 const exitOK = 0

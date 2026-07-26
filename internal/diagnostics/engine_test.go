@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // --------------- fakes ---------------
@@ -219,6 +219,9 @@ func TestProviderEdgeMissingTunnel(t *testing.T) {
 		ConnectionID: "conn-1",
 		ProviderID:   "mock",
 		Tunnel:       nil,
+		ResourceStatuses: []core.ObservedResourceStatus{{
+			Type: core.ResourceTunnel, ExternalID: "tun-1", Status: core.ObservationMissing,
+		}},
 	}
 
 	findings := diagnose(t, f)
@@ -230,6 +233,65 @@ func TestProviderEdgeMissingTunnel(t *testing.T) {
 	}
 	if f.dns.calls != 0 || f.endpoint.calls != 0 {
 		t.Errorf("downstream probes ran after provider edge failure")
+	}
+}
+
+func TestProviderEdgeUnauthorizedTunnelDoesNotClaimItIsMissing(t *testing.T) {
+	f := healthyFixture()
+	f.provider.observed = &core.ObservedConnection{
+		ConnectionID: "conn-1", ProviderID: "mock",
+		ResourceStatuses: []core.ObservedResourceStatus{{
+			Type: core.ResourceTunnel, ExternalID: "tun-1", Status: core.ObservationUnauthorized,
+		}},
+	}
+
+	findings := diagnose(t, f)
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d: %+v", len(findings), findings)
+	}
+	if findings[0].Summary != "Provider authentication required" {
+		t.Errorf("unexpected summary: %q", findings[0].Summary)
+	}
+	if f.dns.calls != 0 || f.endpoint.calls != 0 {
+		t.Errorf("downstream probes ran after provider authentication failure")
+	}
+}
+
+func TestProviderEdgeNilTunnelWithoutExactStatusIsUnknown(t *testing.T) {
+	f := healthyFixture()
+	f.provider.observed.Tunnel = nil
+
+	findings := diagnose(t, f)
+	if len(findings) != 0 {
+		t.Fatalf("ambiguous nil tunnel must not fabricate a failure: %+v", findings)
+	}
+}
+
+func TestProviderMissingDNSProducesAddressFindingBeforePublicProbe(t *testing.T) {
+	f := healthyFixture()
+	f.provider.observed.ResourceStatuses = []core.ObservedResourceStatus{{
+		Type: core.ResourceDNSRecord, ExternalID: "dns-1", Status: core.ObservationMissing,
+	}}
+	findings := diagnose(t, f)
+	if len(findings) != 1 || findings[0].Segment != core.SegmentAddress || findings[0].Summary != "Managed DNS record is missing" {
+		t.Fatalf("unexpected finding: %+v", findings)
+	}
+	if f.dns.calls != 0 || f.endpoint.calls != 0 {
+		t.Fatalf("downstream probes ran after authoritative DNS absence: dns=%d endpoint=%d", f.dns.calls, f.endpoint.calls)
+	}
+}
+
+func TestProviderMissingAccessPolicyProducesProtectionFinding(t *testing.T) {
+	f := healthyFixture()
+	f.provider.observed.ResourceStatuses = []core.ObservedResourceStatus{{
+		Type: core.ResourceAccessPolicy, ExternalID: "policy-1", Status: core.ObservationMissing,
+	}}
+	findings := diagnose(t, f)
+	if len(findings) != 1 || findings[0].Segment != core.SegmentProtection || findings[0].Summary != "Managed access protection is missing" {
+		t.Fatalf("unexpected finding: %+v", findings)
+	}
+	if f.dns.calls != 0 || f.endpoint.calls != 0 {
+		t.Fatalf("downstream probes ran after authoritative protection absence: dns=%d endpoint=%d", f.dns.calls, f.endpoint.calls)
 	}
 }
 

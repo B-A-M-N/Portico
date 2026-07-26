@@ -6,7 +6,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // Registry manages provider instances

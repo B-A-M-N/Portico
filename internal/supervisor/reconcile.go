@@ -3,9 +3,13 @@ package supervisor
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
 
-	"github.com/paoloanzn/portico/internal/controller"
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/controller"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // ReconcileInput contains all the information needed to compute
@@ -29,9 +33,24 @@ type reconcileDecision struct {
 func (s *Supervisor) computeReconcileDecision(ctx context.Context, input ReconcileInput) (*reconcileDecision, error) {
 	desired := input.Profile.Desired
 
-	// If no runtime exists, we need a full open or are already closed.
+	// A missing runtime projection does not imply missing infrastructure. An
+	// interrupted bootstrap can leave a durable tunnel inventory with no
+	// runtime row; retain it and start only the connector when observation did
+	// not authoritatively report it missing.
 	if input.Runtime == nil {
 		if desired == core.DesiredOpen {
+			// A missing runtime projection must not suppress a narrower
+			// resource repair. Durable inventory plus authoritative observation
+			// are sufficient to recreate a missing DNS or Access component
+			// without first starting a connector or rebuilding a tunnel.
+			if plan := resourceDeltaRepairPlan(input); plan != nil {
+				return &reconcileDecision{Action: "repair", Plan: plan}, nil
+			}
+			if tunnel := liveTunnelResource(input.Resources); tunnel != nil && !observedMissing(input.Observed, core.ResourceTunnel, tunnel.ExternalID) {
+				if plan := s.buildConnectorRestartPlan(input.Profile.ID, input.Profile); plan != nil {
+					return &reconcileDecision{Action: "repair", Plan: plan}, nil
+				}
+			}
 			plan, err := s.controller.PlanOpen(ctx, input.Profile.ID)
 			if err != nil {
 				return nil, err
@@ -56,6 +75,9 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 	// Desired open - check what needs to be done.
 	switch input.Runtime.State {
 	case core.RuntimeOpen:
+		if plan := resourceDeltaRepairPlan(input); plan != nil {
+			return &reconcileDecision{Action: "repair", Plan: plan}, nil
+		}
 		// Check connector health.
 		if input.Runtime.Connector.Status == core.ConnectorStatusRunning {
 			return &reconcileDecision{Action: "none"}, nil
@@ -93,6 +115,12 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 		return &reconcileDecision{Action: "open", Plan: plan}, nil
 
 	case core.RuntimeDegraded, core.RuntimeError:
+		// Resource drift is independent of the runtime projection. A previous
+		// connector or provider error must not hide an exact authoritative
+		// repair opportunity (for example a missing Access policy).
+		if plan := resourceDeltaRepairPlan(input); plan != nil {
+			return &reconcileDecision{Action: "repair", Plan: plan}, nil
+		}
 		return s.repairDecision(ctx, input.Profile.ID)
 
 	case core.RuntimeOrphaned:
@@ -105,6 +133,312 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 	}
 
 	return &reconcileDecision{Action: "none"}, nil
+}
+
+// resourceDeltaRepairPlan creates the smallest exact-ID repair for an
+// authoritative desired-versus-observed resource delta. It intentionally
+// handles one causal delta per operation; the next reconcile pass evaluates
+// the resulting state rather than combining unrelated remote mutations.
+func resourceDeltaRepairPlan(input ReconcileInput) *core.OperationPlan {
+	profile := input.Profile
+	// Access resources are independent from the tunnel and connector. A
+	// protected profile whose exact Access application was confirmed absent
+	// needs a narrow application-and-policy recreation; do not recreate the
+	// tunnel or touch DNS. If only the policy is absent, retain the exact
+	// observed application and restore only that policy.
+	if profile.Protection.Kind != core.ProtectionNone {
+		if app := missingTrackedResource(input, core.ResourceAccessApp); app != nil {
+			var oldPolicyID string
+			if policy := missingTrackedResource(input, core.ResourceAccessPolicy); policy != nil {
+				oldPolicyID = policy.ExternalID
+			}
+			return buildAccessAppCreatePlan(profile, app.ExternalID, oldPolicyID)
+		}
+		if policy := missingTrackedResource(input, core.ResourceAccessPolicy); policy != nil {
+			if app := presentTrackedResource(input, core.ResourceAccessApp); app != nil {
+				return buildAccessPolicyCreatePlan(profile, app.ExternalID, policy.ExternalID)
+			}
+		}
+		if app := driftedAccessAppResource(input); app != nil && profile.Exposure.RequestedAddress != "" {
+			return buildAccessAppUpdatePlan(profile, app.ExternalID)
+		}
+		if policy, appID := driftedAccessPolicyResource(input); policy != nil {
+			return buildAccessPolicyUpdatePlan(profile, policy.ExternalID, appID)
+		}
+	}
+	// A present DNS record can still point at the wrong tunnel. Compare the
+	// authoritative exact-record observation to the durable tunnel ID and
+	// update only that record when it has drifted.
+	if dns, tunnel := driftedDNSResource(input); dns != nil && tunnel != nil && profile.Exposure.RequestedAddress != "" {
+		return buildDNSUpdatePlan(profile, dns.ExternalID, tunnel.ExternalID)
+	}
+	// An authoritative missing DNS record with an intact tunnel is a narrow
+	// repair. Transient, unauthorized, and rate-limited observations never
+	// enter missingTrackedResource.
+	if dns := missingTrackedResource(input, core.ResourceDNSRecord); dns != nil && liveTunnelResource(input.Resources) != nil && profile.Exposure.RequestedAddress != "" {
+		return buildDNSCreatePlan(profile, dns.ExternalID, liveTunnelResource(input.Resources).ExternalID)
+	}
+	return nil
+}
+
+func missingTrackedResource(input ReconcileInput, resourceType core.ResourceType) *core.ProviderResource {
+	for i := range input.Resources {
+		resource := &input.Resources[i]
+		if resource.Type == resourceType && resourceIsLive(*resource) && observedMissing(input.Observed, resourceType, resource.ExternalID) {
+			return resource
+		}
+	}
+	return nil
+}
+
+func presentTrackedResource(input ReconcileInput, resourceType core.ResourceType) *core.ProviderResource {
+	for i := range input.Resources {
+		resource := &input.Resources[i]
+		if resource.Type == resourceType && resourceIsLive(*resource) && observedPresent(input.Observed, resourceType, resource.ExternalID) {
+			return resource
+		}
+	}
+	return nil
+}
+
+func resourceIsLive(resource core.ProviderResource) bool {
+	switch resource.Lifecycle {
+	case core.LifecycleRemoved, core.LifecycleExternallyRemoved:
+		return false
+	default:
+		return true
+	}
+}
+
+// driftedDNSResource returns a DNS record only when its exact remote
+// observation is present and its target differs from the tracked tunnel.
+// Missing, unauthorized, rate-limited, and transient observations are never
+// interpreted as drift.
+func driftedDNSResource(input ReconcileInput) (*core.ProviderResource, *core.ProviderResource) {
+	tunnel := liveTunnelResource(input.Resources)
+	if tunnel == nil || input.Observed == nil {
+		return nil, nil
+	}
+	wantTarget := normalizeDNSTarget(tunnel.ExternalID + ".cfargotunnel.com")
+	for i := range input.Resources {
+		resource := &input.Resources[i]
+		if resource.Type != core.ResourceDNSRecord || !resourceIsLive(*resource) || !observedPresent(input.Observed, resource.Type, resource.ExternalID) {
+			continue
+		}
+		for _, record := range input.Observed.DNSRecords {
+			if record.ID == resource.ExternalID && record.Target != "" && normalizeDNSTarget(record.Target) != wantTarget {
+				return resource, tunnel
+			}
+		}
+	}
+	return nil, nil
+}
+
+// driftedAccessAppResource returns an exact present Access application whose
+// configured domain no longer matches the desired public hostname. Observation
+// uncertainty and untracked applications are never interpreted as drift.
+func driftedAccessAppResource(input ReconcileInput) *core.ProviderResource {
+	if input.Observed == nil {
+		return nil
+	}
+	wantDomain := normalizeAccessDomain(input.Profile.Exposure.RequestedAddress)
+	if wantDomain == "" {
+		return nil
+	}
+	for i := range input.Resources {
+		resource := &input.Resources[i]
+		if resource.Type != core.ResourceAccessApp || !resource.IsLive() || !observedPresent(input.Observed, resource.Type, resource.ExternalID) {
+			continue
+		}
+		for _, app := range input.Observed.AccessApps {
+			if app.ID == resource.ExternalID && normalizeAccessDomain(app.Domain) != wantDomain {
+				return resource
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeAccessDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+}
+
+// driftedAccessPolicyResource returns an exact present policy whose allow
+// identities, session duration, or decision differs from the desired
+// protection. Only fields Portico owns are compared; unknown provider policy
+// features neither trigger mutation nor get overwritten.
+func driftedAccessPolicyResource(input ReconcileInput) (*core.ProviderResource, string) {
+	if input.Observed == nil {
+		return nil, ""
+	}
+	for i := range input.Resources {
+		resource := &input.Resources[i]
+		if resource.Type != core.ResourceAccessPolicy || !resource.IsLive() || !observedPresent(input.Observed, resource.Type, resource.ExternalID) {
+			continue
+		}
+		appID := resource.Metadata["app_id"]
+		if appID == "" || !observedPresent(input.Observed, core.ResourceAccessApp, appID) {
+			continue
+		}
+		for _, policy := range input.Observed.AccessPolicies {
+			if policy.ID != resource.ExternalID || policy.AppID != appID {
+				continue
+			}
+			if accessPolicyDrifted(input.Profile.Protection, policy) {
+				return resource, appID
+			}
+		}
+	}
+	return nil, ""
+}
+
+func accessPolicyDrifted(want core.ProtectionSpec, observed core.ObservedAccessPolicy) bool {
+	if !strings.EqualFold(observed.Decision, "allow") || !sameNormalizedStrings(want.AllowedEmails, observed.AllowedEmails, false) || !sameNormalizedStrings(want.AllowedDomains, observed.AllowedDomains, true) {
+		return true
+	}
+	// A zero TTL means the profile did not request a policy-specific session
+	// duration; retain the provider default instead of manufacturing drift.
+	if want.SessionTTL > 0 && strings.TrimSpace(observed.SessionDuration) != want.SessionTTL.String() {
+		return true
+	}
+	return false
+}
+
+func sameNormalizedStrings(a, b []string, lowercase bool) bool {
+	normalize := func(values []string) []string {
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if lowercase {
+				value = strings.ToLower(value)
+			}
+			if value != "" {
+				out = append(out, value)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	a, b = normalize(a), normalize(b)
+	return slicesEqual(a, b)
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeDNSTarget(target string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(target)), ".")
+}
+
+// buildDNSCreatePlan materializes the exact tracked tunnel ID into the repair
+// plan. The provider adapter cannot rely on in-memory connection state after
+// a supervisor restart; the durable inventory is the authority for this
+// narrowly scoped DNS repair.
+func buildDNSCreatePlan(profile *core.ConnectionProfile, previousRecordID, tunnelID string) *core.OperationPlan {
+	now := time.Now().UTC()
+	plan := &core.OperationPlan{
+		ID: core.NewPlanID(), ConnectionID: profile.ID, ProfileRevision: profile.Revision,
+		Provider: profile.Provider.ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		Steps: []core.PlanStep{{
+			ID: "repair-dns-" + previousRecordID, Kind: core.StepCreateDNSRecord,
+			Summary: fmt.Sprintf("Recreate DNS CNAME for %s", profile.Exposure.RequestedAddress),
+			Technical: core.TechnicalOperation{Provider: profile.Provider.ProviderID, Type: "create_dns", Parameters: map[string]string{
+				"hostname":  profile.Exposure.RequestedAddress,
+				"tunnel_id": tunnelID,
+			}},
+		}},
+	}
+	_ = plan.ComputeFingerprint()
+	return plan
+}
+
+func buildDNSUpdatePlan(profile *core.ConnectionProfile, recordID, tunnelID string) *core.OperationPlan {
+	now := time.Now().UTC()
+	plan := &core.OperationPlan{
+		ID: core.NewPlanID(), ConnectionID: profile.ID, ProfileRevision: profile.Revision,
+		Provider: profile.Provider.ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		Steps: []core.PlanStep{{
+			ID: "repair-dns-target-" + recordID, Kind: core.StepUpdateDNSRecord,
+			Summary: "Correct DNS CNAME target for " + profile.Exposure.RequestedAddress,
+			Technical: core.TechnicalOperation{Provider: profile.Provider.ProviderID, Type: "update_dns", ResourceID: recordID, Parameters: map[string]string{
+				"hostname":  profile.Exposure.RequestedAddress,
+				"tunnel_id": tunnelID,
+			}},
+		}},
+	}
+	_ = plan.ComputeFingerprint()
+	return plan
+}
+
+func accessRepairParameters(profile *core.ConnectionProfile) map[string]string {
+	return map[string]string{
+		"hostname":         profile.Exposure.RequestedAddress,
+		"protection_kind":  string(profile.Protection.Kind),
+		"allowed_emails":   strings.Join(profile.Protection.AllowedEmails, ","),
+		"allowed_domains":  strings.Join(profile.Protection.AllowedDomains, ","),
+		"session_duration": profile.Protection.SessionTTL.String(),
+	}
+}
+
+// buildAccessAppCreatePlan restores an Access application and its initial
+// policy only after the old application was authoritatively reported missing.
+// The replacement IDs are marked externally removed in the same successful
+// step transaction, preventing repeat repairs against a known-dead resource.
+func buildAccessAppCreatePlan(profile *core.ConnectionProfile, oldAppID, oldPolicyID string) *core.OperationPlan {
+	params := accessRepairParameters(profile)
+	params["replaces_access_app_id"] = oldAppID
+	if oldPolicyID != "" {
+		params["replaces_access_policy_id"] = oldPolicyID
+	}
+	return buildAccessRepairPlan(profile, "repair-access-app-"+oldAppID, core.StepCreateAccessApp,
+		"Recreate Access application and policy", "create_access_app", "", params)
+}
+
+// buildAccessPolicyCreatePlan restores only an exact missing policy beneath
+// an exact present application. It never creates another application.
+func buildAccessPolicyCreatePlan(profile *core.ConnectionProfile, appID, oldPolicyID string) *core.OperationPlan {
+	params := accessRepairParameters(profile)
+	params["app_id"] = appID
+	params["replaces_access_policy_id"] = oldPolicyID
+	return buildAccessRepairPlan(profile, "repair-access-policy-"+oldPolicyID, core.StepCreateAccessPolicy,
+		"Recreate Access policy", "create_access_policy", oldPolicyID, params)
+}
+
+func buildAccessAppUpdatePlan(profile *core.ConnectionProfile, appID string) *core.OperationPlan {
+	return buildAccessRepairPlan(profile, "repair-access-app-domain-"+appID, core.StepUpdateAccessApp,
+		"Correct Access application hostname", "update_access_app", appID, map[string]string{
+			"hostname": profile.Exposure.RequestedAddress,
+		})
+}
+
+func buildAccessPolicyUpdatePlan(profile *core.ConnectionProfile, policyID, appID string) *core.OperationPlan {
+	params := accessRepairParameters(profile)
+	params["app_id"] = appID
+	return buildAccessRepairPlan(profile, "repair-access-policy-spec-"+policyID, core.StepUpdateAccessPolicy,
+		"Correct Access policy", "update_access_policy", policyID, params)
+}
+
+func buildAccessRepairPlan(profile *core.ConnectionProfile, stepID string, kind core.StepKind, summary, operationType, resourceID string, params map[string]string) *core.OperationPlan {
+	now := time.Now().UTC()
+	plan := &core.OperationPlan{
+		ID: core.NewPlanID(), ConnectionID: profile.ID, ProfileRevision: profile.Revision,
+		Provider: profile.Provider.ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		Steps: []core.PlanStep{{
+			ID: stepID, Kind: kind, Summary: summary,
+			Technical: core.TechnicalOperation{Provider: profile.Provider.ProviderID, Type: operationType, ResourceID: resourceID, Parameters: params},
+		}},
+	}
+	_ = plan.ComputeFingerprint()
+	return plan
 }
 
 // repairDecision plans a repair, mapping the typed no-repair result to "none".
@@ -130,8 +464,7 @@ func liveTunnelResource(resources []core.ProviderResource) *core.ProviderResourc
 		if r.Type != core.ResourceTunnel {
 			continue
 		}
-		switch r.Lifecycle {
-		case core.LifecycleRemoved:
+		if !resourceIsLive(*r) {
 			continue
 		}
 		return r
@@ -149,6 +482,18 @@ func observedMissing(obs *core.ObservedConnection, resType core.ResourceType, ex
 	for _, st := range obs.ResourceStatuses {
 		if st.Type == resType && st.ExternalID == externalID {
 			return st.Status == core.ObservationMissing
+		}
+	}
+	return false
+}
+
+func observedPresent(obs *core.ObservedConnection, resType core.ResourceType, externalID string) bool {
+	if obs == nil {
+		return false
+	}
+	for _, st := range obs.ResourceStatuses {
+		if st.Type == resType && st.ExternalID == externalID {
+			return st.Status == core.ObservationPresent
 		}
 	}
 	return false

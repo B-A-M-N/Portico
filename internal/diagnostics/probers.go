@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // defaultDiagTimeout bounds a single diagnostic probe.

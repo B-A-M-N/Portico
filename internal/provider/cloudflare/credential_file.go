@@ -7,26 +7,28 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
-// credentialDir is the directory for temporary credential files.
-var credentialDir string
+const staleCredentialAge = 5 * time.Minute
 
-// SetCredentialDir sets the directory used for temporary credential files.
-func SetCredentialDir(dir string) error {
+func prepareCredentialDir(dir string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create credential dir: %w", err)
 	}
-	credentialDir = dir
 	return nil
 }
 
 // createCredentialFile creates a temporary credential file with a random name
 // in a 0700 directory. The file is created with 0600 permissions.
 // Returns the file path and a cleanup function.
-func createCredentialFile(token []byte) (string, func(), error) {
-	if credentialDir == "" {
+func createCredentialFile(dir string, token []byte) (string, func(), error) {
+	if dir == "" {
 		return "", nil, fmt.Errorf("credential dir not set")
+	}
+	if err := prepareCredentialDir(dir); err != nil {
+		return "", nil, err
 	}
 
 	// Generate a random filename (16 bytes = 32 hex chars).
@@ -35,7 +37,7 @@ func createCredentialFile(token []byte) (string, func(), error) {
 		return "", nil, fmt.Errorf("generate random filename: %w", err)
 	}
 	filename := "cred-" + hex.EncodeToString(randomBytes) + ".tmp"
-	path := filepath.Join(credentialDir, filename)
+	path := filepath.Join(dir, filename)
 
 	// Create the file with 0600 permissions (owner read/write only).
 	// Use O_CREATE|O_EXCL to prevent overwriting existing files.
@@ -64,11 +66,11 @@ func createCredentialFile(token []byte) (string, func(), error) {
 
 // sweepStaleCredentialFiles removes credential files left by a previous
 // supervisor crash. Called on startup.
-func sweepStaleCredentialFiles() error {
-	if credentialDir == "" {
+func sweepStaleCredentialFiles(dir string, now time.Time) error {
+	if dir == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(credentialDir)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -76,18 +78,36 @@ func sweepStaleCredentialFiles() error {
 		return fmt.Errorf("read credential dir: %w", err)
 	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.Type().IsRegular() || !isCredentialFilename(entry.Name()) {
 			continue
 		}
-		// Remove all files in the credential directory.
-		// They are temporary and should not survive restarts.
-		path := filepath.Join(credentialDir, entry.Name())
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < staleCredentialAge {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
 		if err := os.Remove(path); err != nil {
 			// Log but don't fail - best effort cleanup.
 			continue
 		}
 	}
 	return nil
+}
+
+func isCredentialFilename(name string) bool {
+	if !strings.HasPrefix(name, "cred-") || !strings.HasSuffix(name, ".tmp") {
+		return false
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(name, "cred-"), ".tmp")
+	if len(encoded) != 32 {
+		return false
+	}
+	for _, r := range encoded {
+		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // withCredentialFileUntilReady creates a scoped credential file for a
@@ -98,10 +118,10 @@ func sweepStaleCredentialFiles() error {
 // panic, cancellation, and success — via defer.
 func withCredentialFileUntilReady[T any](dir string, token []byte, start func(path string) (T, error), ready func(handle T) error) (T, error) {
 	var zero T
-	if err := SetCredentialDir(dir); err != nil {
+	if err := prepareCredentialDir(dir); err != nil {
 		return zero, err
 	}
-	path, cleanup, err := createCredentialFile(token)
+	path, cleanup, err := createCredentialFile(dir, token)
 	if err != nil {
 		return zero, err
 	}

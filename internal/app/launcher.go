@@ -13,9 +13,9 @@ import (
 
 	"charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/term"
-	"github.com/paoloanzn/portico/internal/ipc"
-	"github.com/paoloanzn/portico/internal/lock"
-	"github.com/paoloanzn/portico/internal/tui"
+	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/lock"
+	"github.com/B-A-M-N/portico/internal/tui"
 )
 
 // Launcher provides shared application bootstrapping for TUI and supervisor.

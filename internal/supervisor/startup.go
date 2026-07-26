@@ -10,18 +10,19 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/app"
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/diagnostics"
-	"github.com/paoloanzn/portico/internal/discovery"
-	"github.com/paoloanzn/portico/internal/ipc"
-	"github.com/paoloanzn/portico/internal/lock"
-	"github.com/paoloanzn/portico/internal/process"
-	"github.com/paoloanzn/portico/internal/store"
+	"github.com/B-A-M-N/portico/internal/app"
+	"github.com/B-A-M-N/portico/internal/controller"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/diagnostics"
+	"github.com/B-A-M-N/portico/internal/discovery"
+	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/lock"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 // SupervisorIdentity stores the identity of a running supervisor.
@@ -309,6 +310,9 @@ func (s *Supervisor) startup(ctx context.Context) error {
 		return fmt.Errorf("ipc server: %w", err)
 	}
 	s.ipcServer = server
+	// The controller writes operation events inside its state transactions;
+	// the IPC server only dispatches those committed rows to live SSE clients.
+	s.controller.SetCommittedEventDispatcher(server)
 
 	listener, err := ipc.NewUnixListener(s.paths.SocketPath)
 	if err != nil {
@@ -390,25 +394,56 @@ func (s *Supervisor) loadProviderAccounts(ctx context.Context) error {
 		return fmt.Errorf("list provider accounts: %w", err)
 	}
 
-	// Group account IDs by provider
-	type providerGroup struct {
-		providerID core.ProviderID
-		ids        []core.ProviderAccountID
-	}
-	groups := make(map[core.ProviderID]*providerGroup)
-	for _, a := range accounts {
-		g, ok := groups[a.Provider]
-		if !ok {
-			g = &providerGroup{providerID: a.Provider}
-			groups[a.Provider] = g
+	// Start with account IDs directly bound to registered provider adapters
+	// (for example, the environment/configured Cloudflare account). A single
+	// adapter must not advertise arbitrary stored rows: it would execute against
+	// its own configured account while the profile claims another one.
+	groups := make(map[core.ProviderID]map[core.ProviderAccountID]struct{})
+	for _, snapshot := range s.registry.List() {
+		ids := s.registry.GetAccounts(snapshot.ID)
+		if len(ids) == 0 {
+			continue
 		}
-		g.ids = append(g.ids, a.ID)
+		group := make(map[core.ProviderAccountID]struct{}, len(ids))
+		for _, id := range ids {
+			group[id] = struct{}{}
+		}
+		groups[snapshot.ID] = group
 	}
 
-	// Register accounts with each provider
-	for provID, group := range groups {
-		s.registry.SetAccounts(provID, group.ids)
-		slog.Info("provider accounts loaded", "provider", provID, "count", len(group.ids))
+	for _, a := range accounts {
+		prov := s.registry.Get(a.Provider)
+		if prov == nil {
+			slog.Warn("stored provider account has no registered provider", "provider", a.Provider, "account", a.ID)
+			continue
+		}
+		if scoped, ok := prov.(core.AccountScopedProvider); ok {
+			if _, err := scoped.ProviderForAccount(a.ID); err != nil {
+				slog.Warn("stored provider account is unavailable to the configured adapter", "provider", a.Provider, "account", a.ID, "err", err)
+				continue
+			}
+		}
+		if binding, ok := prov.(core.ProviderAccountBinding); ok {
+			boundAccount := binding.ProviderAccountID()
+			if boundAccount == "" || a.ID != boundAccount {
+				slog.Warn("stored provider account is unavailable to the configured adapter", "provider", a.Provider, "account", a.ID)
+				continue
+			}
+		}
+		if groups[a.Provider] == nil {
+			groups[a.Provider] = make(map[core.ProviderAccountID]struct{})
+		}
+		groups[a.Provider][a.ID] = struct{}{}
+	}
+
+	for providerID, group := range groups {
+		ids := make([]core.ProviderAccountID, 0, len(group))
+		for id := range group {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		s.registry.SetAccounts(providerID, ids)
+		slog.Info("provider accounts loaded", "provider", providerID, "count", len(ids))
 	}
 
 	slog.Info("loaded provider accounts", "count", len(accounts))
@@ -452,22 +487,25 @@ func (s *Supervisor) loadRuntimes(ctx context.Context) error {
 func (s *Supervisor) restartDesiredOpen(ctx context.Context) {
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		if p.Desired == core.DesiredOpen {
-			go func(connID core.ConnectionID) {
+		if p.Desired == core.DesiredOpen && p.Lifecycle.AutoStart {
+			if s.registry.Get(p.Provider.ProviderID) == nil {
+				s.markProviderUnavailable(ctx, p)
+				continue
+			}
+			profile := p
+			go func(connID core.ConnectionID, profile *core.ConnectionProfile) {
 				// Use the delta planner to determine what needs to be done.
 				rt, _ := s.controller.GetRuntime(connID)
 				resources, _ := s.store.ListResourcesByConnection(ctx, connID)
 
 				input := ReconcileInput{
-					Profile:   p,
+					Profile:   profile,
 					Runtime:   rt,
 					Resources: resources,
 				}
 				// Best-effort provider observation for authoritative decisions.
-				if prov := s.registry.Get(p.Provider.ProviderID); prov != nil {
-					if obs, oErr := prov.Observe(ctx, connID); oErr == nil {
-						input.Observed = obs
-					}
+				if obs, oErr := s.observeConnection(ctx, connID); oErr == nil {
+					input.Observed = obs
 				}
 
 				decision, err := s.computeReconcileDecision(ctx, input)
@@ -490,7 +528,7 @@ func (s *Supervisor) restartDesiredOpen(ctx context.Context) {
 				if err != nil {
 					slog.Warn("restart apply failed", "connection", connID, "err", err)
 				}
-			}(p.ID)
+			}(profile.ID, profile)
 		}
 	}
 }
@@ -499,40 +537,13 @@ func (s *Supervisor) restartDesiredOpen(ctx context.Context) {
 // for a connection with existing infrastructure. This avoids recreating
 // Cloudflare resources that already exist.
 func (s *Supervisor) buildConnectorRestartPlan(connID core.ConnectionID, p *core.ConnectionProfile) *core.OperationPlan {
-	// Check current connector state from runtime.
-	rt, ok := s.controller.GetRuntime(connID)
-	if ok && rt.Connector.Status == core.ConnectorStatusRunning {
-		// Connector already running, no restart needed.
-		slog.Info("restart: connector already running", "connection", connID)
+	_ = p // Profile access and provider selection are owned by controller planning.
+	plan, err := s.controller.PlanRepair(context.Background(), connID)
+	if err == controller.ErrNoRepairNeeded {
 		return nil
 	}
-
-	plan := &core.OperationPlan{
-		ID:              core.NewPlanID(),
-		ConnectionID:    connID,
-		ProfileRevision: p.Revision,
-		Provider:        p.Provider.ProviderID,
-		Intent:          core.IntentRepair,
-		Steps: []core.PlanStep{
-			{
-				ID:      "restart-start-connector",
-				Kind:    core.StepStartConnector,
-				Summary: "Start connector process",
-				Technical: core.TechnicalOperation{
-					Provider:   p.Provider.ProviderID,
-					Type:       "start_connector",
-					Parameters: map[string]string{"mode": "permanent"},
-				},
-				Destructive:  false,
-				Irreversible: false,
-			},
-		},
-		CreatedAt: time.Now().UTC(),
-		ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
-	}
-
-	if err := plan.ComputeFingerprint(); err != nil {
-		slog.Warn("restart: plan fingerprint failed", "connection", connID, "err", err)
+	if err != nil {
+		slog.Warn("restart: plan failed", "connection", connID, "err", err)
 		return nil
 	}
 	return plan
@@ -929,13 +940,11 @@ func (s *Supervisor) recoverOperationJournals(ctx context.Context) error {
 
 		// Best-effort provider re-observation for additional evidence.
 		var observed *core.ObservedConnection
-		if prov := s.registry.Get(plan.Provider); prov != nil {
-			if obs, oErr := prov.Observe(ctx, op.ConnectionID); oErr == nil {
-				observed = obs
-			} else {
-				slog.Warn("recovery: provider observation failed",
-					"operation", op.ID, "provider", plan.Provider, "err", oErr)
-			}
+		if obs, oErr := s.observeConnection(ctx, op.ConnectionID); oErr == nil {
+			observed = obs
+		} else {
+			slog.Warn("recovery: provider observation failed",
+				"operation", op.ID, "provider", plan.Provider, "err", oErr)
 		}
 
 		decision := classifyOperationRecovery(plan, events, resources, observed)
@@ -952,21 +961,65 @@ func (s *Supervisor) recoverOperationJournals(ctx context.Context) error {
 }
 
 func (s *Supervisor) verifyConnectorIdentities(ctx context.Context) {
-	// Check if any persisted connector processes are still running
-	// by verifying /proc entries against stored identities.
-	processes := s.procMgr.ListProcesses()
-	for _, mp := range processes {
-		if err := process.VerifyIdentity(mp); err != nil {
-			slog.Warn("connector identity mismatch",
-				"connection", mp.ConnectionID,
-				"pid", mp.Identity.PID,
-				"err", err,
-			)
+	// Re-attach persisted connector processes to the process manager.
+	// The manager map is empty after a supervisor restart; adoption
+	// verifies the FULL persisted identity (PID, start time, executable,
+	// command hash) before the process is tracked. A mismatch means the
+	// PID may have been reused: the process is never signaled, the
+	// connector status becomes unknown, and repair is required.
+	for _, rt := range s.controller.ListRuntimes() {
+		conn := rt.Connector
+		if conn.PID <= 0 {
 			continue
 		}
-		slog.Debug("connector identity verified",
-			"connection", mp.ConnectionID,
-			"pid", mp.Identity.PID,
+		if conn.Status != core.ConnectorStatusRunning && conn.Status != core.ConnectorStatusStarting {
+			continue
+		}
+		if _, ok := s.procMgr.GetProcess(rt.ConnectionID); ok {
+			continue
+		}
+
+		identity := core.ProcessIdentity{
+			PID:            conn.PID,
+			StartTime:      conn.StartTime,
+			ExecutablePath: conn.Executable,
+			CommandHash:    conn.CommandHash,
+		}
+		spec := core.ProcessSpec{Executable: conn.Executable}
+
+		if err := s.procMgr.Adopt(rt.ConnectionID, identity, spec); err != nil {
+			slog.Warn("connector adoption failed - marking status unknown",
+				"connection", rt.ConnectionID,
+				"pid", conn.PID,
+				"err", err,
+			)
+			rt.Connector.Status = core.ConnectorStatusUnknown
+			s.controller.RestoreRuntime(rt)
+			if sErr := s.store.SaveRuntime(ctx, rt); sErr != nil {
+				slog.Warn("failed to persist unknown connector status",
+					"connection", rt.ConnectionID, "err", sErr)
+			}
+			finding := core.DiagnosticFinding{
+				ID:           core.FindingID(fmt.Sprintf("finding-adopt-%s-%d", rt.ConnectionID, conn.PID)),
+				ConnectionID: rt.ConnectionID,
+				Segment:      core.SegmentConnector,
+				Severity:     core.SeverityError,
+				Summary:      "Connector process identity could not be verified after restart",
+				Explanation: fmt.Sprintf(
+					"Persisted connector PID %d failed identity verification (%v). The PID may have been reused by another process; it will not be signaled. Run repair to start a fresh connector.",
+					conn.PID, err),
+				ObservedAt: time.Now().UTC(),
+			}
+			if fErr := s.store.SaveFinding(ctx, &finding); fErr != nil {
+				slog.Warn("failed to persist adoption finding",
+					"connection", rt.ConnectionID, "err", fErr)
+			}
+			continue
+		}
+
+		slog.Info("connector process adopted after restart",
+			"connection", rt.ConnectionID,
+			"pid", conn.PID,
 		)
 	}
 }
@@ -978,22 +1031,16 @@ func (s *Supervisor) observeProviderResources(ctx context.Context) {
 	// provenance: created by Portico, explicitly adopted, or externally observed.
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		prov := s.registry.Get(p.Provider.ProviderID)
-		if prov == nil {
+		if s.registry.Get(p.Provider.ProviderID) == nil {
+			s.markProviderUnavailable(ctx, p)
 			continue
 		}
-		observed, err := prov.Observe(ctx, p.ID)
+		observed, err := s.observeConnection(ctx, p.ID)
 		if err != nil {
 			slog.Warn("observe failed", "connection", p.ID, "err", err)
 			continue
 		}
 		if observed == nil {
-			continue
-		}
-
-		// Persist observation into controller runtime.
-		if _, err := s.controller.Observe(ctx, p.ID); err != nil {
-			slog.Warn("observe persist failed", "connection", p.ID, "err", err)
 			continue
 		}
 
@@ -1066,6 +1113,7 @@ func (s *Supervisor) observeProviderResources(ctx context.Context) {
 		var acceptedResources []core.ProviderResource
 		for _, res := range resources {
 			// Check global resource lookup to prevent cross-connection conflicts.
+			existsSameConn := false
 			globalRes, err := s.store.LoadResource(ctx, res.ProviderID, res.Type, res.ExternalID)
 			if err == nil && globalRes != nil {
 				// Resource exists globally - check if it's under the same connection.
@@ -1078,7 +1126,7 @@ func (s *Supervisor) observeProviderResources(ctx context.Context) {
 					)
 					continue
 				}
-				// Same connection - update will happen via SaveResource
+				existsSameConn = true
 			} else if err != nil && err != sql.ErrNoRows {
 				// Database error - stop observation for this resource.
 				slog.Warn("observe: database error checking resource, skipping",
@@ -1090,12 +1138,21 @@ func (s *Supervisor) observeProviderResources(ctx context.Context) {
 				continue
 			}
 
-			if err := s.store.SaveResource(ctx, &res); err != nil {
-				slog.Warn("observe: save resource failed",
+			// Observation refresh must never mutate ownership or
+			// association; insertion is only for previously untracked
+			// (external) resources.
+			var persistErr error
+			if existsSameConn {
+				persistErr = s.store.UpdateResourceObservation(ctx, &res)
+			} else {
+				persistErr = s.store.SaveResource(ctx, &res)
+			}
+			if persistErr != nil {
+				slog.Warn("observe: persist resource failed",
 					"connection", p.ID,
 					"resource_type", res.Type,
 					"external_id", res.ExternalID,
-					"err", err,
+					"err", persistErr,
 				)
 				// Do not restore resources whose persistence failed: the
 				// database is the ownership authority and an unpersisted
@@ -1116,6 +1173,60 @@ func (s *Supervisor) observeProviderResources(ctx context.Context) {
 			"resource_count", len(resources),
 		)
 	}
+}
+
+// markProviderUnavailable turns an otherwise misleading runtime projection
+// into an actionable state. Persisted profiles are retained intact: the user
+// can restore the provider/account later, but Portico must never represent an
+// open connection as healthy when it cannot load its selected adapter.
+func (s *Supervisor) markProviderUnavailable(ctx context.Context, profile *core.ConnectionProfile) {
+	if profile == nil {
+		return
+	}
+	now := time.Now().UTC()
+	finding := core.DiagnosticFinding{
+		ID:           core.FindingID(fmt.Sprintf("find-%s-provider-unavailable", profile.ID)),
+		ConnectionID: profile.ID,
+		Segment:      core.SegmentProviderEdge,
+		Severity:     core.SeverityError,
+		Summary:      "Selected provider is unavailable",
+		Explanation:  fmt.Sprintf("Portico cannot load the %q provider selected by this connection. The profile and its resources are retained, but opening, repair, and automatic reconciliation are paused until that provider is configured.", profile.Provider.ProviderID),
+		Evidence: []core.Evidence{{
+			Type: "provider_registry", Source: "supervisor", Message: "provider adapter is not registered",
+			Data: map[string]string{"provider_id": string(profile.Provider.ProviderID)},
+		}},
+		ObservedAt: now,
+	}
+
+	if rt, ok := s.controller.GetRuntime(profile.ID); ok {
+		// A desired-open connection cannot be truthfully presented as open
+		// while no provider adapter exists. Closed profiles remain closed but
+		// receive the same durable finding for visibility.
+		if profile.Desired == core.DesiredOpen {
+			rt.State = core.RuntimeError
+			rt.LastTransition = now
+			rt.Error = core.ErrProviderNotFound(profile.Provider.ProviderID)
+		}
+		if !hasFinding(rt.Diagnostics, finding.ID) {
+			rt.Diagnostics = append(rt.Diagnostics, finding)
+		}
+		s.controller.RestoreRuntime(rt)
+		if err := s.store.SaveRuntime(ctx, rt); err != nil {
+			slog.Warn("persist unavailable provider runtime", "connection", profile.ID, "err", err)
+		}
+	}
+	if err := s.store.SaveFinding(ctx, &finding); err != nil {
+		slog.Warn("persist unavailable provider finding", "connection", profile.ID, "err", err)
+	}
+}
+
+func hasFinding(findings []core.DiagnosticFinding, id core.FindingID) bool {
+	for _, finding := range findings {
+		if finding.ID == id && finding.ResolvedAt == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // ownershipForObserved returns the ownership for an observed resource.
@@ -1145,13 +1256,19 @@ func (s *Supervisor) rehydrateTunnelCredentials(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		var tunnelID string
+		var tunnelIDs []string
 		for _, r := range resources {
-			if r.Type == core.ResourceTunnel {
-				tunnelID = r.ExternalID
-				break
+			if r.Type == core.ResourceTunnel && resourceIsLive(r) {
+				tunnelIDs = append(tunnelIDs, r.ExternalID)
 			}
 		}
+		if len(tunnelIDs) != 1 {
+			if len(tunnelIDs) > 1 {
+				slog.Warn("cannot select an unambiguous tunnel credential for rehydration", "connection", p.ID, "tunnels", len(tunnelIDs))
+			}
+			continue
+		}
+		tunnelID := tunnelIDs[0]
 
 		// Try to rehydrate the connection from stored credentials.
 		if cf, ok := prov.(interface {
@@ -1170,35 +1287,17 @@ func (s *Supervisor) classifyResourceState(ctx context.Context) {
 	// by comparing observed resources with stored provider resources.
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		prov := s.registry.Get(p.Provider.ProviderID)
-		if prov == nil {
+		if s.registry.Get(p.Provider.ProviderID) == nil {
+			s.markProviderUnavailable(ctx, p)
 			continue
 		}
-
-		observed, err := prov.Observe(ctx, p.ID)
+		observed, err := s.observeConnection(ctx, p.ID)
 		if err != nil {
 			slog.Warn("classify: observe failed", "connection", p.ID, "err", err)
 			continue
 		}
 		if observed == nil {
 			continue
-		}
-
-		// Build set of observed resource external IDs by type.
-		type observedKey struct {
-			resourceType string
-			externalID   string
-		}
-		observedSet := make(map[observedKey]bool)
-
-		if observed.Tunnel != nil {
-			observedSet[observedKey{"tunnel", observed.Tunnel.ID}] = true
-		}
-		for _, dns := range observed.DNSRecords {
-			observedSet[observedKey{"dns_record", dns.ID}] = true
-		}
-		for _, app := range observed.AccessApps {
-			observedSet[observedKey{"access_application", app.ID}] = true
 		}
 
 		// Compare stored resources against observed set.
@@ -1209,14 +1308,34 @@ func (s *Supervisor) classifyResourceState(ctx context.Context) {
 		}
 
 		for _, res := range stored {
-			key := observedKey{string(res.Type), res.ExternalID}
-			if res.Ownership == core.OwnershipManaged && !observedSet[key] {
-				// Managed resource not found in observed state — orphaned.
+			if res.Lifecycle == core.LifecycleRemoved || res.Lifecycle == core.LifecycleExternallyRemoved {
+				continue
+			}
+			if res.Ownership == core.OwnershipManaged && observedMissing(observed, res.Type, res.ExternalID) {
+				// Observation supplied an exact resource inventory; this resource
+				// was therefore authoritatively removed outside Portico.
 				slog.Warn("orphaned managed resource",
 					"connection", p.ID,
 					"resource_type", res.Type,
 					"external_id", res.ExternalID,
 				)
+				if err := s.store.MarkResourceExternallyRemoved(ctx, p.ID, res.ProviderID, res.Type, res.ExternalID); err != nil {
+					slog.Warn("classify: persist externally removed resource", "connection", p.ID, "resource_type", res.Type, "external_id", res.ExternalID, "err", err)
+					continue
+				}
+				finding := core.DiagnosticFinding{
+					ID:           core.FindingID(fmt.Sprintf("finding-%s-resource-externally-removed-%s-%s", p.ID, res.Type, res.ExternalID)),
+					ConnectionID: p.ID,
+					Segment:      core.SegmentProviderEdge,
+					Severity:     core.SeverityWarning,
+					Summary:      "Managed provider resource was removed outside Portico",
+					Explanation:  fmt.Sprintf("Portico could not find the managed %s resource %q during an exact provider observation. Review and apply the smallest proposed repair before opening the connection again.", res.Type, res.ExternalID),
+					Evidence:     []core.Evidence{{Type: "provider_resource", Source: "exact_observation", Message: "provider returned resource not found", Data: map[string]string{"provider_id": string(res.ProviderID), "resource_type": string(res.Type), "external_id": res.ExternalID}}},
+					ObservedAt:   time.Now().UTC(),
+				}
+				if err := s.store.SaveFinding(ctx, &finding); err != nil {
+					slog.Warn("classify: persist externally removed finding", "connection", p.ID, "resource_type", res.Type, "external_id", res.ExternalID, "err", err)
+				}
 			}
 		}
 	}
@@ -1249,9 +1368,32 @@ func (s *Supervisor) shutdownOnce_(ctx context.Context) error {
 		close(s.stopCh)
 	}
 
-	// Stop connectors before shutting down IPC — no new work after this.
-	slog.Info("shutdown: stopping connectors")
-	s.procMgr.Cleanup()
+	// Prevent new mutations and settle every active operation before stopping
+	// connector processes or closing SQLite. Use an independent timeout because
+	// the caller's supervisor context is commonly already canceled.
+	if s.controller != nil {
+		settleCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := s.controller.ShutdownOperations(settleCtx); err != nil {
+			slog.Warn("shutdown: active operations did not settle cleanly", "err", err)
+		}
+		cancel()
+	}
+
+	// Respect connection lifecycle policy. Keep-alive connectors are deliberately
+	// left running for later identity-verified adoption; close-on-disconnect
+	// connectors are stopped without deleting their remote resources.
+	for _, profile := range s.controller.ListProfiles() {
+		if profile.Lifecycle.OnDisconnect == core.DisconnectClose {
+			if err := s.procMgr.Stop(profile.ID, 5*time.Second); err != nil {
+				slog.Warn("shutdown: stop connector", "connection", profile.ID, "err", err)
+			}
+		}
+	}
+	if s.origins != nil {
+		if err := s.origins.StopAll(ctx); err != nil {
+			slog.Warn("shutdown: stopping local origins", "err", err)
+		}
+	}
 
 	// Stop accepting mutations (IPC server shuts down first).
 	// This causes Serve() to return, which unblocks serveWG.
@@ -1319,9 +1461,17 @@ func (s *Supervisor) PublishEvent(evt core.Event) {
 
 	// Pass structured data directly - do not pre-marshal to JSON
 	// to avoid double-marshalling when the IPC server encodes it.
-	s.ipcServer.PublishEvent(ipc.EventDTO{
-		Type:      string(evt.Type),
-		Timestamp: evt.Timestamp.Format(time.RFC3339),
-		Data:      evt.Data,
-	})
+	dto := ipc.EventDTO{Type: string(evt.Type), Timestamp: evt.Timestamp.Format(time.RFC3339), Data: evt.Data}
+	switch data := evt.Data.(type) {
+	case core.OperationEvent:
+		dto.OperationID = string(data.OperationID)
+		dto.ConnectionID = string(data.ConnectionID)
+		dto.Stage = string(data.Stage)
+	case core.ConnectionEvent:
+		dto.ConnectionID = string(data.ConnectionID)
+	case core.ConnectorEvent:
+		dto.ConnectionID = string(data.ConnectionID)
+		dto.Stage = string(data.Status)
+	}
+	s.ipcServer.PublishEvent(dto)
 }

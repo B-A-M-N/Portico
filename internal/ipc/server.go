@@ -3,6 +3,7 @@ package ipc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/store"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 // Server is the HTTP/SSE IPC server over a Unix domain socket.
@@ -29,9 +30,12 @@ type Server struct {
 	mu         sync.Mutex
 	subs       map[string]chan EventDTO
 	nextSubID  int
-	seqCounter int64
-	seqMu      sync.Mutex
 	store      *store.Store
+	dispatchMu sync.Mutex
+	// dispatchedSequence is the highest durable event broadcast live. SSE
+	// replay remains independent, so reconnecting clients always read the
+	// journal rather than trusting this in-memory cursor.
+	dispatchedSequence int64
 }
 
 // RequestHandler is the interface the supervisor implements to handle IPC requests.
@@ -48,7 +52,6 @@ type RequestHandler interface {
 	HandleApplyPlan(planID string) (*OperationDTO, error)
 	HandleListProviders() ([]ProviderDTO, error)
 	HandleAuthenticateProvider(id string) error
-	HandleDeleteConnection(id string) error
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
 	HandleDiscovery() (*DiscoveryDTO, error)
@@ -59,6 +62,9 @@ type RequestHandler interface {
 
 // NewServer creates a new IPC server.
 func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Server, error) {
+	if st == nil {
+		return nil, fmt.Errorf("ipc server requires durable event store")
+	}
 	// Ensure parent directory exists.
 	dir := filepath.Dir(socketPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -75,19 +81,17 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 		return nil, fmt.Errorf("socket %s owned by different user", socketPath)
 	}
 
-	// Initialize sequence from store
-	seq, err := st.GetSequence(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("ipc get sequence: %w", err)
-	}
-
 	s := &Server{
 		socketPath: socketPath,
 		handler:    handler,
 		subs:       make(map[string]chan EventDTO),
-		seqCounter: seq,
 		store:      st,
 	}
+	seq, err := st.GetLastEventSeq(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("read durable event sequence: %w", err)
+	}
+	s.dispatchedSequence = seq
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
@@ -153,44 +157,62 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// PublishEvent broadcasts an event to all SSE subscribers.
-// Events are persisted to the append-only events table before broadcasting.
-func (s *Server) PublishEvent(evt EventDTO) {
-	// Extract connection ID and stage from the Data field for persistence.
-	var connID, stage string
-	if dataMap, ok := evt.Data.(map[string]interface{}); ok {
-		if v, ok := dataMap["connection_id"].(string); ok {
-			connID = v
-		}
-		if v, ok := dataMap["stage"].(string); ok {
-			stage = v
-		}
+// PublishEvent appends an event durably before broadcasting it to SSE
+// subscribers. A persistence failure is returned and deliberately produces no
+// live-only event: clients must be able to replay every event they receive.
+func (s *Server) PublishEvent(evt EventDTO) error {
+	if s.store == nil {
+		return fmt.Errorf("publish event: durable event store unavailable")
 	}
-
-	// Persist event to the append-only table and get the sequence number.
-	if s.store != nil {
-		payloadJSON, err := json.Marshal(evt.Data)
+	payloadJSON, err := json.Marshal(evt.Data)
+	if err != nil {
+		return fmt.Errorf("marshal event payload: %w", err)
+	}
+	occurredAt := time.Now().UTC()
+	if evt.Timestamp != "" {
+		parsed, err := time.Parse(time.RFC3339, evt.Timestamp)
 		if err != nil {
-			slog.Error("failed to marshal event payload", "err", err)
-		} else {
-			seq, err := s.store.AppendEvent(context.Background(),
-				"", core.ConnectionID(connID), evt.Type, stage, payloadJSON)
-			if err != nil {
-				slog.Error("failed to append event to journal", "err", err)
-			} else {
-				evt.Sequence = seq
-			}
+			return fmt.Errorf("parse event timestamp: %w", err)
+		}
+		occurredAt = parsed
+	}
+	seq, err := s.store.AppendEvent(context.Background(), core.OperationID(evt.OperationID), core.ConnectionID(evt.ConnectionID), evt.Type, evt.Stage, occurredAt, payloadJSON)
+	if err != nil {
+		return fmt.Errorf("append event to journal: %w", err)
+	}
+	_ = seq // DispatchCommittedEvents reads the committed row and its payload.
+	return s.DispatchCommittedEvents(context.Background())
+}
+
+// DispatchCommittedEvents broadcasts every event that has already committed
+// to the durable journal. State transactions call this only after their
+// commit succeeds; the method itself never writes an unrelated event row.
+// It is also safe to call after a failed dispatch, because the cursor moves
+// only after an event has been offered to all current subscribers.
+func (s *Server) DispatchCommittedEvents(ctx context.Context) error {
+	if s.store == nil {
+		return fmt.Errorf("dispatch events: durable event store unavailable")
+	}
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+
+	for {
+		events, err := s.store.GetDurableEventsSince(ctx, s.dispatchedSequence, 1000)
+		if err != nil {
+			return fmt.Errorf("load committed events: %w", err)
+		}
+		if len(events) == 0 {
+			return nil
+		}
+		for _, event := range events {
+			evt := eventDTOFromDurable(event)
+			s.broadcast(evt)
+			s.dispatchedSequence = evt.Sequence
 		}
 	}
+}
 
-	// Fallback to in-memory counter if store unavailable.
-	if evt.Sequence == 0 {
-		s.seqMu.Lock()
-		s.seqCounter++
-		evt.Sequence = s.seqCounter
-		s.seqMu.Unlock()
-	}
-
+func (s *Server) broadcast(evt EventDTO) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, ch := range s.subs {
@@ -207,15 +229,15 @@ func (s *Server) PublishEvent(evt EventDTO) {
 
 // CurrentSeq returns the current event sequence number.
 func (s *Server) CurrentSeq() int64 {
-	if s.store != nil {
-		seq, err := s.store.GetLastEventSeq(context.Background())
-		if err == nil {
-			return seq
-		}
+	if s.store == nil {
+		return 0
 	}
-	s.seqMu.Lock()
-	defer s.seqMu.Unlock()
-	return s.seqCounter
+	seq, err := s.store.GetLastEventSeq(context.Background())
+	if err != nil {
+		slog.Warn("read durable event sequence", "err", err)
+		return 0
+	}
+	return seq
 }
 
 func (s *Server) subscribe() (string, chan EventDTO) {
@@ -256,26 +278,15 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, "GET")
 		return
 	}
-	// Capture the sequence before building the snapshot: events published
-	// while the snapshot is assembled will then be replayed by the client
-	// (at-least-once), never skipped.
-	lastSeq := s.CurrentSeq()
 	snap, err := s.handler.HandleSnapshot()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "PTO-SNAP", err.Error())
+		writeHandlerError(w, "PTO-SNAP", err)
 		return
 	}
-	snap.LastSeq = lastSeq
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Protocol-Version", "1")
 	w.WriteHeader(http.StatusOK)
 
-	// Limit snapshot body size by not including connections if too many
-	maxConns := 100
-	if len(snap.Connections) > maxConns {
-		truncated := snap.Connections[:maxConns]
-		snap.Connections = truncated
-	}
 	json.NewEncoder(w).Encode(snap)
 }
 
@@ -313,7 +324,6 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-
 	// Subscribe FIRST, then replay — this closes the race window where events
 	// published between replay and subscription would be lost.
 	subID, ch := s.subscribe()
@@ -328,7 +338,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// events at or below it are duplicates and must be dropped.
 	highWater := lastSeq
 	if lastSeq > 0 {
-		replayEvents, err := s.getPersistentEvents(lastSeq)
+		replayEvents, err := s.getPersistentEventsUntil(lastSeq, replaySeq)
 		if err != nil {
 			slog.Warn("failed to replay events from store", "err", err)
 		} else {
@@ -377,25 +387,46 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getPersistentEvents returns events after the given sequence from the store.
-func (s *Server) getPersistentEvents(afterSeq int64) ([]EventDTO, error) {
+// getPersistentEventsUntil replays a fixed sequence interval in bounded
+// queries. A reconnect with a large retained backlog therefore remains
+// lossless while publication after highWater stays on the live stream.
+func (s *Server) getPersistentEventsUntil(afterSeq, highWater int64) ([]EventDTO, error) {
 	if s.store == nil {
-		return nil, nil
+		return nil, fmt.Errorf("durable event store unavailable")
 	}
-	events, err := s.store.GetEventsSince(context.Background(), afterSeq, 1000)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]EventDTO, 0, len(events))
-	for _, evt := range events {
-		result = append(result, EventDTO{
-			Sequence:  evt.Sequence,
-			Type:      string(evt.Type),
-			Timestamp: evt.Timestamp.Format(time.RFC3339),
-			Data:      evt.Data,
-		})
+	const replayPageSize = 1000
+	result := make([]EventDTO, 0)
+	cursor := afterSeq
+	for cursor < highWater {
+		events, err := s.store.GetDurableEventsBetween(context.Background(), cursor, highWater, replayPageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(events) == 0 {
+			break
+		}
+		for _, evt := range events {
+			result = append(result, eventDTOFromDurable(evt))
+		}
+		next := events[len(events)-1].Event.Sequence
+		if next <= cursor {
+			return nil, fmt.Errorf("non-monotonic durable event replay at sequence %d", next)
+		}
+		cursor = next
 	}
 	return result, nil
+}
+
+func eventDTOFromDurable(evt store.DurableEvent) EventDTO {
+	return EventDTO{
+		Sequence:     evt.Event.Sequence,
+		OperationID:  string(evt.OperationID),
+		ConnectionID: string(evt.ConnectionID),
+		Type:         string(evt.Event.Type),
+		Stage:        evt.Stage,
+		Timestamp:    evt.Event.Timestamp.Format(time.RFC3339),
+		Data:         evt.Event.Data,
+	}
 }
 
 // oldestRetainedSequence returns the oldest sequence in the store, or 0 if empty.
@@ -403,8 +434,12 @@ func (s *Server) oldestRetainedSequence() int64 {
 	if s.store == nil {
 		return 0
 	}
-	// For now, we retain all events. In the future, this could query MIN(seq).
-	return 0
+	seq, err := s.store.OldestEventSeq(context.Background())
+	if err != nil {
+		slog.Warn("failed to read oldest retained event", "err", err)
+		return 0
+	}
+	return seq
 }
 
 func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
@@ -412,7 +447,7 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		conns, err := s.handler.HandleListConnections()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "PTO-CONN-LIST", err.Error())
+			writeHandlerError(w, "PTO-CONN-LIST", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -428,7 +463,7 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 		}
 		conn, err := s.handler.HandleCreateConnection(req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "PTO-CONN-CREATE", err.Error())
+			writeHandlerError(w, "PTO-CONN-CREATE", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -457,7 +492,7 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 1 && r.Method == http.MethodGet:
 		conn, err := s.handler.HandleGetConnection(id)
 		if err != nil {
-			writeError(w, http.StatusNotFound, "PTO-CONN-GET", err.Error())
+			writeHandlerError(w, "PTO-CONN-GET", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -475,7 +510,7 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		}
 		conn, err := s.handler.HandleUpdateConnection(id, req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "PTO-CONN-UPDATE", err.Error())
+			writeHandlerError(w, "PTO-CONN-UPDATE", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -483,14 +518,9 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(conn)
 
 	case len(parts) == 1 && r.Method == http.MethodDelete:
-		plan, err := s.handler.HandlePlanDelete(id)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "PTO-CONN-DELETE", err.Error())
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(plan)
+		// Destruction is intentionally a plan-preview-confirm-apply workflow.
+		// Do not let a conventional DELETE bypass the destructive preview.
+		writeMethodNotAllowed(w, "GET, PATCH")
 
 	case len(parts) == 3 && parts[1] == "plan" && r.Method == http.MethodPost:
 		action := parts[2]
@@ -510,7 +540,7 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "PTO-PLAN-"+action, err.Error())
+			writeHandlerError(w, "PTO-PLAN-"+action, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -537,7 +567,7 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 
 	op, err := s.handler.HandleApplyPlan(planID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "PTO-PLAN-APPLY", err.Error())
+		writeHandlerError(w, "PTO-PLAN-APPLY", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -552,7 +582,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	}
 	providers, err := s.handler.HandleListProviders()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "PTO-PROV-LIST", err.Error())
+		writeHandlerError(w, "PTO-PROV-LIST", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -575,7 +605,7 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<10) // 1KB limit
 
 	if err := s.handler.HandleAuthenticateProvider(id); err != nil {
-		writeError(w, http.StatusInternalServerError, "PROV-002", err.Error())
+		writeHandlerError(w, "PROV-002", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -596,7 +626,7 @@ func (s *Server) handleOperations(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 1 && r.Method == http.MethodGet:
 		op, err := s.handler.HandleGetOperation(id)
 		if err != nil {
-			writeError(w, http.StatusNotFound, "OP-002", err.Error())
+			writeHandlerError(w, "OP-002", err)
 			return
 		}
 		json.NewEncoder(w).Encode(op)
@@ -604,7 +634,7 @@ func (s *Server) handleOperations(w http.ResponseWriter, r *http.Request) {
 	case len(parts) >= 2 && parts[1] == "events" && r.Method == http.MethodGet:
 		events, err := s.handler.HandleGetOperationEvents(id)
 		if err != nil {
-			writeError(w, http.StatusNotFound, "OP-003", err.Error())
+			writeHandlerError(w, "OP-003", err)
 			return
 		}
 		json.NewEncoder(w).Encode(events)
@@ -619,14 +649,14 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		result, err := s.handler.HandleDiscovery()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "DISC-001", err.Error())
+			writeHandlerError(w, "DISC-001", err)
 			return
 		}
 		json.NewEncoder(w).Encode(result)
 	case http.MethodPost:
 		result, err := s.handler.HandleRefreshDiscovery()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "DISC-002", err.Error())
+			writeHandlerError(w, "DISC-002", err)
 			return
 		}
 		json.NewEncoder(w).Encode(result)
@@ -642,7 +672,7 @@ func (s *Server) handleSupervisorStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.handler.HandleSupervisorStop(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "PTO-STOP", err.Error())
+		writeHandlerError(w, "PTO-STOP", err)
 		return
 	}
 
@@ -660,7 +690,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 	findings, err := s.handler.HandleDiagnostics(connID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "DIAG-002", err.Error())
+		writeHandlerError(w, "DIAG-002", err)
 		return
 	}
 	json.NewEncoder(w).Encode(findings)
@@ -675,6 +705,38 @@ func writeError(w http.ResponseWriter, code int, errCode, msg string) {
 		Code:    errCode,
 		Summary: msg,
 	})
+}
+
+// writeHandlerError converts expected controller/store failures into stable
+// HTTP categories. Clients use these categories for actionable exit codes;
+// only unexpected faults remain 500s.
+func writeHandlerError(w http.ResponseWriter, fallbackCode string, err error) {
+	status := http.StatusInternalServerError
+	code := fallbackCode
+
+	var porticoErr *core.PorticoError
+	var resourceConflict *store.ResourceAssociationConflict
+	switch {
+	case errors.As(err, &porticoErr):
+		code = porticoErr.Code
+		switch porticoErr.Code {
+		case core.ErrCorePrefix + "001", core.ErrCorePrefix + "002", core.ErrCorePrefix + "003", core.ErrCorePrefix + "005":
+			status = http.StatusNotFound
+		case core.ErrCorePrefix + "004", core.ErrCorePrefix + "008":
+			status = http.StatusPreconditionFailed
+		case core.ErrCorePrefix + "006", core.ErrCorePrefix + "007":
+			status = http.StatusConflict
+		case core.ErrCorePrefix + "009":
+			status = http.StatusUnprocessableEntity
+		default:
+			status = http.StatusUnprocessableEntity
+		}
+	case errors.As(err, &resourceConflict):
+		status = http.StatusConflict
+		code = "PTO-RESOURCE-CONFLICT"
+	}
+
+	writeError(w, status, code, err.Error())
 }
 
 // writeMethodNotAllowed sets Allow header and returns 405.

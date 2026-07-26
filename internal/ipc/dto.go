@@ -40,10 +40,13 @@ type ProviderDTO struct {
 
 // EventDTO is an event delivered via SSE.
 type EventDTO struct {
-	Sequence  int64       `json:"seq"`
-	Type      string      `json:"type"`
-	Timestamp string      `json:"timestamp"`
-	Data      interface{} `json:"data"`
+	Sequence     int64       `json:"seq"`
+	OperationID  string      `json:"operation_id,omitempty"`
+	ConnectionID string      `json:"connection_id,omitempty"`
+	Type         string      `json:"type"`
+	Stage        string      `json:"stage,omitempty"`
+	Timestamp    string      `json:"timestamp"`
+	Data         interface{} `json:"data"`
 }
 
 // --------------- plans ---------------
@@ -57,6 +60,7 @@ type PlanDTO struct {
 	Steps        []StepDTO `json:"steps"`
 	Warnings     []string  `json:"warnings,omitempty"`
 	Fingerprint  string    `json:"fingerprint"`
+	Noop         bool      `json:"noop,omitempty"`
 }
 
 // StepDTO is a step in a plan preview.

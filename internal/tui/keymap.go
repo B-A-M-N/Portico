@@ -20,6 +20,8 @@ type KeyMap struct {
 	New       KeyBinding
 	Providers KeyBinding
 	Repair    KeyBinding
+	Discover  KeyBinding
+	Delete    KeyBinding
 	Back      KeyBinding
 }
 
@@ -35,6 +37,8 @@ func (km KeyMap) Bindings() []KeyBinding {
 	add(km.Enter)
 	add(km.Space)
 	add(km.Repair)
+	add(km.Discover)
+	add(km.Delete)
 	add(km.Providers)
 	add(km.Help)
 	add(km.Back)
@@ -53,11 +57,13 @@ var DefaultKeyMap = KeyMap{
 	New:       KeyBinding{Key: "n", Label: "New", Enabled: true},
 	Providers: KeyBinding{Key: "p", Label: "Providers", Enabled: true},
 	Repair:    KeyBinding{Key: "r", Label: "Repair", Enabled: true},
+	Discover:  KeyBinding{Key: "a", Label: "Discover", Enabled: true},
+	Delete:    KeyBinding{Key: "d", Label: "Delete", Enabled: true},
 	Back:      KeyBinding{Key: "esc", Label: "Back", Enabled: true},
 }
 
 // helpRow renders a help text row with context-sensitive bindings.
 func helpRow(km KeyMap) string {
-	help := "  ↑↓ Navigate  Enter Inspect  Space Open/Close  n New  r Repair  q Quit  ? Help"
+	help := "  ↑↓ Navigate  Enter Inspect  Space Open/Close  n New  a Discover  r Repair  d Delete  q Quit  ? Help"
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("#8a7f70")).Render(help)
 }

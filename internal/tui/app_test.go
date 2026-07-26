@@ -10,8 +10,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/paoloanzn/portico/internal/ipc"
-	"github.com/paoloanzn/portico/internal/tui/screens"
+	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/tui/screens"
 )
 
 // fakeClient implements SupervisorClient without a real socket.
@@ -59,10 +59,28 @@ func (f *fakeClient) PlanClose(ctx context.Context, connID string) (*ipc.PlanDTO
 	return f.plan, f.planErr
 }
 
+func (f *fakeClient) PlanRepair(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.plan, f.planErr
+}
+
+func (f *fakeClient) PlanDelete(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.plan, f.planErr
+}
+
 func (f *fakeClient) ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.applyCalls++
+	return f.operation, f.applyErr
+}
+
+func (f *fakeClient) GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.operation, f.applyErr
 }
 
@@ -85,6 +103,10 @@ func (f *fakeClient) ConnectEventStream(ctx context.Context, lastSeq int64) (*ip
 
 func (f *fakeClient) Diagnostics(ctx context.Context, connID string) ([]ipc.DiagnosticDTO, error) {
 	return []ipc.DiagnosticDTO{}, nil
+}
+
+func (f *fakeClient) Discovery(ctx context.Context) (*ipc.DiscoveryDTO, error) {
+	return &ipc.DiscoveryDTO{}, nil
 }
 
 // --------------- helpers ---------------
@@ -293,6 +315,25 @@ func TestSnapshotMsgUpdatesModel(t *testing.T) {
 	}
 }
 
+func TestEmergencyHomeLayoutIsReadable(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.width = 50
+	view := m.renderHome()
+	if !strings.Contains(view, "Portico needs at least 60 columns") {
+		t.Fatalf("emergency layout not rendered: %q", view)
+	}
+}
+
+func TestASCIIConnectionListUsesASCIIGlyphs(t *testing.T) {
+	got := renderConnectionList([]ipc.ConnectionDTO{{Name: "example", UserState: "Open"}}, 0, 80, MonochromeTheme, true)
+	if !strings.Contains(got, "> * example") {
+		t.Fatalf("ASCII list did not use fallback glyphs: %q", got)
+	}
+	if strings.ContainsAny(got, "▸●◐○╳◌") {
+		t.Fatalf("ASCII list contained Unicode status glyphs: %q", got)
+	}
+}
+
 func TestApplyPlanFromPreviewIsAsync(t *testing.T) {
 	fake := &fakeClient{
 		plan:      &ipc.PlanDTO{ID: "plan-1", Intent: "open"},
@@ -332,6 +373,38 @@ func TestApplyPlanFromPreviewIsAsync(t *testing.T) {
 	}
 	if m.operation == nil || m.operation.ID != "op-1" {
 		t.Fatalf("operation not stored on model: %+v", m.operation)
+	}
+}
+
+func TestApplyPlanPreviewIgnoresRepeatedEnterWhileRequestIsInFlight(t *testing.T) {
+	fake := &fakeClient{
+		plan:      &ipc.PlanDTO{ID: "plan-1", Intent: "open"},
+		operation: &ipc.OperationDTO{ID: "op-1", PlanID: "plan-1", State: "running"},
+	}
+	m := readyModel(fake, testSnapshot())
+	m, cmd := press(t, m, "space")
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+
+	m, firstApply := press(t, m, "enter")
+	if firstApply == nil || !m.applying {
+		t.Fatal("first enter did not begin asynchronous apply")
+	}
+	m, secondApply := press(t, m, "enter")
+	if secondApply != nil {
+		t.Fatal("second enter started a duplicate apply request")
+	}
+	if fake.applyCalls != 0 {
+		t.Fatal("apply request ran synchronously")
+	}
+	msg := firstApply()
+	if fake.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1", fake.applyCalls)
+	}
+	next, _ = m.Update(msg)
+	m = next.(Model)
+	if m.applying {
+		t.Fatal("apply state remained set after completion")
 	}
 }
 

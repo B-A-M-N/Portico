@@ -9,13 +9,13 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	accesspkg "github.com/paoloanzn/portico/internal/access"
-	"github.com/paoloanzn/portico/internal/config"
-	dnspkg "github.com/paoloanzn/portico/internal/dns"
-	"github.com/paoloanzn/portico/internal/origin"
-	"github.com/paoloanzn/portico/internal/pipeline"
-	"github.com/paoloanzn/portico/internal/session"
-	tunnelpkg "github.com/paoloanzn/portico/internal/tunnel"
+	accesspkg "github.com/B-A-M-N/portico/internal/access"
+	"github.com/B-A-M-N/portico/internal/config"
+	dnspkg "github.com/B-A-M-N/portico/internal/dns"
+	"github.com/B-A-M-N/portico/internal/origin"
+	"github.com/B-A-M-N/portico/internal/pipeline"
+	"github.com/B-A-M-N/portico/internal/session"
+	tunnelpkg "github.com/B-A-M-N/portico/internal/tunnel"
 )
 
 var serveCmd = &cobra.Command{

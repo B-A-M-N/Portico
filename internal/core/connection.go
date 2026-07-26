@@ -2,6 +2,8 @@ package core
 
 import (
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -58,6 +60,15 @@ func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 		cp.Source.MCP = &mcp
 		if mcp.Command != nil {
 			cmd := *mcp.Command
+			if mcp.Command.Args != nil {
+				cmd.Args = append([]string(nil), mcp.Command.Args...)
+			}
+			if mcp.Command.Env != nil {
+				cmd.Env = make(map[string]string, len(mcp.Command.Env))
+				for key, value := range mcp.Command.Env {
+					cmd.Env[key] = value
+				}
+			}
 			cp.Source.MCP.Command = &cmd
 		}
 	}
@@ -131,6 +142,9 @@ func (p *ConnectionProfile) Validate() error {
 		default:
 			return fmt.Errorf("invalid directory mode %q", p.Source.Directory.Mode)
 		}
+		if p.Source.Directory.Mode != DirectoryModeWrites && (p.Source.Directory.AllowUpload || p.Source.Directory.AllowDelete) {
+			return fmt.Errorf("directory upload/delete permissions require writes mode")
+		}
 	}
 	if p.Source.Command != nil {
 		sourceCount++
@@ -139,6 +153,12 @@ func (p *ConnectionProfile) Validate() error {
 		}
 		if p.Source.Command.Executable == "" {
 			return fmt.Errorf("command executable is required")
+		}
+		if p.Source.Command.Port < 1 || p.Source.Command.Port > 65535 {
+			return fmt.Errorf("command port must be between 1 and 65535")
+		}
+		if err := validateCommandEnvironment(p.Source.Command.Env); err != nil {
+			return err
 		}
 		switch p.Source.Command.Protocol {
 		case ProtocolHTTP, ProtocolHTTPS, "":
@@ -154,6 +174,29 @@ func (p *ConnectionProfile) Validate() error {
 		}
 		if p.Source.MCP.Endpoint == "" && p.Source.MCP.Command == nil {
 			return fmt.Errorf("MCP endpoint or command is required")
+		}
+		if p.Source.MCP.Endpoint != "" && p.Source.MCP.Command != nil {
+			return fmt.Errorf("MCP source must use either an endpoint or a command, not both")
+		}
+		if p.Source.MCP.Endpoint != "" {
+			u, err := url.ParseRequestURI(p.Source.MCP.Endpoint)
+			if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
+				return fmt.Errorf("MCP endpoint must be an absolute HTTP URL without embedded credentials")
+			}
+		}
+		if p.Source.MCP.Command != nil {
+			if p.Source.MCP.Command.Executable == "" {
+				return fmt.Errorf("MCP command executable is required")
+			}
+			if p.Source.MCP.Command.Port < 1 || p.Source.MCP.Command.Port > 65535 {
+				return fmt.Errorf("MCP command port must be between 1 and 65535")
+			}
+			if err := validateCommandEnvironment(p.Source.MCP.Command.Env); err != nil {
+				return err
+			}
+			if p.Source.MCP.Command.Protocol != "" && p.Source.MCP.Command.Protocol != ProtocolHTTP {
+				return fmt.Errorf("MCP command protocol %q is not supported", p.Source.MCP.Command.Protocol)
+			}
 		}
 		switch p.Source.MCP.Transport {
 		case MCPTransportHTTP, MCPTransportStreamable, MCPTransportSSE, "":
@@ -215,6 +258,10 @@ func (p *ConnectionProfile) Validate() error {
 		}
 	}
 
+	if p.Lifecycle.OnDisconnect != "" && p.Lifecycle.OnDisconnect != DisconnectKeepAlive && p.Lifecycle.OnDisconnect != DisconnectClose {
+		return fmt.Errorf("invalid disconnect policy %q", p.Lifecycle.OnDisconnect)
+	}
+
 	// Validate provider selection
 	if p.Provider.ProviderID == "" {
 		return fmt.Errorf("provider ID is required")
@@ -227,6 +274,18 @@ func (p *ConnectionProfile) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+func validateCommandEnvironment(environment map[string]string) error {
+	for name := range environment {
+		upper := strings.ToUpper(name)
+		if strings.Contains(upper, "TOKEN") || strings.Contains(upper, "SECRET") ||
+			strings.Contains(upper, "PASSWORD") || strings.Contains(upper, "CREDENTIAL") ||
+			strings.HasSuffix(upper, "_KEY") {
+			return fmt.Errorf("command environment variable %q appears to contain a credential; use a provider or OS secret reference instead", name)
+		}
+	}
 	return nil
 }
 
@@ -358,6 +417,11 @@ type ProtectionSpec struct {
 	AllowedDomains []string
 	SessionTTL     time.Duration
 }
+
+// DefaultProtectedSessionTTL is used when an authenticated access policy is
+// requested without an explicit session lifetime. It avoids serializing 0s to
+// provider APIs while retaining a short, secure default for interactive use.
+const DefaultProtectedSessionTTL = 30 * time.Minute
 
 // ProtectionKind defines the type of protection.
 type ProtectionKind string

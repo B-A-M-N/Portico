@@ -2,13 +2,14 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/provider"
-	"github.com/paoloanzn/portico/internal/provider/mock"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/mock"
 )
 
 // testJournal is a no-op Journal for tests that don't need persistence verification.
@@ -55,10 +56,11 @@ func (j *testJournal) AppendFinding(ctx context.Context, finding core.Diagnostic
 // registry is a minimal registry for tests that only stores a single provider.
 type testRegistry struct {
 	providers map[core.ProviderID]core.Provider
+	accounts  map[core.ProviderID][]core.ProviderAccountID
 }
 
 func newTestRegistry(providers ...core.Provider) *testRegistry {
-	r := &testRegistry{providers: make(map[core.ProviderID]core.Provider)}
+	r := &testRegistry{providers: make(map[core.ProviderID]core.Provider), accounts: make(map[core.ProviderID][]core.ProviderAccountID)}
 	for _, p := range providers {
 		id := p.Identity().ID
 		r.providers[id] = p
@@ -66,14 +68,122 @@ func newTestRegistry(providers ...core.Provider) *testRegistry {
 	return r
 }
 
-func (r *testRegistry) Add(p core.Provider) error                                         { r.providers[p.Identity().ID] = p; return nil }
-func (r *testRegistry) Get(id core.ProviderID) core.Provider                              { return r.providers[id] }
-func (r *testRegistry) List() []provider.ProviderSnapshot                                 { return nil }
-func (r *testRegistry) Snapshot() []provider.ProviderSnapshot                             { return nil }
-func (r *testRegistry) SetAccounts(id core.ProviderID, accounts []core.ProviderAccountID) {}
-func (r *testRegistry) GetAccounts(id core.ProviderID) []core.ProviderAccountID           { return nil }
+func (r *testRegistry) Add(p core.Provider) error             { r.providers[p.Identity().ID] = p; return nil }
+func (r *testRegistry) Get(id core.ProviderID) core.Provider  { return r.providers[id] }
+func (r *testRegistry) List() []provider.ProviderSnapshot     { return nil }
+func (r *testRegistry) Snapshot() []provider.ProviderSnapshot { return nil }
+func (r *testRegistry) SetAccounts(id core.ProviderID, accounts []core.ProviderAccountID) {
+	r.accounts[id] = append([]core.ProviderAccountID(nil), accounts...)
+}
+func (r *testRegistry) GetAccounts(id core.ProviderID) []core.ProviderAccountID {
+	return append([]core.ProviderAccountID(nil), r.accounts[id]...)
+}
 func (r *testRegistry) DiscoverIdentities(ctx context.Context) []provider.ProviderSnapshot {
 	return nil
+}
+
+type accountBoundMockProvider struct {
+	*mock.Provider
+	accountID core.ProviderAccountID
+}
+
+type multiAccountMockProvider struct {
+	*mock.Provider
+	children map[core.ProviderAccountID]core.Provider
+}
+
+func (p *multiAccountMockProvider) ProviderForAccount(id core.ProviderAccountID) (core.Provider, error) {
+	child := p.children[id]
+	if child == nil {
+		return nil, errors.New("account unavailable")
+	}
+	return child, nil
+}
+
+func (p *accountBoundMockProvider) ProviderAccountID() core.ProviderAccountID {
+	return p.accountID
+}
+
+func TestCreateProfileDefaultsProtectedSessionTTL(t *testing.T) {
+	ctrl := New(newTestRegistry(mock.New()), newTestJournal())
+	profile := newFailureTestProfile()
+	profile.Protection = core.ProtectionSpec{
+		Kind:          core.ProtectionEmailOTP,
+		AllowedEmails: []string{"person@example.com"},
+	}
+
+	stored, _, err := ctrl.CreateProfile(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if stored.Protection.SessionTTL != core.DefaultProtectedSessionTTL {
+		t.Fatalf("session TTL = %s, want %s", stored.Protection.SessionTTL, core.DefaultProtectedSessionTTL)
+	}
+}
+
+func TestCreateProfilePersistsTheOnlyConfiguredAccount(t *testing.T) {
+	child := &accountBoundMockProvider{Provider: mock.New(), accountID: "account-a"}
+	parent := &multiAccountMockProvider{Provider: mock.New(), children: map[core.ProviderAccountID]core.Provider{"account-a": child}}
+	registry := newTestRegistry(parent)
+	registry.SetAccounts("mock", []core.ProviderAccountID{"account-a"})
+	ctrl := New(registry, newTestJournal())
+
+	profile := newFailureTestProfile()
+	stored, _, err := ctrl.CreateProfile(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if stored.Provider.AccountID != "account-a" {
+		t.Fatalf("stored account = %q, want account-a", stored.Provider.AccountID)
+	}
+}
+
+func TestControllerRejectsMismatchedProviderAccountBeforePlanningOrMutation(t *testing.T) {
+	prov := &accountBoundMockProvider{Provider: mock.New(), accountID: "account-a"}
+	ctrl := New(newTestRegistry(prov), newTestJournal())
+	ctx := context.Background()
+
+	profile := newFailureTestProfile()
+	profile.Provider.AccountID = "account-b"
+	if _, _, err := ctrl.CreateProfile(ctx, profile); err == nil {
+		t.Fatal("CreateProfile accepted a provider account bound to a different adapter")
+	} else {
+		var porticoErr *core.PorticoError
+		if !errors.As(err, &porticoErr) || porticoErr.Code != core.ErrCorePrefix+"010" {
+			t.Fatalf("CreateProfile error = %v, want typed provider-account error", err)
+		}
+	}
+
+	profile = newFailureTestProfile()
+	profile.Provider.AccountID = "account-a"
+	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
+		t.Fatalf("CreateProfile with bound account: %v", err)
+	}
+	plan, err := ctrl.PlanOpen(ctx, profile.ID)
+	if err != nil {
+		t.Fatalf("PlanOpen with bound account: %v", err)
+	}
+	if err := ctrl.SavePlan(plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+
+	// Simulate a pre-existing profile loaded after its selected account was
+	// changed outside a current controller update. Apply must repeat the check
+	// so an already-previewed plan cannot mutate the wrong remote account.
+	loaded, ok := ctrl.GetProfile(profile.ID)
+	if !ok {
+		t.Fatal("profile missing")
+	}
+	loaded.Provider.AccountID = "account-b"
+	ctrl.RestoreProfile(loaded)
+	if _, err := ctrl.ApplyPlan(ctx, plan.ID); err == nil {
+		t.Fatal("ApplyPlan accepted a stale account binding")
+	} else {
+		var porticoErr *core.PorticoError
+		if !errors.As(err, &porticoErr) || porticoErr.Code != core.ErrCorePrefix+"010" {
+			t.Fatalf("ApplyPlan error = %v, want typed provider-account error", err)
+		}
+	}
 }
 
 // TestController_OpenCloseFullPath tests the full open → observe → close cycle
@@ -394,6 +504,40 @@ func TestController_RepairFullPath(t *testing.T) {
 	}
 }
 
+func TestPlanRepairHandlesUnknownAndUnstableConnector(t *testing.T) {
+	for _, status := range []core.ConnectorStatus{core.ConnectorStatusUnknown, core.ConnectorStatusUnstable} {
+		t.Run(string(status), func(t *testing.T) {
+			ctrl := New(newTestRegistry(mock.New()), newTestJournal())
+			profile := &core.ConnectionProfile{
+				ID:         core.ConnectionID("repair-" + string(status)),
+				Name:       "repair " + string(status),
+				Source:     core.SourceSpec{Kind: core.SourceExisting, Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:8080", Protocol: core.ProtocolHTTP}},
+				Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+				Provider:   core.ProviderSelection{ProviderID: "mock"},
+				Desired:    core.DesiredOpen,
+			}
+			if _, _, err := ctrl.CreateProfile(context.Background(), profile); err != nil {
+				t.Fatalf("create profile: %v", err)
+			}
+			rt, ok := ctrl.GetRuntime(profile.ID)
+			if !ok {
+				t.Fatal("missing runtime")
+			}
+			rt.State = core.RuntimeDegraded
+			rt.Connector.Status = status
+			ctrl.RestoreRuntime(rt)
+			plan, err := ctrl.PlanRepair(context.Background(), profile.ID)
+			if err != nil {
+				t.Fatalf("plan repair: %v", err)
+			}
+			if len(plan.Steps) == 0 || plan.Steps[len(plan.Steps)-1].Kind != core.StepStartConnector {
+				t.Fatalf("expected connector restart plan, got %+v", plan.Steps)
+			}
+		})
+	}
+}
+
 // TestController_DeleteFullPath tests the delete path.
 func TestController_DeleteFullPath(t *testing.T) {
 	prov := mock.New()
@@ -496,6 +640,85 @@ func TestController_DeleteFullPath(t *testing.T) {
 	status = prov.GetConnectorStatus(connID)
 	if status != core.ConnectorStatusStopped {
 		t.Fatalf("expected connector stopped after delete, got %s", status)
+	}
+}
+
+func TestController_LocalOnlyDeleteDoesNotRequireUnavailableProvider(t *testing.T) {
+	ctrl := New(newTestRegistry(), newTestJournal())
+	committer := &fakeRuntimeCommitter{}
+	ctrl.SetRuntimeCommitter(committer)
+
+	profile := &core.ConnectionProfile{
+		ID:       "connection-unavailable-provider",
+		Name:     "legacy development connection",
+		Revision: 1,
+		Source: core.SourceSpec{
+			Kind:     core.SourceExisting,
+			Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:8080", Protocol: core.ProtocolHTTP},
+		},
+		Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+		Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+		Provider:   core.ProviderSelection{ProviderID: "removed-provider"},
+		Desired:    core.DesiredClosed,
+	}
+	ctrl.RestoreProfile(profile)
+	ctrl.RestoreRuntime(&core.ConnectionRuntime{
+		ConnectionID: profile.ID,
+		State:        core.RuntimeError,
+		Connector:    core.ConnectorRuntime{Status: core.ConnectorStatusStopped},
+	})
+
+	plan, err := ctrl.PlanDelete(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatalf("PlanDelete: %v", err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Kind != core.StepFinalizeLocalDeletion {
+		t.Fatalf("expected one local finalizer step, got %#v", plan.Steps)
+	}
+	if planRequiresProvider(plan) {
+		t.Fatal("local-only delete should not require an unavailable provider")
+	}
+	if err := ctrl.SavePlan(plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+	op, err := ctrl.ApplyPlan(context.Background(), plan.ID)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if result := awaitOperationTerminal(t, ctrl, op.ID); result.State != OperationStateCompleted {
+		t.Fatalf("operation state = %s, error = %v", result.State, result.Error)
+	}
+	if _, ok := ctrl.GetProfile(profile.ID); ok {
+		t.Fatal("profile should be removed after local-only deletion")
+	}
+}
+
+func TestPlanDeleteSkipsResourcesAlreadyConfirmedExternallyRemoved(t *testing.T) {
+	prov := mock.New()
+	ctrl := New(newTestRegistry(prov), newTestJournal())
+	profile := newFailureTestProfile()
+	if _, _, err := ctrl.CreateProfile(context.Background(), profile); err != nil {
+		t.Fatal(err)
+	}
+	ctrl.RestoreRuntime(&core.ConnectionRuntime{
+		ConnectionID: profile.ID,
+		Connector:    core.ConnectorRuntime{Status: core.ConnectorStatusStopped},
+		Provider: core.ProviderRuntime{Resources: []core.ProviderResource{
+			{ProviderID: "mock", Type: core.ResourceDNSRecord, ExternalID: "dead-dns", Ownership: core.OwnershipManaged, Lifecycle: core.LifecycleExternallyRemoved},
+			{ProviderID: "mock", Type: core.ResourceTunnel, ExternalID: "live-tunnel", Ownership: core.OwnershipManaged, Lifecycle: core.LifecyclePresent},
+		}},
+	})
+	plan, err := ctrl.PlanDelete(context.Background(), profile.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range plan.Steps {
+		if step.Technical.ResourceID == "dead-dns" {
+			t.Fatalf("delete plan must not retry known-absent resource: %#v", plan.Steps)
+		}
+	}
+	if len(plan.Steps) != 2 || plan.Steps[0].Technical.ResourceID != "live-tunnel" {
+		t.Fatalf("unexpected deletion plan: %#v", plan.Steps)
 	}
 }
 

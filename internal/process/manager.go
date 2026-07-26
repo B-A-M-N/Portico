@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // ErrIdentityMismatch is returned when a process's observed identity
@@ -25,8 +25,10 @@ var ErrIdentityMismatch = errors.New("process identity mismatch")
 // only holds actor handles; the manager mutex is never held while sleeping,
 // waiting, or signaling.
 type Manager struct {
-	mu     sync.Mutex
-	actors map[core.ConnectionID]*actor
+	mu        sync.Mutex
+	actors    map[core.ConnectionID]*actor
+	eventMu   sync.RWMutex
+	eventSink ProcessEventSink
 
 	// Restart/log policy. Package-private and injectable for tests.
 	restartSchedule []time.Duration // nil => SPEC schedule 1s,2s,5s,10s,30s
@@ -36,6 +38,31 @@ type Manager struct {
 	logMaxSize      int64
 	logMaxFiles     int
 }
+
+// ProcessEventType is a normalized lifecycle transition emitted by a process
+// actor. The supervisor persists these transitions into runtime state and its
+// durable client event stream.
+type ProcessEventType string
+
+const (
+	ProcessEventStarted   ProcessEventType = "started"
+	ProcessEventExited    ProcessEventType = "exited"
+	ProcessEventRestarted ProcessEventType = "restarted"
+	ProcessEventStopped   ProcessEventType = "stopped"
+	ProcessEventUnstable  ProcessEventType = "unstable"
+)
+
+type ProcessEvent struct {
+	ConnectionID core.ConnectionID
+	Type         ProcessEventType
+	Identity     core.ProcessIdentity
+	Status       ProcessStatus
+	Restarts     int
+	Error        string
+	Timestamp    time.Time
+}
+
+type ProcessEventSink func(ProcessEvent)
 
 // ManagedProcess is a tracked connector process. Values returned by the
 // manager are point-in-time snapshots; they are safe to read without locks.
@@ -95,6 +122,23 @@ func NewManager() *Manager {
 	}
 }
 
+// SetEventSink registers the supervisor's lifecycle listener. It may be set
+// before or after actors exist; callbacks are made without a manager lock.
+func (pm *Manager) SetEventSink(sink ProcessEventSink) {
+	pm.eventMu.Lock()
+	pm.eventSink = sink
+	pm.eventMu.Unlock()
+}
+
+func (pm *Manager) emit(event ProcessEvent) {
+	pm.eventMu.RLock()
+	sink := pm.eventSink
+	pm.eventMu.RUnlock()
+	if sink != nil {
+		sink(event)
+	}
+}
+
 // newActor builds an actor carrying the manager's policy configuration.
 func (pm *Manager) newActor(connID core.ConnectionID, spec core.ProcessSpec, adopted bool) *actor {
 	return &actor{
@@ -107,6 +151,7 @@ func (pm *Manager) newActor(connID core.ConnectionID, spec core.ProcessSpec, ado
 		pollInterval: pm.pollInterval,
 		logMaxSize:   pm.logMaxSize,
 		logMaxFiles:  pm.logMaxFiles,
+		emit:         pm.emit,
 		stopCh:       make(chan stopReq),
 		started:      make(chan struct{}),
 		done:         make(chan struct{}),

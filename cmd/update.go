@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	accesspkg "github.com/paoloanzn/portico/internal/access"
-	"github.com/paoloanzn/portico/internal/session"
-	"github.com/paoloanzn/portico/internal/ui"
+	accesspkg "github.com/B-A-M-N/portico/internal/access"
+	"github.com/B-A-M-N/portico/internal/session"
+	"github.com/B-A-M-N/portico/internal/ui"
 )
 
 var updateCmd = &cobra.Command{

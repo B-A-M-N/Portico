@@ -16,6 +16,13 @@ func (r ProviderResource) Clone() ProviderResource {
 	return cp
 }
 
+// IsLive reports whether Portico still considers a provider resource to have
+// a remote representation. A resource confirmed deleted by Portico or by an
+// authoritative external observation must not be observed or deleted again.
+func (r ProviderResource) IsLive() bool {
+	return r.Lifecycle != LifecycleRemoved && r.Lifecycle != LifecycleExternallyRemoved
+}
+
 // RuntimeCommitResult carries the exact values committed by a terminal
 // operation transaction so the controller installs committed state into
 // memory instead of fabricating its own revision and timestamp.
@@ -135,6 +142,9 @@ const (
 	// ConnectorStatusUnknown means the process identity could not be
 	// verified. Unknown processes must never be signaled; repair is required.
 	ConnectorStatusUnknown ConnectorStatus = "unknown"
+	// ConnectorStatusUnstable means Portico exhausted the connector's restart
+	// budget. It is distinct from crashed because automatic recovery stopped.
+	ConnectorStatusUnstable ConnectorStatus = "unstable"
 )
 
 // ProviderRuntime represents provider-specific runtime info.

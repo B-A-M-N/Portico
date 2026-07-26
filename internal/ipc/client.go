@@ -188,16 +188,6 @@ func (c *Client) CreateConnection(ctx context.Context, req CreateConnectionReque
 	return &conn, nil
 }
 
-// DeleteConnection deletes a connection.
-func (c *Client) DeleteConnection(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, "DELETE", "/v1/connections/"+id, nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return checkResponse(resp)
-}
-
 // PlanOpen creates an open plan.
 func (c *Client) PlanOpen(ctx context.Context, connID string) (*PlanDTO, error) {
 	resp, err := c.doRequest(ctx, "POST", "/v1/connections/"+connID+"/plan/open", nil)
@@ -296,6 +286,23 @@ func (c *Client) ApplyPlan(ctx context.Context, planID string) (*OperationDTO, e
 		return nil, err
 	}
 
+	var op OperationDTO
+	if err := json.NewDecoder(resp.Body).Decode(&op); err != nil {
+		return nil, err
+	}
+	return &op, nil
+}
+
+// GetOperation returns the current state of an asynchronous operation.
+func (c *Client) GetOperation(ctx context.Context, operationID string) (*OperationDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/operations/"+operationID, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
 	var op OperationDTO
 	if err := json.NewDecoder(resp.Body).Decode(&op); err != nil {
 		return nil, err

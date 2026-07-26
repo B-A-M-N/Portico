@@ -12,7 +12,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Security fixes reported by govulncheck require this patch release.
+          go-version: "1.25.12"
 
       - name: gofmt
         run: |
@@ -32,7 +33,13 @@ jobs:
       - name: go test
         run: go test ./...
 
+      - name: go test (race)
+        run: go test -race ./...
+
+      - name: vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
       - name: staticcheck
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck ./...

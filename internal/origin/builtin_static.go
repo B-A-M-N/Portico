@@ -53,7 +53,11 @@ func (s *BuiltinStatic) Type() Type {
 }
 
 func (s *BuiltinStatic) Start(_ context.Context) (string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listenAddr := "127.0.0.1:0"
+	if s.cfg.ListenPort != 0 {
+		listenAddr = fmt.Sprintf("127.0.0.1:%d", s.cfg.ListenPort)
+	}
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return "", fmt.Errorf("binding to loopback: %w", err)
 	}

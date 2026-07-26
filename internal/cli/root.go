@@ -3,7 +3,7 @@ package cli
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/paoloanzn/portico/internal/app"
+	"github.com/B-A-M-N/portico/internal/app"
 )
 
 // NewCLI creates the Portico CLI with supervisor-aware commands.
@@ -132,7 +132,7 @@ func newCreateCmd() *cobra.Command {
 			return handleCreate(cmd, args[0])
 		},
 	}
-	cmd.Flags().String("source", "localhost:8080", "Local service address to expose")
+	addSourceFlags(cmd)
 	cmd.Flags().String("provider", "cloudflare", "Provider to use")
 	return cmd
 }
@@ -146,10 +146,26 @@ func newServeCmd() *cobra.Command {
 			return handleServe(cmd, args[0])
 		},
 	}
-	cmd.Flags().String("source", "localhost:8080", "Local service address to expose")
+	addSourceFlags(cmd)
 	cmd.Flags().String("provider", "cloudflare", "Provider to use")
 	cmd.Flags().Bool("yes", false, "Skip confirmation prompt")
 	return cmd
+}
+
+func addSourceFlags(cmd *cobra.Command) {
+	cmd.Flags().String("source", "localhost:8080", "Service address, directory path, command executable, or MCP endpoint")
+	cmd.Flags().String("source-type", "existing_service", "Source type: existing_service, directory, command, or mcp_server")
+	cmd.Flags().String("source-protocol", "http", "Protocol for existing or command sources")
+	cmd.Flags().Int("source-port", 0, "HTTP port for command sources (or existing service when --source omits a port)")
+	cmd.Flags().StringArray("source-arg", nil, "Argument for a command source (repeatable)")
+	cmd.Flags().String("source-working-dir", "", "Working directory for a command source")
+	cmd.Flags().StringToString("source-env", nil, "Environment variable for a command source (KEY=VALUE; repeatable)")
+	cmd.Flags().Bool("source-shell", false, "Run command source through sh -c (explicit opt-in)")
+	cmd.Flags().String("directory-mode", "read", "Directory mode: read or writes")
+	cmd.Flags().Bool("directory-spa", false, "Serve missing directory paths from index.html")
+	cmd.Flags().Bool("directory-allow-upload", false, "Allow uploads for a writable directory")
+	cmd.Flags().Bool("directory-allow-delete", false, "Allow deletion for a writable directory")
+	cmd.Flags().Bool("mcp-command", false, "Treat an MCP source as a Portico-owned command instead of an endpoint")
 }
 
 func newInspectCmd() *cobra.Command {
@@ -270,14 +286,17 @@ func newProviderCmd() *cobra.Command {
 			return handleProviderList(cmd)
 		},
 	})
-	cmd.AddCommand(&cobra.Command{
+	loginCmd := &cobra.Command{
 		Use:   "login <provider>",
-		Short: "Authenticate with a provider",
+		Short: "Securely configure a provider",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return handleProviderLogin(cmd, args[0])
 		},
-	})
+	}
+	loginCmd.Flags().String("account-id", "", "Cloudflare account ID")
+	loginCmd.Flags().String("zone-id", "", "Cloudflare zone ID")
+	cmd.AddCommand(loginCmd)
 	return cmd
 }
 

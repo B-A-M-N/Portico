@@ -6,17 +6,19 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/app"
-	"github.com/paoloanzn/portico/internal/config"
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/process"
-	"github.com/paoloanzn/portico/internal/provider"
-	"github.com/paoloanzn/portico/internal/provider/cloudflare"
-	"github.com/paoloanzn/portico/internal/provider/mock"
-	"github.com/paoloanzn/portico/internal/store"
+	"github.com/B-A-M-N/portico/internal/app"
+	"github.com/B-A-M-N/portico/internal/config"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/process"
+	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
+	"github.com/B-A-M-N/portico/internal/provider/mock"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 // processManagerAdapter wraps *process.Manager to implement core.ConnectorProcessService.
@@ -73,34 +75,9 @@ func RunSupervisor(ctx context.Context) error {
 		return fmt.Errorf("store open: %w", err)
 	}
 
-	// Load provider accounts from store.
-	accounts, err := st.ListProviderAccounts(ctx)
-	if err != nil {
-		slog.Warn("provider accounts not available", "err", err)
-	} else {
-		// Group account IDs by provider
-		type providerGroup struct {
-			providerID core.ProviderID
-			ids        []core.ProviderAccountID
-		}
-		groups := make(map[core.ProviderID]*providerGroup)
-		for _, a := range accounts {
-			g, ok := groups[a.Provider]
-			if !ok {
-				g = &providerGroup{providerID: a.Provider}
-				groups[a.Provider] = g
-			}
-			g.ids = append(g.ids, a.ID)
-		}
-
-		// Register accounts with each provider
-		for provID, group := range groups {
-			reg.SetAccounts(provID, group.ids)
-			slog.Info("provider accounts loaded", "provider", provID, "count", len(group.ids))
-		}
-	}
-
-	// Register production providers using loaded accounts.
+	// Register production providers. Persisted account rows are loaded and
+	// validated against the concrete adapter during startup; doing it before
+	// adapter construction would advertise credentials it cannot actually use.
 	hasRealProvider := registerCloudflareWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st)
 
 	// Register mock provider only in explicit development mode.
@@ -144,40 +121,81 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 		return false
 	}
 
-	// Get accounts for Cloudflare from the store
-	accounts := reg.GetAccounts("cloudflare")
-	hasAPIAccount := len(accounts) > 0
+	// Environment/configured token credentials are a one-time bootstrap path.
+	// Move them to the supervisor's encrypted account store before constructing
+	// adapters, so subsequent operations resolve the account selected by the
+	// profile rather than a process-global environment token.
+	apiToken := config.APIToken()
+	accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	if accountID == "" {
+		accountID = config.AccountID()
+	}
+	zoneID := os.Getenv("CLOUDFLARE_ZONE_ID")
+	if zoneID == "" {
+		zoneID = config.ZoneID()
+	}
 
-	var apiToken, accountID, zoneID string
-
-	if hasAPIAccount {
-		// Use the first account's credentials
-		// In a real implementation, we'd resolve the credential reference
-		// For now, fall back to env vars for actual token values
-		apiToken = config.APIToken()
-		if apiToken != "" {
-			accountID = os.Getenv("CLOUDFLARE_ACCOUNT_ID")
-			zoneID = os.Getenv("CLOUDFLARE_ZONE_ID")
+	if apiToken != "" && accountID != "" && zoneID != "" {
+		credentialRef := fmt.Sprintf("cloudflare:%s:api-token", accountID)
+		if err := st.SaveProviderCredential(context.Background(), "cloudflare", credentialRef, []byte(apiToken)); err != nil {
+			slog.Warn("persist Cloudflare bootstrap credential", "err", err)
+		} else if err := st.UpsertProviderAccount(context.Background(), core.ProviderAccount{
+			ID:            core.ProviderAccountID(accountID),
+			Provider:      "cloudflare",
+			Label:         accountID,
+			CredentialRef: credentialRef,
+			Metadata:      map[string]string{"zone_id": zoneID},
+			Status:        core.AccountAuthenticated,
+		}); err != nil {
+			slog.Warn("persist Cloudflare bootstrap account", "err", err)
 		}
 	}
 
-	if apiToken != "" {
-		// Full provider with API access
-		cf, err := cloudflare.New(apiToken, accountID, zoneID, cloudflaredBin, paths.ConnectorDir, procMgr)
-		if err != nil {
-			slog.Warn("cloudflare provider init failed", "err", err)
+	accounts, err := st.ListProviderAccounts(context.Background())
+	if err != nil {
+		slog.Warn("list Cloudflare accounts", "err", err)
+		accounts = nil
+	}
+	children := make(map[core.ProviderAccountID]*cloudflare.Provider)
+	for _, account := range accounts {
+		if account.Provider != "cloudflare" || account.Status != core.AccountAuthenticated {
+			continue
+		}
+		zone := strings.TrimSpace(account.Metadata["zone_id"])
+		if account.CredentialRef == "" || zone == "" {
+			slog.Warn("Cloudflare account is missing a credential reference or zone", "account", account.ID)
+			continue
+		}
+		token, loadErr := st.LoadProviderCredential(context.Background(), "cloudflare", account.CredentialRef)
+		if loadErr != nil || token == "" {
+			slog.Warn("Cloudflare account credential is unavailable", "account", account.ID, "err", loadErr)
+			continue
+		}
+		child, newErr := cloudflare.New(token, string(account.ID), zone, cloudflaredBin, paths.ConnectorDir, procMgr)
+		if newErr != nil {
+			slog.Warn("Cloudflare account adapter init failed", "account", account.ID, "err", newErr)
+			continue
+		}
+		child.SetCredentialStore(st)
+		children[account.ID] = child
+	}
+	if len(children) > 0 {
+		accountsProvider, newErr := cloudflare.NewAccountsProvider(children)
+		if newErr != nil {
+			slog.Warn("Cloudflare multi-account provider init failed", "err", newErr)
 			return false
 		}
-
-		// Wire credential store for durable tunnel token storage (P0 #4).
-		cf.SetCredentialStore(st)
-
-		if err := reg.Add(cf); err != nil {
-			slog.Warn("cloudflare provider register failed", "err", err)
+		if err := reg.Add(accountsProvider); err != nil {
+			slog.Warn("Cloudflare provider register failed", "err", err)
 			return false
 		}
-
-		slog.Info("cloudflare provider registered (full API access)")
+		accountIDs := make([]core.ProviderAccountID, 0, len(children))
+		for id := range children {
+			accountIDs = append(accountIDs, id)
+		}
+		sort.Slice(accountIDs, func(i, j int) bool { return accountIDs[i] < accountIDs[j] })
+		reg.SetAccounts("cloudflare", accountIDs)
+		slog.Info("Cloudflare provider registered", "accounts", len(accountIDs))
 		return true
 	}
 

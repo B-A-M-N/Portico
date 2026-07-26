@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/store"
+	"github.com/B-A-M-N/portico/internal/controller"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 // --------------- test fixtures ---------------
@@ -130,6 +132,144 @@ func openSteps() []core.PlanStep {
 	return []core.PlanStep{
 		{ID: "step-1", Kind: core.StepCreateTunnel, Summary: "Create tunnel"},
 		{ID: "step-2", Kind: core.StepCreateDNSRecord, Summary: "Create DNS record"},
+	}
+}
+
+func TestUnavailableProviderIsPersistedAsActionableRuntimeError(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-unavailable-provider")
+	profile := recoveryTestProfile(connID)
+	profile.Provider.ProviderID = "missing-provider"
+	profile.Desired = core.DesiredOpen
+	runtime := recoveryTestRuntime(connID)
+	runtime.State = core.RuntimeOpen
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	if err := st.SaveRuntime(ctx, runtime); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+
+	registry := provider.NewRegistry() // intentionally does not register missing-provider
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	ctrl.RestoreRuntime(runtime)
+	sup := &Supervisor{store: st, controller: ctrl, registry: registry}
+
+	sup.markProviderUnavailable(ctx, profile)
+
+	gotRuntime, err := st.LoadRuntime(ctx, connID)
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if gotRuntime.State != core.RuntimeError {
+		t.Fatalf("runtime state = %q, want %q", gotRuntime.State, core.RuntimeError)
+	}
+	if gotRuntime.Error == nil || gotRuntime.Error.Code != core.ErrCorePrefix+"002" {
+		t.Fatalf("runtime error = %+v, want typed provider-not-found error", gotRuntime.Error)
+	}
+	findings, err := st.ListUnresolvedFindings(ctx, connID)
+	if err != nil {
+		t.Fatalf("ListUnresolvedFindings: %v", err)
+	}
+	if len(findings) != 1 || findings[0].Summary != "Selected provider is unavailable" {
+		t.Fatalf("findings = %+v", findings)
+	}
+
+	// Repeated startup/reconciliation passes must upsert rather than duplicate.
+	sup.markProviderUnavailable(ctx, profile)
+	findings, err = st.ListUnresolvedFindings(ctx, connID)
+	if err != nil {
+		t.Fatalf("ListUnresolvedFindings after repeat: %v", err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("repeat created duplicate findings: %+v", findings)
+	}
+}
+
+func TestClassifyResourceStateOnlyMarksAuthoritativelyMissingResources(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-externally-removed")
+	profile := recoveryTestProfile(connID)
+	profile.Provider.ProviderID = "repair-observer"
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	resource := &core.ProviderResource{
+		ConnectionID: connID,
+		ProviderID:   profile.Provider.ProviderID,
+		Type:         core.ResourceDNSRecord,
+		ExternalID:   "dns-externally-removed",
+		Ownership:    core.OwnershipManaged,
+	}
+	if err := st.SaveResource(ctx, resource); err != nil {
+		t.Fatalf("SaveResource: %v", err)
+	}
+
+	observer := &repairObservationProvider{observed: &core.ObservedConnection{ResourceStatuses: []core.ObservedResourceStatus{{
+		Type: resource.Type, ExternalID: resource.ExternalID, Status: core.ObservationUnauthorized,
+	}}}}
+	registry := provider.NewRegistry()
+	if err := registry.Add(observer); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	sup := &Supervisor{store: st, controller: ctrl, registry: registry}
+
+	sup.classifyResourceState(ctx)
+	stored, err := st.LoadResource(ctx, resource.ProviderID, resource.Type, resource.ExternalID)
+	if err != nil {
+		t.Fatalf("LoadResource after unauthorized observation: %v", err)
+	}
+	if stored.Lifecycle != core.LifecyclePresent {
+		t.Fatalf("unauthorized observation changed lifecycle to %q", stored.Lifecycle)
+	}
+	findings, err := st.ListUnresolvedFindings(ctx, connID)
+	if err != nil {
+		t.Fatalf("ListUnresolvedFindings: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("unauthorized observation created findings: %#v", findings)
+	}
+
+	observer.observed.ResourceStatuses[0].Status = core.ObservationMissing
+	sup.classifyResourceState(ctx)
+	stored, err = st.LoadResource(ctx, resource.ProviderID, resource.Type, resource.ExternalID)
+	if err != nil {
+		t.Fatalf("LoadResource after missing observation: %v", err)
+	}
+	if stored.Lifecycle != core.LifecycleExternallyRemoved {
+		t.Fatalf("missing observation lifecycle = %q, want %q", stored.Lifecycle, core.LifecycleExternallyRemoved)
+	}
+	findings, err = st.ListUnresolvedFindings(ctx, connID)
+	if err != nil {
+		t.Fatalf("ListUnresolvedFindings: %v", err)
+	}
+	if len(findings) != 1 || findings[0].Summary != "Managed provider resource was removed outside Portico" {
+		t.Fatalf("externally removed findings: %#v", findings)
+	}
+}
+
+func TestOperationEventEndpointUsesUnifiedDurableSequence(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-operation-history")
+	_, opID := seedInterruptedOperation(t, st, connID, core.IntentOpen, openSteps())
+	appendStepEvent(t, st, opID, "step-1", core.StepCreateTunnel, core.StageStarted)
+
+	journal, err := st.GetDurableEventsForOperation(context.Background(), opID)
+	if err != nil || len(journal) != 2 {
+		t.Fatalf("GetDurableEventsForOperation = %#v, %v", journal, err)
+	}
+	h := &supervisorHandler{sup: &Supervisor{store: st}}
+	events, err := h.HandleGetOperationEvents(string(opID))
+	if err != nil {
+		t.Fatalf("HandleGetOperationEvents: %v", err)
+	}
+	if len(events) != 2 || events[1].Sequence != journal[1].Event.Sequence || events[1].OperationID != string(opID) || events[1].ConnectionID != string(connID) {
+		t.Fatalf("operation endpoint did not preserve durable event metadata: %#v vs %#v", events, journal)
 	}
 }
 

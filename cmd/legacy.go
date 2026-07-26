@@ -4,13 +4,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// LegacyCmd returns the legacy flare-cli command subtree.
+// LegacyCmd returns the preserved pre-Portico command subtree.
 // These commands are preserved for backwards compatibility.
 func LegacyCmd() *cobra.Command {
 	legacy := &cobra.Command{
 		Use:    "legacy",
-		Short:  "Preserved flare-cli commands for backwards compatibility",
-		Long:   "Access the original flare-cli functionality. This is temporary and will be removed once the new Portico commands reach feature parity.",
+		Short:  "Preserved pre-Portico commands for backwards compatibility",
+		Long:   "Access the preserved legacy functionality. This is temporary and will be removed once the new Portico commands reach feature parity.",
 		Hidden: true,
 	}
 

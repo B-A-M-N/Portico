@@ -9,7 +9,6 @@ BINARY="portico"
 OS="$(uname -s)"
 case "$OS" in
   Linux*)  GOOS="linux" ;;
-  Darwin*) GOOS="darwin" ;;
   *)       echo "Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 

@@ -59,16 +59,16 @@ Portico follows a strict layered architecture:
 ## Current Features (Implemented)
 
 ### Connection Management
-- **Create connections** with various source types:
-  - `local:http` — existing HTTP/TCP service
-  - `local:command` — command that starts a service
-  - `docker:container` — Docker container
-  - `docker:compose-service` — Docker Compose service
-  - `builtin:static` — static file server
-  - `builtin:file-browser` — file browser with upload/download
-- **Cloudflare provider** with full API and Quick Tunnel support
-- **Temporary (Quick Tunnel)** and **Permanent (named tunnel + DNS)** exposure modes
-- **Protection modes**: none, email OTP, identity provider, service token, private network
+- **Create connections** for an existing local HTTP/HTTPS service, a directory
+  served by Portico, an owned HTTP command, or an HTTP/streamable/SSE MCP
+  endpoint. Portico starts and stops owned directory/command origins as part
+  of the same reviewed plan as the provider connector.
+- **Cloudflare provider** with Quick Tunnel support by default and named
+  tunnels/DNS when a Cloudflare account, zone, and API token are configured.
+- **Temporary (Quick Tunnel)** and, when configured, **Permanent (named
+  tunnel + DNS)** exposure modes.
+- The beginner TUI offers only configurations it can complete. Private
+  exposure, service tokens, and identity-provider policies are deferred.
 - **Lifecycle control**: auto-start, keep-alive on disconnect
 
 ### Reliability & Correctness
@@ -82,8 +82,9 @@ Portico follows a strict layered architecture:
 ### Diagnostics & Observability
 - **Route segment diagnostics** — local service → connector → provider edge → DNS → endpoint
 - **Finding classification** — errors, warnings with evidence and repair options
-- **Repair workflow** — targeted repair plans with confirmation
-- **SSE event stream** — real-time operation progress with replay support
+- **Repair workflow** — diagnostics followed by a targeted repair-plan preview
+- **SSE event stream** — real-time operation progress with bounded replay and
+  snapshot resynchronization after reconnects
 
 ### CLI Interface
 ```bash
@@ -98,6 +99,16 @@ portico plan repair <id>        # preview repair plan
 portico doctor                  # system health check
 portico discover                # discover local services
 portico logs                    # show supervisor logs
+
+# Serve a directory through a Portico-owned local origin
+portico serve docs --source-type directory --source ./public --yes
+
+# Start an HTTP command, wait for its explicit port, then tunnel it
+portico serve app --source-type command --source ./my-server \
+  --source-port 8080 --source-arg=--listen=8080 --yes
+
+# Expose an already-running HTTP MCP server
+portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp --yes
 ```
 
 ### TUI
@@ -105,13 +116,14 @@ portico logs                    # show supervisor logs
 - Inspect view with route visualization
 - Plan preview with step-by-step breakdown
 - Operation progress with SSE events
-- Provider status and discovery
+- Provider status, local-service discovery, directory/command/MCP creation,
+  repair, and delete-plan previews
 
 ## Current Provider Support
 
 | Provider | Status | Exposure Modes | Protection |
 |----------|--------|----------------|------------|
-| Cloudflare | ✅ Full | Temporary, Permanent | None, Email OTP, Identity Provider, Service Token, Private Network |
+| Cloudflare | ✅ | Temporary; Permanent when configured | None in the TUI; email OTP with explicit allow rules in the API |
 | ngrok | 🔄 Planned | | |
 | Tailscale | 🔄 Planned | | |
 | zrok | 🔄 Planned | | |
@@ -128,6 +140,9 @@ go test -race ./...
 # Build
 go build -o portico .
 
+# Install as `portico` for the current user (~/.local/bin must be on PATH)
+make install
+
 # Run the TUI
 ./portico
 
@@ -137,10 +152,12 @@ portico supervisor run
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.25.12+ (earlier 1.25 patch releases have known standard-library vulnerabilities)
 - Linux (for Unix sockets, process identity via /proc)
-- `cloudflared` binary in PATH (for Cloudflare provider)
-- `cloudflared` tunnel token or API token for full Cloudflare features
+- `cloudflared` in `PATH`
+- For permanent Cloudflare connections: `CLOUDFLARE_API_TOKEN`, an account ID,
+  and a zone ID. Run `portico provider login cloudflare --account-id … --zone-id …`
+  to encrypt and persist this setup locally, then restart the supervisor.
 
 ## Testing
 

@@ -52,6 +52,7 @@ type Config struct {
 	Index        string // Index file (static)
 	SPA          bool   // SPA mode (static)
 	CacheControl string // Cache-Control header (static)
+	ListenPort   int    // Optional fixed loopback port for owned HTTP origins
 
 	// builtin:file-browser
 	AllowUpload bool

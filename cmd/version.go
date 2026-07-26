@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/paoloanzn/portico/internal/ui"
+	"github.com/B-A-M-N/portico/internal/ui"
 )
 
 // Build-time variables injected via -ldflags.
@@ -39,7 +39,7 @@ var versionCmd = &cobra.Command{
 			return enc.Encode(info)
 		}
 
-		fmt.Fprintln(cmd.OutOrStdout(), ui.Bold.Render("flare-cli"))
+		fmt.Fprintln(cmd.OutOrStdout(), ui.Bold.Render("Portico Legacy"))
 		fmt.Fprintf(cmd.OutOrStdout(), "  Version:     %s\n", info["version"])
 		fmt.Fprintf(cmd.OutOrStdout(), "  Commit:      %s\n", info["commit"])
 		fmt.Fprintf(cmd.OutOrStdout(), "  Built:       %s\n", info["built"])

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
 )
 
 // Controller manages connections using providers.
@@ -37,7 +37,24 @@ type Controller struct {
 	resourceRemover  ResourceRemover
 	credentialStorer CredentialStorer
 	stepCommitter    StepResultCommitter
+	stepJournal      StepExecutionJournal
 	runtimeCommitter RuntimeCommitter
+	runtimeSaver     RuntimeSaver
+	cleanupRecorder  CleanupRecorder
+	eventDispatcher  CommittedEventDispatcher
+	originManager    OriginManager
+	operationMu      sync.Mutex
+	operationWG      sync.WaitGroup
+	acceptingOps     bool
+}
+
+// OriginManager resolves and owns local source processes/servers. The
+// controller depends on this narrow contract so it retains no knowledge of
+// concrete origin implementations or process details.
+type OriginManager interface {
+	Plan(connectionID core.ConnectionID, source core.SourceSpec) (*core.ResolvedOrigin, error)
+	Start(ctx context.Context, connectionID core.ConnectionID, source core.SourceSpec, expectedURL string) error
+	Stop(ctx context.Context, connectionID core.ConnectionID) error
 }
 
 // Journal defines the operation persistence interface used by the controller
@@ -51,8 +68,9 @@ type Journal interface {
 
 // operationRecord wraps an Operation with synchronization for thread-safe access.
 type operationRecord struct {
-	mu   sync.RWMutex
-	oper Operation
+	mu     sync.RWMutex
+	oper   Operation
+	cancel context.CancelFunc
 }
 
 // Operation tracks an in-progress operation.
@@ -90,13 +108,48 @@ type StepEvent struct {
 // New creates a new controller.
 func New(registry provider.Registry, journal Journal) *Controller {
 	return &Controller{
-		profiles:   make(map[core.ConnectionID]*core.ConnectionProfile),
-		runtimes:   make(map[core.ConnectionID]*core.ConnectionRuntime),
-		operations: make(map[core.OperationID]*operationRecord),
-		plans:      make(map[core.PlanID]*core.OperationPlan),
-		registry:   registry,
-		accounts:   nil,
-		journal:    journal,
+		profiles:     make(map[core.ConnectionID]*core.ConnectionProfile),
+		runtimes:     make(map[core.ConnectionID]*core.ConnectionRuntime),
+		operations:   make(map[core.OperationID]*operationRecord),
+		plans:        make(map[core.PlanID]*core.OperationPlan),
+		registry:     registry,
+		accounts:     nil,
+		journal:      journal,
+		acceptingOps: true,
+	}
+}
+
+// ShutdownOperations prevents new mutations, cancels active operation
+// contexts, and waits for their goroutines before the supervisor closes
+// persistent state. It is safe to call repeatedly.
+func (c *Controller) ShutdownOperations(ctx context.Context) error {
+	c.operationMu.Lock()
+	c.acceptingOps = false
+	c.mu.RLock()
+	operations := make([]*operationRecord, 0, len(c.operations))
+	for _, record := range c.operations {
+		operations = append(operations, record)
+	}
+	c.mu.RUnlock()
+	c.operationMu.Unlock()
+	for _, record := range operations {
+		record.mu.RLock()
+		cancel := record.cancel
+		record.mu.RUnlock()
+		if cancel != nil {
+			cancel()
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		c.operationWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -107,6 +160,13 @@ func (c *Controller) SetDeleteFinalizer(f DeleteConnectionFinalizer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleteFinalizer = f
+}
+
+// SetOriginManager attaches the supervisor-owned local source manager.
+func (c *Controller) SetOriginManager(manager OriginManager) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.originManager = manager
 }
 
 // Snapshot returns an immutable copy of the operation.
@@ -179,21 +239,33 @@ func (c *Controller) CreateProfile(
 ) (*core.ConnectionProfile, *core.ConnectionRuntime, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
+	if profile == nil {
+		return nil, nil, core.ErrValidation("profile is required")
+	}
 	// Assign ID before validation
 	if profile.ID == "" {
 		profile.ID = core.NewConnectionID()
 	}
+	if profile.Provider.AccountID == "" && profile.Provider.ProviderID != "" {
+		if accounts := c.registry.GetAccounts(profile.Provider.ProviderID); len(accounts) == 1 {
+			// Make the implicit single-account choice durable. A profile created
+			// before a second account is added must continue using the account it
+			// was originally planned against.
+			profile.Provider.AccountID = accounts[0]
+		}
+	}
+	if profile.Protection.Kind != "" && profile.Protection.Kind != core.ProtectionNone && profile.Protection.SessionTTL <= 0 {
+		profile.Protection.SessionTTL = core.DefaultProtectedSessionTTL
+	}
 
 	// Validate before storing
 	if err := profile.Validate(); err != nil {
-		return nil, nil, fmt.Errorf("profile validation failed: %w", err)
+		return nil, nil, core.ErrValidation(err.Error())
 	}
 
 	// Validate provider exists
-	prov := c.registry.Get(profile.Provider.ProviderID)
-	if prov == nil {
-		return nil, nil, fmt.Errorf("provider not found: %s", profile.Provider.ProviderID)
+	if _, err := c.providerForProfile(profile); err != nil {
+		return nil, nil, err
 	}
 
 	// Deep copy before storing
@@ -205,7 +277,7 @@ func (c *Controller) CreateProfile(
 
 	// Reject duplicate IDs
 	if _, exists := c.profiles[storedProfile.ID]; exists {
-		return nil, nil, fmt.Errorf("profile already exists: %s", storedProfile.ID)
+		return nil, nil, core.ErrConnectionExists(storedProfile.ID)
 	}
 
 	// Initialize runtime in closed state (explicit initial state contract)
@@ -280,13 +352,12 @@ func (c *Controller) ListRuntimes() []*core.ConnectionRuntime {
 func (c *Controller) UpdateProfile(ctx context.Context, profile *core.ConnectionProfile, expectedRevision uint64) error {
 	// Validate the updated profile before storing
 	if err := profile.Validate(); err != nil {
-		return fmt.Errorf("profile validation failed: %w", err)
+		return core.ErrValidation(err.Error())
 	}
 
 	// Validate provider exists
-	prov := c.registry.Get(profile.Provider.ProviderID)
-	if prov == nil {
-		return fmt.Errorf("provider not found: %s", profile.Provider.ProviderID)
+	if _, err := c.providerForProfile(profile); err != nil {
+		return err
 	}
 
 	// Load existing profile to preserve CreatedAt
@@ -295,7 +366,7 @@ func (c *Controller) UpdateProfile(ctx context.Context, profile *core.Connection
 	c.mu.RUnlock()
 
 	if !ok {
-		return fmt.Errorf("profile not found: %s", profile.ID)
+		return core.ErrProfileNotFound(profile.ID)
 	}
 
 	// Preserve CreatedAt
@@ -315,7 +386,7 @@ func (c *Controller) UpdateProfile(ctx context.Context, profile *core.Connection
 		defer c.mu.Unlock()
 		existing, ok := c.profiles[profile.ID]
 		if !ok {
-			return fmt.Errorf("profile not found: %s", profile.ID)
+			return core.ErrProfileNotFound(profile.ID)
 		}
 		if existing.Revision != expectedRevision {
 			return fmt.Errorf("revision mismatch: expected %d, got %d", expectedRevision, existing.Revision)
@@ -379,8 +450,49 @@ type ResourceSaver interface {
 // tunnel credentials returned by provider steps. The supervisor
 // provides the store implementation. (SPEC P0 #3)
 type CredentialStorer interface {
-	SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, tunnelID, token string) error
-	DeleteTunnelCredential(ctx context.Context, connID core.ConnectionID) error
+	SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string, token []byte) error
+	DeleteTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) error
+}
+
+// CleanupRecorder persists cleanup obligations for resources that may exist
+// remotely but were never successfully inserted into the normal inventory.
+type CleanupRecorder interface {
+	RecordCleanupItem(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, providerID core.ProviderID, resourceType core.ResourceType, externalID, state, lastError string) error
+}
+
+// CommittedEventDispatcher delivers rows that have already committed to the
+// shared durable event journal. It deliberately cannot create events: the
+// store transaction is the source of truth and the dispatcher only wakes SSE
+// subscribers after that transaction has succeeded.
+type CommittedEventDispatcher interface {
+	DispatchCommittedEvents(ctx context.Context) error
+}
+
+// SetCommittedEventDispatcher wires the supervisor's SSE broker to the
+// controller without giving the controller knowledge of IPC transport types.
+func (c *Controller) SetCommittedEventDispatcher(dispatcher CommittedEventDispatcher) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.eventDispatcher = dispatcher
+}
+
+func (c *Controller) dispatchCommittedEvents(ctx context.Context) {
+	c.mu.RLock()
+	dispatcher := c.eventDispatcher
+	c.mu.RUnlock()
+	if dispatcher == nil {
+		return
+	}
+	if err := dispatcher.DispatchCommittedEvents(ctx); err != nil {
+		slog.Warn("dispatch committed events", "err", err)
+	}
+}
+
+// SetCleanupRecorder sets the durable orphan/cleanup ledger.
+func (c *Controller) SetCleanupRecorder(recorder CleanupRecorder) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupRecorder = recorder
 }
 
 // StepCommitRequest describes the full result of executing a step
@@ -394,6 +506,22 @@ type LifecycleMark = core.LifecycleMark
 // transaction: terminal event, resources, credentials, lifecycle changes.
 type StepResultCommitter interface {
 	CommitStepResult(ctx context.Context, req core.StepCommitRequest) error
+}
+
+// StepExecutionJournal durably brackets every normal step execution. Begin
+// and terminal outcome commits are each atomic with their corresponding
+// operation event, so interrupted operations have a recovery ledger instead
+// of relying on best-effort event reconstruction.
+type StepExecutionJournal interface {
+	BeginStep(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, step core.PlanStep) error
+	CommitStepOutcome(ctx context.Context, req core.StepCommitRequest) error
+}
+
+// CompensationJournal records compensating mutations in the same recovery
+// ledger used by normal steps. It is optional for lightweight test wiring.
+type CompensationJournal interface {
+	BeginCompensation(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, step core.PlanStep) error
+	CommitCompensationOutcome(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, step core.PlanStep, result core.StepResult) error
 }
 
 // ConnectionStorer is the interface the controller uses to create
@@ -428,6 +556,9 @@ func (c *Controller) SetStepCommitter(s StepResultCommitter) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.stepCommitter = s
+	if journal, ok := s.(StepExecutionJournal); ok {
+		c.stepJournal = journal
+	}
 }
 
 // SetProfileUpdater sets the store used for optimistic profile updates.
@@ -454,6 +585,19 @@ type RuntimeCommitter interface {
 	CommitRepairSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error)
 	CommitOperationFailure(ctx context.Context, connID core.ConnectionID, opID core.OperationID, errMsg string, provider core.ProviderID, retryable bool) error
 	CommitDeleteSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) error
+}
+
+// RuntimeSaver persists observed runtime projections that are not terminal
+// operation commits, including the complete process identity used for safe
+// restart adoption.
+type RuntimeSaver interface {
+	SaveRuntime(ctx context.Context, runtime *core.ConnectionRuntime) error
+}
+
+func (c *Controller) SetRuntimeSaver(s RuntimeSaver) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.runtimeSaver = s
 }
 
 // SetRuntimeCommitter sets the store used to durably commit
@@ -484,12 +628,12 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	c.mu.RUnlock()
 
 	if !ok {
-		return nil, fmt.Errorf("profile not found: %s", connID)
+		return nil, core.ErrProfileNotFound(connID)
 	}
 
-	prov := c.registry.Get(profile.Provider.ProviderID)
-	if prov == nil {
-		return nil, fmt.Errorf("provider not found: %s", profile.Provider.ProviderID)
+	prov, err := c.providerForProfile(profile)
+	if err != nil {
+		return nil, err
 	}
 
 	// New profiles are stored as DesiredClosed; the provider needs an
@@ -497,8 +641,10 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	openProfile := profile.DeepCopy()
 	openProfile.Desired = core.DesiredOpen
 
-	// Prepare/resolve the local origin before calling the provider.
-	resolvedOrigin, err := c.prepareOrigin(ctx, openProfile.Source)
+	// Prepare/resolve the local origin before calling the provider. Owned
+	// origins are represented by an explicit plan step and are started only
+	// after the preview is accepted.
+	resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, openProfile.Source)
 	if err != nil {
 		return nil, fmt.Errorf("origin preparation: %w", err)
 	}
@@ -512,20 +658,22 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	if err != nil {
 		return nil, err
 	}
+	if resolvedOrigin.Owned {
+		insertStartOriginStep(plan, resolvedOrigin.URL)
+	}
 
-	// Compute fingerprint after receiving from provider.
-	if plan.Fingerprint == "" {
-		if err := plan.ComputeFingerprint(); err != nil {
-			return nil, fmt.Errorf("fingerprint: %w", err)
-		}
+	// Providers compute their own fingerprint, but controller-owned origin
+	// steps are part of what will execute and therefore must be rehashed.
+	if err := plan.ComputeFingerprint(); err != nil {
+		return nil, fmt.Errorf("fingerprint: %w", err)
 	}
 
 	return plan, nil
 }
 
-// prepareOrigin resolves or starts the local origin based on the source spec.
-// For existing services, it returns the resolved URL.
-// For directory, command, and MCP sources, it returns the expected URL (origin will be started by the plan).
+// prepareOrigin resolves an existing origin or asks the supervisor-owned
+// OriginManager to plan a stable owned source URL. Planning never launches a
+// process or opens a listener.
 func (c *Controller) prepareOrigin(ctx context.Context, source core.SourceSpec) (*core.ResolvedOrigin, error) {
 	switch source.Kind {
 	case core.SourceExisting:
@@ -539,55 +687,71 @@ func (c *Controller) prepareOrigin(ctx context.Context, source core.SourceSpec) 
 			Owned:    false,
 		}, nil
 
-	case core.SourceDirectory:
-		if source.Directory == nil || source.Directory.Path == "" {
-			return nil, fmt.Errorf("directory source has no path")
+	case core.SourceDirectory, core.SourceCommand, core.SourceMCP:
+		c.mu.RLock()
+		manager := c.originManager
+		c.mu.RUnlock()
+		if manager == nil {
+			return nil, fmt.Errorf("local source manager is unavailable")
 		}
-		// Note: In v0.1, we don't start the origin here — the plan
-		// will include starting it. For now, return the expected URL.
-		// TODO: Actually start the origin and wait for readiness.
-		return &core.ResolvedOrigin{
-			URL:      "http://127.0.0.1:0", // Placeholder — port assigned at start
-			Protocol: core.ProtocolHTTP,
-			Owned:    true,
-		}, nil
-
-	case core.SourceCommand:
-		if source.Command == nil || source.Command.Executable == "" {
-			return nil, fmt.Errorf("command source has no executable")
-		}
-		if source.Command.Port == 0 {
-			return nil, fmt.Errorf("command source requires a port")
-		}
-		return &core.ResolvedOrigin{
-			URL:      fmt.Sprintf("http://127.0.0.1:%d", source.Command.Port),
-			Protocol: source.Command.Protocol,
-			Owned:    true,
-		}, nil
-
-	case core.SourceMCP:
-		if source.MCP == nil {
-			return nil, fmt.Errorf("MCP source is nil")
-		}
-		if source.MCP.Endpoint == "" && source.MCP.Command == nil {
-			return nil, fmt.Errorf("MCP source requires endpoint or command")
-		}
-		// For MCP, the origin is the MCP server itself
-		var url string
-		if source.MCP.Endpoint != "" {
-			url = source.MCP.Endpoint
-		} else {
-			url = fmt.Sprintf("http://127.0.0.1:%d", source.MCP.Command.Port)
-		}
-		return &core.ResolvedOrigin{
-			URL:      url,
-			Protocol: core.ProtocolHTTP,
-			Owned:    source.MCP.Command != nil,
-		}, nil
+		// The manager needs the connection ID to derive stable endpoint data;
+		// PlanOpen fills it through the surrounding profile, so callers of this
+		// helper use a source copy with no runtime mutation.
+		return nil, fmt.Errorf("local source resolution requires a connection ID")
 
 	default:
 		return nil, fmt.Errorf("unknown source kind %q", source.Kind)
 	}
+}
+
+func (c *Controller) prepareOriginForConnection(ctx context.Context, connectionID core.ConnectionID, source core.SourceSpec) (*core.ResolvedOrigin, error) {
+	if source.Kind == core.SourceExisting {
+		return c.prepareOrigin(ctx, source)
+	}
+	c.mu.RLock()
+	manager := c.originManager
+	c.mu.RUnlock()
+	if manager == nil {
+		return nil, fmt.Errorf("local source manager is unavailable")
+	}
+	return manager.Plan(connectionID, source)
+}
+
+func insertStartOriginStep(plan *core.OperationPlan, originURL string) {
+	step := core.PlanStep{
+		ID:      "origin-start",
+		Kind:    core.StepStartOrigin,
+		Summary: "Start local source",
+		Technical: core.TechnicalOperation{Type: "start_origin", Parameters: map[string]string{
+			"origin_url": originURL,
+		}},
+		Compensation: &core.CompensationStep{
+			ID:        "origin-stop-compensation",
+			Kind:      core.StepStopOrigin,
+			Technical: core.TechnicalOperation{Type: "stop_origin"},
+		},
+	}
+	for i, existing := range plan.Steps {
+		if existing.Kind == core.StepStartConnector {
+			plan.Steps = append(plan.Steps, core.PlanStep{})
+			copy(plan.Steps[i+1:], plan.Steps[i:])
+			plan.Steps[i] = step
+			return
+		}
+	}
+	// A provider opening a connection must start a connector. Retaining the
+	// step at the end makes malformed provider plans visible during execution
+	// instead of performing an invisible side effect during preview.
+	plan.Steps = append(plan.Steps, step)
+}
+
+func appendStopOriginStep(plan *core.OperationPlan) {
+	plan.Steps = append(plan.Steps, core.PlanStep{
+		ID:        "origin-stop",
+		Kind:      core.StepStopOrigin,
+		Summary:   "Stop local source",
+		Technical: core.TechnicalOperation{Type: "stop_origin"},
+	})
 }
 
 // PlanClose creates a close plan.
@@ -597,16 +761,16 @@ func (c *Controller) PlanClose(ctx context.Context, connID core.ConnectionID) (*
 	c.mu.RUnlock()
 
 	if !ok {
-		return nil, fmt.Errorf("profile not found: %s", connID)
+		return nil, core.ErrProfileNotFound(connID)
 	}
 
 	// Derive a closed-profile view for the provider.
 	closedProfile := *profile
 	closedProfile.Desired = core.DesiredClosed
 
-	prov := c.registry.Get(profile.Provider.ProviderID)
-	if prov == nil {
-		return nil, fmt.Errorf("provider not found: %s", profile.Provider.ProviderID)
+	prov, err := c.providerForProfile(profile)
+	if err != nil {
+		return nil, err
 	}
 
 	desired := core.DesiredConnection{
@@ -618,10 +782,12 @@ func (c *Controller) PlanClose(ctx context.Context, connID core.ConnectionID) (*
 		return nil, err
 	}
 
-	if plan.Fingerprint == "" {
-		if err := plan.ComputeFingerprint(); err != nil {
-			return nil, fmt.Errorf("fingerprint: %w", err)
-		}
+	if sourceOwnsOrigin(profile.Source) {
+		appendStopOriginStep(plan)
+	}
+
+	if err := plan.ComputeFingerprint(); err != nil {
+		return nil, fmt.Errorf("fingerprint: %w", err)
 	}
 
 	return plan, nil
@@ -633,7 +799,7 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 	profile, ok := c.profiles[connID]
 	c.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("profile not found: %s", connID)
+		return nil, core.ErrProfileNotFound(connID)
 	}
 
 	// Gather managed resources from runtime to inform the delete plan.
@@ -663,13 +829,22 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 			Irreversible: false,
 		})
 	}
+	if sourceOwnsOrigin(profile.Source) {
+		steps = append(steps, core.PlanStep{
+			ID:          "delete-stop-origin",
+			Kind:        core.StepStopOrigin,
+			Summary:     "Stop local source",
+			Technical:   core.TechnicalOperation{Type: "stop_origin"},
+			Destructive: true,
+		})
+	}
 
 	// Step 2: Remove managed remote resources.
 	// Create a step for each managed resource with its exact external ID.
 	// Note: Access policy resources are deleted as part of Access application
 	// deletion (cascading), so we don't generate separate steps for them.
 	for _, res := range resources {
-		if res.Ownership != core.OwnershipManaged {
+		if res.Ownership != core.OwnershipManaged || !res.IsLive() {
 			continue
 		}
 		var stepKind core.StepKind
@@ -751,6 +926,11 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 	return plan, nil
 }
 
+func sourceOwnsOrigin(source core.SourceSpec) bool {
+	return source.Kind == core.SourceDirectory || source.Kind == core.SourceCommand ||
+		(source.Kind == core.SourceMCP && source.MCP != nil && source.MCP.Command != nil)
+}
+
 // ErrNoRepairNeeded is returned by PlanRepair when the connection is healthy
 // and no repair action is required.
 var ErrNoRepairNeeded = errors.New("no repair needed")
@@ -761,12 +941,11 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 	profile, ok := c.profiles[connID]
 	c.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("profile not found: %s", connID)
+		return nil, core.ErrProfileNotFound(connID)
 	}
 
-	prov := c.registry.Get(profile.Provider.ProviderID)
-	if prov == nil {
-		return nil, fmt.Errorf("provider not found: %s", profile.Provider.ProviderID)
+	if _, err := c.providerForProfile(profile); err != nil {
+		return nil, err
 	}
 
 	// Get current findings to determine repair actions.
@@ -778,7 +957,15 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 	steps := []core.PlanStep{}
 	if rtOk {
 		switch rt.Connector.Status {
-		case core.ConnectorStatusCrashed, core.ConnectorStatusStopped:
+		case core.ConnectorStatusCrashed, core.ConnectorStatusStopped, core.ConnectorStatusUnknown, core.ConnectorStatusUnstable:
+			resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, profile.Source)
+			if err != nil {
+				return nil, fmt.Errorf("origin preparation: %w", err)
+			}
+			mode := "permanent"
+			if profile.Exposure.Mode == core.ExposureTemporary {
+				mode = "quick"
+			}
 			steps = append(steps, core.PlanStep{
 				ID:      "repair-restart-connector",
 				Kind:    core.StepStartConnector,
@@ -786,9 +973,14 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 				Technical: core.TechnicalOperation{
 					Provider:   profile.Provider.ProviderID,
 					Type:       "start_connector",
-					Parameters: map[string]string{"mode": "permanent"},
+					Parameters: map[string]string{"mode": mode, "origin_url": resolvedOrigin.URL},
 				},
 			})
+			if resolvedOrigin.Owned {
+				planStub := &core.OperationPlan{Steps: steps}
+				insertStartOriginStep(planStub, resolvedOrigin.URL)
+				steps = planStub.Steps
+			}
 		}
 	}
 
@@ -869,7 +1061,7 @@ func (c *Controller) GetPlan(id core.PlanID) (*core.OperationPlan, bool) {
 func (c *Controller) ApplyPlan(ctx context.Context, planID core.PlanID) (Operation, error) {
 	plan, ok := c.GetPlan(planID)
 	if !ok {
-		return Operation{}, fmt.Errorf("plan not found: %s", planID)
+		return Operation{}, core.ErrPlanNotFound(planID)
 	}
 
 	// Verify fingerprint before execution — checks immutability by
@@ -891,9 +1083,27 @@ func (c *Controller) ApplyPlan(ctx context.Context, planID core.PlanID) (Operati
 		return Operation{}, fmt.Errorf("connection %s already has an active operation", plan.ConnectionID)
 	}
 
-	prov := c.registry.Get(plan.Provider)
-	if prov == nil {
-		return Operation{}, fmt.Errorf("provider not found: %s", plan.Provider)
+	// A delete plan may consist solely of controller-owned cleanup (for
+	// example, removing an old profile whose optional development provider is
+	// no longer installed). Do not make that recoverable local action depend
+	// on loading a provider. Any plan containing a provider-owned step still
+	// fails closed when its provider is unavailable.
+	var prov core.Provider
+	if planRequiresProvider(plan) {
+		c.mu.RLock()
+		profile := c.profiles[plan.ConnectionID]
+		c.mu.RUnlock()
+		if profile == nil {
+			return Operation{}, core.ErrProfileNotFound(plan.ConnectionID)
+		}
+		var err error
+		prov, err = c.providerForProfile(profile)
+		if err != nil {
+			return Operation{}, err
+		}
+		if prov.Identity().ID != plan.Provider {
+			return Operation{}, core.ErrProviderNotFound(plan.Provider)
+		}
 	}
 
 	// Validate preconditions
@@ -908,6 +1118,27 @@ func (c *Controller) ApplyPlan(ctx context.Context, planID core.PlanID) (Operati
 	default:
 		return Operation{}, fmt.Errorf("unknown plan intent: %s", plan.Intent)
 	}
+}
+
+// planRequiresProvider reports whether executing a plan can mutate or query
+// provider-owned infrastructure. Origin lifecycle and final local deletion
+// are controller-owned, so an otherwise local cleanup plan remains usable
+// after a provider plugin has been removed. Keep this deliberately allowlist
+// based: new step kinds require a provider unless they are explicitly proven
+// controller-local here.
+func planRequiresProvider(plan *core.OperationPlan) bool {
+	if plan == nil {
+		return true
+	}
+	for _, step := range plan.Steps {
+		switch step.Kind {
+		case core.StepStartOrigin, core.StepStopOrigin, core.StepFinalizeLocalDeletion:
+			continue
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // GetOperation returns an immutable snapshot of an operation by ID.
@@ -926,17 +1157,30 @@ func (c *Controller) GetOperation(id core.OperationID) (*Operation, bool) {
 func (c *Controller) Observe(ctx context.Context, connID core.ConnectionID) (*core.ObservedConnection, error) {
 	c.mu.RLock()
 	profile, ok := c.profiles[connID]
+	var resources []core.ProviderResource
+	if runtime := c.runtimes[connID]; runtime != nil {
+		for _, resource := range runtime.Provider.Resources {
+			if resource.IsLive() {
+				resources = append(resources, resource)
+			}
+		}
+	}
 	c.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("profile not found: %s", connID)
+		return nil, core.ErrProfileNotFound(connID)
 	}
 
-	prov := c.registry.Get(profile.Provider.ProviderID)
-	if prov == nil {
-		return nil, fmt.Errorf("provider not found: %s", profile.Provider.ProviderID)
+	prov, err := c.providerForProfile(profile)
+	if err != nil {
+		return nil, err
 	}
 
-	observed, err := prov.Observe(ctx, connID)
+	var observed *core.ObservedConnection
+	if aware, ok := prov.(core.ResourceAwareObserver); ok {
+		observed, err = aware.ObserveWithResources(ctx, connID, resources)
+	} else {
+		observed, err = prov.Observe(ctx, connID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -949,12 +1193,26 @@ func (c *Controller) Observe(ctx context.Context, connID core.ConnectionID) (*co
 		if observed.Connector != nil {
 			rt.Connector.Status = core.ConnectorStatus(observed.Connector.Status)
 			rt.Connector.PID = observed.Connector.PID
+			rt.Connector.StartTime = observed.Connector.StartTime
+			rt.Connector.Executable = observed.Connector.ExecutablePath
+			rt.Connector.CommandHash = observed.Connector.CommandHash
+			rt.Connector.Restarts = observed.Connector.Restarts
+			rt.Connector.LastError = observed.Connector.LastError
 		}
 		if observed.Tunnel != nil {
 			// Update runtime with tunnel info if needed
 		}
 	}
+	var runtimeSnapshot *core.ConnectionRuntime
+	if rt, ok := c.runtimes[connID]; ok {
+		runtimeSnapshot = rt.DeepCopy()
+	}
 	c.mu.Unlock()
+	if runtimeSnapshot != nil && c.runtimeSaver != nil {
+		if err := c.runtimeSaver.SaveRuntime(ctx, runtimeSnapshot); err != nil {
+			return nil, fmt.Errorf("persist observed runtime: %w", err)
+		}
+	}
 
 	return observed, nil
 }
@@ -1034,7 +1292,7 @@ func (c *Controller) Reconcile(ctx context.Context, connID core.ConnectionID) (s
 	profile, profileOk := c.profiles[connID]
 	c.mu.RUnlock()
 	if !profileOk {
-		return "", fmt.Errorf("profile not found: %s", connID)
+		return "", core.ErrProfileNotFound(connID)
 	}
 
 	// Step 1: Observe current state from the provider.
@@ -1130,7 +1388,7 @@ func (c *Controller) validatePlan(ctx context.Context, plan *core.OperationPlan)
 	c.mu.RUnlock()
 
 	if !profileOk {
-		return fmt.Errorf("profile not found: %s", plan.ConnectionID)
+		return core.ErrProfileNotFound(plan.ConnectionID)
 	}
 	if plan.ProfileRevision != profile.Revision {
 		return fmt.Errorf(
@@ -1186,6 +1444,22 @@ func (c *Controller) RestoreFinding(finding *core.DiagnosticFinding) {
 	defer c.mu.Unlock()
 	if rt, ok := c.runtimes[finding.ConnectionID]; ok {
 		rt.Diagnostics = append(rt.Diagnostics, *finding)
+	}
+}
+
+// ReplaceDiagnostics installs the durable diagnostic projection into memory.
+// Persistence is deliberately owned by Store.SyncFindings so a diagnostic
+// run never has a separately committed runtime and finding set.
+func (c *Controller) ReplaceDiagnostics(connID core.ConnectionID, findings []core.DiagnosticFinding) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt := c.runtimes[connID]
+	if rt == nil {
+		return
+	}
+	rt.Diagnostics = make([]core.DiagnosticFinding, len(findings))
+	for i := range findings {
+		rt.Diagnostics[i] = findings[i].Clone()
 	}
 }
 

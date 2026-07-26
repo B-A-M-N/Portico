@@ -7,11 +7,12 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // stopReq asks an actor to terminate its process and exit.
@@ -23,7 +24,7 @@ type stopReq struct {
 // actorIO holds the per-launch pipe/writer resources for log capture.
 type actorIO struct {
 	readers []*os.File
-	writers []*RotatingWriter
+	closers []io.Closer
 	wg      sync.WaitGroup
 }
 
@@ -38,8 +39,8 @@ func (aio *actorIO) close() {
 		_ = r.Close()
 	}
 	aio.wg.Wait()
-	for _, w := range aio.writers {
-		_ = w.Close()
+	for _, closer := range aio.closers {
+		_ = closer.Close()
 	}
 }
 
@@ -58,6 +59,7 @@ type actor struct {
 	pollInterval time.Duration
 	logMaxSize   int64
 	logMaxFiles  int
+	emit         func(ProcessEvent)
 
 	stopCh   chan stopReq
 	started  chan struct{} // closed once the first launch attempt finished
@@ -95,6 +97,27 @@ func (a *actor) setStatus(s ProcessStatus) {
 	a.mu.Unlock()
 }
 
+func (a *actor) publishEvent(eventType ProcessEventType, err error) {
+	if a.emit == nil {
+		return
+	}
+	snapshot := a.snapshot()
+	event := ProcessEvent{
+		ConnectionID: a.connID,
+		Type:         eventType,
+		Identity:     snapshot.Identity,
+		Status:       snapshot.Status,
+		Restarts:     snapshot.Restarts,
+		Timestamp:    time.Now().UTC(),
+	}
+	if err != nil {
+		event.Error = err.Error()
+	} else {
+		event.Error = snapshot.LastExitError
+	}
+	a.emit(event)
+}
+
 // recordExit publishes the outcome of an unexpected process exit.
 func (a *actor) recordExit(err error) {
 	a.mu.Lock()
@@ -114,6 +137,7 @@ func (a *actor) recordExit(err error) {
 		default:
 		}
 	}
+	a.publishEvent(ProcessEventExited, err)
 }
 
 // launch starts the process with log pipes attached to rotating writers.
@@ -130,19 +154,23 @@ func (a *actor) launch() error {
 		}
 	}
 
-	var stdoutW, stderrW *RotatingWriter
+	var stdoutW, stderrW io.Writer
+	var redactorClosers []io.Closer
+	redactions := processLogRedactions(spec)
 	if spec.StdoutPath != "" {
 		w, err := NewRotatingWriter(spec.StdoutPath, a.logMaxSize, a.logMaxFiles)
 		if err != nil {
 			return fmt.Errorf("process stdout: %w", err)
 		}
-		stdoutW = w
+		stdoutW = NewRedactingWriter(w, redactions)
 		writers = append(writers, w)
+		redactorClosers = append(redactorClosers, stdoutW.(io.Closer))
 	}
 	if spec.StderrPath != "" {
 		if spec.StderrPath == spec.StdoutPath && stdoutW != nil {
 			// Same path: share one writer so rotation is coherent.
-			stderrW = stdoutW
+			stderrW = NewRedactingWriter(writers[0], redactions)
+			redactorClosers = append(redactorClosers, stderrW.(io.Closer))
 		} else {
 			w, err := NewRotatingWriter(spec.StderrPath, a.logMaxSize, a.logMaxFiles)
 			if err != nil {
@@ -150,8 +178,9 @@ func (a *actor) launch() error {
 				closeWriters()
 				return fmt.Errorf("process stderr: %w", err)
 			}
-			stderrW = w
+			stderrW = NewRedactingWriter(w, redactions)
 			writers = append(writers, w)
+			redactorClosers = append(redactorClosers, stderrW.(io.Closer))
 		}
 	}
 
@@ -166,7 +195,7 @@ func (a *actor) launch() error {
 
 	type pipePair struct {
 		r, w *os.File
-		dst  *RotatingWriter
+		dst  io.Writer
 	}
 	var pipes []pipePair
 	closePipes := func() {
@@ -201,14 +230,18 @@ func (a *actor) launch() error {
 		return fmt.Errorf("process start: %w", err)
 	}
 
-	aio := &actorIO{writers: writers}
+	closers := append(redactorClosers, make([]io.Closer, 0, len(writers))...)
+	for _, writer := range writers {
+		closers = append(closers, writer)
+	}
+	aio := &actorIO{closers: closers}
 	// The parent must close the child's write ends so the copiers see EOF
 	// when the process group exits.
 	for _, p := range pipes {
 		_ = p.w.Close()
 		aio.readers = append(aio.readers, p.r)
 		aio.wg.Add(1)
-		go func(dst *RotatingWriter, src *os.File) {
+		go func(dst io.Writer, src *os.File) {
 			defer aio.wg.Done()
 			_, _ = io.Copy(dst, src)
 		}(p.dst, p.r)
@@ -245,7 +278,19 @@ func (a *actor) launch() error {
 		"pid", ident.PID,
 		"executable", spec.Executable,
 	)
+	a.publishEvent(ProcessEventStarted, nil)
 	return nil
+}
+
+func processLogRedactions(spec core.ProcessSpec) []string {
+	redactions := append([]string(nil), spec.Redactions...)
+	for _, arg := range spec.Args {
+		lower := strings.ToLower(arg)
+		if (strings.Contains(lower, "credential") || strings.Contains(lower, "token")) && strings.Contains(arg, "/") {
+			redactions = append(redactions, arg)
+		}
+	}
+	return redactions
 }
 
 // run is the actor main loop. It owns the process lifecycle: waiting for
@@ -291,6 +336,7 @@ func (a *actor) run() {
 				a.setStatus(ProcessStatusUnstable)
 				slog.Warn("connector process unstable: restart budget exhausted",
 					"connection", a.connID, "attempts", backoff.Attempts())
+				a.publishEvent(ProcessEventUnstable, errors.New("restart budget exhausted"))
 				return
 			}
 			if !a.sleepOrStop(delay) {
@@ -304,6 +350,7 @@ func (a *actor) run() {
 			a.mu.Lock()
 			a.rec.Restarts++
 			a.mu.Unlock()
+			a.publishEvent(ProcessEventRestarted, nil)
 			restarted = true
 		}
 		owned = true
@@ -340,6 +387,7 @@ func (a *actor) waitOwned() (exitErr error, stopped bool) {
 		a.aio = nil
 		if err == nil {
 			a.setStatus(ProcessStatusStopped)
+			a.publishEvent(ProcessEventStopped, nil)
 		}
 		req.reply <- err
 		return nil, true

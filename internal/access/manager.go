@@ -2,6 +2,7 @@ package access
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -41,15 +42,32 @@ type AppState struct {
 
 // PolicyState represents the observed state of an Access policy.
 type PolicyState struct {
-	ID       string
-	Name     string
-	Decision string
+	ID              string
+	Name            string
+	Decision        string
+	AllowedEmails   []string
+	AllowedDomains  []string
+	SessionDuration string
 }
 
 // PolicyGetter is an optional extension of Manager for retrieving an
 // individual Access policy by its exact ID. Implemented by APIManager.
 type PolicyGetter interface {
 	GetPolicy(ctx context.Context, accountID, appID, policyID string) (*PolicyState, error)
+}
+
+// PolicyCreator is an optional extension for restoring one exact policy on
+// an existing Access application. Keeping it optional lets narrow adapters
+// expose the capability without forcing unrelated legacy managers to grow a
+// method they cannot safely implement.
+type PolicyCreator interface {
+	CreatePolicy(ctx context.Context, accountID, appID string, policy Policy) (string, error)
+}
+
+// AppUpdater is an optional extension for correcting the hostname of one
+// exact Access application without replacing its policy or application ID.
+type AppUpdater interface {
+	UpdateApp(ctx context.Context, accountID, appID, hostname string) error
 }
 
 // APIManager implements Manager using the Cloudflare API.
@@ -150,11 +168,92 @@ func (m *APIManager) GetPolicy(ctx context.Context, accountID, appID, policyID s
 		}
 		return nil, fmt.Errorf("getting Access policy: %w", err)
 	}
-	return &PolicyState{
+	emails, domains := policyIdentities(policy.Include)
+	state := &PolicyState{
 		ID:       policy.ID,
 		Name:     policy.Name,
 		Decision: policy.Decision,
-	}, nil
+	}
+	state.AllowedEmails = emails
+	state.AllowedDomains = domains
+	if policy.SessionDuration != nil {
+		state.SessionDuration = *policy.SessionDuration
+	}
+	return state, nil
+}
+
+func policyIdentities(include []interface{}) (emails, domains []string) {
+	for _, rule := range include {
+		encoded, err := json.Marshal(rule)
+		if err != nil {
+			continue
+		}
+		var envelope struct {
+			Email *struct {
+				Email string `json:"email"`
+			} `json:"email"`
+			EmailDomain *struct {
+				Domain string `json:"domain"`
+			} `json:"email_domain"`
+		}
+		if err := json.Unmarshal(encoded, &envelope); err != nil {
+			continue
+		}
+		if envelope.Email != nil && envelope.Email.Email != "" {
+			emails = append(emails, envelope.Email.Email)
+		}
+		if envelope.EmailDomain != nil && envelope.EmailDomain.Domain != "" {
+			domains = append(domains, envelope.EmailDomain.Domain)
+		}
+	}
+	return emails, domains
+}
+
+// CreatePolicy creates the allow policy for an existing Access application
+// and returns its exact Cloudflare ID.
+func (m *APIManager) CreatePolicy(ctx context.Context, accountID, appID string, policy Policy) (string, error) {
+	rc := cf.AccountIdentifier(accountID)
+	include := buildIncludeRules(policy)
+	if policy.AuthMode != "none" && policy.AuthMode != "private_network" && len(include) == 0 {
+		return "", fmt.Errorf("access policy requires at least one allowed email or domain for %s", policy.AuthMode)
+	}
+	created, err := m.client.CreateAccessPolicy(ctx, rc, cf.CreateAccessPolicyParams{
+		ApplicationID: appID,
+		Name:          "portico-allow-policy",
+		Decision:      "allow",
+		Precedence:    1,
+		Include:       include,
+	})
+	if err != nil {
+		return "", fmt.Errorf("creating Access policy: %w", err)
+	}
+	return created.ID, nil
+}
+
+// UpdateApp corrects the hostname of an existing self-hosted Access
+// application while preserving the fields Cloudflare requires on its PUT
+// endpoint. The preceding exact-ID read prevents a partial update from
+// clearing the application name, type, or session policy.
+func (m *APIManager) UpdateApp(ctx context.Context, accountID, appID, hostname string) error {
+	rc := cf.AccountIdentifier(accountID)
+	app, err := m.client.GetAccessApplication(ctx, rc, appID)
+	if err != nil {
+		return fmt.Errorf("getting Access application for update: %w", err)
+	}
+	_, err = m.client.UpdateAccessApplication(ctx, rc, cf.UpdateAccessApplicationParams{
+		ID:              appID,
+		Name:            app.Name,
+		Domain:          hostname,
+		DomainType:      app.DomainType,
+		Type:            app.Type,
+		SessionDuration: app.SessionDuration,
+		PrivateAddress:  app.PrivateAddress,
+		Destinations:    app.Destinations,
+	})
+	if err != nil {
+		return fmt.Errorf("updating Access application: %w", err)
+	}
+	return nil
 }
 func (m *APIManager) UpdatePolicy(ctx context.Context, accountID, appID, policyID string, policy Policy) error {
 	rc := cf.AccountIdentifier(accountID)

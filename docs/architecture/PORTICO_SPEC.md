@@ -36,4 +36,4 @@ This document is the authoritative specification for Portico implementation.
 10. Motion and telemetry (Phase 9)
 11. Hardening and release (Phase 10)
 
-For full specification, see: https://github.com/paoloanzn/portico/blob/main/SPEC.md
+For full specification, see: https://github.com/B-A-M-N/portico/blob/main/SPEC.md

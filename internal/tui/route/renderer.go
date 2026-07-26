@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // RouteVM is the view model for the route renderer.
@@ -172,30 +172,42 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 	canvas.Set(localX, 1, localGlyph, styleForState(vm.State))
 
 	// Draw gateway at center, row 1
-	canvas.Set(gw, 1, gatewayGlyph, StyleGateway)
+	gateway := gatewayGlyph
+	if useASCII {
+		gateway = '#'
+	}
+	canvas.Set(gw, 1, gateway, StyleGateway)
 
 	// Draw endpoint at far right, row 1
 	canvas.Set(endX, 1, endpointGlyph, styleForState(vm.State))
 
 	// Draw top route: local → gateway
 	topRouteEnd := gw - 1
+	line := activeLine
+	cornerTopRight, cornerTopLeft, cornerBottomLeft, cornerBottomLine := '╮', '╭', '╰', '━'
+	breakMark := breakGlyph
+	if useASCII {
+		line = '='
+		cornerTopRight, cornerTopLeft, cornerBottomLeft, cornerBottomLine = '+', '+', '+', '='
+		breakMark = 'X'
+	}
 	if topRouteEnd > localX+1 {
-		canvas.HLine(localX+1, topRouteEnd, 0, activeLine, StyleActive)
+		canvas.HLine(localX+1, topRouteEnd, 0, line, StyleActive)
 		// Corner
-		canvas.Set(topRouteEnd, 1, '╮', StyleActive)
-		canvas.Set(topRouteEnd, 0, '╭', StyleActive)
+		canvas.Set(topRouteEnd, 1, cornerTopRight, StyleActive)
+		canvas.Set(topRouteEnd, 0, cornerTopLeft, StyleActive)
 	} else {
-		canvas.Set(localX+1, 1, '─', StyleActive)
+		canvas.Set(localX+1, 1, line, StyleActive)
 	}
 
 	// Draw bottom route: gateway → endpoint
 	bottomRouteStart := gw + 1
 	if bottomRouteStart < endX {
-		canvas.HLine(bottomRouteStart, endX-1, 2, activeLine, StyleActive)
-		canvas.Set(gw, 2, '╰', StyleActive)
-		canvas.Set(gw+1, 2, '━', StyleActive)
+		canvas.HLine(bottomRouteStart, endX-1, 2, line, StyleActive)
+		canvas.Set(gw, 2, cornerBottomLeft, StyleActive)
+		canvas.Set(gw+1, 2, cornerBottomLine, StyleActive)
 	} else {
-		canvas.Set(gw, 2, '╰', StyleActive)
+		canvas.Set(gw, 2, cornerBottomLeft, StyleActive)
 	}
 
 	// Handle finding overlay
@@ -203,9 +215,9 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 		switch vm.ActiveFinding.SegmentID {
 		case core.SegmentConnector:
 			// Put break at gateway entry
-			canvas.Set(gw, 1, breakGlyph, StyleFailed)
+			canvas.Set(gw, 1, breakMark, StyleFailed)
 		case core.SegmentProviderEdge:
-			canvas.Set(gw+2, 2, breakGlyph, StyleFailed)
+			canvas.Set(gw+2, 2, breakMark, StyleFailed)
 			canvas.Set(endX, 1, unknownGlyph, StyleMuted)
 		}
 	}
@@ -245,7 +257,11 @@ func renderCompactRoute(vm RouteVM, useASCII bool) string {
 	endStr := string(endG)
 
 	if vm.ActiveFinding != nil {
-		route := fmt.Sprintf("%s ╳ %s", localStr, endStr)
+		breakMark := "╳"
+		if useASCII {
+			breakMark = "X"
+		}
+		route := fmt.Sprintf("%s %s %s", localStr, breakMark, endStr)
 		seg := vm.ActiveFinding.Summary
 		if len(vm.LocalLabel) > 0 {
 			route = fmt.Sprintf("%s %s", vm.LocalLabel, route)
@@ -256,7 +272,11 @@ func renderCompactRoute(vm RouteVM, useASCII bool) string {
 		return route
 	}
 
-	route := fmt.Sprintf("%s━━━%s━━━%s", localStr, string(gatewayGlyph), endStr)
+	line, gateway := "━━━", string(gatewayGlyph)
+	if useASCII {
+		line, gateway = "===", "#"
+	}
+	route := fmt.Sprintf("%s%s%s%s%s", localStr, line, gateway, line, endStr)
 	if vm.EndpointLabel != "" {
 		parts := len(vm.EndpointLabel)
 		if parts > 10 {

@@ -5,8 +5,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/paoloanzn/portico/internal/config"
-	"github.com/paoloanzn/portico/internal/ui"
+	"github.com/B-A-M-N/portico/internal/config"
+	"github.com/B-A-M-N/portico/internal/ui"
 )
 
 var authLogoutCmd = &cobra.Command{

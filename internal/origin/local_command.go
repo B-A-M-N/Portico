@@ -1,21 +1,44 @@
 package origin
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
-	"strings"
+	"sync"
 	"time"
 )
 
 // LocalCommand launches a local command and exposes its HTTP port.
 type LocalCommand struct {
-	cfg    Config
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
+	cfg   Config
+	cmd   *exec.Cmd
+	done  chan struct{}
+	logMu sync.Mutex
+	logs  []byte
+}
+
+const maxCommandLogBytes = 1 << 20
+
+type commandLogWriter struct{ command *LocalCommand }
+
+func (w commandLogWriter) Write(data []byte) (int, error) {
+	w.command.logMu.Lock()
+	defer w.command.logMu.Unlock()
+	if len(data) >= maxCommandLogBytes {
+		w.command.logs = append(w.command.logs[:0], data[len(data)-maxCommandLogBytes:]...)
+		return len(data), nil
+	}
+	overflow := len(w.command.logs) + len(data) - maxCommandLogBytes
+	if overflow > 0 {
+		copy(w.command.logs, w.command.logs[overflow:])
+		w.command.logs = w.command.logs[:len(w.command.logs)-overflow]
+	}
+	w.command.logs = append(w.command.logs, data...)
+	return len(data), nil
 }
 
 // NewLocalCommand creates a LocalCommand origin.
@@ -37,11 +60,13 @@ func (l *LocalCommand) Type() Type {
 func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 	// Build the command.
 	var cmd *exec.Cmd
-	if strings.Contains(l.cfg.Command, " ") {
-		// Shell mode: wrap in sh -c.
+	if l.cfg.Shell {
+		// Shell evaluation is opt-in only. It is never inferred from spaces in
+		// a command string because that would silently change user input into
+		// shell syntax.
 		cmd = exec.CommandContext(ctx, "sh", "-c", l.cfg.Command)
 	} else {
-		cmd = exec.CommandContext(ctx, l.cfg.Command)
+		cmd = exec.CommandContext(ctx, l.cfg.Command, l.cfg.Args...)
 	}
 
 	if l.cfg.Dir != "" {
@@ -58,18 +83,23 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
-	l.stdout = pr
+	go func() {
+		_, _ = io.Copy(commandLogWriter{command: l}, pr)
+		_ = pr.Close()
+	}()
 
 	if err := cmd.Start(); err != nil {
 		pw.Close()
 		return "", fmt.Errorf("starting command: %w", err)
 	}
 	l.cmd = cmd
+	l.done = make(chan struct{})
 
 	// Close write end when process exits.
 	go func() {
-		cmd.Wait()
+		_ = cmd.Wait()
 		pw.Close()
+		close(l.done)
 	}()
 
 	// Wait for the port to be ready.
@@ -99,9 +129,16 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 			}
 		}
 
-		// Check if the process exited.
-		if l.cmd.ProcessState != nil && l.cmd.ProcessState.Exited() {
-			return "", fmt.Errorf("command exited before becoming ready (exit code %d)", l.cmd.ProcessState.ExitCode())
+		// Check if the process exited without racing exec.Cmd.Wait, which owns
+		// ProcessState in the waiter goroutine.
+		select {
+		case <-l.done:
+			exitCode := -1
+			if l.cmd.ProcessState != nil {
+				exitCode = l.cmd.ProcessState.ExitCode()
+			}
+			return "", fmt.Errorf("command exited before becoming ready (exit code %d)", exitCode)
+		default:
 		}
 
 		if time.Now().After(deadline) {
@@ -120,28 +157,35 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 
 func (l *LocalCommand) Stop(_ context.Context) error {
 	if l.cmd != nil && l.cmd.Process != nil {
-		l.cmd.Process.Signal(os.Interrupt)
-		done := make(chan error, 1)
-		go func() { done <- l.cmd.Wait() }()
+		_ = l.cmd.Process.Signal(os.Interrupt)
 		select {
-		case <-done:
+		case <-l.done:
 		case <-time.After(10 * time.Second):
-			l.cmd.Process.Kill()
+			_ = l.cmd.Process.Kill()
+			<-l.done
 		}
 	}
 	return nil
 }
 
 func (l *LocalCommand) Logs() io.ReadCloser {
-	return l.stdout
+	l.logMu.Lock()
+	defer l.logMu.Unlock()
+	return io.NopCloser(bytes.NewReader(append([]byte(nil), l.logs...)))
 }
 
 func (l *LocalCommand) Healthy(ctx context.Context) error {
 	if l.cmd == nil || l.cmd.Process == nil {
 		return fmt.Errorf("command not running")
 	}
-	if l.cmd.ProcessState != nil && l.cmd.ProcessState.Exited() {
-		return fmt.Errorf("command exited (code %d)", l.cmd.ProcessState.ExitCode())
+	select {
+	case <-l.done:
+		exitCode := -1
+		if l.cmd.ProcessState != nil {
+			exitCode = l.cmd.ProcessState.ExitCode()
+		}
+		return fmt.Errorf("command exited (code %d)", exitCode)
+	default:
 	}
 	return nil
 }

@@ -7,15 +7,15 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/paoloanzn/portico/internal/config"
-	flareexec "github.com/paoloanzn/portico/internal/exec"
-	"github.com/paoloanzn/portico/internal/ui"
+	"github.com/B-A-M-N/portico/internal/config"
+	flareexec "github.com/B-A-M-N/portico/internal/exec"
+	"github.com/B-A-M-N/portico/internal/ui"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Bootstrap flare-cli for a Cloudflare account and zone",
-	Long: `Initialize flare-cli by providing your Cloudflare account ID, zone ID,
+	Short: "Bootstrap Portico Legacy for a Cloudflare account and zone",
+	Long: `Initialize Portico Legacy by providing your Cloudflare account ID, zone ID,
 and domain. This stores the configuration so subsequent commands can
 create tunnels, DNS records, and Access applications.
 

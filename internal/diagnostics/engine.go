@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // SegmentProbe is the outcome of probing one route segment.
@@ -185,9 +185,36 @@ func (e *Engine) checkConnector(ctx context.Context, profile *core.ConnectionPro
 			RepairOptions: []core.RepairOption{restart},
 			ObservedAt:    time.Now().UTC(),
 		}
+	case core.ConnectorStatusUnknown:
+		return &core.DiagnosticFinding{
+			ID:           core.FindingID(fmt.Sprintf("find-%s-conn-identity", profile.ID)),
+			ConnectionID: profile.ID,
+			Segment:      core.SegmentConnector,
+			Severity:     core.SeverityWarning,
+			Summary:      "Connector identity could not be verified",
+			Explanation:  "Portico will not signal the recorded PID because its process identity no longer matches. Confirm the existing process or start a fresh connector through a repair plan.",
+			Evidence: []core.Evidence{
+				{Type: "process_identity", Source: "supervisor", Message: "Recorded connector PID cannot be safely verified"},
+			},
+			RepairOptions: []core.RepairOption{restart},
+			ObservedAt:    time.Now().UTC(),
+		}
+	case core.ConnectorStatusUnstable:
+		return &core.DiagnosticFinding{
+			ID:           core.FindingID(fmt.Sprintf("find-%s-conn-unstable", profile.ID)),
+			ConnectionID: profile.ID,
+			Segment:      core.SegmentConnector,
+			Severity:     core.SeverityError,
+			Summary:      "Connector restart budget exhausted",
+			Explanation:  "The connector repeatedly exited and Portico stopped automatic restarts. Review its log, then use a repair plan to start a fresh connector.",
+			Evidence: []core.Evidence{
+				{Type: "process_status", Source: "supervisor", Message: "Connector restart budget exhausted"},
+			},
+			RepairOptions: []core.RepairOption{restart},
+			ObservedAt:    time.Now().UTC(),
+		}
 	default:
-		// running, starting, or unknown. Unknown identity must never
-		// be treated as failure (never signal on PID alone).
+		// Running and starting produce no causal finding.
 		return nil
 	}
 }
@@ -198,12 +225,23 @@ func (e *Engine) checkProvider(ctx context.Context, profile *core.ConnectionProf
 	if e.deps.Provider != nil {
 		observed, err := e.deps.Provider.ObserveProvider(ctx, profile.ID)
 		if err == nil && observed != nil {
-			if observed.Tunnel == nil && rt.State == core.RuntimeOpen {
-				evidence = append(evidence, core.Evidence{
-					Type:    "provider_observation",
-					Source:  string(observed.ProviderID),
-					Message: "Provider reports no tunnel for this connection",
-				})
+			// An absent observed object is ambiguous. Only exact resource-status
+			// lookups are actionable, and their stable physical order determines
+			// the first causal finding.
+			for _, status := range observed.ResourceStatuses {
+				switch status.Status {
+				case core.ObservationUnauthorized, core.ObservationRateLimited, core.ObservationTransient:
+					return providerObservationFinding(profile.ID, observed.ProviderID, status)
+				}
+			}
+			for _, resourceType := range []core.ResourceType{
+				core.ResourceTunnel, core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy,
+			} {
+				for _, status := range observed.ResourceStatuses {
+					if status.Type == resourceType && status.Status == core.ObservationMissing {
+						return missingProviderResourceFinding(profile.ID, observed.ProviderID, status)
+					}
+				}
 			}
 		}
 		// Observation errors are treated as unknown, not failure.
@@ -234,6 +272,78 @@ func (e *Engine) checkProvider(ctx context.Context, profile *core.ConnectionProf
 		}
 	}
 	return nil
+}
+
+// missingProviderResourceFinding turns an authoritative exact-ID 404 into a
+// segment-specific finding. It does not infer absence from a nil resource or
+// from an unavailable provider response.
+func missingProviderResourceFinding(connectionID core.ConnectionID, providerID core.ProviderID, status core.ObservedResourceStatus) *core.DiagnosticFinding {
+	evidence := []core.Evidence{{
+		Type: "provider_observation", Source: string(providerID),
+		Message: "Provider reports the tracked resource is missing",
+		Data:    map[string]string{"resource_id": status.ExternalID, "resource_type": string(status.Type), "detail": status.Detail},
+	}}
+	switch status.Type {
+	case core.ResourceTunnel:
+		return &core.DiagnosticFinding{
+			ID: core.FindingID(fmt.Sprintf("find-%s-edge", connectionID)), ConnectionID: connectionID,
+			Segment: core.SegmentProviderEdge, Severity: core.SeverityError,
+			Summary:     "Provider tunnel is missing",
+			Explanation: "The provider no longer reports the tunnel backing this connection. The public endpoint will not be reachable until the tunnel is recreated.",
+			Evidence:    evidence, ObservedAt: time.Now().UTC(),
+		}
+	case core.ResourceDNSRecord:
+		return &core.DiagnosticFinding{
+			ID: core.FindingID(fmt.Sprintf("find-%s-dns-resource", connectionID)), ConnectionID: connectionID,
+			Segment: core.SegmentAddress, Severity: core.SeverityError,
+			Summary:     "Managed DNS record is missing",
+			Explanation: "The provider confirmed that Portico's DNS record is absent. The tunnel remains intact; repair should recreate only this DNS record.",
+			Evidence:    evidence, ObservedAt: time.Now().UTC(),
+		}
+	case core.ResourceAccessApp, core.ResourceAccessPolicy:
+		return &core.DiagnosticFinding{
+			ID: core.FindingID(fmt.Sprintf("find-%s-protection-resource", connectionID)), ConnectionID: connectionID,
+			Segment: core.SegmentProtection, Severity: core.SeverityError,
+			Summary:     "Managed access protection is missing",
+			Explanation: "The provider confirmed that a tracked Access application or policy is absent. Portico will not silently weaken protection; review and repair the exact protection resource.",
+			Evidence:    evidence, ObservedAt: time.Now().UTC(),
+		}
+	default:
+		return nil
+	}
+}
+
+// providerObservationFinding records an inability to determine provider
+// state without incorrectly presenting it as missing infrastructure.
+func providerObservationFinding(connectionID core.ConnectionID, providerID core.ProviderID, status core.ObservedResourceStatus) *core.DiagnosticFinding {
+	summary := "Provider state could not be verified"
+	explanation := "Portico could not determine whether the tracked provider resource exists. No infrastructure will be recreated until observation succeeds."
+	severity := core.SeverityWarning
+	switch status.Status {
+	case core.ObservationUnauthorized:
+		summary = "Provider authentication required"
+		explanation = "The provider rejected the tunnel lookup. Reauthenticate the selected provider account, then run diagnostics again."
+		severity = core.SeverityError
+	case core.ObservationRateLimited:
+		summary = "Provider is rate limiting observation"
+		explanation = "The provider temporarily rate limited the tunnel lookup. Portico will not treat the tunnel as missing; try again after the rate limit clears."
+	case core.ObservationTransient:
+		summary = "Provider is temporarily unavailable"
+		explanation = "The provider lookup failed transiently. Portico will not recreate infrastructure until the provider can be observed again."
+	}
+	return &core.DiagnosticFinding{
+		ID:           core.FindingID(fmt.Sprintf("find-%s-edge", connectionID)),
+		ConnectionID: connectionID,
+		Segment:      core.SegmentProviderEdge,
+		Severity:     severity,
+		Summary:      summary,
+		Explanation:  explanation,
+		Evidence: []core.Evidence{{
+			Type: "provider_observation", Source: string(providerID), Message: string(status.Status),
+			Data: map[string]string{"resource_id": status.ExternalID, "detail": status.Detail},
+		}},
+		ObservedAt: time.Now().UTC(),
+	}
 }
 
 // checkDNS resolves the public hostname (address segment).

@@ -2,13 +2,27 @@ package ipc
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
-	"github.com/paoloanzn/portico/internal/store"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 type nullHandler struct{}
+
+type diagnosticsErrorHandler struct {
+	nullHandler
+	err error
+}
+
+func (h diagnosticsErrorHandler) HandleDiagnostics(string) ([]DiagnosticDTO, error) {
+	return nil, h.err
+}
 
 func (nullHandler) HandleSnapshot() (*SnapshotDTO, error)           { return &SnapshotDTO{}, nil }
 func (nullHandler) HandleListConnections() ([]ConnectionDTO, error) { return nil, nil }
@@ -30,7 +44,6 @@ func (nullHandler) HandleApplyPlan(string) (*OperationDTO, error) {
 }
 func (nullHandler) HandleListProviders() ([]ProviderDTO, error) { return nil, nil }
 func (nullHandler) HandleAuthenticateProvider(string) error     { return nil }
-func (nullHandler) HandleDeleteConnection(string) error         { return nil }
 func (nullHandler) HandleGetOperation(string) (*OperationDTO, error) {
 	return nil, nil
 }
@@ -87,6 +100,83 @@ func TestPublishEventMonotonicSequences(t *testing.T) {
 	}
 	if got := s.CurrentSeq(); got != events[len(events)-1].Sequence {
 		t.Fatalf("CurrentSeq %d != last persisted %d", got, events[len(events)-1].Sequence)
+	}
+}
+
+func TestPublishEventDoesNotBroadcastWhenDurableAppendFails(t *testing.T) {
+	st := openTestStore(t)
+	s := newTestServer(t, st)
+	listener := make(chan EventDTO, 1)
+	s.subs["listener"] = listener
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if err := s.PublishEvent(EventDTO{Type: "must-not-broadcast"}); err == nil {
+		t.Fatal("expected durable append failure")
+	}
+	select {
+	case event := <-listener:
+		t.Fatalf("received non-durable event: %+v", event)
+	default:
+	}
+}
+
+func TestPublishEventPreservesSuppliedTimestamp(t *testing.T) {
+	st := openTestStore(t)
+	s := newTestServer(t, st)
+	want := "2026-07-25T12:34:56Z"
+	if err := s.PublishEvent(EventDTO{
+		OperationID: "op-1", ConnectionID: "conn-1", Type: "timestamped", Stage: "succeeded", Timestamp: want,
+		Data: map[string]string{"connection_id": "payload-value-is-not-indexed"},
+	}); err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	events, err := st.GetDurableEventsSince(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("GetDurableEventsSince: %v", err)
+	}
+	if len(events) != 1 || events[0].Event.Timestamp.Format(time.RFC3339) != want {
+		t.Fatalf("stored timestamp = %+v, want %s", events, want)
+	}
+	if events[0].OperationID != "op-1" || events[0].ConnectionID != "conn-1" || events[0].Stage != "succeeded" {
+		t.Fatalf("durable metadata = %+v", events[0])
+	}
+}
+
+func TestDispatchCommittedEventsBroadcastsWithoutAppendingDuplicate(t *testing.T) {
+	st := openTestStore(t)
+	s := newTestServer(t, st)
+	_, events := s.subscribe()
+	defer s.unsubscribe("1")
+
+	seq, err := st.AppendEvent(context.Background(), "op-1", "conn-1", "operation.step_succeeded", "succeeded", time.Now().UTC(), []byte(`{"step_id":"step-1"}`))
+	if err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	if err := s.DispatchCommittedEvents(context.Background()); err != nil {
+		t.Fatalf("DispatchCommittedEvents: %v", err)
+	}
+	select {
+	case got := <-events:
+		if got.Sequence != seq || got.OperationID != "op-1" || got.ConnectionID != "conn-1" || got.Type != "operation.step_succeeded" {
+			t.Fatalf("unexpected dispatched event: %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for committed event dispatch")
+	}
+	all, err := st.GetDurableEventsSince(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("dispatch must not append a duplicate event, got %d rows", len(all))
+	}
+}
+
+func TestNewServerRequiresDurableStore(t *testing.T) {
+	_, err := NewServer(filepath.Join(t.TempDir(), "test.sock"), nullHandler{}, nil)
+	if err == nil {
+		t.Fatal("expected nil durable store to be rejected")
 	}
 }
 
@@ -149,5 +239,83 @@ func TestReplayFromCursor(t *testing.T) {
 		if e.Sequence <= cursor {
 			t.Fatalf("replay returned event at or before cursor: %d <= %d", e.Sequence, cursor)
 		}
+	}
+}
+
+func TestReplayPagesBeyondThousandEvents(t *testing.T) {
+	st := openTestStore(t)
+	s := newTestServer(t, st)
+	tx, err := st.DB().Begin()
+	if err != nil {
+		t.Fatalf("begin event seed: %v", err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO events (operation_id, connection_id, occurred_at, event_type, stage, payload_json)
+		VALUES ('op-1', 'conn-1', '2026-07-25T12:00:00Z', 'replay.test', 'succeeded', '{}')`)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("prepare event seed: %v", err)
+	}
+	for i := 0; i < 1001; i++ {
+		if _, err := stmt.Exec(); err != nil {
+			stmt.Close()
+			tx.Rollback()
+			t.Fatalf("seed event %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		tx.Rollback()
+		t.Fatalf("close event statement: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit event seed: %v", err)
+	}
+	highWater := s.CurrentSeq()
+	replayed, err := s.getPersistentEventsUntil(0, highWater)
+	if err != nil {
+		t.Fatalf("getPersistentEventsUntil: %v", err)
+	}
+	if len(replayed) != 1001 {
+		t.Fatalf("replayed %d events, want 1001", len(replayed))
+	}
+	if replayed[0].Sequence != 1 || replayed[len(replayed)-1].Sequence != highWater {
+		t.Fatalf("unexpected replay bounds: first=%d last=%d highWater=%d", replayed[0].Sequence, replayed[len(replayed)-1].Sequence, highWater)
+	}
+}
+
+func TestWriteHandlerErrorUsesTypedDomainStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "validation", err: core.ErrValidation("invalid input"), want: http.StatusUnprocessableEntity},
+		{name: "not found", err: core.ErrProfileNotFound("missing"), want: http.StatusNotFound},
+		{name: "conflict", err: core.ErrConnectionExists("existing"), want: http.StatusConflict},
+		{name: "stale", err: core.ErrStalePlan("plan", "changed"), want: http.StatusPreconditionFailed},
+		{name: "untyped is internal", err: errors.New("profile not found but untyped"), want: http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			writeHandlerError(rr, "TEST", tt.err)
+			if rr.Code != tt.want {
+				t.Fatalf("status=%d, want %d", rr.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestDiagnosticsMapsTypedHandlerError(t *testing.T) {
+	st := openTestStore(t)
+	socket := filepath.Join(t.TempDir(), "test.sock")
+	s, err := NewServer(socket, diagnosticsErrorHandler{err: core.ErrProfileNotFound("missing")}, st)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/diagnostics/missing", nil)
+	rr := httptest.NewRecorder()
+	s.handleDiagnostics(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("diagnostics status=%d, want %d", rr.Code, http.StatusNotFound)
 	}
 }

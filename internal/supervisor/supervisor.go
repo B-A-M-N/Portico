@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,15 +12,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/app"
-	"github.com/paoloanzn/portico/internal/controller"
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/diagnostics"
-	"github.com/paoloanzn/portico/internal/discovery"
-	"github.com/paoloanzn/portico/internal/ipc"
-	"github.com/paoloanzn/portico/internal/process"
-	"github.com/paoloanzn/portico/internal/provider"
-	"github.com/paoloanzn/portico/internal/store"
+	"github.com/B-A-M-N/portico/internal/app"
+	"github.com/B-A-M-N/portico/internal/controller"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/diagnostics"
+	"github.com/B-A-M-N/portico/internal/discovery"
+	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/origin"
+	"github.com/B-A-M-N/portico/internal/process"
+	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 // Supervisor is the local daemon that owns the database, manages processes,
@@ -41,6 +43,16 @@ type Supervisor struct {
 	// Discovery, diagnostics, and origins
 	discoverer discovery.Discoverer
 	diagEngine *diagnostics.Engine
+	origins    *origin.Manager
+}
+
+type cleanupRecorder struct{ store *store.Store }
+
+func (r cleanupRecorder) RecordCleanupItem(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, providerID core.ProviderID, resourceType core.ResourceType, externalID, state, lastError string) error {
+	return r.store.RecordCleanupItem(ctx, store.CleanupItem{
+		OperationID: operationID, ConnectionID: connectionID, ProviderID: providerID,
+		ResourceType: resourceType, ExternalID: externalID, State: state, LastError: lastError,
+	})
 }
 
 // New creates a new supervisor.
@@ -70,20 +82,82 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 	ctrl.SetConnectionStorer(st)
 	ctrl.SetResourceRemover(st)
 	ctrl.SetRuntimeCommitter(st)
+	ctrl.SetRuntimeSaver(st)
 	ctrl.SetResourceSaver(st)
 	ctrl.SetCredentialStorer(st)
 	ctrl.SetStepCommitter(st)
+	ctrl.SetCleanupRecorder(cleanupRecorder{store: st})
 	ctrl.SetProfileUpdater(st)
+	origins := origin.NewManager()
+	ctrl.SetOriginManager(origins)
 
-	return &Supervisor{
+	sup := &Supervisor{
 		store:      st,
 		controller: ctrl,
 		procMgr:    procMgr,
 		registry:   registry,
 		paths:      paths,
 		lock:       lock,
+		origins:    origins,
 		stopCh:     make(chan struct{}),
-	}, nil
+	}
+	procMgr.SetEventSink(sup.handleProcessEvent)
+	return sup, nil
+}
+
+// handleProcessEvent consumes actor lifecycle events and keeps the durable
+// runtime projection synchronized with the real connector process.
+func (s *Supervisor) handleProcessEvent(event process.ProcessEvent) {
+	select {
+	case <-s.stopCh:
+		return // shutdown owns ordering; never write after it begins closing storage
+	default:
+	}
+	rt, ok := s.controller.GetRuntime(event.ConnectionID)
+	if !ok {
+		return
+	}
+	rt.Connector.PID = event.Identity.PID
+	rt.Connector.StartTime = event.Identity.StartTime
+	rt.Connector.Executable = event.Identity.ExecutablePath
+	rt.Connector.CommandHash = event.Identity.CommandHash
+	rt.Connector.Restarts = event.Restarts
+	rt.Connector.LastError = event.Error
+	switch event.Status {
+	case process.ProcessStatusRunning:
+		rt.Connector.Status = core.ConnectorStatusRunning
+	case process.ProcessStatusStarting:
+		rt.Connector.Status = core.ConnectorStatusStarting
+	case process.ProcessStatusStopped:
+		rt.Connector.Status = core.ConnectorStatusStopped
+	case process.ProcessStatusUnstable:
+		rt.Connector.Status = core.ConnectorStatusUnstable
+		rt.State = core.RuntimeDegraded
+	default:
+		rt.Connector.Status = core.ConnectorStatusCrashed
+		if rt.State == core.RuntimeOpen {
+			rt.State = core.RuntimeDegraded
+		}
+	}
+	rt.LastTransition = event.Timestamp
+	payload := map[string]interface{}{
+		"connection_id": string(event.ConnectionID),
+		"stage":         string(event.Status),
+		"restarts":      event.Restarts,
+		"error":         event.Error,
+	}
+	if _, err := s.store.CommitConnectorRuntimeEvent(
+		context.Background(), rt, "connector."+string(event.Type), string(event.Status), event.Timestamp, payload,
+	); err != nil {
+		slog.Error("persist connector process event", "connection", event.ConnectionID, "type", event.Type, "err", err)
+		return
+	}
+	s.controller.RestoreRuntime(rt)
+	if s.ipcServer != nil {
+		if err := s.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
+			slog.Error("dispatch connector process event", "connection", event.ConnectionID, "type", event.Type, "err", err)
+		}
+	}
 }
 
 // Start initializes the supervisor and begins serving.
@@ -171,16 +245,25 @@ func (s *Supervisor) reconcileLoop(ctx context.Context) {
 func (s *Supervisor) reconcileAll(ctx context.Context) {
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
+		if s.registry.Get(p.Provider.ProviderID) == nil {
+			s.markProviderUnavailable(ctx, p)
+			continue
+		}
 		input := ReconcileInput{Profile: p}
 		if rt, ok := s.controller.GetRuntime(p.ID); ok {
 			input.Runtime = rt
 			input.Resources = rt.Provider.Resources
+		} else if resources, err := s.store.ListResourcesByConnection(ctx, p.ID); err != nil {
+			slog.Warn("reconcile: load persisted resources", "connection", p.ID, "err", err)
+		} else {
+			// Runtime is a projection and may be absent after an interrupted
+			// bootstrap. Durable resource inventory remains authoritative for
+			// deciding whether a full open would duplicate infrastructure.
+			input.Resources = resources
 		}
 		// Best-effort provider observation for authoritative decisions.
-		if prov := s.registry.Get(p.Provider.ProviderID); prov != nil {
-			if obs, err := prov.Observe(ctx, p.ID); err == nil {
-				input.Observed = obs
-			}
+		if obs, err := s.observeConnection(ctx, p.ID); err == nil {
+			input.Observed = obs
 		}
 
 		decision, err := s.computeReconcileDecision(ctx, input)
@@ -221,8 +304,12 @@ type supervisorHandler struct {
 }
 
 func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
-	profiles := h.sup.controller.ListProfiles()
-	runtimes := h.sup.controller.ListRuntimes()
+	state, err := h.sup.store.ReadSnapshot(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot: %w", err)
+	}
+	profiles := state.Profiles
+	runtimes := state.Runtimes
 
 	rtMap := make(map[core.ConnectionID]*core.ConnectionRuntime)
 	for _, rt := range runtimes {
@@ -266,6 +353,7 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 	return &ipc.SnapshotDTO{
 		Connections: connDTOs,
 		Providers:   provDTOs,
+		LastSeq:     state.LastSeq,
 	}, nil
 }
 
@@ -281,7 +369,7 @@ func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, 
 	cid := core.ConnectionID(id)
 	p, ok := h.sup.controller.GetProfile(cid)
 	if !ok {
-		return nil, fmt.Errorf("connection not found: %s", id)
+		return nil, core.ErrProfileNotFound(cid)
 	}
 	rt, _ := h.sup.controller.GetRuntime(cid)
 
@@ -331,6 +419,9 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 			Address:  req.Source.Existing.Address,
 			Protocol: core.Protocol(req.Source.Existing.Protocol),
 		}
+		if profile.Source.Existing.Protocol == "" {
+			profile.Source.Existing.Protocol = core.ProtocolHTTP
+		}
 	}
 	if req.Source.Directory != nil {
 		profile.Source.Directory = &core.DirectorySpec{
@@ -350,6 +441,9 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 			Port:       req.Source.Command.Port,
 			Protocol:   core.Protocol(req.Source.Command.Protocol),
 			UseShell:   req.Source.Command.UseShell,
+		}
+		if profile.Source.Command.Protocol == "" {
+			profile.Source.Command.Protocol = core.ProtocolHTTP
 		}
 	}
 	if req.Source.MCP != nil {
@@ -418,12 +512,14 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 	// CreateProfile persists atomically via the ConnectionStorer when configured;
 	// the canonical values are returned for event publication and the Get response.
 
-	// Publish event.
-	h.sup.ipcServer.PublishEvent(ipc.EventDTO{
-		Type:      "connection.created",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data:      map[string]string{"connection_id": string(canonicalProfile.ID)},
-	})
+	// Connection creation committed its normalized event in the same database
+	// transaction. IPC only broadcasts committed rows; reconnecting clients can
+	// replay it if delivery fails here.
+	if h.sup.ipcServer != nil {
+		if err := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
+			slog.Warn("dispatch connection creation event", "connection", canonicalProfile.ID, "err", err)
+		}
+	}
 
 	return h.HandleGetConnection(string(canonicalProfile.ID))
 }
@@ -501,15 +597,11 @@ func (h *supervisorHandler) HandleApplyPlan(planID string) (*ipc.OperationDTO, e
 		return nil, err
 	}
 
-	// Publish event.
-	h.sup.ipcServer.PublishEvent(ipc.EventDTO{
-		Type:      "operation.created",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data: map[string]string{
-			"operation_id":  string(op.ID),
-			"connection_id": string(op.ConnectionID),
-		},
-	})
+	if h.sup.ipcServer != nil {
+		if err := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
+			slog.Warn("dispatch operation creation event", "operation", op.ID, "err", err)
+		}
+	}
 
 	dto := &ipc.OperationDTO{
 		ID:           string(op.ID),
@@ -529,81 +621,7 @@ func (h *supervisorHandler) HandleListProviders() ([]ipc.ProviderDTO, error) {
 	return snap.Providers, nil
 }
 
-func (h *supervisorHandler) HandleDeleteConnection(id string) error {
-	cid := core.ConnectionID(id)
-	ctx := context.Background()
-
-	// Generate and apply a delete plan through the standard plan lifecycle,
-	// so that operation events and transactional finalization both fire.
-	plan, err := h.sup.controller.PlanDelete(ctx, cid)
-	if err != nil {
-		return fmt.Errorf("plan delete: %w", err)
-	}
-
-	if err := h.sup.controller.SavePlan(plan); err != nil {
-		return fmt.Errorf("save delete plan: %w", err)
-	}
-	if err := h.sup.store.SavePlan(ctx, plan); err != nil {
-		return fmt.Errorf("persist delete plan: %w", err)
-	}
-
-	op, err := h.sup.controller.ApplyPlan(ctx, plan.ID)
-	if err != nil {
-		return fmt.Errorf("apply delete plan: %w", err)
-	}
-
-	h.sup.ipcServer.PublishEvent(ipc.EventDTO{
-		Type:      "operation.created",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data: map[string]string{
-			"operation_id":  string(op.ID),
-			"connection_id": string(op.ConnectionID),
-		},
-	})
-
-	// Wait for the operation to complete so the EventOperationCompleted
-	// handler can call FinalizeDeletion transactionally.
-	// ApplyPlan starts the provider goroutine and returns immediately;
-	// the operation completes asynchronously via the event channel.
-	deadline := time.Now().Add(10 * time.Second)
-	deleted := false
-	failed := false
-	for time.Now().Before(deadline) {
-		snap, ok := h.sup.controller.GetOperation(op.ID)
-		if !ok {
-			break
-		}
-		if snap.State == controller.OperationStateCompleted {
-			deleted = true
-			break
-		}
-		if snap.State == controller.OperationStateFailed {
-			failed = true
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	if deleted {
-		h.sup.ipcServer.PublishEvent(ipc.EventDTO{
-			Type:      "connection.deleted",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Data:      map[string]string{"connection_id": id},
-		})
-		return nil
-	}
-
-	if failed {
-		return fmt.Errorf("delete operation failed for connection %s (operation %s)", id, op.ID)
-	}
-
-	// Timeout or operation still running — return the operation ID for polling.
-	slog.Warn("delete operation timed out or still running",
-		"connection", id, "operation", op.ID)
-	return fmt.Errorf("delete operation timed out for connection %s: operation %s still in progress", id, op.ID)
-}
-
-// --------------- new handler methods ---------------
+// --------------- handler methods ---------------
 
 func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConnectionRequest) (*ipc.ConnectionDTO, error) {
 	cid := core.ConnectionID(id)
@@ -611,7 +629,7 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 
 	profile, ok := h.sup.controller.GetProfile(cid)
 	if !ok {
-		return nil, fmt.Errorf("connection not found: %s", id)
+		return nil, core.ErrProfileNotFound(cid)
 	}
 
 	if req.Name != nil {
@@ -627,6 +645,11 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 	if err := h.sup.controller.UpdateProfile(ctx, profile, expectedRevision); err != nil {
 		return nil, err
 	}
+	if h.sup.ipcServer != nil {
+		if err := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
+			slog.Warn("dispatch connection update event", "connection", cid, "err", err)
+		}
+	}
 
 	return h.HandleGetConnection(id)
 }
@@ -635,18 +658,44 @@ func (h *supervisorHandler) HandlePlanRepair(id string) (*ipc.PlanDTO, error) {
 	cid := core.ConnectionID(id)
 	ctx := context.Background()
 
-	repairPlan, err := h.sup.controller.PlanRepair(ctx, cid)
-	if errors.Is(err, controller.ErrNoRepairNeeded) {
-		// Connection is healthy - return an explicit no-op response.
-		return &ipc.PlanDTO{
-			ID:           "",
-			ConnectionID: id,
-			Intent:       "repair",
-			Steps:        []ipc.StepDTO{},
-		}, nil
+	profile, ok := h.sup.controller.GetProfile(cid)
+	if !ok {
+		return nil, core.ErrProfileNotFound(cid)
 	}
-	if err != nil {
-		return nil, err
+	// Prefer the authoritative desired-versus-observed delta planner. It can
+	// produce narrowly scoped repairs (for example one DNS record) that the
+	// controller's connector-focused fallback cannot infer from runtime alone.
+	var repairPlan *core.OperationPlan
+	if profile.Desired == core.DesiredOpen {
+		resources, err := h.sup.store.ListResourcesByConnection(ctx, cid)
+		if err != nil {
+			return nil, fmt.Errorf("load repair resources: %w", err)
+		}
+		runtime, _ := h.sup.controller.GetRuntime(cid)
+		observed, observeErr := h.sup.observeConnection(ctx, cid)
+		if observeErr == nil {
+			decision, decisionErr := h.sup.computeReconcileDecision(ctx, ReconcileInput{
+				Profile: profile, Runtime: runtime, Resources: resources, Observed: observed,
+			})
+			if decisionErr != nil {
+				return nil, decisionErr
+			}
+			if decision.Action == "repair" && decision.Plan != nil && decision.Plan.Intent == core.IntentRepair {
+				repairPlan = decision.Plan
+			} else if decision.Action == "none" {
+				return &ipc.PlanDTO{ConnectionID: id, Intent: "repair", Steps: []ipc.StepDTO{}, Noop: true}, nil
+			}
+		}
+	}
+	if repairPlan == nil {
+		var err error
+		repairPlan, err = h.sup.controller.PlanRepair(ctx, cid)
+		if err != nil {
+			if errors.Is(err, controller.ErrNoRepairNeeded) {
+				return &ipc.PlanDTO{ConnectionID: id, Intent: "repair", Steps: []ipc.StepDTO{}, Noop: true}, nil
+			}
+			return nil, err
+		}
 	}
 
 	// Persist the plan through canonical path so controller and store agree.
@@ -664,7 +713,7 @@ func (h *supervisorHandler) HandlePlanRepair(id string) (*ipc.PlanDTO, error) {
 	return &ipc.PlanDTO{
 		ID:           string(repairPlan.ID),
 		ConnectionID: id,
-		Intent:       "repair",
+		Intent:       string(repairPlan.Intent),
 		Provider:     string(repairPlan.Provider),
 		Steps:        steps,
 	}, nil
@@ -716,7 +765,7 @@ func (h *supervisorHandler) HandlePlanDelete(id string) (*ipc.PlanDTO, error) {
 func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 	prov := h.sup.registry.Get(core.ProviderID(id))
 	if prov == nil {
-		return fmt.Errorf("provider not found: %s", id)
+		return core.ErrProviderNotFound(core.ProviderID(id))
 	}
 	return prov.Authenticate(context.Background(), core.AuthRequest{
 		ProviderID: core.ProviderID(id),
@@ -727,8 +776,19 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 // A connector tracked by the process manager is running; otherwise the
 // controller runtime's last observed status is used.
 func (s *Supervisor) observeConnectorStatus(ctx context.Context, connID core.ConnectionID) (core.ConnectorStatus, bool) {
-	if _, ok := s.procMgr.Observe(connID); ok {
-		return core.ConnectorStatusRunning, true
+	if managed, ok := s.procMgr.GetProcess(connID); ok {
+		switch managed.Status {
+		case process.ProcessStatusRunning:
+			return core.ConnectorStatusRunning, true
+		case process.ProcessStatusStarting:
+			return core.ConnectorStatusStarting, true
+		case process.ProcessStatusStopped:
+			return core.ConnectorStatusStopped, true
+		case process.ProcessStatusUnstable:
+			return core.ConnectorStatusUnstable, true
+		default:
+			return core.ConnectorStatusCrashed, true
+		}
 	}
 	if rt, ok := s.controller.GetRuntime(connID); ok {
 		return rt.Connector.Status, true
@@ -739,15 +799,14 @@ func (s *Supervisor) observeConnectorStatus(ctx context.Context, connID core.Con
 // observeProviderState backs the diagnostics engine's ProviderObserver
 // using the provider registry's observation.
 func (s *Supervisor) observeProviderState(ctx context.Context, connID core.ConnectionID) (*core.ObservedConnection, error) {
-	p, ok := s.controller.GetProfile(connID)
-	if !ok {
-		return nil, fmt.Errorf("connection not found: %s", connID)
-	}
-	prov := s.registry.Get(p.Provider.ProviderID)
-	if prov == nil {
-		return nil, fmt.Errorf("provider not available: %s", p.Provider.ProviderID)
-	}
-	return prov.Observe(ctx, connID)
+	return s.observeConnection(ctx, connID)
+}
+
+// observeConnection is the sole supervisor observation path. Controller
+// observation supplies persisted resources to ResourceAwareObserver providers
+// and updates the runtime projection in the same place.
+func (s *Supervisor) observeConnection(ctx context.Context, connID core.ConnectionID) (*core.ObservedConnection, error) {
+	return s.controller.Observe(ctx, connID)
 }
 
 // persistCanonicalPlan canonicalizes a plan through persistence first,
@@ -765,55 +824,79 @@ func (s *Supervisor) persistCanonicalPlan(ctx context.Context, candidate *core.O
 }
 
 func (h *supervisorHandler) HandleGetOperation(id string) (*ipc.OperationDTO, error) {
-	op, ok := h.sup.controller.GetOperation(core.OperationID(id))
-	if !ok {
-		return nil, fmt.Errorf("operation not found: %s", id)
+	op, err := h.sup.store.GetOperation(context.Background(), core.OperationID(id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, core.ErrOperationNotFound(core.OperationID(id))
 	}
-
-	steps := make([]ipc.StepDTO, len(op.StepEvents))
-	for i, se := range op.StepEvents {
-		steps[i] = ipc.StepDTO{
-			ID:      se.StepID,
-			Summary: se.Summary,
-		}
+	if err != nil {
+		return nil, fmt.Errorf("load operation: %w", err)
 	}
-
+	events, err := h.sup.store.GetOperationEvents(context.Background(), op.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load operation events: %w", err)
+	}
+	steps := operationSteps(events)
 	dto := &ipc.OperationDTO{
 		ID:           string(op.ID),
 		PlanID:       string(op.PlanID),
 		ConnectionID: string(op.ConnectionID),
 		State:        string(op.State),
 		Steps:        steps,
-		StartedAt:    op.StartedAt.Format(time.RFC3339),
+		StartedAt:    op.StartedAt,
 	}
-	if !op.CompletedAt.IsZero() {
-		dto.CompletedAt = op.CompletedAt.Format(time.RFC3339)
+	if op.CompletedAt != "" {
+		dto.CompletedAt = op.CompletedAt
 	}
-	if op.Error != nil {
-		dto.Error = op.Error.Error()
+	if op.Error != "" {
+		dto.Error = op.Error
 	}
 	return dto, nil
 }
 
 func (h *supervisorHandler) HandleGetOperationEvents(id string) ([]ipc.EventDTO, error) {
-	op, ok := h.sup.controller.GetOperation(core.OperationID(id))
-	if !ok {
-		return nil, fmt.Errorf("operation not found: %s", id)
+	op, err := h.sup.store.GetOperation(context.Background(), core.OperationID(id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, core.ErrOperationNotFound(core.OperationID(id))
 	}
-
-	events := make([]ipc.EventDTO, len(op.StepEvents))
-	for i, se := range op.StepEvents {
+	if err != nil {
+		return nil, fmt.Errorf("load operation: %w", err)
+	}
+	journal, err := h.sup.store.GetDurableEventsForOperation(context.Background(), op.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load operation events: %w", err)
+	}
+	events := make([]ipc.EventDTO, len(journal))
+	for i, event := range journal {
 		events[i] = ipc.EventDTO{
-			Sequence:  int64(i + 1),
-			Type:      "operation.step_" + string(se.Stage),
-			Timestamp: se.Timestamp.Format(time.RFC3339),
-			Data: map[string]string{
-				"step_id": se.StepID,
-				"summary": se.Summary,
-			},
+			Sequence:     event.Event.Sequence,
+			OperationID:  string(event.OperationID),
+			ConnectionID: string(event.ConnectionID),
+			Type:         string(event.Event.Type),
+			Stage:        event.Stage,
+			Timestamp:    event.Event.Timestamp.Format(time.RFC3339),
+			Data:         event.Event.Data,
 		}
 	}
 	return events, nil
+}
+
+func operationSteps(events []store.OperationJournalEvent) []ipc.StepDTO {
+	byID := make(map[string]ipc.StepDTO)
+	order := make([]string, 0, len(events))
+	for _, event := range events {
+		if event.StepID == "" {
+			continue
+		}
+		if _, seen := byID[event.StepID]; !seen {
+			order = append(order, event.StepID)
+		}
+		byID[event.StepID] = ipc.StepDTO{ID: event.StepID, Summary: event.Summary}
+	}
+	steps := make([]ipc.StepDTO, 0, len(order))
+	for _, id := range order {
+		steps = append(steps, byID[id])
+	}
+	return steps
 }
 
 func (h *supervisorHandler) HandleDiscovery() (*ipc.DiscoveryDTO, error) {
@@ -851,6 +934,7 @@ func (h *supervisorHandler) runDiscovery(refresh bool) (*ipc.DiscoveryDTO, error
 			Address:    svc.Address,
 			Port:       svc.Port,
 			Protocol:   svc.Protocol,
+			Framework:  svc.Framework,
 			Confidence: string(svc.Confidence),
 			PID:        svc.PID,
 			Process:    svc.Process,
@@ -867,7 +951,7 @@ func (h *supervisorHandler) HandleDiagnostics(connID string) ([]ipc.DiagnosticDT
 	if h.sup.diagEngine != nil {
 		profile, ok := h.sup.controller.GetProfile(cid)
 		if !ok {
-			return nil, fmt.Errorf("connection not found: %s", connID)
+			return nil, core.ErrProfileNotFound(cid)
 		}
 		rt, _ := h.sup.controller.GetRuntime(cid)
 
@@ -885,6 +969,15 @@ func (h *supervisorHandler) HandleDiagnostics(connID string) ([]ipc.DiagnosticDT
 			return nil, err
 		}
 		findings = fs
+	}
+	if err := h.sup.store.SyncFindings(context.Background(), cid, findings); err != nil {
+		return nil, fmt.Errorf("persist diagnostics: %w", err)
+	}
+	h.sup.controller.ReplaceDiagnostics(cid, findings)
+	if h.sup.ipcServer != nil {
+		if err := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
+			return nil, fmt.Errorf("dispatch diagnostic events: %w", err)
+		}
 	}
 
 	dtos := make([]ipc.DiagnosticDTO, len(findings))

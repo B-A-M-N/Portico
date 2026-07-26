@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/paoloanzn/portico/internal/access"
-	"github.com/paoloanzn/portico/internal/session"
-	"github.com/paoloanzn/portico/internal/tunnel"
+	"github.com/B-A-M-N/portico/internal/access"
+	"github.com/B-A-M-N/portico/internal/session"
+	"github.com/B-A-M-N/portico/internal/tunnel"
 )
 
 // --- MockTunnelManager ---

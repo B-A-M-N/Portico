@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // VerifyIdentity checks that the process identity stored in a ManagedProcess
@@ -188,8 +188,9 @@ func computeSpecHash(spec core.ProcessSpec) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// CaptureProcessIdentity captures the full identity of a running process.
-func CaptureProcessIdentity(pid int) (core.ProcessIdentity, error) {
+// captureProcessIdentity reads the full identity of a running process once.
+// Callers that have just launched a process should use captureIdentityStable.
+func captureProcessIdentity(pid int) (core.ProcessIdentity, error) {
 	procStat, err := parseProcStat(pid)
 	if err != nil {
 		return core.ProcessIdentity{}, err
@@ -210,6 +211,13 @@ func CaptureProcessIdentity(pid int) (core.ProcessIdentity, error) {
 	}, nil
 }
 
+// CaptureProcessIdentity captures the full identity of a running process.
+// It waits for a stable post-exec /proc view so callers adopting a freshly
+// launched process cannot accidentally record the parent/pre-exec command.
+func CaptureProcessIdentity(pid int) (core.ProcessIdentity, error) {
+	return captureIdentityStable(pid, 500*time.Millisecond)
+}
+
 // captureIdentityStable captures the identity of a just-started process.
 // Immediately after fork, /proc/<pid>/cmdline can transiently be empty (or
 // reflect the pre-exec image) until execve fully completes. Capturing at
@@ -220,13 +228,20 @@ func CaptureProcessIdentity(pid int) (core.ProcessIdentity, error) {
 // whose cmdline is permanently empty).
 func captureIdentityStable(pid int, deadline time.Duration) (core.ProcessIdentity, error) {
 	end := time.Now().Add(deadline)
+	// execve happens in the child after Start returns. Give it a short window
+	// before inspecting /proc; merely seeing a non-empty cmdline is not enough
+	// because it can still describe the inherited pre-exec image.
+	notBefore := time.Now().Add(10 * time.Millisecond)
 	for {
+		if now := time.Now(); now.Before(notBefore) {
+			time.Sleep(notBefore.Sub(now))
+		}
 		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		if err == nil && len(data) > 0 {
-			return CaptureProcessIdentity(pid)
+			return captureProcessIdentity(pid)
 		}
 		if err != nil || time.Now().After(end) {
-			return CaptureProcessIdentity(pid)
+			return captureProcessIdentity(pid)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

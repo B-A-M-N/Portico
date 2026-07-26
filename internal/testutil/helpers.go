@@ -3,7 +3,7 @@ package testutil
 import (
 	"time"
 
-	"github.com/paoloanzn/portico/internal/session"
+	"github.com/B-A-M-N/portico/internal/session"
 )
 
 // MakeTestSession creates a session with sensible defaults for testing.

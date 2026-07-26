@@ -3,8 +3,10 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,7 @@ type DiscoveredService struct {
 	Address    string
 	Port       int
 	Protocol   string // "http", "https", "unknown-tcp", or "udp"
+	Framework  string
 	PID        int
 	Process    string
 	Confidence Confidence
@@ -169,8 +172,9 @@ func (d *CachedDiscoverer) scan(ctx context.Context) (*Result, error) {
 // classify enriches one listener with process metadata, probes it when
 // it is a TCP listener, and assigns an evidence-based classification.
 func (d *CachedDiscoverer) classify(ctx context.Context, sock ListeningSocket) DiscoveredService {
+	host := probeHost(sock.Address)
 	svc := DiscoveredService{
-		Address: fmt.Sprintf("127.0.0.1:%d", sock.Port),
+		Address: net.JoinHostPort(host, strconv.Itoa(sock.Port)),
 		Port:    sock.Port,
 		PID:     sock.PID,
 		Process: sock.Process,
@@ -178,18 +182,16 @@ func (d *CachedDiscoverer) classify(ctx context.Context, sock ListeningSocket) D
 
 	// Process enrichment from /proc where available.
 	if sock.PID > 0 && d.procInfo != nil {
-		comm, cmdline := d.procInfo(sock.PID)
+		comm, _ := d.procInfo(sock.PID)
 		if svc.Process == "" && comm != "" {
 			svc.Process = comm
-		}
-		if cmdline != "" {
-			svc.Evidence = append(svc.Evidence, "cmdline: "+cmdline)
 		}
 	}
 	hasProcess := svc.Process != ""
 	if hasProcess {
 		svc.Evidence = append(svc.Evidence,
 			fmt.Sprintf("process: %s (pid %d)", svc.Process, sock.PID))
+		svc.Framework = classifyFramework(svc.Process)
 	}
 
 	if !isTCP(sock.Protocol) {
@@ -200,6 +202,11 @@ func (d *CachedDiscoverer) classify(ctx context.Context, sock ListeningSocket) D
 	}
 
 	outcome := d.prober.Probe(ctx, sock.Port)
+	if addressProber, ok := d.prober.(interface {
+		ProbeAddress(context.Context, string, int) ProbeOutcome
+	}); ok {
+		outcome = addressProber.ProbeAddress(ctx, host, sock.Port)
+	}
 	svc.Evidence = append(svc.Evidence, outcome.Evidence...)
 	switch outcome.Scheme {
 	case "http":
@@ -220,6 +227,32 @@ func (d *CachedDiscoverer) classify(ctx context.Context, sock ListeningSocket) D
 		svc.Confidence = ConfidenceLikely
 	}
 	return svc
+}
+
+func probeHost(bindAddress string) string {
+	switch bindAddress {
+	case "::1", "[::1]", "::", "[::]":
+		return "::1"
+	default:
+		return "127.0.0.1"
+	}
+}
+
+func classifyFramework(process string) string {
+	switch strings.ToLower(process) {
+	case "node", "npm", "yarn", "pnpm", "bun":
+		return "Node.js"
+	case "python", "python3", "uvicorn", "gunicorn":
+		return "Python"
+	case "go":
+		return "Go"
+	case "ruby", "rails":
+		return "Ruby"
+	case "java":
+		return "Java"
+	default:
+		return ""
+	}
 }
 
 // selectCandidates filters listeners to local bind addresses with a

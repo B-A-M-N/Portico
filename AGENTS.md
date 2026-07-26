@@ -55,8 +55,8 @@ internal/
 2. **Git history starts at the Portico baseline commit.** Repo originated from `paoloanzn/flare-cli`; pre-rename history is gone.
 3. **`portico legacy ...` still active.** Old flare-cli commands preserved in `cmd/`, hidden from help.
 4. **Only Cloudflare + mock providers exist.** Ngrok, Tailscale, zrok directories are SPEC-only stubs.
-5. **Tunnel logs use `~/.config/flare-cli/logs`.** Legacy path not yet migrated to XDG state dir.
-6. **Credentials never serialized** into plans, events, logs, runtimes, or UI. Resolved by reference at operation time.
+5. **Tunnel logs use Portico's XDG state log directory.** Legacy Flare paths are compatibility-read only.
+6. **Credentials never serialized** into plans, events, logs, runtimes, or UI. Resolved by reference at operation time; durable tunnel credentials are keyed by exact connection, provider, and tunnel identity.
 7. **Plan fingerprints are SHA-256** of canonical JSON (`core/plan.go:ComputeFingerprint`).
 8. **Process identity uses 4 fields** (PID, StartTime, ExecutablePath, CommandHash) — never signal on PID alone.
 9. **Restart backoff:** 5 attempts in 10-min window (1s, 2s, 5s, 10s, 30s), then mark unstable.

@@ -10,6 +10,7 @@ import (
 // Manager manages Cloudflare DNS records.
 type Manager interface {
 	CreateCNAME(ctx context.Context, zoneID, hostname, tunnelID string) (recordID string, err error)
+	UpdateCNAME(ctx context.Context, zoneID, recordID, hostname, tunnelID string) error
 	GetRecord(ctx context.Context, zoneID, recordID string) (*RecordState, error)
 	DeleteRecord(ctx context.Context, zoneID, recordID string) error
 }
@@ -44,13 +45,33 @@ func (m *APIManager) CreateCNAME(ctx context.Context, zoneID, hostname, tunnelID
 		Content: fmt.Sprintf("%s.cfargotunnel.com", tunnelID),
 		TTL:     1, // Auto TTL.
 		Proxied: &proxied,
-		Comment: "Created by flare-cli",
+		Comment: "Created by Portico",
 	})
 	if err != nil {
 		return "", fmt.Errorf("creating CNAME record: %w", err)
 	}
 
 	return record.ID, nil
+}
+
+// UpdateCNAME retargets one exact managed CNAME record without deleting and
+// recreating it. This preserves the durable resource identity and avoids an
+// ambiguous intermediate state if the provider call fails.
+func (m *APIManager) UpdateCNAME(ctx context.Context, zoneID, recordID, hostname, tunnelID string) error {
+	rc := cf.ZoneIdentifier(zoneID)
+	proxied := true
+	_, err := m.client.UpdateDNSRecord(ctx, rc, cf.UpdateDNSRecordParams{
+		ID:      recordID,
+		Type:    "CNAME",
+		Name:    hostname,
+		Content: fmt.Sprintf("%s.cfargotunnel.com", tunnelID),
+		TTL:     1,
+		Proxied: &proxied,
+	})
+	if err != nil {
+		return fmt.Errorf("updating CNAME record: %w", err)
+	}
+	return nil
 }
 
 // GetRecord retrieves the current state of a DNS record.

@@ -116,16 +116,21 @@ type PlanStep struct {
 type StepKind string
 
 const (
-	StepValidateAccount       StepKind = "validate_account"
-	StepCreateTunnel          StepKind = "create_tunnel"
-	StepConfigureRoute        StepKind = "configure_route"
-	StepCreateDNSRecord       StepKind = "create_dns_record"
-	StepCreateAccessApp       StepKind = "create_access_application"
-	StepCreateAccessPolicy    StepKind = "create_access_policy"
-	StepStartConnector        StepKind = "start_connector"
+	StepValidateAccount    StepKind = "validate_account"
+	StepCreateTunnel       StepKind = "create_tunnel"
+	StepConfigureRoute     StepKind = "configure_route"
+	StepCreateDNSRecord    StepKind = "create_dns_record"
+	StepCreateAccessApp    StepKind = "create_access_application"
+	StepCreateAccessPolicy StepKind = "create_access_policy"
+	StepStartConnector     StepKind = "start_connector"
+	// StepStartOrigin starts a local service owned by Portico before the
+	// provider connector is started. It is deliberately separate from the
+	// connector so plans show both lifecycles and can compensate safely.
+	StepStartOrigin           StepKind = "start_origin"
 	StepVerifyConnector       StepKind = "verify_connector"
 	StepVerifyEndpoint        StepKind = "verify_endpoint"
 	StepStopConnector         StepKind = "stop_connector"
+	StepStopOrigin            StepKind = "stop_origin"
 	StepDeleteTunnel          StepKind = "delete_tunnel"
 	StepDeleteDNSRecord       StepKind = "delete_dns_record"
 	StepDeleteAccessApp       StepKind = "delete_access_application"
@@ -133,6 +138,7 @@ const (
 	StepRestartConnector      StepKind = "restart_connector"
 	StepUpdateRoute           StepKind = "update_route"
 	StepUpdateDNSRecord       StepKind = "update_dns_record"
+	StepUpdateAccessApp       StepKind = "update_access_application"
 	StepUpdateAccessPolicy    StepKind = "update_access_policy"
 	StepRecreateTunnel        StepKind = "recreate_tunnel"
 	StepFinalizeLocalDeletion StepKind = "finalize_local_deletion"
@@ -172,6 +178,11 @@ const (
 	LifecycleRemoved        ResourceLifecycle = "removed"
 	LifecycleRemovalFailed  ResourceLifecycle = "removal_failed"
 	LifecycleOrphaned       ResourceLifecycle = "orphaned"
+	// LifecycleExternallyRemoved records a managed resource that an
+	// authoritative provider lookup confirmed was deleted outside Portico.
+	// It is distinct from LifecycleRemoved, which records a Portico-owned
+	// deletion operation. Both are terminal remote-absence states.
+	LifecycleExternallyRemoved ResourceLifecycle = "externally_removed"
 )
 
 // PlanWarning represents a warning about the plan

@@ -117,3 +117,23 @@ func ErrStalePlan(id PlanID, message string) *PorticoError {
 		Retryable: true,
 	}
 }
+
+// ErrValidation reports input that cannot form a valid Portico domain object.
+// Keeping this typed lets IPC return a stable client error without inspecting
+// implementation-specific validation text.
+func ErrValidation(message string) *PorticoError {
+	return &PorticoError{
+		Code:    ErrCorePrefix + "009",
+		Message: message,
+	}
+}
+
+// ErrProviderAccountUnavailable reports a profile selecting an account that
+// the registered provider instance cannot safely serve.
+func ErrProviderAccountUnavailable(provider ProviderID, account ProviderAccountID) *PorticoError {
+	return &PorticoError{
+		Code:     ErrCorePrefix + "010",
+		Message:  fmt.Sprintf("Provider account is unavailable: provider=%s account=%s", provider, account),
+		Provider: provider,
+	}
+}

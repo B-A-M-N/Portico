@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/paoloanzn/portico/internal/core"
-	"github.com/paoloanzn/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
 )
 
 // Recommendation contains the recommendation result.

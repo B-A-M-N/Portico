@@ -10,12 +10,12 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/paoloanzn/portico/internal/access"
-	"github.com/paoloanzn/portico/internal/dns"
-	"github.com/paoloanzn/portico/internal/origin"
-	"github.com/paoloanzn/portico/internal/session"
-	"github.com/paoloanzn/portico/internal/tunnel"
-	"github.com/paoloanzn/portico/internal/ui"
+	"github.com/B-A-M-N/portico/internal/access"
+	"github.com/B-A-M-N/portico/internal/dns"
+	"github.com/B-A-M-N/portico/internal/origin"
+	"github.com/B-A-M-N/portico/internal/session"
+	"github.com/B-A-M-N/portico/internal/tunnel"
+	"github.com/B-A-M-N/portico/internal/ui"
 )
 
 // ServeParams holds the inputs for the serve pipeline.

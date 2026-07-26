@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -19,10 +20,11 @@ type StepResult struct {
 
 // CredentialMutation describes a credential that should be persisted
 // after a successful step. The controller transactionally persists
-// the credential reference alongside the step result.
+// the credential reference alongside the step result. Secret buffers
+// are zeroed by the controller after successful storage.
 type CredentialMutation struct {
 	TunnelID string
-	Token    string // opaque secret material
+	Secret   []byte // opaque secret material
 }
 
 // StepExecutionResult tracks the execution state of a single step for recovery.
@@ -46,6 +48,7 @@ type LifecycleMark struct {
 type StepCommitRequest struct {
 	OperationID  OperationID
 	ConnectionID ConnectionID
+	Provider     ProviderID
 	Step         PlanStep
 	Result       StepResult
 	Lifecycle    []LifecycleMark
@@ -68,11 +71,32 @@ type Provider interface {
 	ExecuteStep(ctx context.Context, connectionID ConnectionID, step PlanStep) (StepResult, error)
 
 	Observe(ctx context.Context, id ConnectionID) (*ObservedConnection, error)
+}
 
-	// Legacy async execution — deprecated, to be removed after migration.
-	Apply(ctx context.Context, plan OperationPlan) (<-chan Event, error)
-	Repair(ctx context.Context, plan RepairPlan) (<-chan Event, error)
-	Remove(ctx context.Context, plan RemovePlan) (<-chan Event, error)
+// ProviderAccountBinding is an optional capability implemented by providers
+// whose adapter instance is configured for one exact provider account. The
+// controller uses it to reject a profile that selected a different account
+// before planning, observing, or mutating remote infrastructure.
+//
+// An empty ID means the provider instance is not account-bound (for example,
+// a Cloudflare Quick Tunnel adapter).
+type ProviderAccountBinding interface {
+	ProviderAccountID() ProviderAccountID
+}
+
+// AccountScopedProvider supplies an account-bound child adapter for a profile
+// that selected one of several authenticated accounts. Controllers resolve the
+// child before planning, executing, or observing, so an operation can never
+// fall through to whichever account happened to be registered first.
+type AccountScopedProvider interface {
+	ProviderForAccount(accountID ProviderAccountID) (Provider, error)
+}
+
+// ResourceAwareObserver is an optional provider capability for authoritative
+// observation after a supervisor restart. The durable resource inventory is
+// supplied explicitly instead of relying on provider adapter memory.
+type ResourceAwareObserver interface {
+	ObserveWithResources(ctx context.Context, id ConnectionID, resources []ProviderResource) (*ObservedConnection, error)
 }
 
 // ResolvedOrigin describes a prepared local origin ready for provider consumption.
@@ -98,12 +122,13 @@ type AuthRequest struct {
 
 // ObservedConnection describes observed provider state
 type ObservedConnection struct {
-	ConnectionID ConnectionID
-	ProviderID   ProviderID
-	Tunnel       *ObservedTunnel
-	DNSRecords   []ObservedDNSRecord
-	AccessApps   []ObservedAccessApp
-	Connector    *ObservedConnector
+	ConnectionID   ConnectionID
+	ProviderID     ProviderID
+	Tunnel         *ObservedTunnel
+	DNSRecords     []ObservedDNSRecord
+	AccessApps     []ObservedAccessApp
+	AccessPolicies []ObservedAccessPolicy
+	Connector      *ObservedConnector
 	// ResourceStatuses records the per-resource observation
 	// classification for each persisted provider resource that was
 	// queried by exact external ID. Observation never assigns ownership.
@@ -164,11 +189,27 @@ type ObservedAccessApp struct {
 	AuthMode string
 }
 
+// ObservedAccessPolicy is the exact policy state Portico needs to compare
+// desired access protection without listing or adopting unrelated policies.
+type ObservedAccessPolicy struct {
+	ID              string
+	AppID           string
+	Decision        string
+	AllowedEmails   []string
+	AllowedDomains  []string
+	SessionDuration string
+}
+
 // ObservedConnector describes an observed connector
 type ObservedConnector struct {
-	PID       int
-	Status    string
-	StartedAt time.Time
+	PID            int
+	Status         string
+	StartedAt      time.Time
+	StartTime      uint64
+	ExecutablePath string
+	CommandHash    string
+	Restarts       int
+	LastError      string
 }
 
 // ComputeFingerprint computes a canonical fingerprint of the observed
@@ -180,42 +221,49 @@ func (o *ObservedConnection) ComputeFingerprint() (string, error) {
 		return "", nil
 	}
 	type observedHash struct {
-		ConnectionID    ConnectionID
-		ProviderID      ProviderID
-		TunnelState     string
-		ConnectorStatus string
-		ConnectorPID    int
-		DNSCount        int
-		DNSNames        []string
-		AccessAppCount  int
+		ConnectionID     ConnectionID
+		ProviderID       ProviderID
+		Tunnel           *ObservedTunnel
+		Connector        *ObservedConnector
+		DNSRecords       []ObservedDNSRecord
+		AccessApps       []ObservedAccessApp
+		AccessPolicies   []ObservedAccessPolicy
+		ResourceStatuses []ObservedResourceStatus
 	}
-
-	tunnelState := ""
-	if o.Tunnel != nil {
-		tunnelState = o.Tunnel.State
+	dnsRecords := append([]ObservedDNSRecord(nil), o.DNSRecords...)
+	sort.Slice(dnsRecords, func(i, j int) bool {
+		if dnsRecords[i].ID != dnsRecords[j].ID {
+			return dnsRecords[i].ID < dnsRecords[j].ID
+		}
+		return dnsRecords[i].Name < dnsRecords[j].Name
+	})
+	accessApps := append([]ObservedAccessApp(nil), o.AccessApps...)
+	sort.Slice(accessApps, func(i, j int) bool { return accessApps[i].ID < accessApps[j].ID })
+	accessPolicies := append([]ObservedAccessPolicy(nil), o.AccessPolicies...)
+	for i := range accessPolicies {
+		accessPolicies[i].AllowedEmails = append([]string(nil), accessPolicies[i].AllowedEmails...)
+		accessPolicies[i].AllowedDomains = append([]string(nil), accessPolicies[i].AllowedDomains...)
+		sort.Strings(accessPolicies[i].AllowedEmails)
+		sort.Strings(accessPolicies[i].AllowedDomains)
 	}
-
-	connectorStatus := ""
-	connectorPID := 0
-	if o.Connector != nil {
-		connectorStatus = o.Connector.Status
-		connectorPID = o.Connector.PID
-	}
-
-	dnsNames := make([]string, 0, len(o.DNSRecords))
-	for _, r := range o.DNSRecords {
-		dnsNames = append(dnsNames, r.Name)
-	}
+	sort.Slice(accessPolicies, func(i, j int) bool { return accessPolicies[i].ID < accessPolicies[j].ID })
+	statuses := append([]ObservedResourceStatus(nil), o.ResourceStatuses...)
+	sort.Slice(statuses, func(i, j int) bool {
+		if statuses[i].Type != statuses[j].Type {
+			return statuses[i].Type < statuses[j].Type
+		}
+		return statuses[i].ExternalID < statuses[j].ExternalID
+	})
 
 	h := observedHash{
-		ConnectionID:    o.ConnectionID,
-		ProviderID:      o.ProviderID,
-		TunnelState:     tunnelState,
-		ConnectorStatus: connectorStatus,
-		ConnectorPID:    connectorPID,
-		DNSCount:        len(o.DNSRecords),
-		DNSNames:        dnsNames,
-		AccessAppCount:  len(o.AccessApps),
+		ConnectionID:     o.ConnectionID,
+		ProviderID:       o.ProviderID,
+		Tunnel:           o.Tunnel,
+		Connector:        o.Connector,
+		DNSRecords:       dnsRecords,
+		AccessApps:       accessApps,
+		AccessPolicies:   accessPolicies,
+		ResourceStatuses: statuses,
 	}
 
 	data, err := json.Marshal(h)

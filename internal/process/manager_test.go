@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 func requireBinaries(t *testing.T, bins ...string) {
@@ -504,6 +504,36 @@ func TestStartFailureReturnsErrorAndUntracked(t *testing.T) {
 	}
 	if _, found := pm.GetProcess(connID); found {
 		t.Error("failed process still tracked")
+	}
+}
+
+func TestProcessEventsReportStartAndStop(t *testing.T) {
+	requireBinaries(t, "sleep")
+	pm := NewManager()
+	defer pm.Cleanup()
+	events := make(chan ProcessEvent, 4)
+	pm.SetEventSink(func(event ProcessEvent) { events <- event })
+	connID := core.ConnectionID("events")
+	if _, err := pm.Start(context.Background(), ProcessConfig{
+		ConnectionID: connID,
+		Spec:         core.ProcessSpec{Executable: "sleep", Args: []string{"60"}, Restart: core.RestartNever},
+	}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	started := <-events
+	if started.Type != ProcessEventStarted || started.ConnectionID != connID || started.Identity.PID <= 0 {
+		t.Fatalf("unexpected start event: %+v", started)
+	}
+	if err := pm.Stop(connID, 2*time.Second); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	select {
+	case stopped := <-events:
+		if stopped.Type != ProcessEventStopped || stopped.Status != ProcessStatusStopped {
+			t.Fatalf("unexpected stop event: %+v", stopped)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stopped event")
 	}
 }
 

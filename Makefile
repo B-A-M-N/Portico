@@ -2,9 +2,9 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS  = -s -w \
-           -X github.com/paoloanzn/portico/cmd.Version=$(VERSION) \
-           -X github.com/paoloanzn/portico/cmd.Commit=$(COMMIT) \
-           -X github.com/paoloanzn/portico/cmd.Date=$(DATE)
+           -X github.com/B-A-M-N/portico/cmd.Version=$(VERSION) \
+           -X github.com/B-A-M-N/portico/cmd.Commit=$(COMMIT) \
+           -X github.com/B-A-M-N/portico/cmd.Date=$(DATE)
 
 SHELL := /bin/bash
 

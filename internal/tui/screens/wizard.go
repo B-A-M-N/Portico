@@ -3,12 +3,14 @@ package screens
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/mail"
 	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/paoloanzn/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 // ConnectionCreator is the subset of the IPC client the wizard needs.
@@ -26,24 +28,28 @@ type ConnectionCreatedMsg struct {
 
 // WizardModel is the wizard for creating new connections.
 type WizardModel struct {
-	client   ConnectionCreator
-	state    WizardState
-	selected int
-	input    string
-	err      error
+	client         ConnectionCreator
+	state          WizardState
+	selected       int
+	input          string
+	err            error
+	fullCloudflare bool
 }
 
 // WizardState holds the state for the new connection wizard.
 type WizardState struct {
-	Step          int
-	SourceType    string
-	Name          string
-	SourceAddress string
-	Port          string
-	Hostname      string
-	ExposureMode  string
-	Protection    string
-	Provider      string
+	Step           int
+	SourceType     string
+	Name           string
+	SourceAddress  string
+	SourceProtocol string
+	Port           string
+	Hostname       string
+	ExposureMode   string
+	Protection     string
+	AllowedEmails  []string
+	AllowedDomains []string
+	Provider       string
 }
 
 // Wizard step constants
@@ -55,6 +61,7 @@ const (
 	WizardStepExposure
 	WizardStepHostname
 	WizardStepProtection
+	WizardStepProtectionRules
 	WizardStepProvider
 	WizardStepReview
 	WizardStepCreating
@@ -63,18 +70,45 @@ const (
 
 // Valid enum values (see internal/core/connection.go).
 var (
-	wizardSourceKinds = []string{"existing_service", "directory", "command", "mcp_server", "existing_service"}
-	wizardExposures   = []string{"temporary_public", "permanent_public", "private_only"}
-	wizardProtections = []string{"none", "email_otp", "identity_provider", "service_token"}
-	wizardProviders   = []string{"cloudflare", "mock"}
+	wizardSourceKinds = []string{"existing_service", "directory", "command", "mcp_server"}
+	wizardProviders   = []string{"cloudflare"}
 )
 
 // NewWizard creates a new wizard model.
-func NewWizard(client ConnectionCreator) *WizardModel {
+func NewWizard(client ConnectionCreator, fullCloudflare bool) *WizardModel {
 	return &WizardModel{
-		client: client,
-		state:  WizardState{Step: WizardStepIntent, Provider: wizardProviders[0]},
+		client:         client,
+		fullCloudflare: fullCloudflare,
+		state:          WizardState{Step: WizardStepIntent, Provider: wizardProviders[0]},
 	}
+}
+
+// NewWizardForService starts the normal wizard with a discovery result already
+// selected, so a user never has to retype a port discovered by Portico.
+func NewWizardForService(client ConnectionCreator, fullCloudflare bool, address, protocol string) *WizardModel {
+	m := NewWizard(client, fullCloudflare)
+	m.state.SourceType = "existing_service"
+	m.state.SourceAddress = address
+	m.state.SourceProtocol = protocol
+	m.state.Step = WizardStepName
+	return m
+}
+
+func (m *WizardModel) exposures() []string {
+	if m.fullCloudflare {
+		return []string{"temporary_public", "permanent_public"}
+	}
+	return []string{"temporary_public"}
+}
+
+// protections returns only choices that the selected, configured provider can
+// actually create. Cloudflare Access is available only for named (permanent)
+// tunnels, so a temporary Quick Tunnel never offers an unusable choice.
+func (m *WizardModel) protections() []string {
+	if m.fullCloudflare && m.state.ExposureMode == "permanent_public" {
+		return []string{"none", "email_otp"}
+	}
+	return []string{"none"}
 }
 
 // Step returns the current wizard step.
@@ -165,6 +199,12 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.err = fmt.Errorf("enter a port or go back and enter an address")
 				return nil
 			}
+			if m.state.SourceType == "existing_service" && port != "" {
+				if _, err := existingServiceAddress(m.state.SourceAddress, port); err != nil {
+					m.err = err
+					return nil
+				}
+			}
 			m.err = nil
 			m.state.Port = port
 			m.state.Step = WizardStepExposure
@@ -180,11 +220,11 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(wizardExposures)-1 {
+			if m.selected < len(m.exposures())-1 {
 				m.selected++
 			}
 		case "enter":
-			m.state.ExposureMode = wizardExposures[m.selected]
+			m.state.ExposureMode = m.exposures()[m.selected]
 			if m.state.ExposureMode == "permanent_public" {
 				m.state.Step = WizardStepHostname
 				m.input = m.state.Hostname
@@ -228,11 +268,19 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(wizardProtections)-1 {
+			if m.selected < len(m.protections())-1 {
 				m.selected++
 			}
 		case "enter":
-			m.state.Protection = wizardProtections[m.selected]
+			m.state.Protection = m.protections()[m.selected]
+			if m.state.Protection == "email_otp" {
+				m.state.Step = WizardStepProtectionRules
+				m.input = protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains)
+				m.err = nil
+				return nil
+			}
+			m.state.AllowedEmails = nil
+			m.state.AllowedDomains = nil
 			m.state.Step = WizardStepProvider
 			m.selected = 0
 		case "esc":
@@ -243,6 +291,26 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepExposure
 				m.selected = 0
 			}
+		}
+
+	case WizardStepProtectionRules:
+		switch key {
+		case "esc":
+			m.state.Step = WizardStepProtection
+			m.selected = protectionIndex(m.protections(), m.state.Protection)
+		case "enter":
+			emails, domains, err := parseProtectionRules(m.input)
+			if err != nil {
+				m.err = err
+				return nil
+			}
+			m.err = nil
+			m.state.AllowedEmails = emails
+			m.state.AllowedDomains = domains
+			m.state.Step = WizardStepProvider
+			m.selected = 0
+		default:
+			m.input = editInput(m.input, key)
 		}
 
 	case WizardStepProvider:
@@ -260,8 +328,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepReview
 			m.selected = 0
 		case "esc":
-			m.state.Step = WizardStepProtection
-			m.selected = 0
+			if m.state.Protection == "email_otp" {
+				m.state.Step = WizardStepProtectionRules
+				m.input = protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains)
+			} else {
+				m.state.Step = WizardStepProtection
+				m.selected = protectionIndex(m.protections(), m.state.Protection)
+			}
 		}
 
 	case WizardStepReview:
@@ -297,19 +370,19 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 	switch s.SourceType {
 	case "existing_service":
 		addr := s.SourceAddress
-		if s.Port != "" {
-			if addr == "" {
-				addr = "127.0.0.1:" + s.Port
-			} else if !strings.Contains(addr, ":") {
-				addr = addr + ":" + s.Port
-			}
+		if normalized, err := existingServiceAddress(addr, s.Port); err == nil {
+			addr = normalized
 		}
-		src.Existing = &ipc.ExistingSourceDTO{Address: addr}
+		protocol := s.SourceProtocol
+		if protocol == "" {
+			protocol = "http"
+		}
+		src.Existing = &ipc.ExistingSourceDTO{Address: addr, Protocol: protocol}
 	case "directory":
 		src.Directory = &ipc.DirectorySourceDTO{Path: s.SourceAddress}
 	case "command":
 		port, _ := strconv.Atoi(s.Port)
-		src.Command = &ipc.CommandSourceDTO{Executable: s.SourceAddress, Port: port}
+		src.Command = &ipc.CommandSourceDTO{Executable: s.SourceAddress, Port: port, Protocol: "http"}
 	case "mcp_server":
 		src.MCP = &ipc.MCPSourceDTO{Transport: "http", Endpoint: s.SourceAddress}
 	}
@@ -323,12 +396,40 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 			RequestedAddress: s.Hostname,
 		},
 		Protection: ipc.ProtectionDTO{
-			Kind: s.Protection,
+			Kind:           s.Protection,
+			AllowedEmails:  append([]string(nil), s.AllowedEmails...),
+			AllowedDomains: append([]string(nil), s.AllowedDomains...),
 		},
 		Provider: ipc.ProviderSelectionDTO{
 			ProviderID: s.Provider,
 		},
 	}
+}
+
+// existingServiceAddress adds a separately entered port without confusing an
+// IPv6 host for an address that already includes a port. Existing host:port
+// values are retained exactly, so a discovered address is never rewritten.
+func existingServiceAddress(address, port string) (string, error) {
+	address = strings.TrimSpace(address)
+	port = strings.TrimSpace(port)
+	if port == "" {
+		return address, nil
+	}
+	if address == "" {
+		return net.JoinHostPort("127.0.0.1", port), nil
+	}
+	if _, _, err := net.SplitHostPort(address); err == nil {
+		return address, nil
+	}
+
+	host := strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
+	if net.ParseIP(host) != nil {
+		return net.JoinHostPort(host, port), nil
+	}
+	if strings.Contains(address, ":") {
+		return "", fmt.Errorf("address %q is not a host or valid IPv6 literal; use host:port or [IPv6]:port", address)
+	}
+	return net.JoinHostPort(address, port), nil
 }
 
 // createConnectionCmd returns a command that performs the IPC call off the
@@ -382,6 +483,8 @@ func (m *WizardModel) View() string {
 		return m.withError(renderInput("Enter the hostname to use:", m.input))
 	case WizardStepProtection:
 		return m.renderProtection()
+	case WizardStepProtectionRules:
+		return m.withError(renderInput("Allow emails or domains (comma-separated; @example.com permits a domain):", m.input))
 	case WizardStepProvider:
 		return m.renderProvider()
 	case WizardStepReview:
@@ -417,29 +520,25 @@ func (m *WizardModel) sourcePrompt() string {
 func (m *WizardModel) renderIntent() string {
 	options := []string{
 		"A service already running on this computer",
-		"A folder of files",
-		"A command or application",
-		"An MCP server",
-		"Something else (enter manually)",
+		"A directory Portico should serve",
+		"An HTTP command Portico should run",
+		"An HTTP MCP server",
 	}
 	return renderMenu("What should be reachable?", options, m.selected)
 }
 
 func (m *WizardModel) renderExposure() string {
-	options := []string{
-		"Temporarily, with a generated address",
-		"Permanently, with my own hostname",
-		"Privately, only from my devices",
+	options := []string{"Temporarily, with a generated address"}
+	if m.fullCloudflare && m.state.ExposureMode == "permanent_public" {
+		options = append(options, "Permanently, with my own hostname")
 	}
 	return renderMenu("How should it be reachable?", options, m.selected)
 }
 
 func (m *WizardModel) renderProtection() string {
-	options := []string{
-		"Anyone with the address",
-		"People who verify their email",
-		"Specific identity providers",
-		"Service tokens",
+	options := []string{"Anyone with the address"}
+	if m.fullCloudflare {
+		options = append(options, "Email one-time passcode (limit who can sign in)")
 	}
 	return renderMenu("Who should be able to reach it?", options, m.selected)
 }
@@ -447,7 +546,6 @@ func (m *WizardModel) renderProtection() string {
 func (m *WizardModel) renderProvider() string {
 	options := []string{
 		"Cloudflare (default)",
-		"Mock (testing)",
 	}
 	return renderMenu("Which provider should carry the connection?", options, m.selected)
 }
@@ -466,6 +564,12 @@ func (m *WizardModel) renderReview() string {
 	lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
 	if m.state.Hostname != "" {
 		lines = append(lines, fmt.Sprintf("Hostname:   %s", m.state.Hostname))
+	}
+	if len(m.state.AllowedEmails) > 0 {
+		lines = append(lines, fmt.Sprintf("Allowed emails:  %s", strings.Join(m.state.AllowedEmails, ", ")))
+	}
+	if len(m.state.AllowedDomains) > 0 {
+		lines = append(lines, fmt.Sprintf("Allowed domains: %s", strings.Join(m.state.AllowedDomains, ", ")))
 	}
 	lines = append(lines,
 		fmt.Sprintf("Protection: %s", m.state.Protection),
@@ -499,4 +603,75 @@ func renderMenu(title string, options []string, selected int) string {
 func renderInput(prompt, value string) string {
 	lines := []string{prompt, "", "> " + value, "", "Enter to continue  Esc Back"}
 	return strings.Join(lines, "\n")
+}
+
+// parseProtectionRules accepts explicit email addresses and domains. Domains
+// may be entered as example.com or @example.com, making the common intent
+// clear without making the user remember provider-specific policy syntax.
+func parseProtectionRules(input string) ([]string, []string, error) {
+	seenEmails := make(map[string]struct{})
+	seenDomains := make(map[string]struct{})
+	var emails, domains []string
+	for _, raw := range strings.Split(input, ",") {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value == "" {
+			continue
+		}
+		if strings.Contains(value, "@") && !strings.HasPrefix(value, "@") {
+			parsed, err := mail.ParseAddress(value)
+			if err != nil || parsed.Address != value {
+				return nil, nil, fmt.Errorf("%q is not a valid email address", raw)
+			}
+			if _, exists := seenEmails[value]; !exists {
+				seenEmails[value] = struct{}{}
+				emails = append(emails, value)
+			}
+			continue
+		}
+
+		value = strings.TrimPrefix(value, "@")
+		if !validProtectionDomain(value) {
+			return nil, nil, fmt.Errorf("%q is not a valid domain", raw)
+		}
+		if _, exists := seenDomains[value]; !exists {
+			seenDomains[value] = struct{}{}
+			domains = append(domains, value)
+		}
+	}
+	if len(emails) == 0 && len(domains) == 0 {
+		return nil, nil, fmt.Errorf("email passcode protection requires at least one allowed email or domain")
+	}
+	return emails, domains, nil
+}
+
+func validProtectionDomain(value string) bool {
+	if len(value) == 0 || len(value) > 253 || !strings.Contains(value, ".") || strings.ContainsAny(value, "/:@ ") {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func protectionRulesInput(emails, domains []string) string {
+	values := append([]string(nil), emails...)
+	values = append(values, domains...)
+	return strings.Join(values, ", ")
+}
+
+func protectionIndex(options []string, selected string) int {
+	for i, option := range options {
+		if option == selected {
+			return i
+		}
+	}
+	return 0
 }

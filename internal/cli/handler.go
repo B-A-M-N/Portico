@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +14,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/paoloanzn/portico/internal/app"
-	"github.com/paoloanzn/portico/internal/ipc"
-	"github.com/paoloanzn/portico/internal/supervisor"
+	"github.com/B-A-M-N/portico/internal/app"
+	"github.com/B-A-M-N/portico/internal/config"
+	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/supervisor"
 )
 
 // stdinIsTTY reports whether stdin is attached to a terminal.
@@ -155,7 +158,7 @@ func handleLogs(cmd *cobra.Command) error {
 		}
 		return fmt.Errorf("open supervisor log: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	offset, err := printLastLines(f, os.Stdout, lines)
 	if err != nil {
@@ -171,6 +174,20 @@ func handleLogs(cmd *cobra.Command) error {
 		case <-cmd.Context().Done():
 			return nil
 		case <-time.After(500 * time.Millisecond):
+		}
+
+		// Rename-based rotation leaves the original descriptor readable but no
+		// longer connected to the path users asked to follow. Reopen the path
+		// before checking size so `portico logs -f` follows the new inode.
+		reopened, next, rotated, err := reopenRotatedLog(logPath, f, offset)
+		if err != nil {
+			return fmt.Errorf("check supervisor log rotation: %w", err)
+		}
+		if rotated {
+			if err := f.Close(); err != nil {
+				return fmt.Errorf("close rotated supervisor log: %w", err)
+			}
+			f, offset = reopened, next
 		}
 
 		fi, err := f.Stat()
@@ -193,6 +210,32 @@ func handleLogs(cmd *cobra.Command) error {
 			}
 		}
 	}
+}
+
+// reopenRotatedLog detects rename-based rotation by comparing the current
+// descriptor with the path's file identity. When the path names a new file it
+// returns an opened replacement and a zero offset. A temporarily absent path
+// is normal during rotation and leaves the existing descriptor untouched.
+func reopenRotatedLog(path string, current *os.File, offset int64) (*os.File, int64, bool, error) {
+	pathInfo, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return current, offset, false, nil
+	}
+	if err != nil {
+		return nil, offset, false, err
+	}
+	currentInfo, err := current.Stat()
+	if err != nil {
+		return nil, offset, false, err
+	}
+	if os.SameFile(pathInfo, currentInfo) {
+		return current, offset, false, nil
+	}
+	replacement, err := os.Open(path)
+	if err != nil {
+		return nil, offset, false, err
+	}
+	return replacement, 0, true, nil
 }
 
 // printLastLines writes the last n lines of f to w and returns the
@@ -466,6 +509,13 @@ func handleRepair(cmd *cobra.Command, id string) error {
 	}
 
 	jsonFlag, _ := cmd.Flags().GetBool("json")
+	if plan.Noop {
+		if jsonFlag {
+			return json.NewEncoder(os.Stdout).Encode(plan)
+		}
+		fmt.Fprintln(os.Stdout, "No repair needed")
+		return nil
+	}
 	if !jsonFlag {
 		fmt.Printf("Repair Plan: %s (fingerprint: %s)\n", plan.ID, plan.Fingerprint)
 		fmt.Println("Proposed changes:")
@@ -550,7 +600,26 @@ func handleProviderList(cmd *cobra.Command) error {
 }
 
 func handleProviderLogin(cmd *cobra.Command, id string) error {
-	return fmt.Errorf("provider login for %q is not supported yet", id)
+	if id != "cloudflare" {
+		return fmt.Errorf("provider login for %q is not supported", id)
+	}
+	accountID, _ := cmd.Flags().GetString("account-id")
+	zoneID, _ := cmd.Flags().GetString("zone-id")
+	if accountID == "" || zoneID == "" {
+		return fmt.Errorf("cloudflare login requires --account-id and --zone-id")
+	}
+	if err := config.Init(); err != nil {
+		return fmt.Errorf("initialize config: %w", err)
+	}
+	token := config.APIToken()
+	if token == "" {
+		return fmt.Errorf("set CLOUDFLARE_API_TOKEN in the environment before logging in; Portico never accepts provider tokens on the command line")
+	}
+	if err := config.SaveCloudflareSetup(accountID, zoneID, token); err != nil {
+		return fmt.Errorf("save Cloudflare setup: %w", err)
+	}
+	fmt.Println("Cloudflare credentials saved securely. Restart Portico's supervisor to activate full Cloudflare connections.")
+	return nil
 }
 
 func handleDiscover(cmd *cobra.Command) error {
@@ -572,30 +641,35 @@ func handleDiscover(cmd *cobra.Command) error {
 	}
 	fmt.Printf("Discovered %d local services:\n", len(result.Services))
 	for _, svc := range result.Services {
-		// Extract port from address (format: host:port)
-		port := ""
-		if idx := strings.LastIndex(svc.Address, ":"); idx >= 0 {
-			port = svc.Address[idx+1:]
+		label := svc.Process
+		if label == "" {
+			label = "unknown process"
 		}
-		fmt.Printf("  %s:%s (%s) - %s\n", svc.Address, port, svc.Protocol, svc.Process)
+		fmt.Printf("  %s (%s) - %s\n", svc.Address, svc.Protocol, label)
 	}
 	return nil
 }
 
 func handleDoctor(cmd *cobra.Command) error {
-	client, err := getClient(cmd)
-	if err != nil {
-		return err
-	}
-	// Health check
-	snap, err := client.Snapshot(cmd.Context())
-	if err != nil {
-		return fmt.Errorf("supervisor not reachable: %w", err)
-	}
 	fmt.Println("Portico Doctor")
 	fmt.Println("==============")
+	launcher := app.NewLauncher()
+	paths := launcher.GetPaths()
+	doctorFileStatus("Database", paths.DatabasePath, 0600)
+	doctorFileStatus("Installation key", filepath.Join(filepath.Dir(paths.DatabasePath), "portico-key.bin"), 0600)
+
+	// Doctor is observational by default. In particular, it must not call
+	// getClient because that helper starts a supervisor when none is running.
+	client := launcher.ConnectToSupervisor()
+	if err := client.Health(cmd.Context()); err != nil {
+		fmt.Println("~ Supervisor: not running (no changes made)")
+		return nil
+	}
+	snap, err := client.Snapshot(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("read supervisor snapshot: %w", err)
+	}
 	fmt.Printf("✓ Supervisor reachable (seq: %d)\n", snap.LastSeq)
-	fmt.Printf("✓ SQLite support enabled\n")
 	fmt.Printf("✓ Connections: %d\n", len(snap.Connections))
 	// Check providers
 	providers, err := client.ListProviders(cmd.Context())
@@ -628,6 +702,27 @@ func handleDoctor(cmd *cobra.Command) error {
 	return nil
 }
 
+func doctorFileStatus(label, path string, expectedMode os.FileMode) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		fmt.Printf("~ %s: not created yet\n", label)
+		return
+	}
+	if err != nil {
+		fmt.Printf("✗ %s: %v\n", label, err)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		fmt.Printf("✗ %s: not a regular file\n", label)
+		return
+	}
+	if info.Mode().Perm() != expectedMode {
+		fmt.Printf("✗ %s: permissions %o, expected %o\n", label, info.Mode().Perm(), expectedMode)
+		return
+	}
+	fmt.Printf("✓ %s: %s\n", label, path)
+}
+
 // createConnection creates a connection from the command flags.
 func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, error) {
 	client, err := getClient(cmd)
@@ -635,15 +730,46 @@ func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, erro
 		return nil, err
 	}
 	source, _ := cmd.Flags().GetString("source")
+	sourceType, _ := cmd.Flags().GetString("source-type")
+	protocol, _ := cmd.Flags().GetString("source-protocol")
+	port, _ := cmd.Flags().GetInt("source-port")
+	args, _ := cmd.Flags().GetStringArray("source-arg")
+	workingDir, _ := cmd.Flags().GetString("source-working-dir")
+	env, _ := cmd.Flags().GetStringToString("source-env")
+	useShell, _ := cmd.Flags().GetBool("source-shell")
+	directoryMode, _ := cmd.Flags().GetString("directory-mode")
+	directorySPA, _ := cmd.Flags().GetBool("directory-spa")
+	directoryUpload, _ := cmd.Flags().GetBool("directory-allow-upload")
+	directoryDelete, _ := cmd.Flags().GetBool("directory-allow-delete")
+	mcpCommand, _ := cmd.Flags().GetBool("mcp-command")
 	providerID, _ := cmd.Flags().GetString("provider")
+	sourceDTO := ipc.SourceDTO{Kind: sourceType}
+	switch sourceType {
+	case "existing_service":
+		var addressErr error
+		source, addressErr = normalizeExistingAddress(source, port)
+		if addressErr != nil {
+			return nil, addressErr
+		}
+		sourceDTO.Existing = &ipc.ExistingSourceDTO{Address: source, Protocol: protocol}
+	case "directory":
+		sourceDTO.Directory = &ipc.DirectorySourceDTO{Path: source, Mode: directoryMode, SPAFallback: directorySPA, AllowUpload: directoryUpload, AllowDelete: directoryDelete}
+	case "command":
+		sourceDTO.Command = &ipc.CommandSourceDTO{Executable: source, Args: args, WorkingDir: workingDir, Env: env, Port: port, Protocol: protocol, UseShell: useShell}
+	case "mcp_server":
+		if mcpCommand {
+			sourceDTO.MCP = &ipc.MCPSourceDTO{Transport: "http", Command: &ipc.CommandSourceDTO{Executable: source, Args: args, WorkingDir: workingDir, Env: env, Port: port, Protocol: protocol, UseShell: useShell}}
+		} else {
+			sourceDTO.MCP = &ipc.MCPSourceDTO{Transport: "http", Endpoint: source}
+		}
+	default:
+		return nil, fmt.Errorf("unsupported source type %q", sourceType)
+	}
 
 	conn, err := client.CreateConnection(cmd.Context(), ipc.CreateConnectionRequest{
 		Version: 1,
 		Name:    name,
-		Source: ipc.SourceDTO{
-			Kind:     "existing_service",
-			Existing: &ipc.ExistingSourceDTO{Address: source},
-		},
+		Source:  sourceDTO,
 		Exposure: ipc.ExposureDTO{
 			Mode: "temporary_public",
 		},
@@ -655,6 +781,35 @@ func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, erro
 		return nil, fmt.Errorf("create: %w", err)
 	}
 	return conn, nil
+}
+
+// normalizeExistingAddress accepts a host, host:port, IPv6 literal, or HTTP
+// URL and produces the host:port form required by core.ExistingService.
+func normalizeExistingAddress(raw string, port int) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", fmt.Errorf("source address is required")
+	}
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme != "" {
+		if parsed.Host == "" || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return "", fmt.Errorf("source URL must contain only scheme and host[:port]")
+		}
+		value = parsed.Host
+	}
+	if _, _, err := net.SplitHostPort(value); err == nil {
+		return value, nil
+	}
+	if port <= 0 {
+		return value, nil
+	}
+	host := strings.Trim(value, "[]")
+	if net.ParseIP(host) != nil {
+		return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
+	}
+	if strings.Contains(value, ":") {
+		return "", fmt.Errorf("source address %q is not a valid host or host:port", raw)
+	}
+	return net.JoinHostPort(value, fmt.Sprintf("%d", port)), nil
 }
 
 func handleCreate(cmd *cobra.Command, name string) error {

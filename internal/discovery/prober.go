@@ -5,12 +5,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 )
 
 // DefaultProbeTimeout bounds a single HTTP probe.
-const DefaultProbeTimeout = 1 * time.Second
+const DefaultProbeTimeout = 250 * time.Millisecond
 
 // maxProbeBody is the maximum number of response body bytes read per probe.
 const maxProbeBody = 16 << 10 // 16 KiB
@@ -19,8 +20,9 @@ const maxProbeBody = 16 << 10 // 16 KiB
 type ProbeOutcome struct {
 	// Scheme is "http" or "https" when an HTTP response was observed,
 	// empty when the listener did not speak HTTP.
-	Scheme   string
-	Evidence []string
+	Scheme     string
+	Evidence   []string
+	StatusCode int
 }
 
 // Prober probes a local TCP port for an HTTP(S) service.
@@ -41,34 +43,52 @@ func NewHTTPProber(timeout time.Duration) *HTTPProber {
 	return &HTTPProber{Timeout: timeout}
 }
 
-// Probe issues GET http://127.0.0.1:<port>/ with a bounded timeout.
+// Probe issues a bounded HEAD-first loopback probe, falling back to GET only
+// when the server does not implement HEAD.
 func (p *HTTPProber) Probe(ctx context.Context, port int) ProbeOutcome {
+	return p.ProbeAddress(ctx, "127.0.0.1", port)
+}
+
+// ProbeAddress probes a specific local address. It is used for IPv6-only
+// listeners; the Prober interface retains Probe for existing callers.
+func (p *HTTPProber) ProbeAddress(ctx context.Context, host string, port int) ProbeOutcome {
 	timeout := p.Timeout
 	if timeout <= 0 {
 		timeout = DefaultProbeTimeout
 	}
 
+	address := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	// Plain HTTP first.
-	if out, ok := p.get(ctx, fmt.Sprintf("http://127.0.0.1:%d/", port), timeout, nil); ok {
-		out.Scheme = "http"
-		return out
+	if out, ok := p.request(ctx, http.MethodHead, fmt.Sprintf("http://%s/", address), timeout, nil); ok {
+		if out.StatusCode == http.StatusMethodNotAllowed || out.StatusCode == http.StatusNotImplemented {
+			out, ok = p.request(ctx, http.MethodGet, fmt.Sprintf("http://%s/", address), timeout, nil)
+		}
+		if ok {
+			out.Scheme = "http"
+			return out
+		}
 	}
 
 	// Retry over TLS. Verification is skipped only for local
 	// classification; the evidence records that it was not verified.
 	tlsCfg := &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- loopback classification only
-	if out, ok := p.get(ctx, fmt.Sprintf("https://127.0.0.1:%d/", port), timeout, tlsCfg); ok {
-		out.Scheme = "https"
-		out.Evidence = append(out.Evidence, "TLS certificate not verified (local classification only)")
-		return out
+	if out, ok := p.request(ctx, http.MethodHead, fmt.Sprintf("https://%s/", address), timeout, tlsCfg); ok {
+		if out.StatusCode == http.StatusMethodNotAllowed || out.StatusCode == http.StatusNotImplemented {
+			out, ok = p.request(ctx, http.MethodGet, fmt.Sprintf("https://%s/", address), timeout, tlsCfg)
+		}
+		if ok {
+			out.Scheme = "https"
+			out.Evidence = append(out.Evidence, "TLS certificate not verified (local classification only)")
+			return out
+		}
 	}
 
 	return ProbeOutcome{Evidence: []string{"no HTTP response on GET /"}}
 }
 
-// get performs a single bounded GET and reports whether an HTTP
+// request performs a single bounded HTTP request and reports whether an HTTP
 // response was received.
-func (p *HTTPProber) get(ctx context.Context, url string, timeout time.Duration, tlsCfg *tls.Config) (ProbeOutcome, bool) {
+func (p *HTTPProber) request(ctx context.Context, method, url string, timeout time.Duration, tlsCfg *tls.Config) (ProbeOutcome, bool) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -88,7 +108,7 @@ func (p *HTTPProber) get(ctx context.Context, url string, timeout time.Duration,
 	}
 	defer transport.CloseIdleConnections()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return ProbeOutcome{}, false
 	}
@@ -99,12 +119,12 @@ func (p *HTTPProber) get(ctx context.Context, url string, timeout time.Duration,
 	defer resp.Body.Close()
 	_, _ = io.CopyN(io.Discard, resp.Body, maxProbeBody)
 
-	evidence := []string{fmt.Sprintf("GET / -> HTTP %d", resp.StatusCode)}
+	evidence := []string{fmt.Sprintf("%s / -> HTTP %d", method, resp.StatusCode)}
 	if server := resp.Header.Get("Server"); server != "" {
 		evidence = append(evidence, "Server: "+server)
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		evidence = append(evidence, "Content-Type: "+ct)
 	}
-	return ProbeOutcome{Evidence: evidence}, true
+	return ProbeOutcome{Evidence: evidence, StatusCode: resp.StatusCode}, true
 }

@@ -95,7 +95,11 @@ func (fb *BuiltinFileBrowser) Type() Type {
 }
 
 func (fb *BuiltinFileBrowser) Start(_ context.Context) (string, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listenAddr := "127.0.0.1:0"
+	if fb.cfg.ListenPort != 0 {
+		listenAddr = fmt.Sprintf("127.0.0.1:%d", fb.cfg.ListenPort)
+	}
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return "", fmt.Errorf("binding to loopback: %w", err)
 	}
@@ -109,6 +113,9 @@ func (fb *BuiltinFileBrowser) Start(_ context.Context) (string, error) {
 	}
 	if fb.cfg.AllowUpload && !fb.cfg.ReadOnly {
 		mux.HandleFunc("/upload", fb.handleUpload)
+	}
+	if fb.cfg.AllowDelete && !fb.cfg.ReadOnly {
+		mux.HandleFunc("/delete", fb.handleDelete)
 	}
 
 	fb.server = &http.Server{Handler: mux}
@@ -277,6 +284,44 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusCreated)
 }
 
+func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if fb.cfg.ReadOnly || !fb.cfg.AllowDelete {
+		http.Error(w, "read-only mode", http.StatusForbidden)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	target, err := safePath(fb.cfg.Path, r.Form.Get("path"))
+	if err != nil || target == fb.cfg.Path {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "checking path", http.StatusInternalServerError)
+		return
+	}
+	if info.IsDir() {
+		http.Error(w, "refusing to delete directories", http.StatusBadRequest)
+		return
+	}
+	if err := os.Remove(target); err != nil {
+		http.Error(w, "deleting file", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (fb *BuiltinFileBrowser) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -299,12 +344,14 @@ func (fb *BuiltinFileBrowser) handleBrowse(w http.ResponseWriter, r *http.Reques
 		Files    []fileEntry
 		Download bool
 		Upload   bool
+		Delete   bool
 		ReadOnly bool
 	}{
 		Path:     relPath,
 		Files:    files,
 		Download: fb.cfg.Download,
 		Upload:   fb.cfg.AllowUpload && !fb.cfg.ReadOnly,
+		Delete:   fb.cfg.AllowDelete && !fb.cfg.ReadOnly,
 		ReadOnly: fb.cfg.ReadOnly,
 	}
 
@@ -342,7 +389,7 @@ var fileBrowserTmpl = template.Must(template.New("browser").Parse(`<!DOCTYPE htm
 <body>
 <h1>{{.Path}}</h1>
 <table>
-<thead><tr><th>Name</th><th>Size</th><th>Modified</th>{{if .Download}}<th>Actions</th>{{end}}</tr></thead>
+<thead><tr><th>Name</th><th>Size</th><th>Modified</th>{{if or .Download .Delete}}<th>Actions</th>{{end}}</tr></thead>
 <tbody>
 {{if ne .Path "/"}}
 <tr><td colspan="4"><a href="../">..</a></td></tr>
@@ -353,10 +400,20 @@ var fileBrowserTmpl = template.Must(template.New("browser").Parse(`<!DOCTYPE htm
       {{else}}<a href="{{.Name}}">{{.Name}}</a>{{end}}</td>
   <td class="size">{{if .IsDir}}-{{else}}{{.Size}}{{end}}</td>
   <td class="time">{{.ModTime}}</td>
-  {{if $.Download}}<td class="actions">{{if not .IsDir}}<a href="/download{{$.Path}}{{.Name}}">download</a>{{end}}</td>{{end}}
+  {{if or $.Download $.Delete}}<td class="actions">{{if not .IsDir}}
+    {{if $.Download}}<a href="/download{{$.Path}}{{.Name}}">download</a>{{end}}
+    {{if $.Delete}}<form action="/delete" method="post" style="display:inline"><input type="hidden" name="path" value="{{$.Path}}{{.Name}}"><button type="submit">delete</button></form>{{end}}
+  {{end}}</td>{{end}}
 </tr>
 {{end}}
 </tbody>
 </table>
+{{if .Upload}}
+<form action="/upload" method="post" enctype="multipart/form-data">
+  <input type="hidden" name="path" value="{{.Path}}">
+  <label>Upload <input type="file" name="file" required></label>
+  <button type="submit">Upload</button>
+</form>
+{{end}}
 </body>
 </html>`))

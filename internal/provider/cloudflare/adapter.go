@@ -2,6 +2,7 @@ package cloudflare
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,10 +18,10 @@ import (
 
 	cf "github.com/cloudflare/cloudflare-go"
 
-	"github.com/paoloanzn/portico/internal/access"
-	"github.com/paoloanzn/portico/internal/core"
-	cfdns "github.com/paoloanzn/portico/internal/dns"
-	"github.com/paoloanzn/portico/internal/tunnel"
+	"github.com/B-A-M-N/portico/internal/access"
+	"github.com/B-A-M-N/portico/internal/core"
+	cfdns "github.com/B-A-M-N/portico/internal/dns"
+	"github.com/B-A-M-N/portico/internal/tunnel"
 )
 
 // Provider implements core.Provider for Cloudflare.
@@ -111,18 +112,22 @@ func New(apiToken, accountID, zoneID, cloudflaredBin, logDir string, connectorPr
 // sweepStaleCredentials removes credential files left by a previous supervisor crash.
 // Called once during provider initialization.
 func (p *Provider) sweepStaleCredentials() {
-	if err := SetCredentialDir(p.credentialDir()); err != nil {
+	if err := prepareCredentialDir(p.credentialDir()); err != nil {
 		slog.Warn("cloudflare: failed to prepare credential directory", "err", err)
 		return
 	}
-	if err := sweepStaleCredentialFiles(); err != nil {
+	if err := sweepStaleCredentialFiles(p.credentialDir(), time.Now()); err != nil {
 		slog.Warn("cloudflare: failed to sweep stale credential files", "err", err)
 	}
 }
 
 // credentialDir returns the directory used for scoped token credential files.
 func (p *Provider) credentialDir() string {
-	return filepath.Join(p.logDir, "..", "credentials")
+	// Credential files are account-scoped so two provider instances cannot
+	// sweep or write one another's temporary tokens. Hashing avoids treating a
+	// provider-supplied account identifier as a filesystem path.
+	account := sha256.Sum256([]byte(p.accountID))
+	return filepath.Join(p.logDir, "..", "credentials", fmt.Sprintf("%x", account[:8]))
 }
 
 // NewQuickTunnel creates a Cloudflare provider that supports Quick Tunnels only.
@@ -161,9 +166,9 @@ func (p *Provider) SetConnectorProcessService(svc core.ConnectorProcessService) 
 // CredentialStore stores and retrieves encrypted tunnel tokens.
 // Tokens are persisted so permanent connectors can survive supervisor restart.
 type CredentialStore interface {
-	SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, tunnelID, token string) error
-	LoadTunnelCredential(ctx context.Context, connID core.ConnectionID) (tunnelID, token string, err error)
-	DeleteTunnelCredential(ctx context.Context, connID core.ConnectionID) error
+	SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string, token []byte) error
+	LoadTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) (token string, err error)
+	DeleteTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) error
 }
 
 // SetCredentialStore sets the credential store for durable tunnel token storage.
@@ -190,21 +195,15 @@ func (p *Provider) RehydrateConnection(ctx context.Context, connID core.Connecti
 		return false
 	}
 
-	storedTunnelID, token, err := p.credStore.LoadTunnelCredential(ctx, connID)
+	if tunnelID == "" {
+		// A credential must always be selected by the exact tunnel it belongs
+		// to. Picking whichever row happens to be newest can start a connector
+		// with a replacement or stale token after recovery.
+		return false
+	}
+	token, err := p.credStore.LoadTunnelCredentialExact(ctx, connID, "cloudflare", tunnelID)
 	if err != nil || token == "" {
 		return false
-	}
-
-	// Verify the tunnel ID matches to ensure we're restoring the correct credential.
-	if tunnelID != "" && storedTunnelID != "" && storedTunnelID != tunnelID {
-		slog.Warn("tunnel credential mismatch during rehydration",
-			"connection", connID, "expected", tunnelID, "stored", storedTunnelID)
-		return false
-	}
-
-	// Use the stored tunnel ID if we don't have one.
-	if tunnelID == "" {
-		tunnelID = storedTunnelID
 	}
 
 	conn.tunnel = &tunnel.Info{
@@ -223,6 +222,13 @@ func (p *Provider) Identity() core.ProviderIdentity {
 		Name:        "cloudflare",
 		DisplayName: "Cloudflare",
 	}
+}
+
+// ProviderAccountID returns the exact Cloudflare account configured for this
+// adapter instance. It is intentionally empty for Quick Tunnels, which do not
+// operate against an authenticated account.
+func (p *Provider) ProviderAccountID() core.ProviderAccountID {
+	return core.ProviderAccountID(p.accountID)
 }
 
 // Capabilities returns Cloudflare's capability set.
@@ -304,9 +310,11 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 			core.ProtocolHTTPS: {Supported: true, Public: true},
 		},
 		Telemetry: core.TelemetryCapability{
-			Supported:     true,
-			RequestCounts: true,
-			Stability:     core.StabilityBeta,
+			// Metrics collection is not wired into the supervisor yet. Do not
+			// advertise traffic data simply because Cloudflare can provide it.
+			Supported:     false,
+			RequestCounts: false,
+			Stability:     core.StabilityExperimental,
 		},
 		Constraints: []core.CapabilityConstraint{
 			{
@@ -355,12 +363,17 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 	if desired.Profile == nil {
 		return nil, fmt.Errorf("cloudflare: profile required")
 	}
-	if desired.Origin == nil {
+	// Closing only stops a connector and must remain possible when the local
+	// source is no longer available.
+	if desired.Profile.Desired != core.DesiredClosed && desired.Origin == nil {
 		return nil, fmt.Errorf("cloudflare: resolved origin required")
 	}
 
 	profile := desired.Profile
-	originURL := desired.Origin.URL
+	originURL := ""
+	if desired.Origin != nil {
+		originURL = desired.Origin.URL
+	}
 	plan := &core.OperationPlan{
 		ID:              core.NewPlanID(),
 		ConnectionID:    profile.ID,
@@ -496,7 +509,7 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			plan.Steps = append(plan.Steps,
 				core.PlanStep{ID: "cf-connector", Kind: core.StepStartConnector, Summary: "Start cloudflared connector",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "start_connector",
-						Parameters: map[string]string{"mode": "permanent"}}},
+						Parameters: map[string]string{"mode": "permanent", "origin_url": originURL}}},
 				core.PlanStep{ID: "cf-verify-connector", Kind: core.StepVerifyConnector, Summary: "Verify connector process",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_connector"}},
 				core.PlanStep{ID: "cf-verify", Kind: core.StepVerifyEndpoint, Summary: "Verify endpoint reachable",
@@ -540,6 +553,21 @@ func protectionToAuthMode(kind core.ProtectionKind) string {
 	default:
 		return "otp"
 	}
+}
+
+// accessAuthMode accepts both the Cloudflare-specific mode used by normal
+// provider plans and the provider-neutral protection kind used by targeted
+// reconciliation plans. The latter keeps desired-state interpretation out of
+// the supervisor while preserving this adapter as the Cloudflare mapping
+// boundary.
+func accessAuthMode(params map[string]string) string {
+	if mode := params["auth_mode"]; mode != "" {
+		return mode
+	}
+	if kind := core.ProtectionKind(params["protection_kind"]); kind != "" {
+		return protectionToAuthMode(kind)
+	}
+	return "otp"
 }
 
 // verifyLocalOrigin probes the origin URL over HTTP to confirm the local
@@ -653,7 +681,7 @@ func (p *Provider) Apply(ctx context.Context, plan core.OperationPlan) (<-chan c
 					// Store tunnel credential durably so the connector can be restarted
 					// after supervisor restart (P0 #4).
 					if p.credStore != nil {
-						if err := p.credStore.SaveTunnelCredential(ctx, plan.ConnectionID, info.TunnelID, info.Token); err != nil {
+						if err := p.credStore.SaveTunnelCredential(ctx, plan.ConnectionID, "cloudflare", info.TunnelID, []byte(info.Token)); err != nil {
 							slog.Warn("failed to store tunnel credential",
 								"connection", plan.ConnectionID, "tunnel", info.TunnelID, "err", err)
 						}
@@ -1178,6 +1206,9 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 		if err := verifyProcessIdentity(handle); err == nil {
 			obs.Connector.Status = "running"
 			obs.Connector.PID = handle.PID
+			obs.Connector.StartTime = handle.Identity.StartTime
+			obs.Connector.ExecutablePath = handle.Identity.ExecutablePath
+			obs.Connector.CommandHash = handle.Identity.CommandHash
 		} else {
 			obs.Connector.Status = fmt.Sprintf("error: %s", err.Error())
 		}
@@ -1205,6 +1236,11 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 			default:
 				status.Status = core.ObservationPresent
 				obs.Tunnel = &core.ObservedTunnel{ID: state.ID, Name: state.Name, State: state.Status}
+				// Hydrate only the exact observed identifier/name. This is not
+				// ownership adoption; it lets a narrowly scoped follow-up (such
+				// as DNS recreation) operate after a supervisor restart without
+				// inventing or listing provider resources.
+				p.hydrateObservedTunnel(id, state.ID, state.Name)
 			}
 
 		case core.ResourceDNSRecord:
@@ -1223,6 +1259,7 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 				obs.DNSRecords = append(obs.DNSRecords, core.ObservedDNSRecord{
 					ID: state.ID, Name: state.Name, Type: state.Type, Target: state.Content,
 				})
+				p.hydrateObservedDNS(id, state.ID, state.Name)
 			}
 
 		case core.ResourceAccessApp:
@@ -1257,6 +1294,11 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 				status.Status = core.ObservationMissing
 			default:
 				status.Status = core.ObservationPresent
+				obs.AccessPolicies = append(obs.AccessPolicies, core.ObservedAccessPolicy{
+					ID: state.ID, AppID: res.Metadata["app_id"], Decision: state.Decision,
+					AllowedEmails: state.AllowedEmails, AllowedDomains: state.AllowedDomains,
+					SessionDuration: state.SessionDuration,
+				})
 			}
 
 		default:
@@ -1273,6 +1315,31 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 	// This observation only reports state for drift detection.
 
 	return obs, nil
+}
+
+func (p *Provider) hydrateObservedTunnel(connectionID core.ConnectionID, tunnelID, name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	conn := p.connections[connectionID]
+	if conn == nil {
+		conn = &cfConnection{ownership: core.OwnershipExternal}
+		p.connections[connectionID] = conn
+	}
+	conn.tunnel = &tunnel.Info{TunnelID: tunnelID, TunnelName: name}
+}
+
+func (p *Provider) hydrateObservedDNS(connectionID core.ConnectionID, dnsID, hostname string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	conn := p.connections[connectionID]
+	if conn == nil {
+		conn = &cfConnection{ownership: core.OwnershipExternal}
+		p.connections[connectionID] = conn
+	}
+	conn.dnsID = dnsID
+	if conn.hostname == "" {
+		conn.hostname = hostname
+	}
 }
 
 // classifyObservationError maps a Cloudflare API error to an
@@ -1901,7 +1968,7 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			}},
 			CredentialMutations: []core.CredentialMutation{{
 				TunnelID: info.TunnelID,
-				Token:    info.Token,
+				Secret:   []byte(info.Token),
 			}},
 		}, nil
 
@@ -1929,17 +1996,27 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 
 	case core.StepCreateDNSRecord:
-		p.mu.RLock()
-		tun := conn.tunnel
-		p.mu.RUnlock()
 		hostname := step.Technical.Parameters["hostname"]
 		if hostname == "" {
 			return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 		}
-		if tun == nil {
+		// Reconciliation materializes the durable tunnel ID in the step so a
+		// DNS-only repair remains valid after adapter process memory has been
+		// reconstructed. Normal open plans keep using the tunnel just created
+		// in this operation.
+		tunnelID := step.Technical.Parameters["tunnel_id"]
+		if tunnelID == "" {
+			p.mu.RLock()
+			tun := conn.tunnel
+			p.mu.RUnlock()
+			if tun != nil {
+				tunnelID = tun.TunnelID
+			}
+		}
+		if tunnelID == "" {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("no tunnel available")}, nil
 		}
-		dnsID, err := p.dns.CreateCNAME(ctx, p.zoneID, hostname, tun.TunnelID)
+		dnsID, err := p.dns.CreateCNAME(ctx, p.zoneID, hostname, tunnelID)
 		if err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
 		}
@@ -1968,10 +2045,7 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		if hn == "" {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access application requires a hostname")}, nil
 		}
-		authMode := step.Technical.Parameters["auth_mode"]
-		if authMode == "" {
-			authMode = "otp"
-		}
+		authMode := accessAuthMode(step.Technical.Parameters)
 		if authMode != "none" && authMode != "private_network" {
 			emails := step.Technical.Parameters["allowed_emails"]
 			domains := step.Technical.Parameters["allowed_domains"]
@@ -2007,6 +2081,108 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 				{ConnectionID: connectionID, Type: core.ResourceAccessPolicy, ExternalID: appInfo.PolicyID, ProviderID: "cloudflare", Ownership: core.OwnershipManaged, Metadata: map[string]string{"app_id": appInfo.AppID}},
 			},
 		}, nil
+
+	case core.StepCreateAccessPolicy:
+		appID := step.Technical.Parameters["app_id"]
+		if appID == "" {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access policy creation requires exact application ID")}, nil
+		}
+		creator, ok := p.access.(access.PolicyCreator)
+		if p.access == nil || !ok {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access policy creation is unavailable")}, nil
+		}
+		policy := access.Policy{
+			AuthMode:        accessAuthMode(step.Technical.Parameters),
+			AllowedEmails:   splitNonEmpty(step.Technical.Parameters["allowed_emails"]),
+			AllowedDomains:  splitNonEmpty(step.Technical.Parameters["allowed_domains"]),
+			SessionDuration: step.Technical.Parameters["session_duration"],
+		}
+		if policy.AuthMode != "none" && policy.AuthMode != "private_network" && len(policy.AllowedEmails) == 0 && len(policy.AllowedDomains) == 0 {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access policy requires at least one allowed email or domain")}, nil
+		}
+		policyID, err := creator.CreatePolicy(ctx, p.accountID, appID, policy)
+		if err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
+		}
+		p.mu.Lock()
+		conn.accessID = appID
+		conn.policyID = policyID
+		p.mu.Unlock()
+		return core.StepResult{StepID: step.ID, Succeeded: true, Resources: []core.ProviderResource{{
+			ConnectionID: connectionID, ProviderID: "cloudflare", Type: core.ResourceAccessPolicy,
+			ExternalID: policyID, Ownership: core.OwnershipManaged, Metadata: map[string]string{"app_id": appID},
+		}}}, nil
+
+	case core.StepUpdateAccessApp:
+		appID := step.Technical.ResourceID
+		hostname := step.Technical.Parameters["hostname"]
+		if appID == "" || hostname == "" {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access application update requires exact application ID and hostname")}, nil
+		}
+		updater, ok := p.access.(access.AppUpdater)
+		if p.access == nil || !ok {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access application update is unavailable")}, nil
+		}
+		if err := updater.UpdateApp(ctx, p.accountID, appID, hostname); err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
+		}
+		p.mu.Lock()
+		conn.accessID = appID
+		if conn.hostname == "" {
+			conn.hostname = hostname
+		}
+		p.mu.Unlock()
+		return core.StepResult{StepID: step.ID, Succeeded: true, Resources: []core.ProviderResource{{
+			ConnectionID: connectionID, ProviderID: "cloudflare", Type: core.ResourceAccessApp,
+			ExternalID: appID, Ownership: core.OwnershipManaged,
+		}}}, nil
+
+	case core.StepUpdateAccessPolicy:
+		policyID := step.Technical.ResourceID
+		appID := step.Technical.Parameters["app_id"]
+		p.mu.RLock()
+		if policyID == "" {
+			policyID = conn.policyID
+		}
+		if appID == "" {
+			appID = conn.accessID
+		}
+		p.mu.RUnlock()
+		if appID == "" || policyID == "" {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access policy update requires exact application and policy IDs")}, nil
+		}
+		policy := access.Policy{
+			AuthMode:        accessAuthMode(step.Technical.Parameters),
+			AllowedEmails:   splitNonEmpty(step.Technical.Parameters["allowed_emails"]),
+			AllowedDomains:  splitNonEmpty(step.Technical.Parameters["allowed_domains"]),
+			SessionDuration: step.Technical.Parameters["session_duration"],
+		}
+		if policy.AuthMode != "none" && policy.AuthMode != "private_network" && len(policy.AllowedEmails) == 0 && len(policy.AllowedDomains) == 0 {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access policy update requires at least one allowed email or domain")}, nil
+		}
+		err := p.access.UpdatePolicy(ctx, p.accountID, appID, policyID, policy)
+		return core.StepResult{StepID: step.ID, Succeeded: err == nil, Error: err}, nil
+
+	case core.StepUpdateDNSRecord:
+		dnsID := step.Technical.ResourceID
+		hostname := step.Technical.Parameters["hostname"]
+		tunnelID := step.Technical.Parameters["tunnel_id"]
+		if dnsID == "" || hostname == "" || tunnelID == "" {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("DNS update requires exact record ID, hostname, and tunnel ID")}, nil
+		}
+		if err := p.dns.UpdateCNAME(ctx, p.zoneID, dnsID, hostname, tunnelID); err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
+		}
+		p.mu.Lock()
+		conn.dnsID = dnsID
+		if conn.hostname == "" {
+			conn.hostname = hostname
+		}
+		p.mu.Unlock()
+		return core.StepResult{StepID: step.ID, Succeeded: true, Resources: []core.ProviderResource{{
+			ConnectionID: connectionID, ProviderID: "cloudflare", Type: core.ResourceDNSRecord,
+			ExternalID: dnsID, Ownership: core.OwnershipManaged,
+		}}}, nil
 
 	case core.StepStartConnector:
 		mode := step.Technical.Parameters["mode"]
@@ -2223,7 +2399,26 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		slog.Info("cloudflared connector restarted via process service", "pid", handle2.PID, "mode", mode)
 		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 
+	case core.StepFinalizeLocalDeletion:
+		// The controller commits the local profile/runtime deletion after this
+		// provider step succeeds. There is no remote Cloudflare action here.
+		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
+
 	default:
 		return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("unknown step kind: %s", step.Kind)}, nil
 	}
+}
+
+func splitNonEmpty(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }

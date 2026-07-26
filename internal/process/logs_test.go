@@ -8,6 +8,43 @@ import (
 	"testing"
 )
 
+func TestRedactingWriterRedactsSecretSplitAcrossWrites(t *testing.T) {
+	var output bytes.Buffer
+	w := NewRedactingWriter(&output, []string{"super-secret-token"})
+	if _, err := w.Write([]byte("connected with super-sec")); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if strings.Contains(output.String(), "super-sec") {
+		t.Fatal("partial secret leaked before its line completed")
+	}
+	if _, err := w.Write([]byte("ret-token\n")); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := output.String(); strings.Contains(got, "super-secret-token") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("secret was not redacted: %q", got)
+	}
+}
+
+func TestRedactingWriterRedactsCredentialFormats(t *testing.T) {
+	var output bytes.Buffer
+	w := NewRedactingWriter(&output, nil)
+	if _, err := w.Write([]byte("Authorization: Bearer abc.def-123\nBearer another-token\ntunnel-token: value\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	got := output.String()
+	for _, secret := range []string{"abc.def-123", "another-token", "value"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("credential %q leaked in %q", secret, got)
+		}
+	}
+}
+
 func TestRotatingWriterAppendsWithoutTruncating(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")

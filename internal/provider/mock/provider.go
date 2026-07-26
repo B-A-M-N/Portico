@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // Provider is a mock provider for testing the controller vertical slice.
@@ -49,8 +49,8 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 			Stability: core.StabilityStable,
 		},
 		PrivateExposure: core.CapabilitySupport{
-			Supported: true,
-			Stability: core.StabilityStable,
+			Supported: false,
+			Stability: core.StabilityExperimental,
 		},
 		ManagedDNS: core.CapabilitySupport{
 			Supported: true,
@@ -61,13 +61,13 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 			{Kind: core.ProtectionEmailOTP, Supported: true, Stability: core.StabilityStable},
 		},
 		Protocols: map[core.Protocol]core.ProtocolCapability{
-			core.ProtocolHTTP:  {Supported: true, Public: true, Private: true},
-			core.ProtocolHTTPS: {Supported: true, Public: true, Private: true},
+			core.ProtocolHTTP:  {Supported: true, Public: true},
+			core.ProtocolHTTPS: {Supported: true, Public: true},
 		},
 		Telemetry: core.TelemetryCapability{
-			Supported:     true,
-			RequestCounts: true,
-			Stability:     core.StabilityStable,
+			Supported:     false,
+			RequestCounts: false,
+			Stability:     core.StabilityExperimental,
 		},
 		Redundancy: core.RedundancyCapability{
 			Supported:     true,

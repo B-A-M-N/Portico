@@ -13,8 +13,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/paoloanzn/portico/internal/config"
-	"github.com/paoloanzn/portico/internal/ui"
+	"github.com/B-A-M-N/portico/internal/config"
+	"github.com/B-A-M-N/portico/internal/ui"
 )
 
 // tokenCreateURL is the Cloudflare dashboard URL for creating API tokens.
@@ -25,7 +25,7 @@ var authLoginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Authenticate with Cloudflare via API token",
 	Long: `Opens the Cloudflare dashboard in your browser so you can create an API
-token, then prompts you to paste it. After validating the token, flare-cli
+token, then prompts you to paste it. After validating the token, Portico Legacy
 auto-discovers your accounts and zones and writes the configuration.
 
 The token needs these permissions:
@@ -55,7 +55,7 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 		// Interactive flow: open browser, ask user to paste token.
 		ui.PrintHeader("Cloudflare API Token Setup")
 		fmt.Println()
-		ui.PrintInfo("flare-cli needs an API token with these permissions:")
+		ui.PrintInfo("Portico needs an API token with these permissions:")
 		fmt.Println("  • Account — Cloudflare Tunnel — Edit")
 		fmt.Println("  • Account — Access: Apps and Policies — Edit")
 		fmt.Println("  • Zone   — DNS — Edit")

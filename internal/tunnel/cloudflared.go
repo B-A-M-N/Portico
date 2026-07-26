@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	flareexec "github.com/paoloanzn/portico/internal/exec"
+	flareexec "github.com/B-A-M-N/portico/internal/exec"
 )
 
 // quickTunnelURLRe matches the trycloudflare.com URL that cloudflared prints.
@@ -62,14 +62,27 @@ func NewProcessConnector(cloudflaredBin string) *ProcessConnector {
 		cloudflaredBin = "cloudflared"
 	}
 
-	// Use the flare-cli config dir for log files.
-	logDir := ""
-	if home, err := os.UserHomeDir(); err == nil {
-		logDir = filepath.Join(home, ".config", "flare-cli", "logs")
-		os.MkdirAll(logDir, 0700)
+	logDir := porticoConnectorLogDir()
+	if logDir != "" {
+		_ = os.MkdirAll(logDir, 0700)
 	}
 
 	return &ProcessConnector{bin: cloudflaredBin, logDir: logDir}
+}
+
+// porticoConnectorLogDir follows the same XDG state contract as the
+// supervisor. Raw cloudflared output is runtime state, not configuration, so
+// it must never be written into the legacy Flare configuration directory.
+func porticoConnectorLogDir() string {
+	stateHome := os.Getenv("XDG_STATE_HOME")
+	if stateHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		stateHome = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(stateHome, "portico", "logs")
 }
 
 // Run starts `cloudflared tunnel --no-autoupdate run --token <token>`.

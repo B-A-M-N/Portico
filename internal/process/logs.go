@@ -1,13 +1,112 @@
 package process
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 )
+
+const maxUnterminatedLogLine = 1 << 20
+
+var (
+	authorizationHeaderPattern = regexp.MustCompile(`(?i)(authorization\s*:\s*)[^\r\n]*`)
+	bearerTokenPattern         = regexp.MustCompile(`(?i)\bbearer\s+[-._~+/=a-z0-9]+`)
+	tunnelTokenPattern         = regexp.MustCompile(`(?i)(?:tunnel[ _-]?token|token-file|credentials?-file)\s*(?:=|:)\s*\S+`)
+)
+
+// RedactingWriter buffers an unterminated log line and redacts it before it
+// reaches its destination. Holding partial lines is intentional: process
+// pipes may split a secret across writes, and per-write replacement would
+// expose the first half of that secret permanently.
+//
+// Close flushes its buffered data but does not close the destination, making
+// it safe for stdout and stderr redactors to share one RotatingWriter.
+type RedactingWriter struct {
+	mu         sync.Mutex
+	dst        io.Writer
+	redactions [][]byte
+	pending    []byte
+	closed     bool
+}
+
+// NewRedactingWriter wraps dst with streaming redaction for explicit secret
+// values and common credential-bearing log formats.
+func NewRedactingWriter(dst io.Writer, redactions []string) *RedactingWriter {
+	values := make([][]byte, 0, len(redactions))
+	for _, value := range redactions {
+		if value != "" {
+			values = append(values, []byte(value))
+		}
+	}
+	return &RedactingWriter{dst: dst, redactions: values}
+}
+
+func (w *RedactingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	w.pending = append(w.pending, p...)
+	if len(w.pending) > maxUnterminatedLogLine && bytes.IndexByte(w.pending, '\n') < 0 {
+		// Do not risk writing an arbitrarily long partial line whose secret may
+		// not have arrived yet. Preserve the safety invariant over log fidelity.
+		if _, err := io.WriteString(w.dst, "[portico: unterminated log line redacted]\n"); err != nil {
+			return 0, err
+		}
+		w.pending = w.pending[:0]
+		return len(p), nil
+	}
+	if err := w.flushCompleteLinesLocked(); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *RedactingWriter) flushCompleteLinesLocked() error {
+	last := bytes.LastIndexByte(w.pending, '\n')
+	if last < 0 {
+		return nil
+	}
+	if _, err := w.dst.Write(redactLogBytes(w.pending[:last+1], w.redactions)); err != nil {
+		return err
+	}
+	copy(w.pending, w.pending[last+1:])
+	w.pending = w.pending[:len(w.pending)-(last+1)]
+	return nil
+}
+
+func (w *RedactingWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if len(w.pending) == 0 {
+		return nil
+	}
+	_, err := w.dst.Write(redactLogBytes(w.pending, w.redactions))
+	w.pending = nil
+	return err
+}
+
+func redactLogBytes(data []byte, values [][]byte) []byte {
+	result := append([]byte(nil), data...)
+	for _, value := range values {
+		result = bytes.ReplaceAll(result, value, []byte("[REDACTED]"))
+	}
+	result = authorizationHeaderPattern.ReplaceAll(result, []byte("${1}[REDACTED]"))
+	result = bearerTokenPattern.ReplaceAll(result, []byte("Bearer [REDACTED]"))
+	result = tunnelTokenPattern.ReplaceAll(result, []byte("[REDACTED]"))
+	return result
+}
 
 const (
 	maxLogSize  = 10 * 1024 * 1024 // 10 MiB
@@ -44,7 +143,7 @@ func NewRotatingWriter(path string, maxSize int64, maxFiles int) (*RotatingWrite
 }
 
 func (w *RotatingWriter) openLocked() error {
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}

@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
@@ -157,6 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_operations_connection ON operations(connection_id
 CREATE TABLE IF NOT EXISTS operation_step_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
     step_id TEXT NOT NULL,
     step_kind TEXT NOT NULL,
     status TEXT NOT NULL, -- not_started, started, outcome_unknown, succeeded, failed, compensation_pending, compensated, compensation_failed
@@ -165,7 +166,8 @@ CREATE TABLE IF NOT EXISTS operation_step_results (
     recovery_status TEXT NOT NULL DEFAULT 'normal', -- normal, recovery_required
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY(operation_id) REFERENCES operations(id)
+    FOREIGN KEY(operation_id) REFERENCES operations(id),
+    UNIQUE(operation_id, step_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_results_operation ON operation_step_results(operation_id);
@@ -203,36 +205,7 @@ PRAGMA foreign_keys=ON;
 	},
 	{
 		version: 2,
-		sql: `
--- Migration 2: Add missing indexes and tables, freeze migration 1.
-CREATE INDEX IF NOT EXISTS idx_findings_unresolved ON findings(resolved_at) WHERE resolved_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_findings_connection_segment ON findings(connection_id, segment);
-CREATE INDEX IF NOT EXISTS idx_traffic_samples_timestamp ON traffic_samples(timestamp);
-CREATE INDEX IF NOT EXISTS idx_operations_started ON operations(started_at);
-CREATE INDEX IF NOT EXISTS idx_operation_events_sequence ON operation_events(operation_id, sequence);
-
-INSERT OR IGNORE INTO event_sequence (id, last_sequence, updated_at) VALUES (1, 0, datetime('now'));
-
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-    key TEXT PRIMARY KEY,
-    operation_id TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(operation_id) REFERENCES operations(id)
-);
-
-CREATE TABLE IF NOT EXISTS connector_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    connection_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    size INTEGER DEFAULT 0,
-    rotated_at TEXT,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
-);
-
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-`,
+		onApply: migrateV1ToV2,
 	},
 	{
 		version: 3,
@@ -437,10 +410,103 @@ CREATE INDEX IF NOT EXISTS idx_step_results_operation ON operation_step_results(
 		version: 11,
 		sql:     migrationEventsTable,
 	},
+	{
+		version: 12,
+		onApply: func(tx *sql.Tx) error {
+			// Bind credentials to their provider in the AAD context.
+			return addColumnIfNotExists(tx, "tunnel_credentials", "provider_id", "TEXT NOT NULL DEFAULT ''")
+		},
+	},
+	{
+		version: 13,
+		onApply: func(tx *sql.Tx) error {
+			if err := addColumnIfNotExists(tx, "operation_step_results", "connection_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM operation_step_results
+WHERE id NOT IN (SELECT MIN(id) FROM operation_step_results GROUP BY operation_id, step_id)`); err != nil {
+				return err
+			}
+			_, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_step_results_operation_step
+ON operation_step_results(operation_id, step_id)`)
+			return err
+		},
+	},
+	{
+		version: 14,
+		sql: `
+CREATE TABLE IF NOT EXISTS resource_cleanup_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    cleanup_state TEXT NOT NULL,
+    last_error TEXT,
+    provider_request_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider_id, resource_type, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_items_connection ON resource_cleanup_items(connection_id, cleanup_state);
+		`,
+	},
+	{
+		version: 15,
+		onApply: func(tx *sql.Tx) error {
+			// A connection can legitimately retain a credential for an old
+			// tunnel while a replacement is being created or compensated. The
+			// original one-row-per-connection schema silently overwrote that
+			// evidence and made exact cleanup impossible.
+			if _, err := tx.Exec(`
+CREATE TABLE tunnel_credentials_new (
+    connection_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    tunnel_id TEXT NOT NULL,
+    token_encrypted BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (connection_id, provider_id, tunnel_id)
+);
+INSERT INTO tunnel_credentials_new
+    (connection_id, provider_id, tunnel_id, token_encrypted, created_at, updated_at)
+SELECT connection_id, COALESCE(provider_id, ''), tunnel_id, token_encrypted, created_at, updated_at
+FROM tunnel_credentials;
+DROP TABLE tunnel_credentials;
+ALTER TABLE tunnel_credentials_new RENAME TO tunnel_credentials;
+CREATE INDEX idx_tunnel_credentials_connection ON tunnel_credentials(connection_id, updated_at DESC);`); err != nil {
+				return fmt.Errorf("rebuild tunnel credential identity: %w", err)
+			}
+			return nil
+		},
+	},
+	{
+		version: 16,
+		sql: `
+-- Provider account tokens are encrypted installation secrets addressed by an
+-- opaque reference stored in provider_accounts. They are deliberately not
+-- connection/tunnel credentials and must survive connection replacement.
+CREATE TABLE IF NOT EXISTS provider_credentials (
+    credential_ref TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    secret_encrypted BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider ON provider_credentials(provider_id);
+`,
+	},
 }
 
 // Open opens the SQLite database at path, runs migrations, and returns a Store.
 func Open(path string) (*Store, error) {
+	// SQLite creates the database file, but not its parent directory. Create
+	// the Portico data directory before opening so a first-run XDG location is
+	// usable without any external bootstrap step.
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, fmt.Errorf("create store directory: %w", err)
+	}
 	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("store open: %w", err)
@@ -463,10 +529,12 @@ func Open(path string) (*Store, error) {
 
 	if err := os.Chmod(path, 0600); err != nil {
 		db.Close()
+		secretStore.Destroy()
 		return nil, fmt.Errorf("store chmod: %w", err)
 	}
 	if err := s.runMigrations(); err != nil {
 		db.Close()
+		secretStore.Destroy()
 		return nil, fmt.Errorf("store migrate: %w", err)
 	}
 	return s, nil
@@ -474,7 +542,11 @@ func Open(path string) (*Store, error) {
 
 // Close closes the database.
 func (s *Store) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	if s.secretStore != nil {
+		s.secretStore.Destroy()
+	}
+	return err
 }
 
 // DB returns the underlying database handle (for tests).
@@ -517,6 +589,231 @@ func addColumnIfNotExists(tx *sql.Tx, table, column, colType string) error {
 	return err
 }
 
+// migrateV1ToV2 is deliberately a compatibility migration, not merely an
+// index migration. The first released Portico schema used diagnostic_findings,
+// plan_json, error_text, and seq-keyed operation events. Migration 1 was later
+// expanded in source, but databases that already recorded version 1 must be
+// upgraded from their original shape without losing their history.
+func migrateV1ToV2(tx *sql.Tx) error {
+	if err := migrateLegacyOperationTables(tx); err != nil {
+		return err
+	}
+	if err := migrateLegacyIdempotencyKeys(tx); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`
+CREATE TABLE IF NOT EXISTS findings (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    segment TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    explanation TEXT,
+    evidence_json BLOB,
+    repair_options_json BLOB,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
+);
+CREATE TABLE IF NOT EXISTS traffic_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    origin_latency_ms REAL,
+    public_latency_ms REAL,
+    request_count INTEGER,
+    error_count INTEGER,
+    edge_location TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
+);
+CREATE TABLE IF NOT EXISTS event_sequence (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_sequence INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connector_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size INTEGER DEFAULT 0,
+    rotated_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
+);`); err != nil {
+		return fmt.Errorf("create v2 tables: %w", err)
+	}
+
+	legacyFindings, err := tableExists(tx, "diagnostic_findings")
+	if err != nil {
+		return err
+	}
+	if legacyFindings {
+		if _, err := tx.Exec(`
+INSERT OR IGNORE INTO findings
+    (id, connection_id, segment, severity, summary, explanation, evidence_json, repair_options_json, resolved_at, created_at)
+SELECT id, connection_id, segment, severity, summary, explanation, evidence_json, repair_options_json, resolved_at, observed_at
+FROM diagnostic_findings`); err != nil {
+			return fmt.Errorf("copy legacy findings: %w", err)
+		}
+	}
+
+	// The original resource inventory had no creation timestamp. Unknown
+	// provenance is represented by an empty timestamp rather than inventing a
+	// current time, which would misstate ownership history.
+	if err := addColumnIfNotExists(tx, "provider_resources", "created_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add provider resource creation time: %w", err)
+	}
+
+	if _, err := tx.Exec(`
+CREATE INDEX IF NOT EXISTS idx_findings_unresolved ON findings(resolved_at) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_findings_connection_segment ON findings(connection_id, segment);
+CREATE INDEX IF NOT EXISTS idx_traffic_samples_timestamp ON traffic_samples(timestamp);
+CREATE INDEX IF NOT EXISTS idx_operations_started ON operations(started_at);
+CREATE INDEX IF NOT EXISTS idx_operation_events_sequence ON operation_events(operation_id, sequence);
+INSERT OR IGNORE INTO event_sequence (id, last_sequence, updated_at) VALUES (1, 0, datetime('now'));`); err != nil {
+		return fmt.Errorf("create v2 indexes: %w", err)
+	}
+	return nil
+}
+
+func migrateLegacyOperationTables(tx *sql.Tx) error {
+	legacyPlans, err := tableHasColumn(tx, "operation_plans", "plan_json")
+	if err != nil {
+		return err
+	}
+	if !legacyPlans {
+		return nil
+	}
+
+	// Build all replacement tables before replacing any source table. A
+	// failure therefore rolls back cleanly with the legacy data untouched.
+	if _, err := tx.Exec(`
+CREATE TABLE operation_plans_v2 (
+    id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL,
+    profile_revision INTEGER NOT NULL,
+    provider_id TEXT NOT NULL,
+    intent TEXT NOT NULL,
+    steps_json BLOB NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT
+);
+CREATE TABLE operations_v2 (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error_json BLOB,
+    FOREIGN KEY(plan_id) REFERENCES operation_plans_v2(id)
+);
+CREATE TABLE operation_events_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id TEXT NOT NULL,
+    step_id TEXT,
+    event_type TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    summary TEXT,
+    error TEXT,
+    sequence INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    FOREIGN KEY(operation_id) REFERENCES operations_v2(id)
+);
+INSERT INTO operation_plans_v2
+    (id, connection_id, profile_revision, provider_id, intent, steps_json, fingerprint, created_at, expires_at)
+SELECT id, connection_id, profile_revision, provider_id, intent,
+       CASE WHEN json_valid(plan_json) THEN COALESCE(json_extract(plan_json, '$.Steps'), '[]') ELSE '[]' END,
+       fingerprint, created_at, expires_at
+FROM operation_plans;
+INSERT INTO operations_v2
+    (id, plan_id, connection_id, state, started_at, completed_at, error_json)
+SELECT id, plan_id, connection_id, state, started_at, completed_at,
+       CASE WHEN error_text IS NULL OR error_text = '' THEN NULL
+            ELSE json_object('Code', 'PTO-LEGACY-OPERATION', 'Message', error_text) END
+FROM operations;
+INSERT INTO operation_events_v2
+    (operation_id, step_id, event_type, stage, summary, error, sequence, timestamp)
+SELECT operation_id, NULL, event_type, COALESCE(stage, ''), NULL, NULL, seq, occurred_at
+FROM operation_events WHERE operation_id IS NOT NULL;
+DROP TABLE operation_events;
+DROP TABLE operations;
+DROP TABLE operation_plans;
+ALTER TABLE operation_plans_v2 RENAME TO operation_plans;
+ALTER TABLE operations_v2 RENAME TO operations;
+ALTER TABLE operation_events_v2 RENAME TO operation_events;`); err != nil {
+		return fmt.Errorf("rebuild legacy operation tables: %w", err)
+	}
+	return nil
+}
+
+func migrateLegacyIdempotencyKeys(tx *sql.Tx) error {
+	legacy, err := tableHasColumn(tx, "idempotency_keys", "key_hash")
+	if err != nil {
+		return err
+	}
+	if !legacy {
+		_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    operation_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(operation_id) REFERENCES operations(id)
+)`)
+		return err
+	}
+	_, err = tx.Exec(`
+CREATE TABLE idempotency_keys_v2 (
+    key TEXT PRIMARY KEY,
+    operation_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(operation_id) REFERENCES operations(id)
+);
+INSERT INTO idempotency_keys_v2 (key, operation_id, created_at)
+SELECT key_hash, NULL, created_at FROM idempotency_keys;
+DROP TABLE idempotency_keys;
+ALTER TABLE idempotency_keys_v2 RENAME TO idempotency_keys;`)
+	if err != nil {
+		return fmt.Errorf("rebuild legacy idempotency keys: %w", err)
+	}
+	return nil
+}
+
+func tableExists(tx *sql.Tx, table string) (bool, error) {
+	var name string
+	err := tx.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func tableHasColumn(tx *sql.Tx, table, column string) (bool, error) {
+	exists, err := tableExists(tx, table)
+	if err != nil || !exists {
+		return false, err
+	}
+	rows, err := tx.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 // copyFile copies src to dst with 0600 permissions.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -556,15 +853,35 @@ func deriveKey() []byte {
 	return hash[:]
 }
 
+// credentialAADSchemaVersion identifies the AAD context layout so it can
+// evolve without silently accepting mismatched bindings.
+const credentialAADSchemaVersion = 2
+
+// credentialContext builds the v2 AAD context binding a credential to its
+// connection, provider, tunnel, and AAD schema version.
+func credentialContext(connID core.ConnectionID, providerID core.ProviderID, tunnelID string) string {
+	return fmt.Sprintf("v2:%s:%s:%s:schema=%d", connID, providerID, tunnelID, credentialAADSchemaVersion)
+}
+
+func providerCredentialContext(providerID core.ProviderID, credentialRef string) string {
+	return fmt.Sprintf("v2:provider:%s:%s:schema=%d", providerID, credentialRef, credentialAADSchemaVersion)
+}
+
+// legacyCredentialContext is the pre-v2 AAD context (connection:tunnel),
+// kept readable for credentials encrypted before provider binding.
+func legacyCredentialContext(connID core.ConnectionID, tunnelID string) string {
+	return string(connID) + ":" + tunnelID
+}
+
 // encryptCredential encrypts a token using the SecretStore with context-bound AAD.
 // The context binds the ciphertext to a specific connection/provider/tunnel.
 // Encryption without an established secret store is refused: the deprecated
 // machine-ID-derived key is predictable and must never protect new secrets.
-func encryptCredential(store *SecretStore, plaintext, context string) ([]byte, error) {
+func encryptCredential(store *SecretStore, plaintext []byte, context string) ([]byte, error) {
 	if store == nil {
 		return nil, fmt.Errorf("secret store not initialized: refusing to encrypt credential with legacy key")
 	}
-	return store.Encrypt([]byte(plaintext), context)
+	return store.Encrypt(plaintext, context)
 }
 
 // decryptCredential decrypts a token using the SecretStore.
@@ -619,6 +936,16 @@ func decryptCredentialLegacy(ciphertext []byte) (string, error) {
 // --------------- migrations ---------------
 
 func (s *Store) runMigrations() error {
+	// Refuse an on-disk schema written by a newer Portico. Proceeding could
+	// silently discard columns or reinterpret state this binary does not know.
+	var latestOnDisk sql.NullInt64
+	if err := s.db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&latestOnDisk); err == nil && latestOnDisk.Valid {
+		latestSupported := migrations[len(migrations)-1].version
+		if latestOnDisk.Int64 > int64(latestSupported) {
+			return fmt.Errorf("database schema version %d is newer than supported version %d", latestOnDisk.Int64, latestSupported)
+		}
+	}
+
 	// Determine whether any migration is pending; if so, back up the
 	// database file first so destructive rebuilds can be recovered from.
 	pending := false
@@ -636,6 +963,15 @@ func (s *Store) runMigrations() error {
 	}
 	if pending && s.path != "" {
 		if info, err := os.Stat(s.path); err == nil && info.Size() > 0 {
+			// WAL may contain committed pages not present in the main file. A
+			// checkpoint is required before the file copy is a usable backup.
+			var busy, logFrames, checkpointed int
+			if err := s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+				return fmt.Errorf("checkpoint before migration backup: %w", err)
+			}
+			if busy != 0 {
+				return fmt.Errorf("checkpoint before migration backup is busy")
+			}
 			backupPath := fmt.Sprintf("%s.backup-%s", s.path, time.Now().UTC().Format("20060102T150405Z"))
 			if err := copyFile(s.path, backupPath); err != nil {
 				return fmt.Errorf("pre-migration backup: %w", err)
@@ -807,6 +1143,12 @@ func (s *Store) CreateConnection(
 	if err != nil {
 		return fmt.Errorf("insert runtime: %w", err)
 	}
+	if _, err := appendEventTx(ctx, tx, "", profile.ID, string(core.EventConnectionCreated), string(core.StageSucceeded), profile.UpdatedAt, map[string]string{
+		"connection_id": string(profile.ID),
+		"name":          profile.Name,
+	}); err != nil {
+		return fmt.Errorf("persist connection creation event: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit connection creation: %w", err)
@@ -900,10 +1242,16 @@ func (s *Store) UpdateProfile(ctx context.Context, profile *core.ConnectionProfi
 	}
 
 	newRevision := expectedRevision + 1
-	updatedAt := time.Now().UTC().Format(time.RFC3339)
+	updatedAtTime := time.Now().UTC()
+	updatedAt := updatedAtTime.Format(time.RFC3339)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin profile update: %w", err)
+	}
+	defer tx.Rollback()
 
 	// Optimistic update: only update if revision matches
-	result, err := s.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 		UPDATE connection_profiles
 		SET name = ?, revision = ?, source_json = ?, exposure_json = ?, protection_json = ?,
 		    provider_json = ?, lifecycle_json = ?, desired_state = ?, updated_at = ?
@@ -923,15 +1271,27 @@ func (s *Store) UpdateProfile(ctx context.Context, profile *core.ConnectionProfi
 
 	if rowsAffected == 0 {
 		// Revision mismatch or profile not found
+		tx.Rollback()
 		existing, err := s.loadProfileLocked(ctx, profile.ID)
 		if err != nil {
 			return nil, fmt.Errorf("profile not found or revision mismatch: %w", err)
 		}
 		return nil, fmt.Errorf("revision mismatch: expected %d, current %d", expectedRevision, existing.Revision)
 	}
+	if _, err := appendEventTx(ctx, tx, "", profile.ID, string(core.EventConnectionUpdated), string(core.StageSucceeded), updatedAtTime, map[string]any{
+		"connection_id": string(profile.ID),
+		"revision":      newRevision,
+	}); err != nil {
+		return nil, fmt.Errorf("persist profile update event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit profile update: %w", err)
+	}
 
-	// Load and return the committed profile
-	return s.loadProfileLocked(ctx, profile.ID)
+	committed := profile.DeepCopy()
+	committed.Revision = newRevision
+	committed.UpdatedAt = updatedAtTime
+	return committed, nil
 }
 
 // loadProfileLocked loads a profile assuming the caller holds s.mu.
@@ -1025,6 +1385,162 @@ func (s *Store) ListProfiles(ctx context.Context) ([]*core.ConnectionProfile, er
 	return result, nil
 }
 
+// Snapshot is a consistent read of the state projections needed by IPC. The
+// event high-water comes from the same SQLite read transaction as profiles and
+// runtimes, so a reconnecting client can safely use LastEvent-ID=LastSeq.
+type Snapshot struct {
+	Profiles []*core.ConnectionProfile
+	Runtimes []*core.ConnectionRuntime
+	LastSeq  int64
+}
+
+// ReadSnapshot returns profiles, runtimes, and the durable event high-water
+// from one read transaction. Do not replace this with separate list/query
+// calls: a state commit between those calls can make a returned LastSeq lie
+// about the state represented by the snapshot.
+func (s *Store) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin snapshot: %w", err)
+	}
+	defer tx.Rollback()
+
+	profiles, err := readSnapshotProfiles(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	runtimes, err := readSnapshotRuntimes(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	var lastSeq int64
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(seq), 0) FROM events").Scan(&lastSeq); err != nil {
+		return nil, fmt.Errorf("snapshot event high-water: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit snapshot: %w", err)
+	}
+	return &Snapshot{Profiles: profiles, Runtimes: runtimes, LastSeq: lastSeq}, nil
+}
+
+func readSnapshotProfiles(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionProfile, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, name, revision, source_json, exposure_json, protection_json,
+		       provider_json, lifecycle_json, desired_state, created_at, updated_at
+		FROM connection_profiles ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot profiles: %w", err)
+	}
+	defer rows.Close()
+	var profiles []*core.ConnectionProfile
+	for rows.Next() {
+		var p core.ConnectionProfile
+		var sourceJSON, exposureJSON, protectionJSON, providerJSON, lifecycleJSON []byte
+		var desiredState, createdAt, updatedAt string
+		if err := rows.Scan(&p.ID, &p.Name, &p.Revision, &sourceJSON, &exposureJSON, &protectionJSON,
+			&providerJSON, &lifecycleJSON, &desiredState, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan snapshot profile: %w", err)
+		}
+		if err := json.Unmarshal(sourceJSON, &p.Source); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s source: %w", p.ID, err)
+		}
+		if err := json.Unmarshal(exposureJSON, &p.Exposure); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s exposure: %w", p.ID, err)
+		}
+		if err := json.Unmarshal(protectionJSON, &p.Protection); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s protection: %w", p.ID, err)
+		}
+		if err := json.Unmarshal(providerJSON, &p.Provider); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s provider: %w", p.ID, err)
+		}
+		if err := json.Unmarshal(lifecycleJSON, &p.Lifecycle); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s lifecycle: %w", p.ID, err)
+		}
+		p.Desired = core.DesiredConnectionState(desiredState)
+		if p.CreatedAt, err = time.Parse(time.RFC3339, createdAt); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s created_at: %w", p.ID, err)
+		}
+		if p.UpdatedAt, err = time.Parse(time.RFC3339, updatedAt); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s updated_at: %w", p.ID, err)
+		}
+		profiles = append(profiles, &p)
+	}
+	return profiles, rows.Err()
+}
+
+func readSnapshotRuntimes(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionRuntime, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT connection_id, runtime_state, provider_id, public_address, private_address,
+		       connector_json, provider_runtime_json, endpoint_json, diagnostics_json,
+		       active_operation_id, error_json, last_observation, last_transition
+		FROM connection_runtime`)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot runtimes: %w", err)
+	}
+	defer rows.Close()
+	var runtimes []*core.ConnectionRuntime
+	for rows.Next() {
+		var rt core.ConnectionRuntime
+		var runtimeState, lastObs, lastTrans string
+		var providerID, publicAddress, privateAddress sql.NullString
+		var connectorJSON, providerJSON, endpointJSON, diagnosticsJSON, errorJSON []byte
+		var activeOperation sql.NullString
+		if err := rows.Scan(&rt.ConnectionID, &runtimeState, &providerID, &publicAddress, &privateAddress,
+			&connectorJSON, &providerJSON, &endpointJSON, &diagnosticsJSON, &activeOperation, &errorJSON, &lastObs, &lastTrans); err != nil {
+			return nil, fmt.Errorf("scan snapshot runtime: %w", err)
+		}
+		rt.State = core.RuntimeState(runtimeState)
+		if rt.LastObservedAt, err = time.Parse(time.RFC3339, lastObs); err != nil {
+			return nil, fmt.Errorf("snapshot runtime %s last_observation: %w", rt.ConnectionID, err)
+		}
+		if rt.LastTransition, err = time.Parse(time.RFC3339, lastTrans); err != nil {
+			return nil, fmt.Errorf("snapshot runtime %s last_transition: %w", rt.ConnectionID, err)
+		}
+		if providerID.Valid {
+			rt.Provider.ProviderID = core.ProviderID(providerID.String)
+		}
+		if publicAddress.Valid {
+			rt.Endpoint.PublicAddress = publicAddress.String
+		}
+		if privateAddress.Valid {
+			rt.Endpoint.PrivateAddress = privateAddress.String
+		}
+		if len(connectorJSON) > 0 {
+			if err := json.Unmarshal(connectorJSON, &rt.Connector); err != nil {
+				return nil, fmt.Errorf("snapshot runtime %s connector: %w", rt.ConnectionID, err)
+			}
+		}
+		if len(providerJSON) > 0 {
+			if err := json.Unmarshal(providerJSON, &rt.Provider); err != nil {
+				return nil, fmt.Errorf("snapshot runtime %s provider: %w", rt.ConnectionID, err)
+			}
+		}
+		if len(endpointJSON) > 0 {
+			if err := json.Unmarshal(endpointJSON, &rt.Endpoint); err != nil {
+				return nil, fmt.Errorf("snapshot runtime %s endpoint: %w", rt.ConnectionID, err)
+			}
+		}
+		if len(diagnosticsJSON) > 0 {
+			if err := json.Unmarshal(diagnosticsJSON, &rt.Diagnostics); err != nil {
+				return nil, fmt.Errorf("snapshot runtime %s diagnostics: %w", rt.ConnectionID, err)
+			}
+		}
+		if len(errorJSON) > 0 {
+			if err := json.Unmarshal(errorJSON, &rt.Error); err != nil {
+				return nil, fmt.Errorf("snapshot runtime %s error: %w", rt.ConnectionID, err)
+			}
+		}
+		if activeOperation.Valid {
+			opID := core.OperationID(activeOperation.String)
+			rt.ActiveOperation = &opID
+		}
+		runtimes = append(runtimes, &rt)
+	}
+	return runtimes, rows.Err()
+}
+
 // DeleteProfile removes a profile by ID.
 func (s *Store) DeleteProfile(ctx context.Context, id core.ConnectionID) error {
 	s.mu.Lock()
@@ -1036,11 +1552,14 @@ func (s *Store) DeleteProfile(ctx context.Context, id core.ConnectionID) error {
 
 // --------------- runtime CRUD ---------------
 
-// SaveRuntime persists a connection runtime.
-func (s *Store) SaveRuntime(ctx context.Context, rt *core.ConnectionRuntime) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+type runtimeExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
 
+// upsertRuntime writes a complete runtime projection through either the
+// database or an existing transaction. Keeping serialization here prevents
+// state/event transactions from drifting from ordinary runtime persistence.
+func upsertRuntime(ctx context.Context, execer runtimeExecer, rt *core.ConnectionRuntime) error {
 	connectorJSON, err := json.Marshal(rt.Connector)
 	if err != nil {
 		return fmt.Errorf("marshal connector: %w", err)
@@ -1069,7 +1588,7 @@ func (s *Store) SaveRuntime(ctx context.Context, rt *core.ConnectionRuntime) err
 		activeOpID = rt.ActiveOperation
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	_, err = execer.ExecContext(ctx, `
 		INSERT INTO connection_runtime
 			(connection_id, runtime_state, provider_id, public_address, private_address,
 			 connector_json, provider_runtime_json, endpoint_json, diagnostics_json,
@@ -1090,6 +1609,37 @@ func (s *Store) SaveRuntime(ctx context.Context, rt *core.ConnectionRuntime) err
 		rt.LastTransition.Format(time.RFC3339),
 	)
 	return err
+}
+
+// SaveRuntime persists a connection runtime.
+func (s *Store) SaveRuntime(ctx context.Context, rt *core.ConnectionRuntime) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return upsertRuntime(ctx, s.db, rt)
+}
+
+// CommitConnectorRuntimeEvent updates connector-derived runtime state and
+// appends its normalized durable event in one transaction. SSE callers must
+// dispatch only after this returns successfully.
+func (s *Store) CommitConnectorRuntimeEvent(ctx context.Context, rt *core.ConnectionRuntime, eventType, stage string, occurredAt time.Time, payload any) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := upsertRuntime(ctx, tx, rt); err != nil {
+		return 0, err
+	}
+	seq, err := appendEventTx(ctx, tx, "", rt.ConnectionID, eventType, stage, occurredAt, payload)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
 // LoadRuntime loads runtime by connection ID.
@@ -1251,12 +1801,141 @@ func (s *Store) SaveResource(ctx context.Context, res *core.ProviderResource) er
 	// Resource does not exist - insert it.
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO provider_resources
-			(connection_id, provider_id, resource_type, external_id, ownership, spec_hash, metadata_json, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(connection_id, provider_id, resource_type, external_id, ownership, lifecycle, spec_hash, metadata_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		res.ConnectionID, res.ProviderID, string(res.Type), res.ExternalID,
-		string(res.Ownership), res.SpecHash, metaJSON, now,
+		string(res.Ownership), string(core.LifecyclePresent), res.SpecHash, metaJSON, now,
 	)
 	return err
+}
+
+// CreateManagedResource persists a resource created by Portico. Ownership
+// defaults to managed when unset. Cross-connection conflicts return
+// *ResourceAssociationConflict. An existing managed row is an idempotent
+// re-create and is explicitly returned to present lifecycle; plain
+// observation refreshes deliberately do not make that transition.
+func (s *Store) CreateManagedResource(ctx context.Context, res *core.ProviderResource) error {
+	cp := *res
+	if cp.Ownership == "" {
+		cp.Ownership = core.OwnershipManaged
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	metaJSON, err := json.Marshal(cp.Metadata)
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	var existingConnectionID string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT connection_id FROM provider_resources
+		WHERE provider_id = ? AND resource_type = ? AND external_id = ?`,
+		cp.ProviderID, string(cp.Type), cp.ExternalID,
+	).Scan(&existingConnectionID)
+	if err == nil {
+		if existingConnectionID != string(cp.ConnectionID) {
+			return &ResourceAssociationConflict{
+				ProviderID: cp.ProviderID, ResourceType: cp.Type, ExternalID: cp.ExternalID,
+				OwnerConnID: core.ConnectionID(existingConnectionID),
+			}
+		}
+		_, err = s.db.ExecContext(ctx, `
+			UPDATE provider_resources
+			SET spec_hash = ?, metadata_json = ?,
+				lifecycle = CASE WHEN ownership = ? THEN ? ELSE lifecycle END
+			WHERE provider_id = ? AND resource_type = ? AND external_id = ? AND connection_id = ?`,
+			cp.SpecHash, metaJSON, string(core.OwnershipManaged), string(core.LifecyclePresent),
+			cp.ProviderID, string(cp.Type), cp.ExternalID, cp.ConnectionID,
+		)
+		return err
+	}
+	if err != sql.ErrNoRows {
+		return fmt.Errorf("query existing resource: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO provider_resources
+			(connection_id, provider_id, resource_type, external_id, ownership, lifecycle, spec_hash, metadata_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		cp.ConnectionID, cp.ProviderID, string(cp.Type), cp.ExternalID,
+		string(cp.Ownership), string(core.LifecyclePresent), cp.SpecHash, metaJSON, now,
+	)
+	return err
+}
+
+// UpdateResourceObservation refreshes observation metadata (spec hash and
+// metadata only) for a resource already tracked under the given connection.
+// It can never insert a row, change ownership, or change association.
+func (s *Store) UpdateResourceObservation(ctx context.Context, res *core.ProviderResource) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	metaJSON, err := json.Marshal(res.Metadata)
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
+
+	var existingConnectionID string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT connection_id FROM provider_resources
+		WHERE provider_id = ? AND resource_type = ? AND external_id = ?`,
+		res.ProviderID, string(res.Type), res.ExternalID,
+	).Scan(&existingConnectionID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("resource not tracked: %s/%s/%s", res.ProviderID, res.Type, res.ExternalID)
+	}
+	if err != nil {
+		return fmt.Errorf("query existing resource: %w", err)
+	}
+	if existingConnectionID != string(res.ConnectionID) {
+		return &ResourceAssociationConflict{
+			ProviderID:   res.ProviderID,
+			ResourceType: res.Type,
+			ExternalID:   res.ExternalID,
+			OwnerConnID:  core.ConnectionID(existingConnectionID),
+		}
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE provider_resources
+		SET spec_hash = ?, metadata_json = ?
+		WHERE provider_id = ? AND resource_type = ? AND external_id = ? AND connection_id = ?`,
+		res.SpecHash, metaJSON,
+		res.ProviderID, string(res.Type), res.ExternalID, res.ConnectionID,
+	)
+	return err
+}
+
+// TransferResourceAssociation moves a resource to a new connection with an
+// expected-current-owner check, preserving the ownership class. Use
+// AdoptResource when the ownership class should become adopted.
+func (s *Store) TransferResourceAssociation(ctx context.Context, providerID core.ProviderID, resourceType core.ResourceType,
+	externalID string, expectedCurrentOwner core.ConnectionID, newOwner core.ConnectionID) error {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE provider_resources
+		SET connection_id = ?
+		WHERE provider_id = ? AND resource_type = ? AND external_id = ? AND connection_id = ?`,
+		newOwner, providerID, string(resourceType), externalID, expectedCurrentOwner,
+	)
+	if err != nil {
+		return fmt.Errorf("transfer resource association: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("transfer failed: resource %s/%s/%s not owned by %s",
+			providerID, resourceType, externalID, expectedCurrentOwner)
+	}
+	return nil
 }
 
 // AdoptResource transfers ownership of a resource from one connection to another.
@@ -1421,6 +2100,29 @@ func (s *Store) MarkResourceRemoved(ctx context.Context, connID core.ConnectionI
 	}
 	if rows == 0 {
 		return fmt.Errorf("no managed resource found for %s %s %s (connection %s)", providerID, resourceType, externalID, connID)
+	}
+	return nil
+}
+
+// MarkResourceExternallyRemoved records that an exact provider lookup
+// authoritatively returned not found. This is distinct from a Portico-issued
+// deletion, whose lifecycle is LifecycleRemoved.
+func (s *Store) MarkResourceExternallyRemoved(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, resourceType core.ResourceType, externalID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx,
+		"UPDATE provider_resources SET lifecycle = ? WHERE connection_id = ? AND provider_id = ? AND resource_type = ? AND external_id = ?",
+		string(core.LifecycleExternallyRemoved), connID, string(providerID), string(resourceType), externalID,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("no exact resource found for external removal: %s %s %s (connection %s)", providerID, resourceType, externalID, connID)
 	}
 	return nil
 }
@@ -1723,7 +2425,16 @@ func (s *Store) SaveOperation(ctx context.Context, opID core.OperationID, planID
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin operation creation: %w", err)
+	}
+	defer tx.Rollback()
+	var existing int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM operations WHERE id = ?", opID).Scan(&existing); err != nil {
+		return fmt.Errorf("check existing operation: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO operations (id, plan_id, connection_id, state, started_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -1731,7 +2442,23 @@ func (s *Store) SaveOperation(ctx context.Context, opID core.OperationID, planID
 			plan_id=excluded.plan_id, connection_id=excluded.connection_id`,
 		opID, planID, connID, state, startedAt,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if existing == 0 {
+		occurredAt, parseErr := time.Parse(time.RFC3339, startedAt)
+		if parseErr != nil {
+			occurredAt = time.Now().UTC()
+		}
+		if _, err := appendEventTx(ctx, tx, opID, connID, "operation.created", string(core.StageStarted), occurredAt, map[string]string{
+			"operation_id":  string(opID),
+			"connection_id": string(connID),
+			"plan_id":       string(planID),
+		}); err != nil {
+			return fmt.Errorf("persist operation creation event: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // CompleteOperation marks an operation as completed and clears the active operation reference.
@@ -1739,21 +2466,45 @@ func (s *Store) CompleteOperation(ctx context.Context, opID core.OperationID, st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin operation completion: %w", err)
+	}
+	defer tx.Rollback()
+	var connID core.ConnectionID
+	if err := tx.QueryRowContext(ctx, "SELECT connection_id FROM operations WHERE id = ?", opID).Scan(&connID); err != nil {
+		return fmt.Errorf("lookup operation for completion: %w", err)
+	}
+	now := time.Now().UTC()
+	_, err = tx.ExecContext(ctx, `
 		UPDATE operations SET state = ?, completed_at = ? WHERE id = ?`,
-		state, time.Now().UTC().Format(time.RFC3339), opID,
+		state, now.Format(time.RFC3339), opID,
 	)
 	if err != nil {
 		return err
 	}
 
 	// Clear active operation reference in runtime
-	_, err = s.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		UPDATE connection_runtime SET active_operation_id = NULL
 		WHERE active_operation_id = ?`,
 		opID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	eventType, stage := core.EventOperationCompleted, core.StageSucceeded
+	if state == "failed" {
+		eventType, stage = core.EventOperationFailed, core.StageFailed
+	}
+	if _, err := appendEventTx(ctx, tx, opID, connID, string(eventType), string(stage), now, map[string]string{
+		"operation_id":  string(opID),
+		"connection_id": string(connID),
+		"state":         state,
+	}); err != nil {
+		return fmt.Errorf("persist generic operation terminal event: %w", err)
+	}
+	return tx.Commit()
 }
 
 // ClearActiveOperation clears the active operation reference for a connection.
@@ -1849,6 +2600,11 @@ func (s *Store) CommitOpenSuccess(ctx context.Context, connID core.ConnectionID,
 		"SELECT revision FROM connection_profiles WHERE id = ?", connID).Scan(&revision); err != nil {
 		return nil, fmt.Errorf("read committed revision: %w", err)
 	}
+	if _, err := appendEventTx(ctx, tx, opID, connID, string(core.EventOperationCompleted), string(core.StageSucceeded), committedAt, core.OperationEvent{
+		OperationID: opID, ConnectionID: connID, Stage: core.StageSucceeded, Message: "Open operation completed", Timestamp: committedAt,
+	}); err != nil {
+		return nil, fmt.Errorf("persist open completion event: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -1925,6 +2681,11 @@ func (s *Store) CommitCloseSuccess(ctx context.Context, connID core.ConnectionID
 		"SELECT revision FROM connection_profiles WHERE id = ?", connID).Scan(&revision); err != nil {
 		return nil, fmt.Errorf("read committed revision: %w", err)
 	}
+	if _, err := appendEventTx(ctx, tx, opID, connID, string(core.EventOperationCompleted), string(core.StageSucceeded), committedAt, core.OperationEvent{
+		OperationID: opID, ConnectionID: connID, Stage: core.StageSucceeded, Message: "Close operation completed", Timestamp: committedAt,
+	}); err != nil {
+		return nil, fmt.Errorf("persist close completion event: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -1984,6 +2745,11 @@ func (s *Store) CommitRepairSuccess(ctx context.Context, connID core.ConnectionI
 		"SELECT revision, desired_state FROM connection_profiles WHERE id = ?", connID).Scan(&revision, &desired); err != nil {
 		return nil, fmt.Errorf("read committed profile: %w", err)
 	}
+	if _, err := appendEventTx(ctx, tx, opID, connID, string(core.EventOperationCompleted), string(core.StageSucceeded), committedAt, core.OperationEvent{
+		OperationID: opID, ConnectionID: connID, Stage: core.StageSucceeded, Message: "Repair operation completed", Timestamp: committedAt,
+	}); err != nil {
+		return nil, fmt.Errorf("persist repair completion event: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -2041,6 +2807,11 @@ func (s *Store) CommitOperationFailure(ctx context.Context, connID core.Connecti
 	if err != nil {
 		return fmt.Errorf("update runtime: %w", err)
 	}
+	if _, err = appendEventTx(ctx, tx, opID, connID, string(core.EventOperationFailed), string(core.StageFailed), time.Now().UTC(), core.OperationEvent{
+		OperationID: opID, ConnectionID: connID, Stage: core.StageFailed, Error: errMsg, Timestamp: time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("persist operation failure event: %w", err)
+	}
 
 	return tx.Commit()
 }
@@ -2071,15 +2842,22 @@ func (s *Store) CommitDeleteSuccess(ctx context.Context, connID core.ConnectionI
 		if err != nil {
 			return fmt.Errorf("complete operation: %w", err)
 		}
+		if _, err = appendEventTx(ctx, tx, opID, connID, string(core.EventOperationCompleted), string(core.StageSucceeded), time.Now().UTC(), core.OperationEvent{
+			OperationID: opID, ConnectionID: connID, Stage: core.StageSucceeded, Message: "Delete operation completed", Timestamp: time.Now().UTC(),
+		}); err != nil {
+			return fmt.Errorf("persist delete completion event: %w", err)
+		}
 	}
 
-	// 2. Verify no managed resources remain except confirmed-removed.
+	// 2. Verify no managed resources remain except confirmed-removed or
+	// externally removed. The latter is an authoritative remote 404, not an
+	// unresolved cleanup obligation.
 	// Managed resources in any other state (present, removal_pending, removal_failed, orphaned)
 	// block deletion. External/adopted resources are detached without remote deletion.
 	var unresolvedManaged int
 	err = tx.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM provider_resources WHERE connection_id = ? AND ownership = ? AND (lifecycle IS NULL OR lifecycle != ?)",
-		connID, string(core.OwnershipManaged), string(core.LifecycleRemoved)).Scan(&unresolvedManaged)
+		"SELECT COUNT(*) FROM provider_resources WHERE connection_id = ? AND ownership = ? AND (lifecycle IS NULL OR lifecycle NOT IN (?, ?))",
+		connID, string(core.OwnershipManaged), string(core.LifecycleRemoved), string(core.LifecycleExternallyRemoved)).Scan(&unresolvedManaged)
 	if err != nil {
 		return fmt.Errorf("check managed resources: %w", err)
 	}
@@ -2119,11 +2897,11 @@ func (s *Store) CommitDeleteSuccess(ctx context.Context, connID core.ConnectionI
 		return fmt.Errorf("delete connector logs: %w", err)
 	}
 
-	// 5. Delete only successfully removed or pending resources.
+	// 5. Delete only successfully removed, externally removed, or pending resources.
 	// Preserve removal_failed and orphaned rows as cleanup evidence.
 	_, err = tx.ExecContext(ctx,
-		"DELETE FROM provider_resources WHERE connection_id = ? AND lifecycle IN (?, ?)",
-		connID, string(core.LifecycleRemoved), string(core.LifecycleRemovalPending))
+		"DELETE FROM provider_resources WHERE connection_id = ? AND lifecycle IN (?, ?, ?)",
+		connID, string(core.LifecycleRemoved), string(core.LifecycleExternallyRemoved), string(core.LifecycleRemovalPending))
 	if err != nil {
 		return fmt.Errorf("delete provider resources: %w", err)
 	}
@@ -2181,6 +2959,105 @@ func (s *Store) SaveFinding(ctx context.Context, f *core.DiagnosticFinding) erro
 		f.ObservedAt.Format(time.RFC3339),
 	)
 	return err
+}
+
+// SyncFindings atomically upserts the findings produced by one diagnostic run
+// and resolves every previously active finding for that connection which is
+// absent from the current stable-ID set.
+func (s *Store) SyncFindings(ctx context.Context, connID core.ConnectionID, findings []core.DiagnosticFinding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finding sync: %w", err)
+	}
+	defer tx.Rollback()
+	nowTime := time.Now().UTC()
+	now := nowTime.Format(time.RFC3339)
+	active := make(map[core.FindingID]struct{}, len(findings))
+	for _, finding := range findings {
+		if finding.ConnectionID != connID {
+			return fmt.Errorf("finding %s belongs to %s, expected %s", finding.ID, finding.ConnectionID, connID)
+		}
+		evidenceJSON, marshalErr := json.Marshal(finding.Evidence)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal finding evidence: %w", marshalErr)
+		}
+		repairJSON, marshalErr := json.Marshal(finding.RepairOptions)
+		if marshalErr != nil {
+			return fmt.Errorf("marshal finding repair options: %w", marshalErr)
+		}
+		var alreadyActive bool
+		lookupErr := tx.QueryRowContext(ctx, `
+			SELECT 1 FROM findings WHERE id = ? AND resolved_at IS NULL`, finding.ID).Scan(new(int))
+		switch lookupErr {
+		case nil:
+			alreadyActive = true
+		case sql.ErrNoRows:
+			// A new or previously resolved finding needs a new durable event.
+		default:
+			return fmt.Errorf("check finding %s: %w", finding.ID, lookupErr)
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO findings (id, connection_id, segment, severity, summary, explanation, evidence_json, repair_options_json, resolved_at, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+			ON CONFLICT(id) DO UPDATE SET
+				segment=excluded.segment, severity=excluded.severity, summary=excluded.summary,
+				explanation=excluded.explanation, evidence_json=excluded.evidence_json,
+				repair_options_json=excluded.repair_options_json, resolved_at=NULL`,
+			finding.ID, connID, string(finding.Segment), string(finding.Severity), finding.Summary,
+			finding.Explanation, evidenceJSON, repairJSON, now)
+		if err != nil {
+			return fmt.Errorf("upsert finding %s: %w", finding.ID, err)
+		}
+		if !alreadyActive {
+			if _, err := appendEventTx(ctx, tx, "", connID, string(core.EventDiagnosticFinding), string(core.StageSucceeded), nowTime, map[string]string{
+				"connection_id": string(connID), "finding_id": string(finding.ID), "segment": string(finding.Segment),
+			}); err != nil {
+				return fmt.Errorf("append finding event %s: %w", finding.ID, err)
+			}
+		}
+		active[finding.ID] = struct{}{}
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM findings WHERE connection_id = ? AND resolved_at IS NULL", connID)
+	if err != nil {
+		return err
+	}
+	var resolve []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, ok := active[core.FindingID(id)]; !ok {
+			resolve = append(resolve, id)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range resolve {
+		if _, err := tx.ExecContext(ctx, "UPDATE findings SET resolved_at = ? WHERE id = ?", now, id); err != nil {
+			return err
+		}
+		if _, err := appendEventTx(ctx, tx, "", connID, string(core.EventDiagnosticResolved), string(core.StageSucceeded), nowTime, map[string]string{
+			"connection_id": string(connID), "finding_id": id,
+		}); err != nil {
+			return fmt.Errorf("append finding resolution event %s: %w", id, err)
+		}
+	}
+	// Keep the runtime projection in the same transaction as findings and
+	// their event rows. A missing runtime is valid for an interrupted/new
+	// connection, so zero affected rows are intentionally not an error.
+	diagnosticsJSON, err := json.Marshal(findings)
+	if err != nil {
+		return fmt.Errorf("marshal runtime diagnostics: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE connection_runtime SET diagnostics_json = ? WHERE connection_id = ?`, diagnosticsJSON, connID); err != nil {
+		return fmt.Errorf("update runtime diagnostics: %w", err)
+	}
+	return tx.Commit()
 }
 
 // ListUnresolvedFindings returns unresolved findings for a connection.
@@ -2309,13 +3186,71 @@ func (s *Store) DeleteResourcesByConnection(ctx context.Context, connID core.Con
 
 // --------------- tunnel credential storage ---------------
 
+// SaveProviderCredential stores an API credential by an opaque account
+// reference. Provider account rows retain only this reference, never the
+// secret itself.
+func (s *Store) SaveProviderCredential(ctx context.Context, providerID core.ProviderID, credentialRef string, secret []byte) error {
+	if providerID == "" || strings.TrimSpace(credentialRef) == "" || len(secret) == 0 {
+		return fmt.Errorf("provider ID, credential reference, and secret are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	encrypted, err := encryptCredential(s.secretStore, secret, providerCredentialContext(providerID, credentialRef))
+	if err != nil {
+		return fmt.Errorf("encrypt provider credential: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO provider_credentials (credential_ref, provider_id, secret_encrypted, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(credential_ref) DO UPDATE SET
+			provider_id=excluded.provider_id,
+			secret_encrypted=excluded.secret_encrypted,
+			updated_at=excluded.updated_at`,
+		credentialRef, string(providerID), encrypted, now, now)
+	return err
+}
+
+// LoadProviderCredential resolves one credential reference for the expected
+// provider. A reference belonging to another provider is rejected rather than
+// decrypted under a different AAD context.
+func (s *Store) LoadProviderCredential(ctx context.Context, providerID core.ProviderID, credentialRef string) (string, error) {
+	if providerID == "" || strings.TrimSpace(credentialRef) == "" {
+		return "", fmt.Errorf("provider ID and credential reference are required")
+	}
+	s.mu.RLock()
+	var storedProvider string
+	var encrypted []byte
+	err := s.db.QueryRowContext(ctx, `
+		SELECT provider_id, secret_encrypted FROM provider_credentials WHERE credential_ref = ?`, credentialRef).Scan(&storedProvider, &encrypted)
+	if err == sql.ErrNoRows {
+		s.mu.RUnlock()
+		return "", nil
+	}
+	if err != nil {
+		s.mu.RUnlock()
+		return "", err
+	}
+	if storedProvider != string(providerID) {
+		s.mu.RUnlock()
+		return "", fmt.Errorf("credential reference %q belongs to provider %q", credentialRef, storedProvider)
+	}
+	secret, err := decryptCredential(s.secretStore, encrypted, providerCredentialContext(providerID, credentialRef))
+	s.mu.RUnlock()
+	if err != nil {
+		return "", fmt.Errorf("decrypt provider credential: %w", err)
+	}
+	return secret, nil
+}
+
 // SaveTunnelCredential stores an encrypted tunnel token for a connection.
-// The token is encrypted with AES-GCM using a key derived from the machine ID.
-func (s *Store) SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, tunnelID, token string) error {
+// The token is encrypted with AES-GCM using the SecretStore installation key,
+// with AAD binding the connection, provider, tunnel, and AAD schema version.
+func (s *Store) SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string, token []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	context := string(connID) + ":" + tunnelID
+	context := credentialContext(connID, providerID, tunnelID)
 	encrypted, err := encryptCredential(s.secretStore, token, context)
 	if err != nil {
 		return fmt.Errorf("encrypt credential: %w", err)
@@ -2323,53 +3258,282 @@ func (s *Store) SaveTunnelCredential(ctx context.Context, connID core.Connection
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO tunnel_credentials (connection_id, tunnel_id, token_encrypted, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(connection_id) DO UPDATE SET
-			tunnel_id=excluded.tunnel_id,
+		INSERT INTO tunnel_credentials (connection_id, provider_id, tunnel_id, token_encrypted, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(connection_id, provider_id, tunnel_id) DO UPDATE SET
 			token_encrypted=excluded.token_encrypted,
 			updated_at=excluded.updated_at`,
-		connID, tunnelID, encrypted, now, now,
+		connID, string(providerID), tunnelID, encrypted, now, now,
 	)
 	return err
 }
 
-// LoadTunnelCredential loads and decrypts the tunnel token for a connection.
-// Returns empty string and nil error if no credential is stored.
+// LoadTunnelCredential loads the sole credential for a connection. It exists
+// for compatibility with one-tunnel connections; callers that know a tunnel
+// ID must use LoadTunnelCredentialExact. Multiple rows are deliberately an
+// error rather than an arbitrary newest-token selection.
 func (s *Store) LoadTunnelCredential(ctx context.Context, connID core.ConnectionID) (tunnelID, token string, err error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var encrypted []byte
-	err = s.db.QueryRowContext(ctx,
-		"SELECT tunnel_id, token_encrypted FROM tunnel_credentials WHERE connection_id = ?", connID,
-	).Scan(&tunnelID, &encrypted)
-	if err == sql.ErrNoRows {
-		return "", "", nil
+	rows, queryErr := s.db.QueryContext(ctx, `
+		SELECT tunnel_id, provider_id, token_encrypted
+		FROM tunnel_credentials WHERE connection_id = ?
+		ORDER BY updated_at DESC LIMIT 2`, connID)
+	if queryErr != nil {
+		s.mu.RUnlock()
+		return "", "", queryErr
 	}
-	if err != nil {
+	var rowsFound int
+	var providerID string
+	var encrypted []byte
+	for rows.Next() {
+		rowsFound++
+		if rowsFound == 1 {
+			if err := rows.Scan(&tunnelID, &providerID, &encrypted); err != nil {
+				rows.Close()
+				s.mu.RUnlock()
+				return "", "", err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		s.mu.RUnlock()
 		return "", "", err
 	}
-
-	token, err = decryptCredential(s.secretStore, encrypted, string(connID)+":"+tunnelID)
-	if err != nil {
-		return "", "", fmt.Errorf("decrypt credential: %w", err)
+	if err := rows.Close(); err != nil {
+		s.mu.RUnlock()
+		return "", "", err
+	}
+	if rowsFound == 0 {
+		s.mu.RUnlock()
+		return "", "", nil
+	}
+	if rowsFound > 1 {
+		s.mu.RUnlock()
+		return "", "", fmt.Errorf("ambiguous tunnel credentials for connection %s; select an exact provider and tunnel", connID)
+	}
+	token, legacy, decryptErr := s.decryptTunnelCredentialLocked(connID, core.ProviderID(providerID), tunnelID, encrypted)
+	s.mu.RUnlock()
+	if decryptErr != nil {
+		return "", "", decryptErr
+	}
+	if legacy && providerID != "" {
+		if err := s.SaveTunnelCredential(ctx, connID, core.ProviderID(providerID), tunnelID, []byte(token)); err != nil {
+			return "", "", fmt.Errorf("migrate legacy credential: %w", err)
+		}
 	}
 	return tunnelID, token, nil
 }
 
-// DeleteTunnelCredential removes the stored tunnel credential for a connection.
-func (s *Store) DeleteTunnelCredential(ctx context.Context, connID core.ConnectionID) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, err := s.db.ExecContext(ctx, "DELETE FROM tunnel_credentials WHERE connection_id = ?", connID)
-	return err
+// LoadTunnelCredentialExact loads the token bound to one provider tunnel.
+// Legacy provider-unbound rows are accepted once and immediately rewritten
+// with the supplied provider binding after successful decryption.
+func (s *Store) LoadTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) (string, error) {
+	s.mu.RLock()
+	var storedProvider string
+	var encrypted []byte
+	err := s.db.QueryRowContext(ctx, `
+		SELECT provider_id, token_encrypted FROM tunnel_credentials
+		WHERE connection_id = ? AND tunnel_id = ? AND provider_id IN (?, '')
+		ORDER BY CASE WHEN provider_id = ? THEN 0 ELSE 1 END LIMIT 1`,
+		connID, tunnelID, string(providerID), string(providerID)).Scan(&storedProvider, &encrypted)
+	if err == sql.ErrNoRows {
+		s.mu.RUnlock()
+		return "", nil
+	}
+	if err != nil {
+		s.mu.RUnlock()
+		return "", err
+	}
+	token, legacy, decryptErr := s.decryptTunnelCredentialLocked(connID, core.ProviderID(storedProvider), tunnelID, encrypted)
+	s.mu.RUnlock()
+	if decryptErr != nil {
+		return "", decryptErr
+	}
+	if legacy || storedProvider != string(providerID) {
+		if err := s.SaveTunnelCredential(ctx, connID, providerID, tunnelID, []byte(token)); err != nil {
+			return "", fmt.Errorf("migrate legacy credential: %w", err)
+		}
+		if storedProvider == "" {
+			if err := s.DeleteTunnelCredentialExact(ctx, connID, "", tunnelID); err != nil {
+				return "", fmt.Errorf("remove migrated legacy credential: %w", err)
+			}
+		}
+	}
+	return token, nil
 }
 
-// CommitStepResult atomically persists the full result of executing a step:
-// terminal step event, provider resources, credential mutations, and lifecycle
-// changes all in a single transaction. (SPEC P0 atomic step commit)
+func (s *Store) decryptTunnelCredentialLocked(connID core.ConnectionID, providerID core.ProviderID, tunnelID string, encrypted []byte) (token string, legacy bool, err error) {
+	credCtx := legacyCredentialContext(connID, tunnelID)
+	legacy = providerID == "" || isLegacyCredentialBlob(encrypted)
+	if providerID != "" {
+		credCtx = credentialContext(connID, providerID, tunnelID)
+	}
+	token, err = decryptCredential(s.secretStore, encrypted, credCtx)
+	if err != nil {
+		return "", legacy, fmt.Errorf("decrypt credential: %w", err)
+	}
+	return token, legacy, nil
+}
+
+// DeleteTunnelCredentialExact removes only the credential bound to a
+// particular tunnel. Compensation must never erase a replacement tunnel's
+// token merely because it shares the same connection.
+func (s *Store) DeleteTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.ExecContext(ctx, "DELETE FROM tunnel_credentials WHERE connection_id = ? AND provider_id = ? AND tunnel_id = ?", connID, string(providerID), tunnelID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows > 1 {
+		return fmt.Errorf("credential identity conflict for connection %s tunnel %s", connID, tunnelID)
+	}
+	return nil
+}
+
+// RotateSecretKey rotates the installation key and transactionally rewrites
+// every durable tunnel credential under the new version. Older keys remain
+// available until every row commits successfully; only then are they retired.
+// If a rewrite fails, the new key is retained alongside the old keys so the
+// database remains decryptable and a later retry is safe.
+func (s *Store) RotateSecretKey(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.secretStore == nil {
+		return 0, fmt.Errorf("secret store not initialized")
+	}
+	version, err := s.secretStore.Rotate()
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return version, fmt.Errorf("begin credential rotation: %w", err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+		SELECT connection_id, provider_id, tunnel_id, token_encrypted
+		FROM tunnel_credentials`)
+	if err != nil {
+		return version, fmt.Errorf("list credentials for rotation: %w", err)
+	}
+	type credentialRow struct {
+		connectionID core.ConnectionID
+		providerID   core.ProviderID
+		tunnelID     string
+		token        string
+	}
+	type providerCredentialRow struct {
+		providerID core.ProviderID
+		ref        string
+		secret     string
+	}
+	var credentials []credentialRow
+	for rows.Next() {
+		var row credentialRow
+		var encrypted []byte
+		if err := rows.Scan(&row.connectionID, &row.providerID, &row.tunnelID, &encrypted); err != nil {
+			rows.Close()
+			return version, fmt.Errorf("scan credential for rotation: %w", err)
+		}
+		context := legacyCredentialContext(row.connectionID, row.tunnelID)
+		if row.providerID != "" {
+			context = credentialContext(row.connectionID, row.providerID, row.tunnelID)
+		}
+		row.token, err = decryptCredential(s.secretStore, encrypted, context)
+		if err != nil {
+			rows.Close()
+			return version, fmt.Errorf("decrypt credential %s/%s: %w", row.connectionID, row.tunnelID, err)
+		}
+		credentials = append(credentials, row)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return version, fmt.Errorf("iterate credentials for rotation: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return version, fmt.Errorf("close credential iterator: %w", err)
+	}
+	providerRows, err := tx.QueryContext(ctx, `
+		SELECT provider_id, credential_ref, secret_encrypted FROM provider_credentials`)
+	if err != nil {
+		return version, fmt.Errorf("list provider credentials for rotation: %w", err)
+	}
+	var providerCredentials []providerCredentialRow
+	for providerRows.Next() {
+		var row providerCredentialRow
+		var encrypted []byte
+		if err := providerRows.Scan(&row.providerID, &row.ref, &encrypted); err != nil {
+			providerRows.Close()
+			return version, fmt.Errorf("scan provider credential for rotation: %w", err)
+		}
+		row.secret, err = decryptCredential(s.secretStore, encrypted, providerCredentialContext(row.providerID, row.ref))
+		if err != nil {
+			providerRows.Close()
+			return version, fmt.Errorf("decrypt provider credential %s/%s: %w", row.providerID, row.ref, err)
+		}
+		providerCredentials = append(providerCredentials, row)
+	}
+	if err := providerRows.Err(); err != nil {
+		providerRows.Close()
+		return version, fmt.Errorf("iterate provider credentials for rotation: %w", err)
+	}
+	if err := providerRows.Close(); err != nil {
+		return version, fmt.Errorf("close provider credential iterator: %w", err)
+	}
+	for _, row := range credentials {
+		context := legacyCredentialContext(row.connectionID, row.tunnelID)
+		if row.providerID != "" {
+			context = credentialContext(row.connectionID, row.providerID, row.tunnelID)
+		}
+		encrypted, err := encryptCredential(s.secretStore, []byte(row.token), context)
+		if err != nil {
+			return version, fmt.Errorf("encrypt credential %s/%s: %w", row.connectionID, row.tunnelID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE tunnel_credentials SET token_encrypted = ?, updated_at = ?
+			WHERE connection_id = ? AND provider_id = ? AND tunnel_id = ?`,
+			encrypted, time.Now().UTC().Format(time.RFC3339), row.connectionID, string(row.providerID), row.tunnelID); err != nil {
+			return version, fmt.Errorf("rewrite credential %s/%s: %w", row.connectionID, row.tunnelID, err)
+		}
+	}
+	for _, row := range providerCredentials {
+		encrypted, err := encryptCredential(s.secretStore, []byte(row.secret), providerCredentialContext(row.providerID, row.ref))
+		if err != nil {
+			return version, fmt.Errorf("encrypt provider credential %s/%s: %w", row.providerID, row.ref, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE provider_credentials SET secret_encrypted = ?, updated_at = ?
+			WHERE provider_id = ? AND credential_ref = ?`,
+			encrypted, time.Now().UTC().Format(time.RFC3339), string(row.providerID), row.ref); err != nil {
+			return version, fmt.Errorf("rewrite provider credential %s/%s: %w", row.providerID, row.ref, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return version, fmt.Errorf("commit credential rotation: %w", err)
+	}
+	if err := s.secretStore.RetireVersionsBefore(version); err != nil {
+		return version, fmt.Errorf("retire old credential keys: %w", err)
+	}
+	return version, nil
+}
+
+// CommitStepResult is retained for compatibility; normal execution uses
+// CommitStepOutcome, which additionally maintains the recovery ledger.
 func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest) error {
+	return s.CommitStepOutcome(ctx, req)
+}
+
+// CommitStepOutcome atomically persists the full result of executing a step:
+// terminal step event, provider resources, credential mutations, and lifecycle
+// changes all in a single transaction, together with the durable recovery
+// ledger row. (SPEC P0 atomic step commit)
+func (s *Store) CommitStepOutcome(ctx context.Context, req core.StepCommitRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2380,6 +3544,32 @@ func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest
 	defer tx.Rollback()
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	stepID := req.Result.StepID
+	if stepID == "" {
+		stepID = req.Step.ID
+	}
+	resultJSON, err := marshalStepResult(req.Result)
+	if err != nil {
+		return fmt.Errorf("marshal step result: %w", err)
+	}
+	status := string(StepSucceeded)
+	if !req.Result.Succeeded {
+		status = string(StepFailed)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_step_results
+			(operation_id, connection_id, step_id, step_kind, status, result_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(operation_id, step_id) DO UPDATE SET
+			connection_id=excluded.connection_id,
+			step_kind=excluded.step_kind,
+			status=excluded.status,
+			result_json=excluded.result_json,
+			updated_at=excluded.updated_at`,
+		req.OperationID, req.ConnectionID, stepID, string(req.Step.Kind), status, resultJSON, now, now)
+	if err != nil {
+		return fmt.Errorf("persist step recovery outcome: %w", err)
+	}
 
 	// 1. Persist terminal step event.
 	stage := string(core.StageSucceeded)
@@ -2396,9 +3586,16 @@ func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest
 		INSERT INTO operation_events
 			(operation_id, step_id, event_type, stage, summary, error, sequence, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.OperationID, req.Result.StepID, eventType, stage, req.Step.Summary, errorMsg, 0, now)
+		req.OperationID, stepID, eventType, stage, req.Step.Summary, errorMsg, 0, now)
 	if err != nil {
 		return fmt.Errorf("persist step event: %w", err)
+	}
+	if _, err = appendEventTx(ctx, tx, req.OperationID, req.ConnectionID, eventType, stage, time.Now().UTC(), core.OperationEvent{
+		OperationID: req.OperationID, ConnectionID: req.ConnectionID, Stage: core.EventStage(stage),
+		StepID: stepID, StepKind: req.Step.Kind, Message: req.Step.Summary, Error: errorMsg,
+		Timestamp: time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("persist durable step event: %w", err)
 	}
 
 	// 2. Persist provider resources with the same association semantics as
@@ -2430,9 +3627,10 @@ func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest
 			}
 			_, err = tx.ExecContext(ctx, `
 				UPDATE provider_resources
-				SET spec_hash = ?, metadata_json = ?
+				SET spec_hash = ?, metadata_json = ?,
+					lifecycle = CASE WHEN ownership = ? THEN ? ELSE lifecycle END
 				WHERE provider_id = ? AND resource_type = ? AND external_id = ? AND connection_id = ?`,
-				res.SpecHash, metaJSON,
+				res.SpecHash, metaJSON, string(core.OwnershipManaged), string(core.LifecyclePresent),
 				res.ProviderID, string(res.Type), res.ExternalID, res.ConnectionID,
 			)
 			if err != nil {
@@ -2441,10 +3639,10 @@ func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest
 		case qErr == sql.ErrNoRows:
 			_, err = tx.ExecContext(ctx, `
 				INSERT INTO provider_resources
-					(connection_id, provider_id, resource_type, external_id, ownership, spec_hash, metadata_json, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					(connection_id, provider_id, resource_type, external_id, ownership, lifecycle, spec_hash, metadata_json, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				res.ConnectionID, res.ProviderID, string(res.Type), res.ExternalID,
-				string(res.Ownership), res.SpecHash, metaJSON, now,
+				string(res.Ownership), string(core.LifecyclePresent), res.SpecHash, metaJSON, now,
 			)
 			if err != nil {
 				return fmt.Errorf("persist resource %s: %w", res.ExternalID, err)
@@ -2456,19 +3654,18 @@ func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest
 
 	// 3. Persist credential mutations.
 	for _, cred := range req.Result.CredentialMutations {
-		credCtx := string(req.ConnectionID) + ":" + cred.TunnelID
-		encrypted, encErr := encryptCredential(s.secretStore, cred.Token, credCtx)
+		credCtx := credentialContext(req.ConnectionID, req.Provider, cred.TunnelID)
+		encrypted, encErr := encryptCredential(s.secretStore, cred.Secret, credCtx)
 		if encErr != nil {
 			return fmt.Errorf("encrypt credential: %w", encErr)
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO tunnel_credentials (connection_id, tunnel_id, token_encrypted, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT(connection_id) DO UPDATE SET
-				tunnel_id=excluded.tunnel_id,
+			INSERT INTO tunnel_credentials (connection_id, provider_id, tunnel_id, token_encrypted, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(connection_id, provider_id, tunnel_id) DO UPDATE SET
 				token_encrypted=excluded.token_encrypted,
 				updated_at=excluded.updated_at`,
-			req.ConnectionID, cred.TunnelID, encrypted, now, now)
+			req.ConnectionID, string(req.Provider), cred.TunnelID, encrypted, now, now)
 		if err != nil {
 			return fmt.Errorf("persist credential: %w", err)
 		}
@@ -2476,24 +3673,161 @@ func (s *Store) CommitStepResult(ctx context.Context, req core.StepCommitRequest
 
 	// 4. Apply lifecycle changes.
 	for _, mark := range req.Lifecycle {
-		_, err = tx.ExecContext(ctx,
+		result, updateErr := tx.ExecContext(ctx,
 			"UPDATE provider_resources SET lifecycle = ? WHERE connection_id = ? AND provider_id = ? AND resource_type = ? AND external_id = ?",
 			string(mark.NewLifecycle), req.ConnectionID, string(mark.ProviderID), string(mark.ResourceType), mark.ExternalID)
-		if err != nil {
-			return fmt.Errorf("update lifecycle %s: %w", mark.ExternalID, err)
+		if updateErr != nil {
+			return fmt.Errorf("update lifecycle %s: %w", mark.ExternalID, updateErr)
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return fmt.Errorf("check lifecycle %s: %w", mark.ExternalID, rowsErr)
+		}
+		if rows != 1 {
+			return fmt.Errorf("lifecycle conflict for %s: expected one resource, updated %d", mark.ExternalID, rows)
 		}
 	}
 
-	// 5. Cascade policy removal for deleted Access applications.
+	// 5. Cascade policy removal for deleted Access applications. The durable
+	// inventory defines the exact expected policy count. A lifecycle transition
+	// that touches fewer rows is an integrity conflict, not a successful delete.
 	for _, appID := range req.RemovedAccessApps {
-		_, err = tx.ExecContext(ctx,
+		var expected int
+		if err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM provider_resources
+			WHERE connection_id = ? AND resource_type = ?
+				AND json_extract(metadata_json, '$.app_id') = ?`,
+			req.ConnectionID, string(core.ResourceAccessPolicy), appID,
+		).Scan(&expected); err != nil {
+			return fmt.Errorf("count policies for app %s: %w", appID, err)
+		}
+		result, updateErr := tx.ExecContext(ctx,
 			"UPDATE provider_resources SET lifecycle = ? WHERE connection_id = ? AND resource_type = ? AND json_extract(metadata_json, '$.app_id') = ?",
 			string(core.LifecycleRemoved), req.ConnectionID, string(core.ResourceAccessPolicy), appID)
-		if err != nil {
-			return fmt.Errorf("cascade policy removal for app %s: %w", appID, err)
+		if updateErr != nil {
+			return fmt.Errorf("cascade policy removal for app %s: %w", appID, updateErr)
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return fmt.Errorf("check cascaded policies for app %s: %w", appID, rowsErr)
+		}
+		if int(rows) != expected {
+			return fmt.Errorf("policy lifecycle conflict for app %s: expected %d policies, updated %d", appID, expected, rows)
 		}
 	}
 
+	return tx.Commit()
+}
+
+// BeginStep atomically records a recovery-ledger "started" row and its
+// durable operation event before a provider or local-origin mutation begins.
+func (s *Store) BeginStep(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, step core.PlanStep) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_step_results
+			(operation_id, connection_id, step_id, step_kind, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(operation_id, step_id) DO UPDATE SET
+			connection_id=excluded.connection_id,
+			step_kind=excluded.step_kind,
+			status=excluded.status,
+			updated_at=excluded.updated_at`,
+		operationID, connectionID, step.ID, string(step.Kind), string(StepStarted), now, now)
+	if err != nil {
+		return fmt.Errorf("record step start: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_events
+			(operation_id, step_id, event_type, stage, summary, error, sequence, timestamp)
+		VALUES (?, ?, ?, ?, ?, '', 0, ?)`,
+		operationID, step.ID, string(core.EventOperationStepStarted), string(core.StageStarted), step.Summary, now)
+	if err != nil {
+		return fmt.Errorf("persist step-start event: %w", err)
+	}
+	if _, err = appendEventTx(ctx, tx, operationID, connectionID, string(core.EventOperationStepStarted), string(core.StageStarted), time.Now().UTC(), core.OperationEvent{
+		OperationID: operationID, ConnectionID: connectionID, Stage: core.StageStarted,
+		StepID: step.ID, StepKind: step.Kind, Message: step.Summary, Timestamp: time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("persist durable step-start event: %w", err)
+	}
+	return tx.Commit()
+}
+
+// BeginCompensation durably records a compensation before it mutates the
+// provider. A restart can therefore distinguish a not-started rollback from
+// an outcome that must be recovered.
+func (s *Store) BeginCompensation(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, step core.PlanStep) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_step_results (operation_id, connection_id, step_id, step_kind, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(operation_id, step_id) DO UPDATE SET
+			connection_id=excluded.connection_id, step_kind=excluded.step_kind,
+			status=excluded.status, updated_at=excluded.updated_at`,
+		operationID, connectionID, step.ID, string(step.Kind), string(StepCompensationPending), now, now); err != nil {
+		return fmt.Errorf("record compensation start: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_events (operation_id, step_id, event_type, stage, summary, error, sequence, timestamp)
+		VALUES (?, ?, ?, ?, ?, '', 0, ?)`,
+		operationID, step.ID, string(core.EventOperationStepStarted), string(core.StageStarted), step.Summary, now); err != nil {
+		return fmt.Errorf("persist compensation start event: %w", err)
+	}
+	return tx.Commit()
+}
+
+// CommitCompensationOutcome atomically stores the terminal compensation
+// state and its operation event.
+func (s *Store) CommitCompensationOutcome(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, step core.PlanStep, result core.StepResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	encoded, err := marshalStepResult(result)
+	if err != nil {
+		return fmt.Errorf("marshal compensation result: %w", err)
+	}
+	status, eventType, stage := string(StepCompensated), string(core.EventOperationStepSucceeded), string(core.StageCompensated)
+	errorText := ""
+	if !result.Succeeded {
+		status, eventType, stage = string(StepCompensationFailed), string(core.EventOperationStepFailed), string(core.StageFailed)
+		if result.Error != nil {
+			errorText = result.Error.Error()
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_step_results (operation_id, connection_id, step_id, step_kind, status, result_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(operation_id, step_id) DO UPDATE SET
+			connection_id=excluded.connection_id, step_kind=excluded.step_kind,
+			status=excluded.status, result_json=excluded.result_json, updated_at=excluded.updated_at`,
+		operationID, connectionID, step.ID, string(step.Kind), status, encoded, now, now); err != nil {
+		return fmt.Errorf("record compensation outcome: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `
+		INSERT INTO operation_events (operation_id, step_id, event_type, stage, summary, error, sequence, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+		operationID, step.ID, eventType, stage, step.Summary, errorText, now); err != nil {
+		return fmt.Errorf("persist compensation outcome event: %w", err)
+	}
 	return tx.Commit()
 }
 
@@ -2515,14 +3849,48 @@ const (
 	StepCompensationFailed  StepResultStatus = "compensation_failed"
 )
 
+// persistedStepResult deliberately omits credential secret bytes. The
+// recovery ledger needs outcome evidence, not a second secret store.
+type persistedStepResult struct {
+	StepID    string                  `json:"step_id"`
+	Succeeded bool                    `json:"succeeded"`
+	Error     string                  `json:"error,omitempty"`
+	Resources []core.ProviderResource `json:"resources,omitempty"`
+}
+
+func marshalStepResult(result core.StepResult) ([]byte, error) {
+	document := persistedStepResult{
+		StepID:    result.StepID,
+		Succeeded: result.Succeeded,
+		Resources: result.Resources,
+	}
+	if result.Error != nil {
+		document.Error = result.Error.Error()
+	}
+	return json.Marshal(document)
+}
+
+func unmarshalStepResult(data []byte) (core.StepResult, error) {
+	var document persistedStepResult
+	if err := json.Unmarshal(data, &document); err != nil {
+		return core.StepResult{}, err
+	}
+	result := core.StepResult{StepID: document.StepID, Succeeded: document.Succeeded, Resources: document.Resources}
+	if document.Error != "" {
+		result.Error = errors.New(document.Error)
+	}
+	return result, nil
+}
+
 // RecordStepStart records that a step has started execution.
 func (s *Store) RecordStepStart(ctx context.Context, opID core.OperationID, stepID string, stepKind core.StepKind) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO operation_step_results (operation_id, step_id, step_kind, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+		INSERT INTO operation_step_results (operation_id, connection_id, step_id, step_kind, status, created_at, updated_at)
+		VALUES (?, '', ?, ?, ?, ?, ?)
+		ON CONFLICT(operation_id, step_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at`,
 		opID, stepID, string(stepKind), string(StepStarted), now, now)
 	return err
 }
@@ -2577,7 +3945,11 @@ func (s *Store) GetStepResults(ctx context.Context, opID core.OperationID) ([]co
 		r.ProviderRequestID = providerRequestID.String
 		r.RecoveryRequired = recoveryStatus.String == "recovery_required"
 		if len(resultJSON) > 0 {
-			_ = json.Unmarshal(resultJSON, &r.Result)
+			result, decodeErr := unmarshalStepResult(resultJSON)
+			if decodeErr != nil {
+				return nil, fmt.Errorf("decode step result for operation %s step %s: %w", opID, r.StepID, decodeErr)
+			}
+			r.Result = result
 		}
 		results = append(results, r)
 	}
@@ -2690,8 +4062,8 @@ func (s *Store) UpsertStepResultStatus(ctx context.Context, opID core.OperationI
 	}
 	if affected == 0 {
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO operation_step_results (operation_id, step_id, step_kind, status, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?)`,
+			INSERT INTO operation_step_results (operation_id, connection_id, step_id, step_kind, status, created_at, updated_at)
+			VALUES (?, '', ?, ?, ?, ?, ?)`,
 			opID, stepID, string(stepKind), string(status), now, now)
 		if err != nil {
 			return err
@@ -2703,6 +4075,7 @@ func (s *Store) UpsertStepResultStatus(ctx context.Context, opID core.OperationI
 // OperationJournalEvent is one persisted operation journal entry from
 // operation_events, used to reconstruct interrupted operations.
 type OperationJournalEvent struct {
+	Sequence  int64
 	StepID    string
 	EventType string
 	Stage     string
@@ -2711,13 +4084,88 @@ type OperationJournalEvent struct {
 	Timestamp string
 }
 
+// StoredOperation is the durable representation used by IPC operation
+// queries. Unlike controller.Operation it remains available after a
+// supervisor restart.
+type StoredOperation struct {
+	ID           core.OperationID
+	PlanID       core.PlanID
+	ConnectionID core.ConnectionID
+	State        string
+	StartedAt    string
+	CompletedAt  string
+	Error        string
+}
+
+// CleanupItem persists an externally-created resource that needs explicit
+// follow-up even when no provider_resources row was committed.
+type CleanupItem struct {
+	OperationID  core.OperationID
+	ConnectionID core.ConnectionID
+	ProviderID   core.ProviderID
+	ResourceType core.ResourceType
+	ExternalID   string
+	State        string
+	LastError    string
+}
+
+// RecordCleanupItem inserts or refreshes a durable cleanup obligation. It is
+// deliberately independent from provider_resources: this is the path for
+// resources created successfully before the normal persistence transaction
+// failed.
+func (s *Store) RecordCleanupItem(ctx context.Context, item CleanupItem) error {
+	if item.OperationID == "" || item.ConnectionID == "" || item.ProviderID == "" || item.ResourceType == "" || item.ExternalID == "" || item.State == "" {
+		return fmt.Errorf("invalid cleanup item")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO resource_cleanup_items
+			(operation_id, connection_id, provider_id, resource_type, external_id, cleanup_state, last_error, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider_id, resource_type, external_id) DO UPDATE SET
+			operation_id=excluded.operation_id, connection_id=excluded.connection_id,
+			cleanup_state=excluded.cleanup_state, last_error=excluded.last_error,
+			updated_at=excluded.updated_at`,
+		item.OperationID, item.ConnectionID, item.ProviderID, string(item.ResourceType), item.ExternalID,
+		item.State, item.LastError, now, now)
+	return err
+}
+
+// GetOperation returns one operation from the durable journal.
+func (s *Store) GetOperation(ctx context.Context, opID core.OperationID) (*StoredOperation, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var operation StoredOperation
+	var completedAt sql.NullString
+	var errorJSON []byte
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, plan_id, connection_id, state, started_at, completed_at, error_json
+		FROM operations WHERE id = ?`, opID).Scan(
+		&operation.ID, &operation.PlanID, &operation.ConnectionID, &operation.State,
+		&operation.StartedAt, &completedAt, &errorJSON)
+	if err != nil {
+		return nil, err
+	}
+	operation.CompletedAt = completedAt.String
+	if len(errorJSON) > 0 {
+		var failure core.PorticoError
+		if err := json.Unmarshal(errorJSON, &failure); err != nil {
+			return nil, fmt.Errorf("decode operation %s error: %w", opID, err)
+		}
+		operation.Error = failure.Message
+	}
+	return &operation, nil
+}
+
 // GetOperationEvents returns the journal events for an operation in
 // insertion order.
 func (s *Store) GetOperationEvents(ctx context.Context, opID core.OperationID) ([]OperationJournalEvent, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT step_id, event_type, stage, summary, error, timestamp
+		SELECT id, step_id, event_type, stage, summary, error, timestamp
 		FROM operation_events WHERE operation_id = ? ORDER BY id`, opID)
 	if err != nil {
 		return nil, err
@@ -2728,7 +4176,7 @@ func (s *Store) GetOperationEvents(ctx context.Context, opID core.OperationID) (
 	for rows.Next() {
 		var e OperationJournalEvent
 		var stepID, summary, errMsg sql.NullString
-		if err := rows.Scan(&stepID, &e.EventType, &e.Stage, &summary, &errMsg, &e.Timestamp); err != nil {
+		if err := rows.Scan(&e.Sequence, &stepID, &e.EventType, &e.Stage, &summary, &errMsg, &e.Timestamp); err != nil {
 			return nil, err
 		}
 		e.StepID = stepID.String
@@ -2809,13 +4257,35 @@ func (s *Store) AppendOperationEvent(ctx context.Context, event core.Event, opID
 		timestamp = event.Timestamp.Format(time.RFC3339)
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	connectionID := core.ConnectionID("")
+	if opEvent, ok := event.Data.(core.OperationEvent); ok {
+		connectionID = opEvent.ConnectionID
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin operation event: %w", err)
+	}
+	defer tx.Rollback()
+	if connectionID == "" && opID != "" {
+		var conn string
+		if err := tx.QueryRowContext(ctx, "SELECT connection_id FROM operations WHERE id = ?", opID).Scan(&conn); err != nil {
+			return fmt.Errorf("lookup operation connection: %w", err)
+		}
+		connectionID = core.ConnectionID(conn)
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO operation_events
 			(operation_id, step_id, event_type, stage, summary, error, sequence, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		opID, stepID, eventType, stage, summary, errorMsg, event.Sequence, timestamp,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err := appendEventTx(ctx, tx, opID, connectionID, string(event.Type), stage, event.Timestamp, event.Data); err != nil {
+		return fmt.Errorf("append unified operation event: %w", err)
+	}
+	return tx.Commit()
 }
 
 // AppendFinding appends a diagnostic finding to the journal.
@@ -2867,6 +4337,39 @@ func (s *Store) ListProviderAccounts(ctx context.Context) ([]core.ProviderAccoun
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// UpsertProviderAccount records account metadata and an opaque credential
+// reference. The secret belongs in provider_credentials and is never encoded
+// in this row or its metadata.
+func (s *Store) UpsertProviderAccount(ctx context.Context, account core.ProviderAccount) error {
+	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" {
+		return fmt.Errorf("provider account ID, provider, label, and credential reference are required")
+	}
+	if account.Status == "" {
+		account.Status = core.AccountAuthenticated
+	}
+	metadata, err := json.Marshal(account.Metadata)
+	if err != nil {
+		return fmt.Errorf("marshal provider account metadata: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO provider_accounts
+			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			provider_id=excluded.provider_id,
+			label=excluded.label,
+			credential_ref=excluded.credential_ref,
+			metadata_json=excluded.metadata_json,
+			status=excluded.status,
+			updated_at=excluded.updated_at`,
+		string(account.ID), string(account.Provider), account.Label, account.CredentialRef,
+		metadata, string(account.Status), now, now)
+	return err
 }
 
 // GetSequence returns the current event sequence number.

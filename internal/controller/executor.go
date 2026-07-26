@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/paoloanzn/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // --------------- operation execution ---------------
@@ -16,6 +16,11 @@ import (
 // It enforces the global concurrency limit and the per-connection
 // single-operation constraint under a single lock acquisition.
 func (c *Controller) reserveOperation(plan *core.OperationPlan) (*operationRecord, error) {
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
+	if !c.acceptingOps {
+		return nil, fmt.Errorf("controller is shutting down and not accepting operations")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -49,6 +54,10 @@ func (c *Controller) reserveOperation(plan *core.OperationPlan) (*operationRecor
 	}
 	rec := &operationRecord{oper: oper}
 	c.operations[rec.oper.ID] = rec
+	// Register the operation before releasing the admission lock. Shutdown
+	// first closes admission under the same lock, so Wait cannot miss a
+	// just-reserved operation.
+	c.operationWG.Add(1)
 
 	// Transition runtime to the appropriate state
 	if rt, ok := c.runtimes[plan.ConnectionID]; ok {
@@ -94,7 +103,7 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 	profile, profileOk := c.profiles[plan.ConnectionID]
 	c.mu.RUnlock()
 	if !profileOk {
-		return Operation{}, fmt.Errorf("profile not found: %s", plan.ConnectionID)
+		return Operation{}, core.ErrProfileNotFound(plan.ConnectionID)
 	}
 	if plan.ProfileRevision != profile.Revision {
 		return Operation{}, fmt.Errorf(
@@ -106,10 +115,15 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 	// 3. Re-observe the provider state and confirm the observed
 	// fingerprint still matches (if the plan was previewed against
 	// a specific observed state).
-	observed, obsErr := c.Observe(ctx, plan.ConnectionID)
-	if obsErr != nil {
-		// Non-fatal: warn but proceed.
-		observed = nil
+	var observed *core.ObservedConnection
+	if planRequiresProvider(plan) {
+		var obsErr error
+		observed, obsErr = c.Observe(ctx, plan.ConnectionID)
+		if obsErr != nil {
+			// Non-fatal: warn but proceed. A provider-backed operation still
+			// verifies its observed fingerprint below when one was supplied.
+			observed = nil
+		}
 	}
 
 	// 4. Confirm the observed fingerprint still matches.
@@ -142,6 +156,7 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 	if c.journal != nil {
 		startedAt := oper.StartedAt.Format(time.RFC3339)
 		if err := c.journal.SaveOperation(ctx, oper.ID, plan.ID, plan.ConnectionID, string(OperationStateRunning), startedAt); err != nil {
+			c.operationWG.Done()
 			// Clean up the operation and runtime records
 			c.mu.Lock()
 			delete(c.operations, rec.oper.ID)
@@ -159,10 +174,24 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 		}
 	}
 
-	// 6. Execute the exact steps through the provider, one by one.
+	// 6. Execute the exact steps through the provider, one by one. Each
+	// operation has a supervisor-owned context, detached from the initiating
+	// request and cancellable during orderly shutdown.
+	operationCtx, cancel := context.WithCancel(context.Background())
+	rec.mu.Lock()
+	rec.cancel = cancel
+	rec.mu.Unlock()
 	// The controller owns sequencing, journaling, compensation, and verification.
 	// Run in a goroutine so ApplyPlan returns immediately with operation in "running" state.
 	go func() {
+		defer c.operationWG.Done()
+		defer func() {
+			rec.mu.Lock()
+			rec.cancel = nil
+			rec.mu.Unlock()
+			cancel()
+		}()
+		ctx := operationCtx
 		completedSteps := []completedExecution{}
 		for _, step := range plan.Steps {
 			// Handle controller-local steps that don't go to the provider.
@@ -174,9 +203,18 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 					Succeeded: true,
 					Resources: []core.ProviderResource{},
 				}
+				if c.stepJournal != nil {
+					if err := c.stepJournal.BeginStep(operationCtx, rec.oper.ID, plan.ConnectionID, step); err != nil {
+						if failErr := c.failOperation(ctx, rec, plan.ConnectionID, plan.Provider, "PTO-OP-JOURNAL-FAILED", fmt.Errorf("step-start journal failure: %w", err), true); failErr != nil {
+							slog.Error("failed to durably record operation failure", "err", failErr)
+						}
+						return
+					}
+					c.dispatchCommittedEvents(ctx)
+				}
 
 				// Emit step started event.
-				if c.journal != nil {
+				if c.stepJournal == nil && c.journal != nil {
 					if err := c.journal.AppendOperationEvent(ctx, core.Event{
 						Type:      core.EventOperationStepStarted,
 						Sequence:  0,
@@ -212,7 +250,18 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				}
 
 				// Emit step succeeded event.
-				if c.journal != nil {
+				if c.stepJournal != nil {
+					if err := c.stepJournal.CommitStepOutcome(ctx, core.StepCommitRequest{
+						OperationID: rec.oper.ID, ConnectionID: plan.ConnectionID, Provider: plan.Provider,
+						Step: step, Result: stepResult,
+					}); err != nil {
+						if failErr := c.failOperation(ctx, rec, plan.ConnectionID, plan.Provider, "PTO-OP-PERSIST-FAILED", fmt.Errorf("persist local deletion finalizer: %w", err), true); failErr != nil {
+							slog.Error("failed to durably record operation failure", "err", failErr)
+						}
+						return
+					}
+					c.dispatchCommittedEvents(ctx)
+				} else if c.journal != nil {
 					evt := core.Event{
 						Type:      core.EventOperationStepSucceeded,
 						Sequence:  0,
@@ -261,9 +310,17 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				continue
 			}
 
-			// Emit step started event BEFORE provider mutation.
-			// This is safety-critical: a journal failure before execution must stop the operation.
-			if c.journal != nil {
+			// Emit step started event BEFORE provider mutation. The production
+			// journal atomically also records the durable recovery-ledger row.
+			if c.stepJournal != nil {
+				if err := c.stepJournal.BeginStep(ctx, rec.oper.ID, plan.ConnectionID, step); err != nil {
+					if failErr := c.failOperation(ctx, rec, plan.ConnectionID, plan.Provider, "PTO-OP-JOURNAL-FAILED", fmt.Errorf("step-start journal failure: %w", err), true); failErr != nil {
+						slog.Error("failed to durably record operation failure", "err", failErr)
+					}
+					return
+				}
+				c.dispatchCommittedEvents(ctx)
+			} else if c.journal != nil {
 				if err := c.journal.AppendOperationEvent(ctx, core.Event{
 					Type:      core.EventOperationStepStarted,
 					Sequence:  0, // will be allocated by store
@@ -329,8 +386,9 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				}
 			}
 
-			// Execute the step.
-			stepResult, execErr := prov.ExecuteStep(ctx, plan.ConnectionID, step)
+			// Execute the step. Local-origin lifecycle steps are controller-owned;
+			// every provider step remains delegated to its selected provider.
+			stepResult, execErr := c.executeStep(ctx, plan, prov, step)
 
 			// Persist step result.
 			if execErr != nil {
@@ -374,8 +432,10 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 					}
 					if violation != nil {
 						slog.Error("provider contract violation", "resource", res.ExternalID, "err", violation)
-						c.failOperation(rec, plan.ConnectionID, plan.Provider, "PTO-OP-CONTRACT-VIOLATION",
-							fmt.Errorf("provider contract violation: %w", violation), false)
+						if failErr := c.failOperation(ctx, rec, plan.ConnectionID, plan.Provider, "PTO-OP-CONTRACT-VIOLATION",
+							fmt.Errorf("provider contract violation: %w", violation), false); failErr != nil {
+							slog.Error("failed to durably record contract violation", "err", failErr)
+						}
 						return
 					}
 				}
@@ -396,19 +456,28 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 						removedApps = append(removedApps, step.Technical.ResourceID)
 					}
 				}
+				// Targeted repairs that replace a resource already confirmed
+				// absent make that fact durable in the same commit as the new
+				// resource. Without this, the stale row would trigger the same
+				// repair on every reconciliation cycle after a successful repair.
+				lifecycle = append(lifecycle, replacementLifecycleMarks(plan.Provider, step)...)
 
 				// Persist the full step result atomically. Only after the
 				// transaction commits may memory be mutated.
 				var persistErr error
-				if c.stepCommitter != nil {
-					persistErr = c.stepCommitter.CommitStepResult(ctx, core.StepCommitRequest{
-						OperationID:       rec.oper.ID,
-						ConnectionID:      plan.ConnectionID,
-						Step:              step,
-						Result:            stepResult,
-						Lifecycle:         lifecycle,
-						RemovedAccessApps: removedApps,
-					})
+				request := core.StepCommitRequest{
+					OperationID:       rec.oper.ID,
+					ConnectionID:      plan.ConnectionID,
+					Provider:          plan.Provider,
+					Step:              step,
+					Result:            stepResult,
+					Lifecycle:         lifecycle,
+					RemovedAccessApps: removedApps,
+				}
+				if c.stepJournal != nil {
+					persistErr = c.stepJournal.CommitStepOutcome(ctx, request)
+				} else if c.stepCommitter != nil {
+					persistErr = c.stepCommitter.CommitStepResult(ctx, request)
 				} else {
 					persistErr = c.persistStepPiecewise(ctx, plan, rec, step, stepResult, lifecycle, removedApps)
 				}
@@ -419,12 +488,24 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 					c.runCompensationForPersistenceFailure(ctx, plan, prov, completedSteps, rec, step, stepResult, persistErr)
 					return
 				}
+				if c.stepJournal != nil {
+					c.dispatchCommittedEvents(ctx)
+				}
+
+				// Zero credential secret buffers now that they are durably
+				// stored; compensation only needs the tunnel ID.
+				for i := range stepResult.CredentialMutations {
+					for j := range stepResult.CredentialMutations[i].Secret {
+						stepResult.CredentialMutations[i].Secret[j] = 0
+					}
+					stepResult.CredentialMutations[i].Secret = nil
+				}
 
 				// Committed — install into memory and record the terminal event.
 				completedSteps = append(completedSteps, completedExecution{Step: step, Result: stepResult})
 				c.mu.Lock()
 				if rt, ok := c.runtimes[plan.ConnectionID]; ok {
-					rt.Provider.Resources = append(rt.Provider.Resources, stepResult.Resources...)
+					rt.Provider.Resources = applyResourceOutcome(rt.Provider.Resources, stepResult.Resources, lifecycle)
 				}
 				c.mu.Unlock()
 				rec.AddStepEvent(StepEvent{
@@ -434,31 +515,34 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 					Timestamp: time.Now().UTC(),
 				})
 			} else {
-				// Step failed. Journal the terminal failed event; a journal
-				// failure here must not prevent compensation of earlier steps.
-				if c.journal != nil {
-					if err := c.journal.AppendOperationEvent(ctx, core.Event{
-						Type:      core.EventOperationStepFailed,
-						Sequence:  0,
-						Timestamp: time.Now().UTC(),
-						Data: core.OperationEvent{
-							StepID:    stepResult.StepID,
-							StepKind:  step.Kind,
-							Stage:     core.StageFailed,
-							Error:     stepResult.Error.Error(),
-							Timestamp: time.Now().UTC(),
-						},
-					}, rec.oper.ID); err != nil {
-						slog.Error("failed to persist step failure event", "step", step.ID, "err", err)
-					}
+				// A provider failure is itself a durable step outcome. For deletion
+				// this atomically changes removal_pending to removal_failed with the
+				// failed event and recovery result.
+				var failureLifecycle []core.LifecycleMark
+				if isDeleteStep(step.Kind) && step.Technical.ResourceID != "" {
+					failureLifecycle = append(failureLifecycle, core.LifecycleMark{
+						ProviderID: plan.Provider, ResourceType: resourceTypeFromStepKind(step.Kind),
+						ExternalID: step.Technical.ResourceID, NewLifecycle: core.LifecycleRemovalFailed,
+					})
 				}
-				// A failed delete step leaves the resource in removal_failed.
-				if isDeleteStep(step.Kind) && step.Technical.ResourceID != "" && c.resourceRemover != nil {
-					if err := c.resourceRemover.MarkResourceRemovalFailed(ctx, plan.ConnectionID, plan.Provider,
-						resourceTypeFromStepKind(step.Kind), step.Technical.ResourceID); err != nil {
-						slog.Error("failed to mark resource removal_failed",
-							"resource", step.Technical.ResourceID, "err", err)
+				failureRequest := core.StepCommitRequest{OperationID: rec.oper.ID, ConnectionID: plan.ConnectionID,
+					Provider: plan.Provider, Step: step, Result: stepResult, Lifecycle: failureLifecycle}
+				var outcomeErr error
+				if c.stepJournal != nil {
+					outcomeErr = c.stepJournal.CommitStepOutcome(ctx, failureRequest)
+				} else if c.stepCommitter != nil {
+					outcomeErr = c.stepCommitter.CommitStepResult(ctx, failureRequest)
+				} else {
+					outcomeErr = c.persistStepPiecewise(ctx, plan, rec, step, stepResult, failureLifecycle, nil)
+				}
+				if outcomeErr != nil {
+					if failErr := c.failOperation(ctx, rec, plan.ConnectionID, plan.Provider, "PTO-OP-OUTCOME-JOURNAL-FAILED", fmt.Errorf("failed to persist step outcome: %w", outcomeErr), true); failErr != nil {
+						slog.Error("failed to durably record operation failure", "err", failErr)
 					}
+					return
+				}
+				if c.stepJournal != nil {
+					c.dispatchCommittedEvents(ctx)
 				}
 				rec.AddStepEvent(StepEvent{
 					StepID:    stepResult.StepID,
@@ -475,15 +559,17 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 		}
 
 		// 7. All steps succeeded — verify outcome before committing terminal state.
-		if err := c.verifyOperationOutcome(ctx, plan.Intent, plan.ConnectionID); err != nil {
-			slog.Warn("operation verification failed", "connection", plan.ConnectionID, "intent", plan.Intent, "err", err)
-			// Outcome verification failure after successful provider steps.
-			// Run safe compensation to avoid leaving an unknown state.
-			c.runCompensation(ctx, plan, prov, completedSteps, rec, plan.Steps[len(plan.Steps)-1], core.StepResult{
-				Succeeded: false,
-				Error:     fmt.Errorf("outcome verification failed: %v", err),
-			}, false)
-			return
+		if planRequiresProvider(plan) {
+			if err := c.verifyOperationOutcome(ctx, plan.Intent, plan.ConnectionID); err != nil {
+				slog.Warn("operation verification failed", "connection", plan.ConnectionID, "intent", plan.Intent, "err", err)
+				// Outcome verification failure after successful provider steps.
+				// Run safe compensation to avoid leaving an unknown state.
+				c.runCompensation(ctx, plan, prov, completedSteps, rec, plan.Steps[len(plan.Steps)-1], core.StepResult{
+					Succeeded: false,
+					Error:     fmt.Errorf("outcome verification failed: %v", err),
+				}, false)
+				return
+			}
 		}
 
 		// 8. Commit terminal success.
@@ -516,6 +602,7 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				}
 			}
 			rec.Transition(OperationStateCompleted, nil)
+			c.dispatchCommittedEvents(ctx)
 
 			// Remove in-memory state after successful store commit.
 			c.mu.Lock()
@@ -594,6 +681,8 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 						fmt.Sprintf("terminal commit failed: %v", persistErr), plan.Provider, true); fErr != nil {
 						slog.Error("failed to durably commit runtime failure",
 							"connection", plan.ConnectionID, "err", fErr)
+					} else {
+						c.dispatchCommittedEvents(ctx)
 					}
 				}
 				c.mu.Lock()
@@ -647,13 +736,104 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 			// already marks the operation as completed atomically. We do NOT call
 			// CompleteOperation again here to avoid duplicate completion records.
 			rec.Transition(OperationStateCompleted, nil)
+			c.dispatchCommittedEvents(ctx)
 		}
 	}()
 
 	return rec.Snapshot(), nil
 }
 
+func replacementLifecycleMarks(provider core.ProviderID, step core.PlanStep) []core.LifecycleMark {
+	if step.Technical.Parameters == nil {
+		return nil
+	}
+	marks := make([]core.LifecycleMark, 0, 2)
+	if appID := step.Technical.Parameters["replaces_access_app_id"]; appID != "" {
+		marks = append(marks, core.LifecycleMark{
+			ProviderID: provider, ResourceType: core.ResourceAccessApp, ExternalID: appID,
+			NewLifecycle: core.LifecycleExternallyRemoved,
+		})
+	}
+	if policyID := step.Technical.Parameters["replaces_access_policy_id"]; policyID != "" {
+		marks = append(marks, core.LifecycleMark{
+			ProviderID: provider, ResourceType: core.ResourceAccessPolicy, ExternalID: policyID,
+			NewLifecycle: core.LifecycleExternallyRemoved,
+		})
+	}
+	return marks
+}
+
+// applyResourceOutcome keeps the in-memory runtime inventory aligned with
+// the store transaction that has just committed. In particular, replacements
+// must retire their exact missing predecessor instead of accumulating stale
+// rows that future observation or deletion could act on.
+func applyResourceOutcome(existing, additions []core.ProviderResource, lifecycle []core.LifecycleMark) []core.ProviderResource {
+	resources := make([]core.ProviderResource, len(existing))
+	for i := range existing {
+		resources[i] = existing[i].Clone()
+	}
+	for _, mark := range lifecycle {
+		for i := range resources {
+			if resources[i].ProviderID == mark.ProviderID && resources[i].Type == mark.ResourceType && resources[i].ExternalID == mark.ExternalID {
+				resources[i].Lifecycle = mark.NewLifecycle
+			}
+		}
+	}
+	for _, addition := range additions {
+		updated := false
+		for i := range resources {
+			if resources[i].ProviderID == addition.ProviderID && resources[i].Type == addition.Type && resources[i].ExternalID == addition.ExternalID {
+				resources[i] = addition.Clone()
+				resources[i].Lifecycle = core.LifecyclePresent
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			addition = addition.Clone()
+			addition.Lifecycle = core.LifecyclePresent
+			resources = append(resources, addition)
+		}
+	}
+	return resources
+}
+
 // isDeleteStep returns true if the step kind is a resource deletion step.
+// executeStep centralizes the boundary between controller-owned local source
+// lifecycle and provider-owned remote lifecycle. Keeping this in the normal
+// executor path preserves journaling, persistence, and compensation behavior.
+func (c *Controller) executeStep(ctx context.Context, plan *core.OperationPlan, prov core.Provider, step core.PlanStep) (core.StepResult, error) {
+	switch step.Kind {
+	case core.StepStartOrigin, core.StepStopOrigin:
+		c.mu.RLock()
+		profile := c.profiles[plan.ConnectionID]
+		manager := c.originManager
+		c.mu.RUnlock()
+		if profile == nil {
+			return core.StepResult{}, core.ErrProfileNotFound(plan.ConnectionID)
+		}
+		if manager == nil {
+			return core.StepResult{}, fmt.Errorf("local source manager is unavailable")
+		}
+		var err error
+		if step.Kind == core.StepStartOrigin {
+			originURL := step.Technical.Parameters["origin_url"]
+			if originURL == "" {
+				return core.StepResult{}, fmt.Errorf("start-origin step is missing origin_url")
+			}
+			err = manager.Start(ctx, plan.ConnectionID, profile.Source, originURL)
+		} else {
+			err = manager.Stop(ctx, plan.ConnectionID)
+		}
+		return core.StepResult{StepID: step.ID, Succeeded: err == nil, Error: err}, err
+	default:
+		if prov == nil {
+			return core.StepResult{}, core.ErrProviderNotFound(plan.Provider)
+		}
+		return prov.ExecuteStep(ctx, plan.ConnectionID, step)
+	}
+}
+
 func isDeleteStep(kind core.StepKind) bool {
 	switch kind {
 	case core.StepDeleteTunnel, core.StepDeleteDNSRecord, core.StepDeleteAccessApp, core.StepDeleteAccessPolicy:
@@ -669,8 +849,10 @@ func resourceTypeFromStepKind(kind core.StepKind) core.ResourceType {
 		return core.ResourceTunnel
 	case core.StepDeleteDNSRecord:
 		return core.ResourceDNSRecord
-	case core.StepDeleteAccessApp, core.StepDeleteAccessPolicy:
+	case core.StepDeleteAccessApp:
 		return core.ResourceAccessApp
+	case core.StepDeleteAccessPolicy:
+		return core.ResourceAccessPolicy
 	}
 	return ""
 }
@@ -715,6 +897,15 @@ func (c *Controller) runCompensation(ctx context.Context, plan *core.OperationPl
 			desiredType := resourceTypeFromStepKind(executed.Step.Compensation.Kind)
 			compTech.ResourceID = selectResourceByType(executed.Result.Resources, desiredType)
 		}
+		if compensationRequiresResourceID(executed.Step.Compensation.Kind) && compTech.ResourceID == "" {
+			compensationFailed = true
+			c.recordCleanupResources(ctx, plan, rec, executed.Result.Resources, "compensation_pending", "exact resource ID could not be materialized for compensation")
+			c.markCompensationResourcesFailed(ctx, plan, executed)
+			c.appendCleanupFinding(ctx, plan.ConnectionID,
+				"Compensation requires an exact resource ID",
+				fmt.Sprintf("Operation %s could not materialize compensation %s from step %s; no unambiguous %s resource ID was returned.", rec.oper.ID, executed.Step.Compensation.ID, executed.Step.ID, resourceTypeFromStepKind(executed.Step.Compensation.Kind)))
+			continue
+		}
 		compPlanStep := core.PlanStep{
 			ID:        executed.Step.Compensation.ID,
 			Kind:      executed.Step.Compensation.Kind,
@@ -723,7 +914,18 @@ func (c *Controller) runCompensation(ctx context.Context, plan *core.OperationPl
 
 		// Journal compensation started - must succeed before remote mutation
 		// unless this is the emergency persistence-failure recovery path.
-		if c.journal != nil {
+		compensationJournal, hasCompensationJournal := c.stepJournal.(CompensationJournal)
+		if hasCompensationJournal {
+			if err := compensationJournal.BeginCompensation(ctx, rec.oper.ID, plan.ConnectionID, compPlanStep); err != nil {
+				if !emergency {
+					slog.Error("failed to persist compensation start - blocking compensation", "step", compPlanStep.ID, "err", err)
+					compensationFailed = true
+					c.recordCleanupResources(ctx, plan, rec, executed.Result.Resources, "compensation_pending", "could not journal compensation start: "+err.Error())
+					continue
+				}
+				slog.Error("compensation start ledger failed - proceeding emergency", "step", compPlanStep.ID, "err", err)
+			}
+		} else if c.journal != nil {
 			if err := c.journal.AppendOperationEvent(ctx, core.Event{
 				Type:      core.EventOperationStepStarted,
 				Sequence:  0,
@@ -749,7 +951,10 @@ func (c *Controller) runCompensation(ctx context.Context, plan *core.OperationPl
 			}
 		}
 
-		compResult, compErr := prov.ExecuteStep(ctx, plan.ConnectionID, compPlanStep)
+		compResult, compErr := c.executeStep(ctx, plan, prov, compPlanStep)
+		if compErr != nil && compResult.Error == nil {
+			compResult.Error = compErr
+		}
 		compSucceeded := compErr == nil && compResult.Succeeded
 
 		// If compensation succeeded and the completed step had credential
@@ -757,7 +962,7 @@ func (c *Controller) runCompensation(ctx context.Context, plan *core.OperationPl
 		if compSucceeded {
 			for _, cred := range executed.Result.CredentialMutations {
 				if c.credentialStorer != nil {
-					if delErr := c.credentialStorer.DeleteTunnelCredential(ctx, plan.ConnectionID); delErr != nil {
+					if delErr := c.credentialStorer.DeleteTunnelCredentialExact(ctx, plan.ConnectionID, plan.Provider, cred.TunnelID); delErr != nil {
 						slog.Error("failed to delete credential during compensation - recording",
 							"tunnel", cred.TunnelID, "err", delErr)
 						// This is NOT best-effort. A stale credential is a retained secret.
@@ -783,10 +988,23 @@ func (c *Controller) runCompensation(ctx context.Context, plan *core.OperationPl
 			// Failed compensation leaves the created resources live remotely:
 			// mark them removal_failed so cleanup/reconciliation can retry.
 			c.markCompensationResourcesFailed(ctx, plan, executed)
+			cleanupError := "compensation returned failure"
+			if compErr != nil {
+				cleanupError = compErr.Error()
+			} else if compResult.Error != nil {
+				cleanupError = compResult.Error.Error()
+			}
+			c.recordCleanupResources(ctx, plan, rec, executed.Result.Resources, "compensation_failed", cleanupError)
 		}
 
 		// Journal compensation result - treat failure as durable recovery failure.
-		if c.journal != nil {
+		if hasCompensationJournal {
+			if err := compensationJournal.CommitCompensationOutcome(ctx, rec.oper.ID, plan.ConnectionID, compPlanStep, compResult); err != nil {
+				slog.Error("failed to persist compensation outcome", "step", compPlanStep.ID, "err", err)
+				compensationFailed = true
+				c.recordCleanupResources(ctx, plan, rec, executed.Result.Resources, "outcome_unknown", "compensation executed but outcome could not be journaled: "+err.Error())
+			}
+		} else if c.journal != nil {
 			compOpEvt := core.OperationEvent{
 				StepID:    compPlanStep.ID,
 				StepKind:  compPlanStep.Kind,
@@ -854,6 +1072,8 @@ func (c *Controller) runCompensation(ctx context.Context, plan *core.OperationPl
 		if err := c.runtimeCommitter.CommitOperationFailure(ctx, plan.ConnectionID, rec.oper.ID, stepResult.Error.Error(), plan.Provider, true); err != nil {
 			slog.Error("failed to commit durable runtime failure after compensation",
 				"operation", rec.oper.ID, "err", err)
+		} else {
+			c.dispatchCommittedEvents(ctx)
 		}
 	}
 }
@@ -869,6 +1089,20 @@ func (c *Controller) markCompensationResourcesFailed(ctx context.Context, plan *
 		if err := c.resourceRemover.MarkResourceRemovalFailed(ctx, plan.ConnectionID, plan.Provider, res.Type, res.ExternalID); err != nil {
 			slog.Warn("failed to mark resource removal_failed after failed compensation",
 				"resource", res.ExternalID, "err", err)
+		}
+	}
+}
+
+func (c *Controller) recordCleanupResources(ctx context.Context, plan *core.OperationPlan, rec *operationRecord, resources []core.ProviderResource, state, lastError string) {
+	if c.cleanupRecorder == nil {
+		return
+	}
+	for _, resource := range resources {
+		if resource.Type == "" || resource.ExternalID == "" {
+			continue
+		}
+		if err := c.cleanupRecorder.RecordCleanupItem(ctx, rec.oper.ID, plan.ConnectionID, plan.Provider, resource.Type, resource.ExternalID, state, lastError); err != nil {
+			slog.Error("record cleanup item", "resource", resource.ExternalID, "state", state, "err", err)
 		}
 	}
 }
@@ -893,12 +1127,21 @@ func (c *Controller) appendCleanupFinding(ctx context.Context, connID core.Conne
 }
 
 // failOperation transitions the operation and runtime to a failed state.
-func (c *Controller) failOperation(rec *operationRecord, connID core.ConnectionID, provider core.ProviderID,
-	code string, err error, retryable bool) {
-	rec.Transition(OperationStateFailed, err)
-	if c.journal != nil {
-		_ = c.journal.CompleteOperation(context.Background(), rec.oper.ID, string(OperationStateFailed))
+func (c *Controller) failOperation(ctx context.Context, rec *operationRecord, connID core.ConnectionID, provider core.ProviderID,
+	code string, cause error, retryable bool) error {
+	// The durable transition is authoritative. Do not show an in-memory error
+	// state when persistence failed as well; startup recovery must be allowed to
+	// classify that uncertain operation from its last committed step.
+	if c.runtimeCommitter != nil {
+		if err := c.runtimeCommitter.CommitOperationFailure(ctx, connID, rec.oper.ID, cause.Error(), provider, retryable); err != nil {
+			return fmt.Errorf("commit operation failure: %w", err)
+		}
+	} else if c.journal != nil {
+		if err := c.journal.CompleteOperation(ctx, rec.oper.ID, string(OperationStateFailed)); err != nil {
+			return fmt.Errorf("complete operation: %w", err)
+		}
 	}
+	rec.Transition(OperationStateFailed, cause)
 	c.mu.Lock()
 	if rt, ok := c.runtimes[connID]; ok {
 		rt.State = core.RuntimeError
@@ -906,12 +1149,14 @@ func (c *Controller) failOperation(rec *operationRecord, connID core.ConnectionI
 		rt.LastTransition = time.Now().UTC()
 		rt.Error = &core.PorticoError{
 			Code:      code,
-			Message:   err.Error(),
+			Message:   cause.Error(),
 			Retryable: retryable,
 			Provider:  provider,
 		}
 	}
 	c.mu.Unlock()
+	c.dispatchCommittedEvents(ctx)
+	return nil
 }
 
 // persistStepPiecewise persists a successful step result using individual
@@ -945,7 +1190,7 @@ func (c *Controller) persistStepPiecewise(ctx context.Context, plan *core.Operat
 	}
 	if c.credentialStorer != nil {
 		for _, cred := range stepResult.CredentialMutations {
-			if err := c.credentialStorer.SaveTunnelCredential(ctx, plan.ConnectionID, cred.TunnelID, cred.Token); err != nil {
+			if err := c.credentialStorer.SaveTunnelCredential(ctx, plan.ConnectionID, plan.Provider, cred.TunnelID, cred.Secret); err != nil {
 				return fmt.Errorf("persist credential for tunnel %s: %w", cred.TunnelID, err)
 			}
 		}
@@ -974,6 +1219,7 @@ func (c *Controller) runCompensationForPersistenceFailure(ctx context.Context, p
 
 	slog.Error("persistence failed after provider mutation - running compensation",
 		"step", currentStep.ID, "error", persistErr)
+	c.recordCleanupResources(ctx, plan, rec, currentResult.Resources, "outcome_unknown", "provider mutation succeeded but normal result persistence failed: "+persistErr.Error())
 
 	// Include the current step in compensation since the provider mutation succeeded.
 	// Emergency mode: the journal may be the failing component, so a
@@ -1030,4 +1276,13 @@ func selectResourceByType(resources []core.ProviderResource, desiredType core.Re
 		}
 	}
 	return found
+}
+
+func compensationRequiresResourceID(kind core.StepKind) bool {
+	switch kind {
+	case core.StepDeleteTunnel, core.StepDeleteDNSRecord, core.StepDeleteAccessApp,
+		core.StepDeleteAccessPolicy, core.StepUpdateDNSRecord, core.StepUpdateAccessPolicy:
+		return true
+	}
+	return false
 }
