@@ -45,6 +45,8 @@ type WizardState struct {
 	SourceAddress  string
 	SourceProtocol string
 	Port           string
+	CommandArgs    []string
+	WorkingDir     string
 	Hostname       string
 	ExposureMode   string
 	Protection     string
@@ -60,6 +62,8 @@ const (
 	WizardStepName
 	WizardStepSource
 	WizardStepPort
+	WizardStepCommandArgs
+	WizardStepCommandWorkingDir
 	WizardStepExposure
 	WizardStepHostname
 	WizardStepProtection
@@ -211,6 +215,44 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.Port = port
+			if m.state.SourceType == "command" {
+				m.state.Step = WizardStepCommandArgs
+				m.input = commandArgsInput(m.state.CommandArgs)
+			} else {
+				m.state.Step = WizardStepExposure
+				m.selected = 0
+			}
+		default:
+			m.input = editInput(m.input, key)
+		}
+
+	case WizardStepCommandArgs:
+		switch key {
+		case "esc":
+			m.state.Step = WizardStepPort
+			m.input = m.state.Port
+		case "enter":
+			args, err := parseCommandArgs(m.input)
+			if err != nil {
+				m.err = err
+				return nil
+			}
+			m.err = nil
+			m.state.CommandArgs = args
+			m.state.Step = WizardStepCommandWorkingDir
+			m.input = m.state.WorkingDir
+		default:
+			m.input = editInput(m.input, key)
+		}
+
+	case WizardStepCommandWorkingDir:
+		switch key {
+		case "esc":
+			m.state.Step = WizardStepCommandArgs
+			m.input = commandArgsInput(m.state.CommandArgs)
+		case "enter":
+			m.err = nil
+			m.state.WorkingDir = strings.TrimSpace(m.input)
 			m.state.Step = WizardStepExposure
 			m.selected = 0
 		default:
@@ -238,7 +280,10 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = 0
 			}
 		case "esc":
-			if m.hasPortStep() {
+			if m.state.SourceType == "command" {
+				m.state.Step = WizardStepCommandWorkingDir
+				m.input = m.state.WorkingDir
+			} else if m.hasPortStep() {
 				m.state.Step = WizardStepPort
 				m.input = m.state.Port
 			} else {
@@ -414,7 +459,13 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 		src.Directory = &ipc.DirectorySourceDTO{Path: s.SourceAddress}
 	case "command":
 		port, _ := strconv.Atoi(s.Port)
-		src.Command = &ipc.CommandSourceDTO{Executable: s.SourceAddress, Port: port, Protocol: "http"}
+		src.Command = &ipc.CommandSourceDTO{
+			Executable: s.SourceAddress,
+			Args:       append([]string(nil), s.CommandArgs...),
+			WorkingDir: s.WorkingDir,
+			Port:       port,
+			Protocol:   "http",
+		}
 	case "mcp_server":
 		src.MCP = &ipc.MCPSourceDTO{Transport: "http", Endpoint: s.SourceAddress}
 	}
@@ -510,6 +561,10 @@ func (m *WizardModel) View() string {
 		return m.withError(renderInput(m.sourcePrompt(), m.input))
 	case WizardStepPort:
 		return m.withError(renderInput("Local port (empty to skip):", m.input))
+	case WizardStepCommandArgs:
+		return m.withError(renderInput("Command arguments (comma-separated; empty to skip):", m.input))
+	case WizardStepCommandWorkingDir:
+		return m.withError(renderInput("Working directory (empty to use Portico's):", m.input))
 	case WizardStepExposure:
 		return m.renderExposure()
 	case WizardStepHostname:
@@ -544,7 +599,7 @@ func (m *WizardModel) sourcePrompt() string {
 	case "directory":
 		return "Enter the directory path to serve:"
 	case "command":
-		return "Enter the command to run:"
+		return "Enter the command executable to run:"
 	case "mcp_server":
 		return "Enter the MCP server endpoint:"
 	default:
@@ -610,6 +665,12 @@ func (m *WizardModel) renderReview() string {
 	if m.state.Port != "" {
 		lines = append(lines, fmt.Sprintf("Port:       %s", m.state.Port))
 	}
+	if len(m.state.CommandArgs) > 0 {
+		lines = append(lines, fmt.Sprintf("Arguments:  %s", strings.Join(m.state.CommandArgs, ", ")))
+	}
+	if m.state.WorkingDir != "" {
+		lines = append(lines, fmt.Sprintf("Working dir: %s", m.state.WorkingDir))
+	}
 	lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
 	if m.state.Hostname != "" {
 		lines = append(lines, fmt.Sprintf("Hostname:   %s", m.state.Hostname))
@@ -664,6 +725,30 @@ func renderMenu(title string, options []string, selected int) string {
 func renderInput(prompt, value string) string {
 	lines := []string{prompt, "", "> " + value, "", "Enter to continue  Esc Back"}
 	return strings.Join(lines, "\n")
+}
+
+// parseCommandArgs uses commas as an unambiguous terminal-friendly separator.
+// Spaces remain part of one argument, so `--title, hello world` maps to two
+// arguments without requiring the user to understand shell quoting rules.
+func parseCommandArgs(input string) ([]string, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil, nil
+	}
+	parts := strings.Split(input, ",")
+	args := make([]string, 0, len(parts))
+	for _, part := range parts {
+		arg := strings.TrimSpace(part)
+		if arg == "" {
+			return nil, fmt.Errorf("command arguments cannot contain an empty entry")
+		}
+		args = append(args, arg)
+	}
+	return args, nil
+}
+
+func commandArgsInput(args []string) string {
+	return strings.Join(args, ", ")
 }
 
 // parseProtectionRules accepts explicit email addresses and domains. Domains

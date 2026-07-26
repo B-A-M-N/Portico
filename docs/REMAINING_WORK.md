@@ -122,10 +122,10 @@ implementations. `portico legacy` also remains a second mutation architecture.
 **Current state**
 
 The wizard can create existing-service, directory, command, and HTTP MCP
-profiles, but only collects a minimal subset of each source schema. It does not
-collect command arguments, working directory, environment references, shell
-mode, directory mode/SPA/upload/delete options, or the full MCP endpoint versus
-command and transport choices.
+profiles. Command sources collect an executable, port, comma-separated
+arguments, and working directory, but the wizard still lacks environment
+references, shell mode, directory mode/SPA/upload/delete options, and the full
+MCP endpoint-versus-command and transport choices.
 
 **Implementation**
 

@@ -126,3 +126,28 @@ func TestWizardDoesNotOfferUnsupportedProtectionOrExposure(t *testing.T) {
 		t.Fatalf("quick-tunnel protection options include unsupported email OTP: %s", view)
 	}
 }
+
+func TestCommandWizardMapsArgumentsAndWorkingDirectory(t *testing.T) {
+	args, err := parseCommandArgs("serve, --host, 127.0.0.1, --title, hello world")
+	if err != nil {
+		t.Fatalf("parseCommandArgs: %v", err)
+	}
+	if want := []string{"serve", "--host", "127.0.0.1", "--title", "hello world"}; !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+	m := NewWizard(nil, true, nil)
+	m.state = WizardState{
+		Name: "Command service", SourceType: "command", SourceAddress: "npm", Port: "3000",
+		CommandArgs: args, WorkingDir: "/work/app", ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
+	}
+	req := m.buildRequest()
+	if req.Source.Command == nil || !reflect.DeepEqual(req.Source.Command.Args, args) || req.Source.Command.WorkingDir != "/work/app" {
+		t.Fatalf("command request = %#v", req.Source.Command)
+	}
+}
+
+func TestCommandArgsRejectEmptyEntries(t *testing.T) {
+	if _, err := parseCommandArgs("serve,,--host"); err == nil {
+		t.Fatal("expected empty command argument to be rejected")
+	}
+}
