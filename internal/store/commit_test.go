@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -561,5 +564,285 @@ func TestCompensationLedgerTransitions(t *testing.T) {
 	results, err = s.GetStepResults(ctx, opID)
 	if err != nil || results[0].Status != string(StepCompensated) {
 		t.Fatalf("unexpected terminal ledger: results=%+v err=%v", results, err)
+	}
+}
+
+// --------------- CAS runtime revision tests ---------------
+
+func TestSaveRuntimeCASBumpsRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+
+	// Load the runtime to get the initial revision.
+	loaded, err := s.LoadRuntime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	if loaded.RuntimeRevision != 0 {
+		t.Fatalf("expected initial revision 0, got %d", loaded.RuntimeRevision)
+	}
+
+	// SaveRuntimeCAS bumps the persisted revision and mirrors in struct.
+	if err := s.SaveRuntimeCAS(ctx, loaded); err != nil {
+		t.Fatalf("SaveRuntimeCAS: %v", err)
+	}
+	if loaded.RuntimeRevision != 1 {
+		t.Fatalf("expected mirrored revision 1, got %d", loaded.RuntimeRevision)
+	}
+
+	// Verify persisted revision is 1.
+	loaded2, err := s.LoadRuntime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("LoadRuntime after CAS: %v", err)
+	}
+	if loaded2.RuntimeRevision != 1 {
+		t.Fatalf("expected persisted revision 1, got %d", loaded2.RuntimeRevision)
+	}
+}
+
+func TestSaveRuntimeCASRejectsStaleRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+
+	// Load at revision 0.
+	rt1, err := s.LoadRuntime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+
+	// First CAS succeeds: 0 → 1.
+	if err := s.SaveRuntimeCAS(ctx, rt1); err != nil {
+		t.Fatalf("SaveRuntimeCAS first: %v", err)
+	}
+
+	// rt1 still has revision 1 (mirrored). Persist a second change with same revision.
+	rt1.Endpoint.PublicAddress = "https://changed.example.com"
+	if err := s.SaveRuntimeCAS(ctx, rt1); err != nil {
+		t.Fatalf("SaveRuntimeCAS second: %v", err)
+	}
+	// Now persisted is 2, rt1 has 2.
+
+	// Load rt3 — also at revision 2. Make rt1 advance first, then rt3 will be stale.
+	rt3, err := s.LoadRuntime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("LoadRuntime: %v", err)
+	}
+	// rt3 has revision 2, rt1 also has 2, persisted is 2.
+
+	// Make rt1 change it (succeeds: 2→3).
+	rt1.Endpoint.PublicAddress = "https://rt1-changed.example.com"
+	if err := s.SaveRuntimeCAS(ctx, rt1); err != nil {
+		t.Fatalf("SaveRuntimeCAS rt1: %v", err)
+	}
+	// Persisted is 3, rt1 has 3.
+
+	// rt3 still has revision 2. CAS should fail.
+	rt3.Endpoint.PublicAddress = "https://rt3-stale.example.com"
+	err = s.SaveRuntimeCAS(ctx, rt3)
+	if !errors.Is(err, ErrRuntimeRevisionMismatch) {
+		t.Fatalf("expected ErrRuntimeRevisionMismatch, got %v", err)
+	}
+
+	// Persisted row should be unchanged (still 3).
+	after, err := s.LoadRuntime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("LoadRuntime after stale CAS: %v", err)
+	}
+	if after.RuntimeRevision != 3 {
+		t.Fatalf("expected persisted revision 3 unchanged, got %d", after.RuntimeRevision)
+	}
+	// The value should be rt1's, not rt3's.
+	if after.Endpoint.PublicAddress != "https://rt1-changed.example.com" {
+		t.Fatalf("persisted row was overwritten: %q", after.Endpoint.PublicAddress)
+	}
+}
+
+func TestCommitOpenSuccessBumpsRuntimeRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+
+	// Manually set runtime_revision to 0 (migration 17 back-fills 0).
+	_, err := s.db.Exec("UPDATE connection_runtime SET runtime_revision = 0 WHERE connection_id = ?", p.ID)
+	if err != nil {
+		t.Fatalf("set initial revision: %v", err)
+	}
+
+	res, err := s.CommitOpenSuccess(ctx, p.ID, "op-open", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("CommitOpenSuccess: %v", err)
+	}
+	if res.RuntimeState != core.RuntimeOpen {
+		t.Fatalf("unexpected runtime state: %+v", res)
+	}
+
+	var rev int64
+	err = s.db.QueryRow("SELECT runtime_revision FROM connection_runtime WHERE connection_id = ?", p.ID).Scan(&rev)
+	if err != nil {
+		t.Fatalf("query revision: %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("expected runtime_revision 1 after open, got %d", rev)
+	}
+}
+
+func TestCommitCloseSuccessBumpsRuntimeRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+	// Open first (bumps to 1).
+	_, err := s.db.Exec("UPDATE connection_runtime SET runtime_revision = 0 WHERE connection_id = ?", p.ID)
+	if err != nil {
+		t.Fatalf("reset revision: %v", err)
+	}
+	s.CommitOpenSuccess(ctx, p.ID, "op-open", time.Now().UTC())
+	// Now revision is 1.
+
+	res, err := s.CommitCloseSuccess(ctx, p.ID, "op-close")
+	if err != nil {
+		t.Fatalf("CommitCloseSuccess: %v", err)
+	}
+	if res.RuntimeState != core.RuntimeClosed {
+		t.Fatalf("unexpected runtime state: %+v", res)
+	}
+
+	var rev int64
+	err = s.db.QueryRow("SELECT runtime_revision FROM connection_runtime WHERE connection_id = ?", p.ID).Scan(&rev)
+	if err != nil {
+		t.Fatalf("query revision: %v", err)
+	}
+	if rev != 2 {
+		t.Fatalf("expected runtime_revision 2 after close, got %d", rev)
+	}
+}
+
+func TestCommitRepairSuccessBumpsRuntimeRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+	// Reset and open first.
+	_, err := s.db.Exec("UPDATE connection_runtime SET runtime_revision = 0 WHERE connection_id = ?", p.ID)
+	if err != nil {
+		t.Fatalf("reset revision: %v", err)
+	}
+	s.CommitOpenSuccess(ctx, p.ID, "op-open", time.Now().UTC())
+
+	res, err := s.CommitRepairSuccess(ctx, p.ID, "op-repair")
+	if err != nil {
+		t.Fatalf("CommitRepairSuccess: %v", err)
+	}
+	if res.RuntimeState != core.RuntimeOpen {
+		t.Fatalf("unexpected runtime state: %+v", res)
+	}
+
+	var rev int64
+	err = s.db.QueryRow("SELECT runtime_revision FROM connection_runtime WHERE connection_id = ?", p.ID).Scan(&rev)
+	if err != nil {
+		t.Fatalf("query revision: %v", err)
+	}
+	if rev != 2 {
+		t.Fatalf("expected runtime_revision 2 after repair, got %d", rev)
+	}
+}
+
+func TestMigration17AddsRuntimeRevision(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_m17.db")
+
+	// Open a fresh store — migrations 1..16 run first, then 17 adds runtime_revision.
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Save a profile + runtime so the table exists.
+	ctx := context.Background()
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	rt.ConnectionID = p.ID
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+
+	// Verify column exists via PRAGMA table_info.
+	rows, err := s.db.Query("PRAGMA table_info(connection_runtime)")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			t.Fatalf("scan column info: %v", err)
+		}
+		if name == "runtime_revision" {
+			found = true
+			if ctype != "INTEGER" {
+				t.Fatalf("expected type INTEGER, got %q", ctype)
+			}
+		}
+	}
+	rows.Close()
+	if !found {
+		t.Fatal("runtime_revision column not found in connection_runtime")
+	}
+
+	// Verify default back-fills to 0.
+	var rev int64
+	err = s.db.QueryRow("SELECT runtime_revision FROM connection_runtime WHERE connection_id = ?", p.ID).Scan(&rev)
+	if err != nil && err != sql.ErrNoRows {
+		t.Fatalf("query revision: %v", err)
+	}
+	if rev != 0 {
+		t.Fatalf("expected back-filled revision 0, got %d", rev)
 	}
 }
