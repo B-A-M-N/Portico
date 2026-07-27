@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strconv"
 	"sync"
@@ -15,12 +16,15 @@ import (
 // runnable process/server separate from ConnectionProfile, which is desired
 // state and must never contain runtime process data.
 type Manager struct {
-	mu     sync.Mutex
-	active map[core.ConnectionID]Origin
+	mu      sync.Mutex
+	active  map[core.ConnectionID]*managedOrigin
+	cleared bool // set to true during StopAll to prevent new starts
 }
 
 func NewManager() *Manager {
-	return &Manager{active: make(map[core.ConnectionID]Origin)}
+	return &Manager{
+		active: make(map[core.ConnectionID]*managedOrigin),
+	}
 }
 
 // Plan resolves the stable loopback URL that a provider may place in an
@@ -90,6 +94,8 @@ func commandOrigin(command *core.CommandSpec) (*core.ResolvedOrigin, error) {
 
 // Start creates the source represented by the profile and verifies it bound
 // to exactly the URL recorded in the plan. Calling Start repeatedly is safe.
+// Start and Stop for the same connection ID are serialized by a per-origin
+// lock. The manager-level mutex is held only for map access.
 func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, source core.SourceSpec, expectedURL string) error {
 	if source.Kind != core.SourceDirectory && source.Kind != core.SourceCommand &&
 		(source.Kind != core.SourceMCP || source.MCP == nil || source.MCP.Command == nil) {
@@ -97,83 +103,190 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 	}
 
 	m.mu.Lock()
-	if running := m.active[connectionID]; running != nil {
-		if err := running.Healthy(ctx); err == nil {
-			m.mu.Unlock()
-			return nil
-		}
-		delete(m.active, connectionID)
+	if m.cleared {
 		m.mu.Unlock()
-		_ = running.Stop(ctx)
-		m.mu.Lock()
+		return fmt.Errorf("origin manager is stopped")
 	}
 
-	origin, err := newOwnedOrigin(connectionID, source)
+	// Reuse existing managed origin or create a new one.
+	existing := m.active[connectionID]
+	if existing != nil {
+		// Same connection: stop the old one first.
+		old := existing
+		m.mu.Unlock()
+		_ = old.stopUnderlying(ctx)
+		m.mu.Lock()
+		existing = m.active[connectionID]
+	}
+
+	// Create the underlying origin (outside per-origin lock).
+	orig, err := newOwnedOrigin(connectionID, source)
 	if err != nil {
 		m.mu.Unlock()
 		return err
 	}
-	// Publish the origin before starting it so a concurrent close or shutdown
-	// can always find and stop it. Start verifies this registration afterwards
-	// before reporting success to the connector step.
-	m.active[connectionID] = origin
+
+	managed := newManagedOrigin(orig)
+	m.active[connectionID] = managed
 	m.mu.Unlock()
 
-	actualURL, err := origin.Start(ctx)
+	// Transition to starting under the per-origin lock.
+	managed.SetState(originStateStarting)
+
+	actualURL, err := orig.Start(ctx)
+
 	if err != nil {
-		m.remove(connectionID, origin)
+		managed.SetState(originStateCrashed)
+		managed.SetLastError(err)
+		m.mu.Lock()
+		delete(m.active, connectionID)
+		m.mu.Unlock()
 		return err
 	}
+
 	if actualURL != expectedURL {
-		_ = origin.Stop(context.Background())
-		m.remove(connectionID, origin)
+		_ = orig.Stop(context.Background())
+		managed.SetState(originStateStopped)
+		managed.SetLastError(fmt.Errorf("bounded %s, expected %s", actualURL, expectedURL))
+		m.mu.Lock()
+		delete(m.active, connectionID)
+		m.mu.Unlock()
 		return fmt.Errorf("owned origin bound %s, but plan requires %s", actualURL, expectedURL)
 	}
 
-	m.mu.Lock()
-	stillActive := m.active[connectionID] == origin
-	m.mu.Unlock()
-	if !stillActive {
-		_ = origin.Stop(context.Background())
-		return fmt.Errorf("owned origin was stopped while starting")
-	}
+	// Success: record URL and set running state under the per-origin lock.
+	managed.SetURL(actualURL)
+	managed.SetState(originStateRunning)
 	return nil
-}
-
-func (m *Manager) remove(connectionID core.ConnectionID, expected Origin) {
-	m.mu.Lock()
-	if m.active[connectionID] == expected {
-		delete(m.active, connectionID)
-	}
-	m.mu.Unlock()
 }
 
 // Stop stops an owned origin. It is intentionally idempotent so close,
 // delete, compensation, and supervisor shutdown can all use it safely.
+// On failure the entry is retained (with URL, state, and error) so callers
+// can retry or perform diagnostics.
 func (m *Manager) Stop(ctx context.Context, connectionID core.ConnectionID) error {
 	m.mu.Lock()
-	origin := m.active[connectionID]
-	delete(m.active, connectionID)
+	managed, ok := m.active[connectionID]
 	m.mu.Unlock()
-	if origin == nil {
+	if !ok {
 		return nil
 	}
-	return origin.Stop(ctx)
+
+	// Prevent stopping while a new start is in progress.
+	prev := managed.SetState(originStateStopping)
+	if prev == originStateStopping || prev == originStateStopped {
+		return nil // already stopping or stopped — idempotent
+	}
+
+	orig := managed.Origin()
+	if orig == nil {
+		managed.SetState(originStateStopped)
+		m.mu.Lock()
+		delete(m.active, connectionID)
+		m.mu.Unlock()
+		return nil
+	}
+
+	err := orig.Stop(ctx)
+
+	if err != nil {
+		managed.SetLastError(err)
+		// Leave as-is for diagnostics.
+		return err
+	}
+
+	managed.SetState(originStateStopped)
+	m.mu.Lock()
+	delete(m.active, connectionID)
+	m.mu.Unlock()
+	return nil
 }
 
 // StopAll is used by supervisor shutdown to ensure owned sources never leak.
+// It honours the caller's context deadline, snapshots entries under the lock,
+// then stops them outside the lock. Failed entries are retained so a retry
+// or forced cleanup can still find them. An aggregated error is returned.
 func (m *Manager) StopAll(ctx context.Context) error {
 	m.mu.Lock()
-	active := m.active
-	m.active = make(map[core.ConnectionID]Origin)
+	snapshot := make(map[core.ConnectionID]*managedOrigin, len(m.active))
+	for connID, mo := range m.active {
+		snapshot[connID] = mo
+	}
+	// Clear active so no new starts succeed; cleared is already true
+	// from where StopAll was called, but be explicit.
+	for connID := range m.active {
+		delete(m.active, connID)
+	}
 	m.mu.Unlock()
+
 	var firstErr error
-	for _, origin := range active {
-		if err := origin.Stop(ctx); err != nil && firstErr == nil {
-			firstErr = err
+	for connID, mo := range snapshot {
+		if err := mo.stopUnderlying(ctx); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			slog.Warn("origin shutdown failed", "connection", connID, "err", err)
+		}
+		// If stop failed, retain the managed entry so diagnostics can
+		// still find it. Successful stops have already set state to
+		// stopped and removed the entry from active.
+		if firstErr != nil && mo.State() != originStateStopped {
+			m.mu.Lock()
+			if _, exists := m.active[connID]; !exists {
+				m.active[connID] = mo
+			}
+			m.mu.Unlock()
 		}
 	}
+
 	return firstErr
+}
+
+// Observe returns the current OriginRuntime for a connection. It returns
+// (zero, false) when the connection does not own a local origin or no
+// origin has been started yet.
+func (m *Manager) Observe(connectionID core.ConnectionID) (core.OriginRuntime, bool) {
+	m.mu.Lock()
+	mo, ok := m.active[connectionID]
+	m.mu.Unlock()
+	if !ok {
+		return core.OriginRuntime{}, false
+	}
+	_, url := mo.StateAndURL()
+	state := mo.State()
+	runtime := core.OriginRuntime{
+		Ownership: core.OriginOwnershipOwned,
+		URL:       url,
+	}
+	// Crashed or unknown state from lifecycle tracking.
+	if state == originStateCrashed || state == originStateUnknown {
+		runtime.Status = core.OriginStatusCrashed
+		if err := mo.LastError(); err != nil {
+			runtime.LastError = err.Error()
+		}
+		return runtime, true
+	}
+	// Check actual health if we think we're running.
+	if err := mo.healthy(context.Background()); err != nil {
+		runtime.Status = core.OriginStatusCrashed
+		runtime.LastError = err.Error()
+		return runtime, true
+	}
+	runtime.Status = core.OriginStatusRunning
+	// Attach process identity if applicable.
+	pbo, ok := mo.originImpl().(ProcessBackedOrigin)
+	if !ok {
+		return runtime, true
+	}
+	id, hasID := pbo.Identity()
+	if !hasID {
+		return runtime, true
+	}
+	runtime.PID = id.PID
+	runtime.StartTime = id.StartTime
+	runtime.Executable = id.ExecutablePath
+	runtime.CommandHash = id.CommandHash
+	return runtime, true
 }
 
 func newOwnedOrigin(connectionID core.ConnectionID, source core.SourceSpec) (Origin, error) {

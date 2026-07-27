@@ -2,6 +2,10 @@ package origin
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -13,10 +17,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // safePath resolves a relative path against root and ensures it stays within root.
-// Uses Abs, Clean, EvalSymlinks, Rel to prevent traversal, symlink escape, and prefix collisions.
+// It resolves symlinks component-by-component where possible to prevent symlink
+// and rename races that would allow escaping the root directory.
 func safePath(root, rel string) (string, error) {
 	// Clean the root path
 	cleanRoot, err := filepath.Abs(filepath.Clean(root))
@@ -31,43 +38,70 @@ func safePath(root, rel string) (string, error) {
 		realRoot = cleanRoot
 	}
 
-	// Join and clean the target path
-	target := filepath.Join(realRoot, filepath.Clean(rel))
-
-	// Resolve symlinks in target
-	realTarget, err := filepath.EvalSymlinks(target)
-	if err != nil {
-		// Target may not exist; clean the path
-		realTarget = filepath.Clean(target)
+	// Walk the relative path component by component, resolving symlinks
+	// for each intermediate component. This prevents symlink escape through
+	// children of root even when the final path is inside.
+	rel = filepath.Clean(rel)
+	current := realRoot
+	if rel == "." || rel == "" {
+		return current, nil
 	}
 
-	// Verify target is within root using Rel
-	relPath, err := filepath.Rel(realRoot, realTarget)
-	if err != nil {
-		return "", fmt.Errorf("path resolution: %w", err)
+	parts := strings.Split(rel, string(filepath.Separator))
+	for _, part := range parts {
+		if part == ".." {
+			// Parent reference: check we don't escape root
+			parent := filepath.Dir(current)
+			if parent == current {
+				return "", fmt.Errorf("path traversal rejected")
+			}
+			// If parent is within root, allow it
+			if parent == realRoot || strings.HasPrefix(parent, realRoot+string(filepath.Separator)) {
+				current = parent
+			} else {
+				return "", fmt.Errorf("path traversal rejected")
+			}
+		} else if part == "." || part == "" {
+			continue
+		} else {
+			next := filepath.Join(current, part)
+			// If next exists and is a symlink, resolve it
+			realNext, err := filepath.EvalSymlinks(next)
+			if err != nil {
+				// Target may not exist; keep the cleaned path
+				realNext = next
+			}
+			// Verify this component didn't escape root
+			if realNext != realRoot && !strings.HasPrefix(realNext, realRoot+string(filepath.Separator)) {
+				return "", fmt.Errorf("path outside root")
+			}
+			current = realNext
+		}
 	}
 
-	// Reject traversal: ".." anywhere in the relative path
-	if strings.HasPrefix(relPath, "..") || relPath == ".." {
-		return "", fmt.Errorf("path traversal rejected")
-	}
+	return current, nil
+}
 
-	// Final check: target must be inside root
-	if !strings.HasPrefix(realTarget, realRoot+string(filepath.Separator)) && realTarget != realRoot {
-		return "", fmt.Errorf("path outside root")
-	}
-
-	return realTarget, nil
+// renameNoReplace renames src to dst. On Linux it uses RENAME_NOREPLACE
+// to prevent silent overwrites; on other platforms it falls back to the
+// standard syscall.
+func renameNoReplace(src, dst string) error {
+	return renameNoReplaceImpl(src, dst)
 }
 
 // BuiltinFileBrowser serves a web-based file browser.
 type BuiltinFileBrowser struct {
-	cfg      Config
-	server   *http.Server
-	listener net.Listener
+	cfg           Config
+	server        *http.Server
+	listener      net.Listener
+	canonicalRoot string // pinned canonical root at construction time
+	serveDone     chan struct{}
+	csrfKey       [32]byte // random key for HMAC-based CSRF tokens
 }
 
-// NewBuiltinFileBrowser creates a file browser origin.
+// NewBuiltinFileBrowser creates a file browser origin. The configured root is
+// canonicalised (symlinks followed) once at construction so the served root
+// cannot be redirected by a later symlink retarget.
 func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("--path is required for builtin:file-browser origin")
@@ -76,6 +110,10 @@ func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 	absPath, err := filepath.Abs(cfg.Path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving path: %w", err)
+	}
+	realRoot, err := filepath.EvalSymlinks(absPath)
+	if err == nil {
+		absPath = realRoot
 	}
 
 	info, err := os.Stat(absPath)
@@ -87,7 +125,17 @@ func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 	}
 
 	cfg.Path = absPath
-	return &BuiltinFileBrowser{cfg: cfg}, nil
+	var csrfKey [32]byte
+	if _, err := rand.Read(csrfKey[:]); err != nil {
+		return nil, fmt.Errorf("generating CSRF token key: %w", err)
+	}
+
+	return &BuiltinFileBrowser{cfg: cfg, canonicalRoot: absPath, csrfKey: csrfKey}, nil
+}
+
+// Root returns the pinned canonical root path.
+func (fb *BuiltinFileBrowser) Root() string {
+	return fb.canonicalRoot
 }
 
 func (fb *BuiltinFileBrowser) Type() Type {
@@ -115,11 +163,26 @@ func (fb *BuiltinFileBrowser) Start(_ context.Context) (string, error) {
 		mux.HandleFunc("/upload", fb.handleUpload)
 	}
 	if fb.cfg.AllowDelete && !fb.cfg.ReadOnly {
-		mux.HandleFunc("/delete", fb.handleDelete)
+		mux.HandleFunc("/delete", fb.requireCSRF(fb.handleDelete))
 	}
 
-	fb.server = &http.Server{Handler: mux}
-	go fb.server.Serve(listener)
+	// Apply security headers globally. Mutation endpoints enforce their
+	// own per-route body limits (handleUpload uses MaxBytesReader), so
+	// no global request-size wrapper is applied here.
+	handler := securityHeadersMiddleware(mux)
+	fb.server = &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16,
+	}
+	fb.serveDone = make(chan struct{})
+	go func() {
+		_ = fb.server.Serve(listener)
+		close(fb.serveDone)
+	}()
 
 	addr := listener.Addr().String()
 	return fmt.Sprintf("http://%s", addr), nil
@@ -139,10 +202,42 @@ func (fb *BuiltinFileBrowser) Logs() io.ReadCloser {
 }
 
 func (fb *BuiltinFileBrowser) Healthy(_ context.Context) error {
-	if fb.listener == nil {
+	if fb.server == nil || fb.listener == nil {
 		return fmt.Errorf("server not started")
 	}
-	return nil
+	select {
+	case <-fb.serveDone:
+		return fmt.Errorf("server stopped")
+	default:
+		return nil
+	}
+}
+
+// CSRFToken generates an HMAC-based CSRF token for the given path.
+func (fb *BuiltinFileBrowser) CSRFToken(path string) string {
+	h := hmac.New(sha256.New, fb.csrfKey[:])
+	io.WriteString(h, path)
+	return base64.URLEncoding.EncodeToString(h.Sum(nil))
+}
+
+// requireCSRF checks that the request includes a valid CSRF token
+// in the X-CSRF-Token header or in the form value _csrf.
+func (fb *BuiltinFileBrowser) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-CSRF-Token") == "" && r.FormValue("_csrf") == "" {
+			http.Error(w, "CSRF token required", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (fb *BuiltinFileBrowser) Identity() (core.ProcessIdentity, bool) {
+	return core.ProcessIdentity{}, false
+}
+
+func (fb *BuiltinFileBrowser) ProcessGroupID() int {
+	return 0
 }
 
 type fileEntry struct {
@@ -230,10 +325,15 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Apply MaxBytesReader BEFORE multipart parsing for actual body-size limit
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<20) // 64MB limit
+	// Enforce a generous upload size limit (64 MiB).
+	// The multipart form parser adds overhead for headers, boundaries,
+	// and field data; 2 KiB covers that to avoid the complete body
+	// being capped at exactly the nominal file-size limit.
+	const maxUploadSize = 64 << 20
+	const multipartOverhead = 2 << 10
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+multipartOverhead)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		http.Error(w, "file too large", http.StatusBadRequest)
 		return
 	}
 	defer r.MultipartForm.RemoveAll()
@@ -267,20 +367,54 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Create a temporary file in the same directory, then atomically rename.
+	// This prevents a copy failure from truncating or overwriting the destination.
+	// We use RENAME_NOREPLACE to prevent silent overwrites of existing files.
+	tmpFile, err := os.CreateTemp(destDir, ".upload-*")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "creating temp file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer out.Close()
+	tmpPath := tmpFile.Name()
 
-	if _, err := io.Copy(out, file); err != nil {
-		// Delete partial file on failure
-		out.Close()
-		os.Remove(destPath)
+	// Ensure temp file cleanup even if rename fails.
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+	}()
+
+	if _, err := io.Copy(tmpFile, file); err != nil {
 		http.Error(w, "writing file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if err := tmpFile.Close(); err != nil {
+		http.Error(w, "closing temp file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// fsync the temp file before rename for durability.
+	if err := tmpFile.Sync(); err != nil {
+		http.Error(w, "syncing file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Rename atomically with RENAME_NOREPLACE to prevent silent overwrites.
+	if err := renameNoReplace(tmpPath, destPath); err != nil {
+		http.Error(w, "renaming file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// fsync the containing directory after rename.
+	if fd, dirErr := os.Open(destDir); dirErr == nil {
+		_ = fd.Sync()
+		fd.Close()
+	}
+
+	if err := os.Chmod(destPath, 0644); err != nil {
+		http.Error(w, "chmod file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
 }
 

@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // BuiltinStatic serves a static directory over HTTP.
@@ -17,6 +20,7 @@ type BuiltinStatic struct {
 	server        *http.Server
 	listener      net.Listener
 	canonicalRoot string // pinned canonical root at construction time
+	serveDone     chan struct{}
 }
 
 // NewBuiltinStatic creates a static file server origin.
@@ -74,7 +78,7 @@ func (s *BuiltinStatic) Start(_ context.Context) (string, error) {
 		}
 		handler = spaHandler(s.canonicalRoot, index, fs)
 	} else {
-		handler = fs
+		handler = noSymlink(s.canonicalRoot, fs)
 	}
 
 	if s.cfg.CacheControl != "" {
@@ -86,7 +90,11 @@ func (s *BuiltinStatic) Start(_ context.Context) (string, error) {
 
 	s.server = &http.Server{Handler: handler, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 
-	go s.server.Serve(listener)
+	s.serveDone = make(chan struct{})
+	go func() {
+		_ = s.server.Serve(listener)
+		close(s.serveDone)
+	}()
 
 	addr := listener.Addr().String()
 	return fmt.Sprintf("http://%s", addr), nil
@@ -106,10 +114,44 @@ func (s *BuiltinStatic) Logs() io.ReadCloser {
 }
 
 func (s *BuiltinStatic) Healthy(_ context.Context) error {
-	if s.listener == nil {
+	if s.server == nil || s.listener == nil {
 		return fmt.Errorf("server not started")
 	}
-	return nil
+	// Check if Serve() has exited — a closed serveDone channel means the
+	// server is down. Use select to avoid race with a concurrent shutdown.
+	select {
+	case <-s.serveDone:
+		return fmt.Errorf("server stopped")
+	default:
+		return nil
+	}
+}
+
+// noSymlink wraps a handler to reject paths that resolve through symlinks
+// beneath the root directory. http.Dir(root) follows descendant symlinks
+// so an extra check is needed to prevent root/public-link -> /outside from
+// being served.
+func noSymlink(root string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target, err := safePath(root, r.URL.Path)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *BuiltinStatic) Identity() (core.ProcessIdentity, bool) {
+	return core.ProcessIdentity{}, false
+}
+
+func (s *BuiltinStatic) ProcessGroupID() int {
+	return 0
 }
 
 // spaHandler serves the index file for any path that doesn't match a real file.
