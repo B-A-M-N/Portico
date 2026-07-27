@@ -108,15 +108,15 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 		return fmt.Errorf("origin manager is stopped")
 	}
 
-	// Reuse existing managed origin or create a new one.
-	existing := m.active[connectionID]
-	if existing != nil {
-		// Same connection: stop the old one first.
-		old := existing
+	// If a managed origin already exists for this connection, stop it
+	// before starting a new one. We snapshot the reference under the
+	// manager lock so stopping outside the lock operates on the exact
+	// entry we found, not a newer one that may have been inserted.
+	old := m.active[connectionID]
+	if old != nil {
 		m.mu.Unlock()
 		_ = old.stopUnderlying(ctx)
 		m.mu.Lock()
-		existing = m.active[connectionID]
 	}
 
 	// Create the underlying origin (outside per-origin lock).
