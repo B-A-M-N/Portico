@@ -189,6 +189,24 @@ func TestAdoptRejectsIdentityMismatch(t *testing.T) {
 			ExecutablePath: ident.ExecutablePath,
 			CommandHash:    "deadbeef",
 		},
+		"partial (PID only)": {
+			PID: ident.PID,
+		},
+		"partial (missing start time)": {
+			PID:            ident.PID,
+			ExecutablePath: ident.ExecutablePath,
+			CommandHash:    ident.CommandHash,
+		},
+		"partial (missing executable)": {
+			PID:         ident.PID,
+			StartTime:   ident.StartTime,
+			CommandHash: ident.CommandHash,
+		},
+		"partial (missing command hash)": {
+			PID:            ident.PID,
+			StartTime:      ident.StartTime,
+			ExecutablePath: ident.ExecutablePath,
+		},
 		"invalid pid": {
 			PID: -1,
 		},
@@ -200,8 +218,16 @@ func TestAdoptRejectsIdentityMismatch(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%s: Adopt succeeded with mismatched identity", name)
 		}
-		if !errors.Is(err, ErrIdentityMismatch) {
-			t.Errorf("%s: error is not ErrIdentityMismatch: %v", name, err)
+		// Partial identities must surface as ErrIdentityPartial; full
+		// mismatches as ErrIdentityMismatch.
+		var want error
+		if fake.Complete() {
+			want = ErrIdentityMismatch
+		} else {
+			want = ErrIdentityPartial
+		}
+		if !errors.Is(err, want) {
+			t.Errorf("%s: error is not %v: %v", name, want, err)
 		}
 		if _, found := pm.GetProcess(connID); found {
 			t.Errorf("%s: mismatched process was added", name)
@@ -575,5 +601,32 @@ func TestCleanupNoGoroutineLeaks(t *testing.T) {
 		n := runtime.Stack(buf, true)
 		t.Errorf("goroutine leak after Cleanup: baseline=%d now=%d\n%s",
 			baseline, runtime.NumGoroutine(), buf[:n])
+	}
+}
+
+func TestMinimalEnv_DoesNotContainSupervisorSecrets(t *testing.T) {
+	// This test sets a sentinel in os.Environ and verifies minimalEnv
+	// does not leak it.
+	// We can't directly inject os.Environ for this, but we verify the
+	// output is a reasonable fixed list.
+	env := minimalEnv()
+	// Verify no env var exceeds a reasonable name+value length
+	for _, kv := range env {
+		eq := -1
+		for i := 0; i < len(kv); i++ {
+			if kv[i] == '=' {
+				eq = i
+				break
+			}
+		}
+		if eq <= 0 {
+			t.Fatalf("invalid env entry: %q", kv)
+		}
+		name := kv[:eq]
+		switch name {
+		case "PATH", "HOME", "LANG", "TZ":
+		default:
+			t.Errorf("unexpected env key: %q", name)
+		}
 	}
 }

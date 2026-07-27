@@ -23,59 +23,47 @@ func VerifyIdentity(mp *ManagedProcess) error {
 	return verifyIdentityFields(mp.Identity)
 }
 
-// verifyIdentityFields checks every available identity field (start time,
-// executable path, command hash) against the live process via /proc.
-// Never trust a PID alone. All failures — including an unreadable or
-// missing process — are wrapped in ErrIdentityMismatch so callers can
-// detect them with errors.Is and must NOT signal the PID afterwards.
+// verifyIdentityFields checks every identity field (start time, executable
+// path, command hash) against the live process via /proc. Adopting a process
+// requires all four fields to be populated — partial identities are rejected
+// as ErrIdentityPartial so they cannot be confused with a verified match.
+// All other failures — including an unreadable or missing process — are
+// wrapped in ErrIdentityMismatch so callers must NOT signal the PID.
 func verifyIdentityFields(ident core.ProcessIdentity) error {
-	pid := ident.PID
-	if pid <= 0 {
-		return fmt.Errorf("%w: invalid PID: %d", ErrIdentityMismatch, pid)
+	if !ident.Complete() {
+		return fmt.Errorf("%w: incomplete identity (pid=%d, start_time=%d, exe=%q, hash=%q)",
+			ErrIdentityPartial, ident.PID, ident.StartTime, ident.ExecutablePath, ident.CommandHash)
 	}
-
+	pid := ident.PID
 	// Verify PID exists and check start time to detect PID reuse
 	procStat, err := parseProcStat(pid)
 	if err != nil {
 		return fmt.Errorf("%w: process %d stat failed: %v", ErrIdentityMismatch, pid, err)
 	}
-
-	// Compare start time to detect PID reuse
-	if ident.StartTime != 0 && procStat.startTime != ident.StartTime {
+	if procStat.startTime != ident.StartTime {
 		return fmt.Errorf("%w: PID %d reused: start time mismatch (stored %d, current %d)",
 			ErrIdentityMismatch, pid, ident.StartTime, procStat.startTime)
 	}
 
-	// Verify executable path
-	if ident.ExecutablePath != "" {
-		exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-		if err != nil {
-			return fmt.Errorf("%w: process %d executable read failed: %v", ErrIdentityMismatch, pid, err)
-		}
-
-		// Normalize paths for comparison (strip " (deleted)" suffix)
-		storedExe := strings.TrimSuffix(ident.ExecutablePath, " (deleted)")
-		currentExe := strings.TrimSuffix(exePath, " (deleted)")
-
-		// EXACT comparison - no prefix matching
-		if currentExe != storedExe {
-			return fmt.Errorf("%w: PID %d executable mismatch: stored %s, current %s",
-				ErrIdentityMismatch, pid, ident.ExecutablePath, exePath)
-		}
+	exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return fmt.Errorf("%w: process %d executable read failed: %v", ErrIdentityMismatch, pid, err)
+	}
+	// Normalize paths for comparison (strip " (deleted)" suffix)
+	storedExe := strings.TrimSuffix(ident.ExecutablePath, " (deleted)")
+	currentExe := strings.TrimSuffix(exePath, " (deleted)")
+	if currentExe != storedExe {
+		return fmt.Errorf("%w: PID %d executable mismatch: stored %s, current %s",
+			ErrIdentityMismatch, pid, ident.ExecutablePath, exePath)
 	}
 
-	// Verify command hash if available
-	if ident.CommandHash != "" {
-		currentHash, err := computeCommandHash(pid)
-		if err != nil {
-			// Cannot verify without reading proc - fail if we had a hash
-			return fmt.Errorf("%w: cannot verify command hash: %v", ErrIdentityMismatch, err)
-		}
-		if currentHash != ident.CommandHash {
-			return fmt.Errorf("%w: PID %d command hash mismatch", ErrIdentityMismatch, pid)
-		}
+	currentHash, err := computeCommandHash(pid)
+	if err != nil {
+		return fmt.Errorf("%w: cannot verify command hash: %v", ErrIdentityMismatch, err)
 	}
-
+	if currentHash != ident.CommandHash {
+		return fmt.Errorf("%w: PID %d command hash mismatch", ErrIdentityMismatch, pid)
+	}
 	return nil
 }
 

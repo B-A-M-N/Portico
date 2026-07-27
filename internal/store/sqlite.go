@@ -497,6 +497,12 @@ CREATE TABLE IF NOT EXISTS provider_credentials (
 CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider ON provider_credentials(provider_id);
 `,
 	},
+	{
+		version: 17,
+		onApply: func(tx *sql.Tx) error {
+			return addColumnIfNotExists(tx, "connection_runtime", "runtime_revision", "INTEGER NOT NULL DEFAULT 0")
+		},
+	},
 }
 
 // Open opens the SQLite database at path, runs migrations, and returns a Store.
@@ -1474,7 +1480,8 @@ func readSnapshotRuntimes(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionRu
 	rows, err := tx.QueryContext(ctx, `
 		SELECT connection_id, runtime_state, provider_id, public_address, private_address,
 		       connector_json, provider_runtime_json, endpoint_json, diagnostics_json,
-		       active_operation_id, error_json, last_observation, last_transition
+		       active_operation_id, error_json, last_observation, last_transition,
+		       runtime_revision
 		FROM connection_runtime`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot runtimes: %w", err)
@@ -1487,11 +1494,14 @@ func readSnapshotRuntimes(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionRu
 		var providerID, publicAddress, privateAddress sql.NullString
 		var connectorJSON, providerJSON, endpointJSON, diagnosticsJSON, errorJSON []byte
 		var activeOperation sql.NullString
+		var runtimeRev int64
 		if err := rows.Scan(&rt.ConnectionID, &runtimeState, &providerID, &publicAddress, &privateAddress,
-			&connectorJSON, &providerJSON, &endpointJSON, &diagnosticsJSON, &activeOperation, &errorJSON, &lastObs, &lastTrans); err != nil {
+			&connectorJSON, &providerJSON, &endpointJSON, &diagnosticsJSON, &activeOperation, &errorJSON, &lastObs, &lastTrans,
+			&runtimeRev); err != nil {
 			return nil, fmt.Errorf("scan snapshot runtime: %w", err)
 		}
 		rt.State = core.RuntimeState(runtimeState)
+		rt.RuntimeRevision = uint64(runtimeRev)
 		if rt.LastObservedAt, err = time.Parse(time.RFC3339, lastObs); err != nil {
 			return nil, fmt.Errorf("snapshot runtime %s last_observation: %w", rt.ConnectionID, err)
 		}
@@ -1618,6 +1628,92 @@ func (s *Store) SaveRuntime(ctx context.Context, rt *core.ConnectionRuntime) err
 	return upsertRuntime(ctx, s.db, rt)
 }
 
+// ErrRuntimeRevisionMismatch is returned by SaveRuntimeCAS when another writer
+// persisted between the caller's load and this CAS write.
+var ErrRuntimeRevisionMismatch = errors.New("runtime: revision mismatch")
+
+// SaveRuntimeCAS persists a connection runtime with optimistic concurrency
+// control. The stored runtime_revision must match the persisted value; on
+// success the persisted revision is bumped by 1 and rt.RuntimeRevision is
+// updated in place to match.
+//
+// Returns ErrRuntimeRevisionMismatch when another writer persisted between
+// the caller's load and this call. Callers must reload and re-apply.
+func (s *Store) SaveRuntimeCAS(ctx context.Context, rt *core.ConnectionRuntime) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	connectorJSON, err := json.Marshal(rt.Connector)
+	if err != nil {
+		return fmt.Errorf("marshal connector: %w", err)
+	}
+	providerJSON, err := json.Marshal(rt.Provider)
+	if err != nil {
+		return fmt.Errorf("marshal provider: %w", err)
+	}
+	endpointJSON, err := json.Marshal(rt.Endpoint)
+	if err != nil {
+		return fmt.Errorf("marshal endpoint: %w", err)
+	}
+	diagnosticsJSON, err := json.Marshal(rt.Diagnostics)
+	if err != nil {
+		return fmt.Errorf("marshal diagnostics: %w", err)
+	}
+	var errorJSON []byte
+	if rt.Error != nil {
+		errorJSON, err = json.Marshal(rt.Error)
+		if err != nil {
+			return fmt.Errorf("marshal error: %w", err)
+		}
+	}
+	var activeOpID *core.OperationID
+	if rt.ActiveOperation != nil {
+		activeOpID = rt.ActiveOperation
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO connection_runtime
+			(connection_id, runtime_state, provider_id, public_address, private_address,
+			 connector_json, provider_runtime_json, endpoint_json, diagnostics_json,
+			 active_operation_id, error_json, last_observation, last_transition)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(connection_id) DO UPDATE SET
+			runtime_revision = runtime_revision + 1,
+			runtime_state = excluded.runtime_state,
+			provider_id = excluded.provider_id,
+			public_address = excluded.public_address,
+			private_address = excluded.private_address,
+			connector_json = excluded.connector_json,
+			provider_runtime_json = excluded.provider_runtime_json,
+			endpoint_json = excluded.endpoint_json,
+			diagnostics_json = excluded.diagnostics_json,
+			active_operation_id = excluded.active_operation_id,
+			error_json = excluded.error_json,
+			last_observation = excluded.last_observation,
+			last_transition = excluded.last_transition
+		WHERE runtime_revision = ?`,
+		rt.ConnectionID, string(rt.State), rt.Provider.ProviderID,
+		rt.Endpoint.PublicAddress, rt.Endpoint.PrivateAddress,
+		connectorJSON, providerJSON, endpointJSON, diagnosticsJSON,
+		activeOpID, errorJSON,
+		rt.LastObservedAt.Format(time.RFC3339),
+		rt.LastTransition.Format(time.RFC3339),
+		rt.RuntimeRevision,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrRuntimeRevisionMismatch
+	}
+	rt.RuntimeRevision++
+	return nil
+}
+
 // CommitConnectorRuntimeEvent updates connector-derived runtime state and
 // appends its normalized durable event in one transaction. SSE callers must
 // dispatch only after this returns successfully.
@@ -1650,7 +1746,8 @@ func (s *Store) LoadRuntime(ctx context.Context, id core.ConnectionID) (*core.Co
 	row := s.db.QueryRowContext(ctx, `
 		SELECT connection_id, runtime_state, provider_id, public_address, private_address,
 		       connector_json, provider_runtime_json, endpoint_json, diagnostics_json,
-		       active_operation_id, error_json, last_observation, last_transition
+		       active_operation_id, error_json, last_observation, last_transition,
+		       runtime_revision
 		FROM connection_runtime WHERE connection_id = ?`, id)
 
 	var rt core.ConnectionRuntime
@@ -1660,10 +1757,12 @@ func (s *Store) LoadRuntime(ctx context.Context, id core.ConnectionID) (*core.Co
 	var activeOpID sql.NullString
 	var errorJSON []byte
 
+	var runtimeRev int64
 	err := row.Scan(
 		&rt.ConnectionID, &runtimeState, &provID, &pubAddr, &privAddr,
 		&connectorJSON, &provRuntimeJSON, &endpointJSON, &diagJSON,
 		&activeOpID, &errorJSON, &lastObs, &lastTrans,
+		&runtimeRev,
 	)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("runtime not found: %s", id)
@@ -1673,6 +1772,7 @@ func (s *Store) LoadRuntime(ctx context.Context, id core.ConnectionID) (*core.Co
 	}
 
 	rt.State = core.RuntimeState(runtimeState)
+	rt.RuntimeRevision = uint64(runtimeRev)
 	rt.LastObservedAt, err = time.Parse(time.RFC3339, lastObs)
 	if err != nil {
 		return nil, fmt.Errorf("parse last_observed_at: %w", err)
@@ -2571,6 +2671,7 @@ func (s *Store) CommitOpenSuccess(ctx context.Context, connID core.ConnectionID,
 	// 3. Update runtime to open state.
 	_, err = tx.ExecContext(ctx, `
 		UPDATE connection_runtime SET
+			runtime_revision = runtime_revision + 1,
 			runtime_state = ?,
 			active_operation_id = NULL,
 			last_transition = ?,
@@ -2652,6 +2753,7 @@ func (s *Store) CommitCloseSuccess(ctx context.Context, connID core.ConnectionID
 	// 3. Update runtime to closed state.
 	_, err = tx.ExecContext(ctx, `
 		UPDATE connection_runtime SET
+			runtime_revision = runtime_revision + 1,
 			runtime_state = ?,
 			active_operation_id = NULL,
 			last_transition = ?,
@@ -2728,6 +2830,7 @@ func (s *Store) CommitRepairSuccess(ctx context.Context, connID core.ConnectionI
 	// profile revision is NOT incremented.
 	_, err = tx.ExecContext(ctx, `
 		UPDATE connection_runtime SET
+			runtime_revision = runtime_revision + 1,
 			runtime_state = ?,
 			active_operation_id = NULL,
 			last_transition = ?,
@@ -2798,6 +2901,7 @@ func (s *Store) CommitOperationFailure(ctx context.Context, connID core.Connecti
 
 	_, err = tx.ExecContext(ctx, `
 		UPDATE connection_runtime SET
+			runtime_revision = runtime_revision + 1,
 			runtime_state = ?,
 			active_operation_id = NULL,
 			last_transition = ?,

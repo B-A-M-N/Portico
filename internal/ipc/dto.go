@@ -221,9 +221,9 @@ type LifecycleDTO struct {
 }
 
 // UpdateConnectionRequest is the request body for PATCH /v1/connections/{id}.
+// State transitions must exclusively use plan open/close endpoints.
 type UpdateConnectionRequest struct {
-	Name         *string `json:"name,omitempty"`
-	DesiredState *string `json:"desired_state,omitempty"`
+	Name *string `json:"name,omitempty"`
 }
 
 // --------------- discovery ---------------

@@ -19,6 +19,11 @@ import (
 // is to set the connector status to unknown and create a finding.
 var ErrIdentityMismatch = errors.New("process identity mismatch")
 
+// ErrIdentityPartial is returned when an identity is missing one or more
+// required fields. Partial identities are never trusted and never adopted;
+// callers must classify the process as unknown.
+var ErrIdentityPartial = errors.New("process identity partial")
+
 // Manager manages connector processes with strict identity validation.
 // Each connection is owned by a per-connection actor goroutine that owns
 // the exec.Cmd, log pipes, restart timer, and exit status. The manager map
@@ -349,4 +354,16 @@ func (pm *Manager) Cleanup() {
 		}(a)
 	}
 	wg.Wait()
+}
+
+// minimalEnv returns a controlled default environment for connector children.
+// This prevents inheriting the supervisor's full environment which may
+// contain provider credentials, keyring variables, or unrelated secrets.
+func minimalEnv() []string {
+	return []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"HOME=/root",
+		"LANG=C.UTF-8",
+		"TZ=UTC",
+	}
 }

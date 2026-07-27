@@ -120,7 +120,7 @@ func (e *Engine) checkOrigin(ctx context.Context, profile *core.ConnectionProfil
 	if e.deps.Origin == nil {
 		return nil
 	}
-	address := originAddress(profile)
+	address := originAddress(profile, rt)
 	if address == "" {
 		return nil
 	}
@@ -400,13 +400,29 @@ func (e *Engine) checkEndpoint(ctx context.Context, profile *core.ConnectionProf
 	}
 }
 
-// originAddress extracts the probe address for the local origin, if
-// the profile references an existing local service.
-func originAddress(profile *core.ConnectionProfile) string {
-	if profile.Source.Existing == nil {
+// originAddress extracts the probe address for the local origin. It supports
+// both external existing services and Portico-owned origins (directory,
+// command, MCP-command). The runtime projection is preferred when the
+// origin is owned so the diagnostics engine probes the actually-running
+// service, not the configured value.
+func originAddress(profile *core.ConnectionProfile, rt *core.ConnectionRuntime) string {
+	if profile == nil {
 		return ""
 	}
-	return profile.Source.Existing.Address
+	if rt != nil && rt.Origin.Ownership == core.OriginOwnershipOwned && rt.Origin.URL != "" {
+		return rt.Origin.URL
+	}
+	switch profile.Source.Kind {
+	case core.SourceExisting:
+		if profile.Source.Existing != nil {
+			return profile.Source.Existing.Address
+		}
+	case core.SourceDirectory, core.SourceCommand, core.SourceMCP:
+		if rt != nil && rt.Origin.URL != "" {
+			return rt.Origin.URL
+		}
+	}
+	return ""
 }
 
 // publicHost extracts the hostname to resolve from the runtime

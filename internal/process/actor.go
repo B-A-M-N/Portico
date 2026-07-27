@@ -190,7 +190,7 @@ func (a *actor) launch() error {
 	if len(spec.Env) > 0 {
 		cmd.Env = spec.Env
 	} else {
-		cmd.Env = os.Environ()
+		cmd.Env = minimalEnv()
 	}
 
 	type pipePair struct {

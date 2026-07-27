@@ -38,8 +38,10 @@ type RuntimeCommitResult struct {
 // the user's desired profile.
 type ConnectionRuntime struct {
 	ConnectionID     ConnectionID
-	ObservedRevision uint64
+	RuntimeRevision  uint64 // persisted CAS clock; bumped on every successful write
+	ObservedRevision uint64 // in-memory observation counter; not persisted
 	State            RuntimeState
+	Origin           OriginRuntime
 	Connector        ConnectorRuntime
 	Provider         ProviderRuntime
 	Endpoint         EndpointRuntime
@@ -56,6 +58,7 @@ func (r *ConnectionRuntime) DeepCopy() *ConnectionRuntime {
 		return nil
 	}
 	cr := *r
+	cr.Origin = r.Origin.DeepCopy()
 	if r.Diagnostics != nil {
 		diags := make([]DiagnosticFinding, len(r.Diagnostics))
 		for i := range r.Diagnostics {
@@ -119,6 +122,41 @@ func (s RuntimeState) UserFacingState() string {
 		return "Unknown"
 	}
 }
+
+// OriginRuntime represents the runtime state of a Portico-owned local origin.
+type OriginRuntime struct {
+	Ownership   OriginOwnership
+	URL         string
+	Status      OriginStatus
+	PID         int
+	StartTime   uint64
+	Executable  string
+	CommandHash string
+	LastError   string
+}
+
+// DeepCopy returns a deep copy of the origin runtime.
+func (o OriginRuntime) DeepCopy() OriginRuntime {
+	return o
+}
+
+// OriginStatus describes the observed lifecycle status of an owned origin.
+type OriginStatus string
+
+const (
+	OriginStatusRunning OriginStatus = "running"
+	OriginStatusStopped OriginStatus = "stopped"
+	OriginStatusCrashed OriginStatus = "crashed"
+	OriginStatusUnknown OriginStatus = "unknown"
+)
+
+// OriginOwnership describes who owns the origin process.
+type OriginOwnership string
+
+const (
+	OriginOwnershipOwned    OriginOwnership = "owned"
+	OriginOwnershipExternal OriginOwnership = "external"
+)
 
 // ConnectorRuntime represents the runtime state of a connector process.
 type ConnectorRuntime struct {
@@ -243,12 +281,17 @@ func (r RepairOption) Clone() RepairOption {
 }
 
 // ProcessIdentity represents a managed process identity.
-// Never trust a PID alone.
+// Never trust a PID alone. Adoption requires every field to be populated.
 type ProcessIdentity struct {
 	PID            int
 	StartTime      uint64
 	ExecutablePath string
 	CommandHash    string
+}
+
+// Complete reports whether the identity has all four fields populated.
+func (p ProcessIdentity) Complete() bool {
+	return p.PID > 0 && p.StartTime != 0 && p.ExecutablePath != "" && p.CommandHash != ""
 }
 
 // ProcessSpec specifies how to start a connector process.

@@ -55,6 +55,10 @@ type OriginManager interface {
 	Plan(connectionID core.ConnectionID, source core.SourceSpec) (*core.ResolvedOrigin, error)
 	Start(ctx context.Context, connectionID core.ConnectionID, source core.SourceSpec, expectedURL string) error
 	Stop(ctx context.Context, connectionID core.ConnectionID) error
+	// Observe returns the current origin runtime for a connection. The
+	// boolean is false when the connection does not own an origin (for
+	// example, an external existing-service source).
+	Observe(connectionID core.ConnectionID) (core.OriginRuntime, bool)
 }
 
 // Journal defines the operation persistence interface used by the controller
@@ -668,6 +672,18 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 		return nil, fmt.Errorf("fingerprint: %w", err)
 	}
 
+	// Populate the observed fingerprint so that execPlan can verify the
+	// provider state hasn't changed since this plan was created.
+	if planRequiresProvider(plan) {
+		if obs, err := c.Observe(ctx, connID); err == nil {
+			if fp, err := obs.ComputeFingerprint(); err == nil {
+				plan.ObservedFingerprint = fp
+				// Recompute because ObservedFingerprint is part of the fingerprint.
+				_ = plan.ComputeFingerprint()
+			}
+		}
+	}
+
 	return plan, nil
 }
 
@@ -790,6 +806,17 @@ func (c *Controller) PlanClose(ctx context.Context, connID core.ConnectionID) (*
 		return nil, fmt.Errorf("fingerprint: %w", err)
 	}
 
+	// Populate observed fingerprint for stale-plan detection.
+	if planRequiresProvider(plan) {
+		if obs, err := c.Observe(ctx, connID); err == nil {
+			if fp, err := obs.ComputeFingerprint(); err == nil {
+				plan.ObservedFingerprint = fp
+				// Recompute because ObservedFingerprint is part of the fingerprint.
+				_ = plan.ComputeFingerprint()
+			}
+		}
+	}
+
 	return plan, nil
 }
 
@@ -803,20 +830,30 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 	}
 
 	// Gather managed resources from runtime to inform the delete plan.
+	// Deep-copy resources to avoid holding a reference to the shared
+	// runtime slice after releasing the lock.
 	c.mu.RLock()
 	rt, rtOk := c.runtimes[connID]
 	var resources []core.ProviderResource
 	var connectorStatus core.ConnectorStatus
 	if rtOk {
-		resources = rt.Provider.Resources
+		if rt.Provider.Resources != nil {
+			resources = make([]core.ProviderResource, len(rt.Provider.Resources))
+			for i, r := range rt.Provider.Resources {
+				resources[i] = r.Clone()
+			}
+		}
 		connectorStatus = rt.Connector.Status
 	}
 	c.mu.RUnlock()
 
 	steps := []core.PlanStep{}
 
-	// Step 1: Stop connector if running.
-	if rtOk && connectorStatus == core.ConnectorStatusRunning {
+	// Step 1: Stop connector if it may still be running.
+	// We stop on any status that indicates a process might exist — running,
+	// crashed, unknown, or unstable — to prevent leaking a connector
+	// process during deletion.
+	if rtOk && connectorStatus != core.ConnectorStatusStopped {
 		steps = append(steps, core.PlanStep{
 			ID:      "delete-stop-connector",
 			Kind:    core.StepStopConnector,
@@ -923,6 +960,17 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 		return nil, fmt.Errorf("fingerprint: %w", err)
 	}
 
+	// Populate observed fingerprint for stale-plan detection.
+	if planRequiresProvider(plan) {
+		if obs, err := c.Observe(ctx, connID); err == nil {
+			if fp, err := obs.ComputeFingerprint(); err == nil {
+				plan.ObservedFingerprint = fp
+				// Recompute because ObservedFingerprint is part of the fingerprint.
+				_ = plan.ComputeFingerprint()
+			}
+		}
+	}
+
 	return plan, nil
 }
 
@@ -953,11 +1001,18 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 	rt, rtOk := c.runtimes[connID]
 	c.mu.RUnlock()
 
-	// Build a repair plan based on connector status.
+	// Build a repair plan based on origin and connector status. Causal order:
+	// origin must be healthy before the connector can succeed.
 	steps := []core.PlanStep{}
 	if rtOk {
-		switch rt.Connector.Status {
-		case core.ConnectorStatusCrashed, core.ConnectorStatusStopped, core.ConnectorStatusUnknown, core.ConnectorStatusUnstable:
+		originNeedsRestart := rt.Origin.Ownership == core.OriginOwnershipOwned &&
+			rt.Origin.Status != core.OriginStatusRunning
+		connectorDown := rt.Connector.Status == core.ConnectorStatusCrashed ||
+			rt.Connector.Status == core.ConnectorStatusStopped ||
+			rt.Connector.Status == core.ConnectorStatusUnknown ||
+			rt.Connector.Status == core.ConnectorStatusUnstable
+
+		if originNeedsRestart || connectorDown {
 			resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, profile.Source)
 			if err != nil {
 				return nil, fmt.Errorf("origin preparation: %w", err)
@@ -966,20 +1021,26 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 			if profile.Exposure.Mode == core.ExposureTemporary {
 				mode = "quick"
 			}
-			steps = append(steps, core.PlanStep{
-				ID:      "repair-restart-connector",
-				Kind:    core.StepStartConnector,
-				Summary: "Restart connector",
-				Technical: core.TechnicalOperation{
-					Provider:   profile.Provider.ProviderID,
-					Type:       "start_connector",
-					Parameters: map[string]string{"mode": mode, "origin_url": resolvedOrigin.URL},
-				},
-			})
+			// Owned origin must come first so the connector has a healthy
+			// upstream to bind to.  Only repair what needs repair.
 			if resolvedOrigin.Owned {
-				planStub := &core.OperationPlan{Steps: steps}
-				insertStartOriginStep(planStub, resolvedOrigin.URL)
-				steps = planStub.Steps
+				if originNeedsRestart {
+					planStub := &core.OperationPlan{Steps: steps}
+					insertStartOriginStep(planStub, resolvedOrigin.URL)
+					steps = planStub.Steps
+				}
+			}
+			if connectorDown {
+				steps = append(steps, core.PlanStep{
+					ID:      "repair-restart-connector",
+					Kind:    core.StepStartConnector,
+					Summary: "Restart connector",
+					Technical: core.TechnicalOperation{
+						Provider:   profile.Provider.ProviderID,
+						Type:       "start_connector",
+						Parameters: map[string]string{"mode": mode, "origin_url": resolvedOrigin.URL},
+					},
+				})
 			}
 		}
 	}
@@ -1002,6 +1063,20 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 
 	if err := plan.ComputeFingerprint(); err != nil {
 		return nil, fmt.Errorf("fingerprint: %w", err)
+	}
+
+	// Populate observed fingerprint for stale-plan detection. Only
+	// meaningful for plans that interact with a provider — local-only
+	// plans (delete with no tracked resources) have no provider state
+	// to verify.
+	if planRequiresProvider(plan) {
+		if obs, err := c.Observe(ctx, connID); err == nil {
+			if fp, err := obs.ComputeFingerprint(); err == nil {
+				plan.ObservedFingerprint = fp
+				// Recompute because ObservedFingerprint is part of the fingerprint.
+				_ = plan.ComputeFingerprint()
+			}
+		}
 	}
 
 	return plan, nil
@@ -1190,6 +1265,19 @@ func (c *Controller) Observe(ctx context.Context, connID core.ConnectionID) (*co
 	if rt, ok := c.runtimes[connID]; ok {
 		rt.ObservedRevision++
 		rt.LastObservedAt = time.Now().UTC()
+		// Always derive origin ownership from the profile.
+		ownsOrigin := sourceOwnsOrigin(profile.Source)
+		if ownsOrigin && c.originManager != nil {
+			if ort, hasOrigin := c.originManager.Observe(connID); hasOrigin {
+				rt.Origin = ort
+			} else {
+				// Manager has no entry: mark as stopped (not leave stale state).
+				rt.Origin = core.OriginRuntime{
+					Ownership: core.OriginOwnershipOwned,
+					Status:    core.OriginStatusStopped,
+				}
+			}
+		}
 		if observed.Connector != nil {
 			rt.Connector.Status = core.ConnectorStatus(observed.Connector.Status)
 			rt.Connector.PID = observed.Connector.PID
@@ -1202,18 +1290,18 @@ func (c *Controller) Observe(ctx context.Context, connID core.ConnectionID) (*co
 		if observed.Tunnel != nil {
 			// Update runtime with tunnel info if needed
 		}
-	}
-	var runtimeSnapshot *core.ConnectionRuntime
-	if rt, ok := c.runtimes[connID]; ok {
-		runtimeSnapshot = rt.DeepCopy()
+		if c.runtimeSaver != nil && rt.ActiveOperation == nil {
+			snapshot := rt.DeepCopy()
+			c.mu.Unlock()
+			if err := c.runtimeSaver.SaveRuntime(ctx, snapshot); err != nil {
+				slog.Warn("persist observed runtime", "connection", connID, "err", err)
+			}
+			return observed, nil
+		}
+		c.mu.Unlock()
+		return observed, nil
 	}
 	c.mu.Unlock()
-	if runtimeSnapshot != nil && c.runtimeSaver != nil {
-		if err := c.runtimeSaver.SaveRuntime(ctx, runtimeSnapshot); err != nil {
-			return nil, fmt.Errorf("persist observed runtime: %w", err)
-		}
-	}
-
 	return observed, nil
 }
 
