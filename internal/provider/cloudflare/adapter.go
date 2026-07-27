@@ -805,10 +805,16 @@ func (p *Provider) Apply(ctx context.Context, plan core.OperationPlan) (<-chan c
 					publicAddr, discoverErr := p.discoverQuickTunnelAddress(plan.ConnectionID, stdoutPath, 10*time.Second)
 					if discoverErr != nil {
 						stepErr = fmt.Errorf("discovering quick tunnel address: %w", discoverErr)
+						// Stop the connector process to prevent leaks.
+						// (SPEC P0 #5)
+						_ = p.connectorProc.Stop(plan.ConnectionID, 2*time.Second)
 						break
 					}
 					if publicAddr == "" {
 						stepErr = fmt.Errorf("quick tunnel address not discovered within timeout")
+						// Stop the connector process to prevent leaks.
+						// (SPEC P0 #5)
+						_ = p.connectorProc.Stop(plan.ConnectionID, 2*time.Second)
 						break
 					}
 					p.mu.Lock()
@@ -2196,9 +2202,13 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			stdoutPath := filepath.Join(p.logDir, fmt.Sprintf("connector-%s.out", safeShortID(string(connectionID), 8)))
 			publicAddr, discoverErr := p.discoverQuickTunnelAddress(connectionID, stdoutPath, 10*time.Second)
 			if discoverErr != nil {
+				// Stop leaked connector to prevent process leak. (SPEC P0 #5)
+				_ = p.connectorProc.Stop(connectionID, 2*time.Second)
 				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("discovering quick tunnel address: %w", discoverErr)}, nil
 			}
 			if publicAddr == "" {
+				// Stop leaked connector to prevent process leak. (SPEC P0 #5)
+				_ = p.connectorProc.Stop(connectionID, 2*time.Second)
 				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("quick tunnel address not discovered within timeout")}, nil
 			}
 			p.mu.Lock()
@@ -2376,6 +2386,27 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 				p.mu.Lock()
 				if conn.accessID == accessID {
 					conn.accessID = ""
+					conn.policyID = ""
+				}
+				p.mu.Unlock()
+			}
+			return core.StepResult{StepID: step.ID, Succeeded: err == nil, Error: err}, nil
+		}
+		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
+
+	case core.StepDeleteAccessPolicy:
+		// Delete the specific Access policy by its exact external ID.
+		policyID := step.Technical.ResourceID
+		if policyID == "" {
+			p.mu.RLock()
+			policyID = conn.policyID
+			p.mu.RUnlock()
+		}
+		if policyID != "" {
+			err := p.access.DeletePolicy(ctx, p.accountID, policyID)
+			if err == nil {
+				p.mu.Lock()
+				if conn.policyID == policyID {
 					conn.policyID = ""
 				}
 				p.mu.Unlock()
