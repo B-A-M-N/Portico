@@ -38,6 +38,43 @@ func TestConnectionProfileAllowsNonSensitiveCommandEnvironment(t *testing.T) {
 	}
 }
 
+func TestConnectionProfileRejectsWriteDirectoryWithoutProtection(t *testing.T) {
+	profile := &ConnectionProfile{
+		ID:   "write-dir-no-protection",
+		Name: "write-dir-no-protection",
+		Source: SourceSpec{Kind: SourceDirectory, Directory: &DirectorySpec{
+			Path:      "/tmp/upload",
+			Mode:      DirectoryModeWrites,
+			AllowUpload: true,
+		}},
+		Exposure:   ExposureSpec{Mode: ExposureTemporary},
+		Protection: ProtectionSpec{Kind: ProtectionNone},
+		Provider:   ProviderSelection{ProviderID: "mock"},
+	}
+	err := profile.Validate()
+	if err == nil || !strings.Contains(err.Error(), "protection") {
+		t.Fatalf("Validate error = %v, want rejection of write-enabled directory without protection", err)
+	}
+}
+
+func TestConnectionProfileAllowsWriteDirectoryWithProtection(t *testing.T) {
+	profile := &ConnectionProfile{
+		ID:   "write-dir-protected",
+		Name: "write-dir-protected",
+		Source: SourceSpec{Kind: SourceDirectory, Directory: &DirectorySpec{
+			Path:      "/tmp/upload",
+			Mode:      DirectoryModeWrites,
+			AllowUpload: true,
+		}},
+		Exposure:   ExposureSpec{Mode: ExposureTemporary},
+		Protection: ProtectionSpec{Kind: ProtectionEmailOTP},
+		Provider:   ProviderSelection{ProviderID: "mock"},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
 func TestObservedConnectionFingerprintIsCanonicalAndComplete(t *testing.T) {
 	base := &ObservedConnection{ConnectionID: "c", ProviderID: "p", Tunnel: &ObservedTunnel{ID: "t1", State: "healthy"},
 		DNSRecords:       []ObservedDNSRecord{{ID: "2", Name: "b", Target: "old"}, {ID: "1", Name: "a", Target: "target"}},

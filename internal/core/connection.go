@@ -258,6 +258,13 @@ func (p *ConnectionProfile) Validate() error {
 		}
 	}
 
+	// Write-enabled directories must not be exposed without protection.
+	// A publicly reachable upload endpoint is a severe security risk.
+	if p.Source.Directory != nil && p.Source.Directory.Mode == DirectoryModeWrites &&
+		p.Source.Directory.AllowUpload && p.Protection.Kind == ProtectionNone {
+		return fmt.Errorf("write-enabled directory with upload requires protection; use email_otp, identity_provider, service_token, or private_network")
+	}
+
 	if p.Lifecycle.OnDisconnect != "" && p.Lifecycle.OnDisconnect != DisconnectKeepAlive && p.Lifecycle.OnDisconnect != DisconnectClose {
 		return fmt.Errorf("invalid disconnect policy %q", p.Lifecycle.OnDisconnect)
 	}
