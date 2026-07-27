@@ -36,6 +36,7 @@ type Supervisor struct {
 	paths        app.Paths
 	lock         *SupervisorLock
 	ready        bool
+	mutating     bool // true while accepting mutations; set false at shutdown start
 	stopCh       chan struct{}
 	serveWG      sync.WaitGroup // tracks the IPC serve goroutine
 	shutdownOnce sync.Once      // guards idempotent shutdown
@@ -100,6 +101,7 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 		lock:       lock,
 		origins:    origins,
 		stopCh:     make(chan struct{}),
+		mutating:   true, // accepting mutations until shutdown begins
 	}
 	procMgr.SetEventSink(sup.handleProcessEvent)
 	return sup, nil
@@ -182,19 +184,20 @@ func (s *Supervisor) loadProfiles(ctx context.Context) error {
 		// without triggering provider mutations or creating new closed runtimes
 		s.controller.RestoreProfile(p)
 
-		// Load runtime if exists.
-		rt, err := s.store.LoadRuntime(ctx, p.ID)
-		if err != nil {
-			// No runtime persisted yet — that's fine for v0.1
-			slog.Debug("no runtime for connection", "id", p.ID)
-			continue
-		}
-		if rt != nil {
-			s.controller.RestoreRuntime(rt)
-			slog.Info("loaded runtime for connection", "id", p.ID, "state", rt.State)
+		// Load runtime if exists. Distinguish sql.ErrNoRows (benign)
+		// from database I/O errors (real problems).
+		rt, runtimeErr := s.store.LoadRuntime(ctx, p.ID)
+		switch runtimeErr {
+		case nil:
+			if rt != nil {
+				s.controller.RestoreRuntime(rt)
+				slog.Info("loaded runtime for connection", "id", p.ID, "state", rt.State)
+			}
+		default:
+			slog.Warn("failed to load runtime for connection", "id", p.ID, "err", runtimeErr)
 		}
 
-		// Load provider resources
+		// Load provider resources regardless of runtime state.
 		resources, err := s.store.ListResourcesByConnection(ctx, p.ID)
 		if err != nil {
 			slog.Warn("failed to load resources", "connection", p.ID, "err", err)
@@ -286,13 +289,6 @@ func (s *Supervisor) reconcileAll(ctx context.Context) {
 				slog.Warn("reconcile: apply failed", "connection", connID, "action", action, "err", err)
 			}
 		}(p.ID, decision.Action, decision.Plan)
-	}
-
-	// Persist runtime after reconcile
-	for _, rt := range s.controller.ListRuntimes() {
-		if err := s.store.SaveRuntime(ctx, rt); err != nil {
-			slog.Warn("failed to persist runtime", "connection", rt.ConnectionID, "err", err)
-		}
 	}
 }
 
@@ -632,6 +628,9 @@ func (h *supervisorHandler) HandleListProviders() ([]ipc.ProviderDTO, error) {
 // --------------- handler methods ---------------
 
 func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	if !h.sup.mutating {
+		return nil, fmt.Errorf("supervisor is shutting down and not accepting mutations")
+	}
 	cid := core.ConnectionID(id)
 	ctx := context.Background()
 
@@ -642,9 +641,6 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 
 	if req.Name != nil {
 		profile.Name = *req.Name
-	}
-	if req.DesiredState != nil {
-		profile.Desired = core.DesiredConnectionState(*req.DesiredState)
 	}
 
 	// Capture current revision for validation

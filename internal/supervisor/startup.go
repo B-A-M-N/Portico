@@ -476,6 +476,7 @@ func (s *Supervisor) loadRuntimes(ctx context.Context) error {
 	for _, p := range profiles {
 		rt, err := s.store.LoadRuntime(ctx, p.ID)
 		if err != nil {
+			slog.Debug("no runtime for connection", "id", p.ID, "err", err)
 			continue
 		}
 		if rt != nil {
@@ -1362,6 +1363,7 @@ func (s *Supervisor) shutdownOnce_(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.ready = false
+	s.mutating = false
 	s.mu.Unlock()
 
 	// Signal stop to all goroutines
@@ -1372,9 +1374,22 @@ func (s *Supervisor) shutdownOnce_(ctx context.Context) error {
 		close(s.stopCh)
 	}
 
-	// Prevent new mutations and settle every active operation before stopping
-	// connector processes or closing SQLite. Use an independent timeout because
-	// the caller's supervisor context is commonly already canceled.
+	// Stop accepting new mutations FIRST (SPEC §10.4). The IPC server is
+	// closed before any operations are canceled or processes are torn
+	// down so no handler can enter the store after the database begins
+	// to close and no mutating call can land during teardown.
+	if s.ipcServer != nil {
+		s.ipcServer.PublishEvent(ipc.EventDTO{
+			Type:      "supervisor.shutdown",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Data:      map[string]string{"reason": "graceful shutdown"},
+		})
+		s.ipcServer.Stop()
+		s.serveWG.Wait()
+	}
+
+	// Settle every active operation. Use a fresh bounded context because
+	// the caller's context is commonly already canceled.
 	if s.controller != nil {
 		settleCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := s.controller.ShutdownOperations(settleCtx); err != nil {
@@ -1383,39 +1398,25 @@ func (s *Supervisor) shutdownOnce_(ctx context.Context) error {
 		cancel()
 	}
 
-	// Respect connection lifecycle policy. Keep-alive connectors are deliberately
-	// left running for later identity-verified adoption; close-on-disconnect
-	// connectors are stopped without deleting their remote resources.
+	// v0.1 shutdown policy: stop every supervisor-owned child — both the
+	// connector and its origin — together. Leaving a connector attached
+	// to a stopped origin creates an invalid route (running cloudflared
+	// with no upstream). Each subsystem gets its own fresh bounded
+	// context so cancellation never leaks from the caller.
 	for _, profile := range s.controller.ListProfiles() {
-		if profile.Lifecycle.OnDisconnect == core.DisconnectClose {
+		if s.procMgr != nil {
 			if err := s.procMgr.Stop(profile.ID, 5*time.Second); err != nil {
 				slog.Warn("shutdown: stop connector", "connection", profile.ID, "err", err)
 			}
 		}
 	}
 	if s.origins != nil {
-		if err := s.origins.StopAll(ctx); err != nil {
+		originCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := s.origins.StopAll(originCtx); err != nil {
 			slog.Warn("shutdown: stopping local origins", "err", err)
 		}
+		cancel()
 	}
-
-	// Stop accepting mutations (IPC server shuts down first).
-	// This causes Serve() to return, which unblocks serveWG.
-	if s.ipcServer != nil {
-		// Publish shutdown event
-		s.ipcServer.PublishEvent(ipc.EventDTO{
-			Type:      "supervisor.shutdown",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Data:      map[string]string{"reason": "graceful shutdown"},
-		})
-		s.ipcServer.Stop()
-	}
-
-	// Wait for the serve goroutine to exit before releasing resources.
-	s.serveWG.Wait()
-
-	// Complete or cancel active operations (v0.1: cancel all).
-	slog.Info("shutdown: completing/cancelling active operations")
 
 	// Flush events.
 	slog.Info("shutdown: flushing events")
