@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/B-A-M-N/portico/internal/core"
 	flareexec "github.com/B-A-M-N/portico/internal/exec"
 )
 
@@ -180,4 +181,13 @@ func (d *DockerContainer) Healthy(ctx context.Context) error {
 		return fmt.Errorf("container is not running")
 	}
 	return nil
+}
+
+// Identity is empty for docker origins; docker daemon owns the process.
+func (d *DockerContainer) Identity() (core.ProcessIdentity, bool) {
+	return core.ProcessIdentity{}, false
+}
+
+func (d *DockerContainer) ProcessGroupID() int {
+	return 0
 }

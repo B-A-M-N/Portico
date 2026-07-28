@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	cf "github.com/cloudflare/cloudflare-go"
@@ -1904,14 +1903,11 @@ func (p *Provider) discoverQuickTunnelAddress(connectionID core.ConnectionID, st
 		}
 
 		// If the process has exited and no URL was found, fail.
-		p.mu.RLock()
-		conn, connOk := p.connections[connectionID]
-		p.mu.RUnlock()
-		if connOk && conn.connectorStarted && conn.connectorPID != 0 {
-			if err := syscall.Kill(conn.connectorPID, 0); err != nil {
-				// Process has exited.
-				return "", fmt.Errorf("connector process exited before tunnel address was assigned")
-			}
+		// Use the process manager for liveness — the provider does not
+		// own process identity.
+		handle, tracked := p.connectorProc.Observe(connectionID)
+		if !tracked || handle.PID == 0 {
+			return "", fmt.Errorf("connector process exited before tunnel address was assigned")
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -1919,15 +1915,13 @@ func (p *Provider) discoverQuickTunnelAddress(connectionID core.ConnectionID, st
 	return "", fmt.Errorf("quick tunnel address not discovered within %v", timeout)
 }
 
-// verifyProcessIdentity checks that a connector handle with the given
-// PID corresponds to a running process. Returns nil if the process
-// exists, or an error otherwise.
+// verifyProcessIdentity checks that a connector handle from the process
+// manager represents a valid, tracked process. Process liveness and
+// identity belong to process.Manager; the provider trusts the handle
+// returned by Observe.
 func verifyProcessIdentity(handle core.ConnectorHandle) error {
 	if handle.PID <= 0 {
 		return fmt.Errorf("invalid PID %d", handle.PID)
-	}
-	if err := syscall.Kill(handle.PID, 0); err != nil {
-		return fmt.Errorf("process %d not alive: %w", handle.PID, err)
 	}
 	return nil
 }

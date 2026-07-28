@@ -45,6 +45,13 @@ type Supervisor struct {
 	discoverer discovery.Discoverer
 	diagEngine *diagnostics.Engine
 	origins    *origin.Manager
+
+	// Event-driven reconciliation: a buffered channel of connection IDs
+	// that need re-evaluation. The reconcileLoop coalesces duplicates
+	// via reconcilePending and reconciles only affected connections.
+	reconcileCh      chan core.ConnectionID
+	reconcilePending map[core.ConnectionID]struct{}
+	reconcileMu      sync.Mutex
 }
 
 type cleanupRecorder struct{ store *store.Store }
@@ -93,15 +100,17 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 	ctrl.SetOriginManager(origins)
 
 	sup := &Supervisor{
-		store:      st,
-		controller: ctrl,
-		procMgr:    procMgr,
-		registry:   registry,
-		paths:      paths,
-		lock:       lock,
-		origins:    origins,
-		stopCh:     make(chan struct{}),
-		mutating:   true, // accepting mutations until shutdown begins
+		store:            st,
+		controller:       ctrl,
+		procMgr:          procMgr,
+		registry:         registry,
+		paths:            paths,
+		lock:             lock,
+		origins:          origins,
+		stopCh:           make(chan struct{}),
+		reconcileCh:      make(chan core.ConnectionID, 64),
+		reconcilePending: make(map[core.ConnectionID]struct{}),
+		mutating:         true, // accepting mutations until shutdown begins
 	}
 	procMgr.SetEventSink(sup.handleProcessEvent)
 	return sup, nil
@@ -158,6 +167,18 @@ func (s *Supervisor) handleProcessEvent(event process.ProcessEvent) {
 	if s.ipcServer != nil {
 		if err := s.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
 			slog.Error("dispatch connector process event", "connection", event.ConnectionID, "type", event.Type, "err", err)
+		}
+	}
+
+	// Trigger event-driven reconciliation for terminal process states.
+	// The reconcile loop will evaluate whether a repair is needed.
+	switch event.Status {
+	case process.ProcessStatusStopped, process.ProcessStatusUnstable:
+		s.TriggerReconcile(event.ConnectionID)
+	default:
+		// Crashed is the default case (line 147)
+		if rt.Connector.Status == core.ConnectorStatusCrashed {
+			s.TriggerReconcile(event.ConnectionID)
 		}
 	}
 }
@@ -230,7 +251,10 @@ func (s *Supervisor) loadProfiles(ctx context.Context) error {
 	return nil
 }
 
-// reconcileLoop periodically reconciles desired vs observed state.
+// reconcileLoop periodically reconciles desired vs observed state and
+// responds to event-driven reconciliation triggers. The periodic ticker
+// acts as a safety net; events from operation completions, connector
+// exits, and profile changes trigger immediate targeted reconciliation.
 func (s *Supervisor) reconcileLoop(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -241,8 +265,96 @@ func (s *Supervisor) reconcileLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.reconcileAll(ctx)
+		case connID := <-s.reconcileCh:
+			// Coalesce: drain all pending events before reconciling.
+			s.reconcileMu.Lock()
+			pending := make(map[core.ConnectionID]struct{})
+			pending[connID] = struct{}{}
+			for k := range s.reconcilePending {
+				pending[k] = struct{}{}
+			}
+			s.reconcilePending = make(map[core.ConnectionID]struct{})
+			s.reconcileMu.Unlock()
+
+			// Drain any additional queued events.
+		drain:
+			for {
+				select {
+				case id := <-s.reconcileCh:
+					pending[id] = struct{}{}
+				default:
+					break drain
+				}
+			}
+
+			// Reconcile only the affected connections.
+			for id := range pending {
+				s.reconcileOne(ctx, id)
+			}
 		}
 	}
+}
+
+// TriggerReconcile enqueues a connection for event-driven reconciliation.
+// Duplicate triggers are coalesced — the connection is reconciled once
+// per drain cycle regardless of how many events arrive.
+func (s *Supervisor) TriggerReconcile(connID core.ConnectionID) {
+	s.reconcileMu.Lock()
+	s.reconcilePending[connID] = struct{}{}
+	s.reconcileMu.Unlock()
+
+	select {
+	case s.reconcileCh <- connID:
+	default:
+		// Channel full — the pending map already records the trigger,
+		// and the next ticker cycle will pick it up.
+	}
+}
+
+// reconcileOne reconciles a single connection by ID.
+func (s *Supervisor) reconcileOne(ctx context.Context, connID core.ConnectionID) {
+	p, ok := s.controller.GetProfile(connID)
+	if !ok {
+		return
+	}
+	if s.registry.Get(p.Provider.ProviderID) == nil {
+		s.markProviderUnavailable(ctx, p)
+		return
+	}
+
+	input := ReconcileInput{Profile: p}
+	if rt, ok := s.controller.GetRuntime(p.ID); ok {
+		input.Runtime = rt
+		input.Resources = rt.Provider.Resources
+	} else if resources, err := s.store.ListResourcesByConnection(ctx, p.ID); err != nil {
+		slog.Warn("reconcile: load persisted resources", "connection", p.ID, "err", err)
+	} else {
+		input.Resources = resources
+	}
+	if obs, err := s.observeConnection(ctx, p.ID); err == nil {
+		input.Observed = obs
+	}
+
+	decision, err := s.computeReconcileDecision(ctx, input)
+	if err != nil {
+		slog.Warn("reconcile error", "connection", p.ID, "err", err)
+		return
+	}
+	if decision == nil || decision.Action == "none" || decision.Plan == nil {
+		return
+	}
+
+	slog.Info("reconcile: applying decision", "connection", p.ID, "action", decision.Action)
+	go func(connID core.ConnectionID, action string, candidate *core.OperationPlan) {
+		plan, err := s.persistCanonicalPlan(ctx, candidate)
+		if err != nil {
+			slog.Warn("reconcile: persist plan failed", "connection", connID, "action", action, "err", err)
+			return
+		}
+		if _, err := s.controller.ApplyPlan(ctx, plan.ID); err != nil {
+			slog.Warn("reconcile: apply failed", "connection", connID, "action", action, "err", err)
+		}
+	}(p.ID, decision.Action, decision.Plan)
 }
 
 func (s *Supervisor) reconcileAll(ctx context.Context) {
@@ -595,14 +707,44 @@ func (h *supervisorHandler) HandlePlanClose(id string) (*ipc.PlanDTO, error) {
 	return dto, nil
 }
 
-func (h *supervisorHandler) HandleApplyPlan(planID string) (*ipc.OperationDTO, error) {
-	op, err := h.sup.controller.ApplyPlan(context.Background(), core.PlanID(planID))
+func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string) (*ipc.OperationDTO, error) {
+	ctx := context.Background()
+
+	// Idempotency: if a key was provided and we already recorded an operation
+	// for it, return the cached result without re-executing.
+	if idempotencyKey != "" {
+		existingOpID, err := h.sup.store.LookupIdempotentKey(ctx, idempotencyKey)
+		if err != nil {
+			return nil, fmt.Errorf("idempotency lookup: %w", err)
+		}
+		if existingOpID != "" {
+			existingOp, err := h.sup.store.GetOperation(ctx, existingOpID)
+			if err == nil && existingOp != nil {
+				return &ipc.OperationDTO{
+					ID:           string(existingOp.ID),
+					PlanID:       planID,
+					ConnectionID: string(existingOp.ConnectionID),
+					State:        string(existingOp.State),
+					StartedAt:    existingOp.StartedAt,
+				}, nil
+			}
+		}
+	}
+
+	op, err := h.sup.controller.ApplyPlan(ctx, core.PlanID(planID))
 	if err != nil {
 		return nil, err
 	}
 
+	// Record the idempotency key to operation mapping for future replays.
+	if idempotencyKey != "" {
+		if err := h.sup.store.RecordIdempotentKey(ctx, idempotencyKey, op.ID); err != nil {
+			slog.Warn("failed to record idempotency key", "key", idempotencyKey, "operation", op.ID, "err", err)
+		}
+	}
+
 	if h.sup.ipcServer != nil {
-		if err := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); err != nil {
+		if err := h.sup.ipcServer.DispatchCommittedEvents(ctx); err != nil {
 			slog.Warn("dispatch operation creation event", "operation", op.ID, "err", err)
 		}
 	}

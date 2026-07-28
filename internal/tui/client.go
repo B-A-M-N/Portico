@@ -21,6 +21,8 @@ type SupervisorClient interface {
 	ConnectEventStream(ctx context.Context, lastSeq int64) (*ipc.EventStream, error)
 	Diagnostics(ctx context.Context, connID string) ([]ipc.DiagnosticDTO, error)
 	Discovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
+	RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
+	ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error)
 }
 
 // Ensure the real client satisfies the interface.

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // LocalHTTP proxies to an already-running local HTTP service.
@@ -92,6 +94,16 @@ func (l *LocalHTTP) Logs() io.ReadCloser {
 func (l *LocalHTTP) Healthy(ctx context.Context) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	return l.healthCheck(ctx, client)
+}
+
+// Identity is empty for external origins.
+func (l *LocalHTTP) Identity() (core.ProcessIdentity, bool) {
+	return core.ProcessIdentity{}, false
+}
+
+// ProcessGroupID is zero for external origins.
+func (l *LocalHTTP) ProcessGroupID() int {
+	return 0
 }
 
 func (l *LocalHTTP) healthCheck(ctx context.Context, client *http.Client) error {

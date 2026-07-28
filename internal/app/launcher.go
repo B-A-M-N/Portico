@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"charm.land/bubbletea/v2"
-	"github.com/charmbracelet/x/term"
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/lock"
 	"github.com/B-A-M-N/portico/internal/tui"
+	"github.com/charmbracelet/x/term"
 )
 
 // Launcher provides shared application bootstrapping for TUI and supervisor.
@@ -55,42 +55,42 @@ func (l *Launcher) StartSupervisor(ctx context.Context) error {
 		return fmt.Errorf("create runtime dir: %w", err)
 	}
 
-	// ---- Serialized startup via supervisor lock file ----
-	// Use a non-blocking lock attempt on the supervisor lock file.
-	// If the lock is held, the supervisor is already running (or
-	// another launcher is starting it).
-	supervisorLockPath := filepath.Join(lockDir, "portico-supervisor.lock")
-	sf, err := os.OpenFile(supervisorLockPath, os.O_RDWR|os.O_CREATE, 0600)
+	// ---- Serialized startup via a launch-specific lock file ----
+	// This lock is distinct from the supervisor's lifetime lock
+	// (portico-supervisor.lock). It serializes concurrent launcher
+	// processes without conflicting with the supervisor's own lock.
+	launchLockPath := filepath.Join(lockDir, "portico-launch.lock")
+	sf, err := os.OpenFile(launchLockPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
-		return fmt.Errorf("open supervisor lock: %w", err)
+		return fmt.Errorf("open launch lock: %w", err)
 	}
 	defer sf.Close()
 
-	// Try non-blocking first. If it fails, the supervisor is already
-	// running or being started by another launcher process.
+	// Try non-blocking first. If it fails, another launcher is starting
+	// the supervisor or it is already running.
 	if err := lock.Lock(sf); err != nil {
 		// Lock held — check if supervisor is actually healthy.
 		if l.isSupervisorRunning(ctx) {
 			slog.Info("supervisor already running")
 			return nil
 		}
-		// Lock held but supervisor not responding — might be a stale lock.
-		// Wait with backoff for lock release (another launcher may be starting up).
-		lock.Unlock(sf)
+		// Lock held but supervisor not responding — might be a stale lock
+		// or another launcher starting up. Wait for the lock.
 		if err := lock.LockBlocking(sf); err != nil {
-			return fmt.Errorf("could not acquire supervisor lock: %w", err)
+			return fmt.Errorf("could not acquire launch lock: %w", err)
 		}
-		// Got the lock. Re-check health.
+		// Got the lock. Re-check health — the other launcher may have
+		// successfully started the supervisor.
 		if l.isSupervisorRunning(ctx) {
 			lock.Unlock(sf)
 			slog.Info("supervisor already running")
 			return nil
 		}
 	}
-	// Lock acquired — we are now responsible for starting the supervisor.
-	// Unlock immediately: the supervisor process will re-acquire the lock
-	// itself during startup. We just needed to serialize launchers.
-	lock.Unlock(sf)
+	// Launch lock acquired — we are now responsible for starting the supervisor.
+	// Hold this lock until the child is confirmed healthy to prevent another
+	// launcher from racing us.
+	defer lock.Unlock(sf)
 
 	// Resolve executable
 	exe, err := Executable()
@@ -263,7 +263,7 @@ func CleanupLock(paths Paths) error {
 		return nil
 	}
 
-	for _, name := range []string{"portico.lock", "portico-startup.lock", "portico-supervisor.lock"} {
+	for _, name := range []string{"portico.lock", "portico-startup.lock", "portico-supervisor.lock", "portico-launch.lock"} {
 		lockPath := filepath.Join(lockDir, name)
 		if _, err := os.Stat(lockPath); err == nil {
 			slog.Info("removing stale lock file", "path", lockPath)

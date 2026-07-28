@@ -49,7 +49,7 @@ type RequestHandler interface {
 	HandlePlanClose(id string) (*PlanDTO, error)
 	HandlePlanRepair(id string) (*PlanDTO, error)
 	HandlePlanDelete(id string) (*PlanDTO, error)
-	HandleApplyPlan(planID string) (*OperationDTO, error)
+	HandleApplyPlan(planID string, idempotencyKey string) (*OperationDTO, error)
 	HandleListProviders() ([]ProviderDTO, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
@@ -566,7 +566,10 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 	}
 	planID := parts[0]
 
-	op, err := s.handler.HandleApplyPlan(planID)
+	// Extract optional idempotency key from header.
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+
+	op, err := s.handler.HandleApplyPlan(planID, idempotencyKey)
 	if err != nil {
 		writeHandlerError(w, "PTO-PLAN-APPLY", err)
 		return

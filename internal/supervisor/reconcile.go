@@ -78,6 +78,12 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 		if plan := resourceDeltaRepairPlan(input); plan != nil {
 			return &reconcileDecision{Action: "repair", Plan: plan}, nil
 		}
+		// Owned origin health is part of the open chain. A dead owned origin
+		// must be repaired before reporting the connection as healthy.
+		if input.Runtime.Origin.Ownership == core.OriginOwnershipOwned &&
+			input.Runtime.Origin.Status != core.OriginStatusRunning {
+			return s.repairDecision(ctx, input.Profile.ID)
+		}
 		// Check connector health.
 		if input.Runtime.Connector.Status == core.ConnectorStatusRunning {
 			return &reconcileDecision{Action: "none"}, nil

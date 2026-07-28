@@ -1,6 +1,7 @@
 package screens
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -168,6 +169,32 @@ func TestDirectoryWizardMapsServingModeAndPermissions(t *testing.T) {
 	}
 }
 
+func TestDirectoryWizardQuickTunnelFiltersWriteModes(t *testing.T) {
+	// Without full Cloudflare (Quick Tunnel only), write-enabled modes
+	// should not be offered because they require protection, which
+	// requires a permanent hostname.
+	m := NewWizard(nil, false, nil)
+	m.state = WizardState{Step: WizardStepDirectoryMode, SourceType: "directory"}
+
+	choices := m.directoryModeChoices()
+	if len(choices) != 2 {
+		t.Fatalf("quick tunnel directory choices = %d, want 2", len(choices))
+	}
+	for _, c := range choices {
+		if c.allowUpload || c.allowDelete {
+			t.Fatalf("quick tunnel offered write-enabled mode: %+v", c)
+		}
+	}
+
+	// With full Cloudflare, all 4 modes should be available.
+	full := NewWizard(nil, true, nil)
+	full.state = WizardState{Step: WizardStepDirectoryMode, SourceType: "directory"}
+	fullChoices := full.directoryModeChoices()
+	if len(fullChoices) != 4 {
+		t.Fatalf("full cloudflare directory choices = %d, want 4", len(fullChoices))
+	}
+}
+
 func TestMCPWizardMapsTransportAndConstrainsSSEExposure(t *testing.T) {
 	limited := NewWizard(nil, false, nil)
 	if got := limited.mcpTransports(); !reflect.DeepEqual(got, []string{"http", "streamable_http"}) {
@@ -211,5 +238,259 @@ func TestCommandOriginRequiresPortBeforeAdvancing(t *testing.T) {
 	m.HandleKey("enter")
 	if m.Step() != WizardStepPort || m.err == nil || !strings.Contains(m.err.Error(), "requires a local port") {
 		t.Fatalf("state after empty MCP command port = %#v, err = %v", m.state, m.err)
+	}
+}
+
+func TestWizardBuildRequestSetsLifecycleDefaults(t *testing.T) {
+	m := NewWizard(nil, false, nil)
+	m.state = WizardState{
+		Step:          WizardStepReview,
+		SourceType:    "existing_service",
+		Name:          "test",
+		SourceAddress: "localhost",
+		Port:          "8080",
+		SourceProtocol: "https",
+		ExposureMode:  "temporary_public",
+		Protection:    "none",
+		Provider:      "cloudflare",
+	}
+	req := m.buildRequest()
+	if !req.Lifecycle.AutoStart {
+		t.Fatal("wizard request should default AutoStart to true")
+	}
+	if req.Lifecycle.OnDisconnect != "keep_alive" {
+		t.Fatalf("wizard request OnDisconnect = %q, want keep_alive", req.Lifecycle.OnDisconnect)
+	}
+	if req.Source.Existing == nil {
+		t.Fatal("existing service source should be set")
+	}
+	if req.Source.Existing.Protocol != "https" {
+		t.Fatalf("protocol = %q, want https", req.Source.Existing.Protocol)
+	}
+}
+
+func TestWizardProtocolSelection(t *testing.T) {
+	m := NewWizard(nil, false, nil)
+	m.state = WizardState{
+		Step:       WizardStepProtocol,
+		SourceType: "existing_service",
+	}
+
+	// Default should be HTTP (index 0)
+	if m.selected != 0 {
+		t.Fatalf("initial protocol selection = %d, want 0", m.selected)
+	}
+
+	// Select HTTPS
+	m.HandleKey("down")
+	if m.selected != 1 {
+		t.Fatalf("after down, protocol selection = %d, want 1", m.selected)
+	}
+
+	// Confirm selection
+	m.HandleKey("enter")
+	if m.state.SourceProtocol != "https" {
+		t.Fatalf("protocol = %q, want https", m.state.SourceProtocol)
+	}
+	if m.state.Step != WizardStepExposure {
+		t.Fatalf("step = %d, want exposure", m.state.Step)
+	}
+}
+
+// fakeWizardClient implements ConnectionCreator for wizard tests.
+type fakeWizardClient struct {
+	createErr   error
+	planErr     error
+	applyErr    error
+	getOpErr    error
+	createdID   string
+	plan        *ipc.PlanDTO
+	operation   *ipc.OperationDTO
+	createCalls int
+	planCalls   int
+	applyCalls  int
+	getOpCalls  int
+}
+
+func (f *fakeWizardClient) CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	f.createCalls++
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	return &ipc.ConnectionDTO{ID: f.createdID, Name: req.Name}, nil
+}
+
+func (f *fakeWizardClient) PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
+	f.planCalls++
+	if f.planErr != nil {
+		return nil, f.planErr
+	}
+	return f.plan, nil
+}
+
+func (f *fakeWizardClient) ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error) {
+	f.applyCalls++
+	if f.applyErr != nil {
+		return nil, f.applyErr
+	}
+	return f.operation, nil
+}
+
+func (f *fakeWizardClient) GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error) {
+	f.getOpCalls++
+	if f.getOpErr != nil {
+		return nil, f.getOpErr
+	}
+	return f.operation, nil
+}
+
+func TestWizardOpenAfterCreateRequestsPlan(t *testing.T) {
+	plan := &ipc.PlanDTO{
+		ID:       "plan-1",
+		Intent:   "open",
+		Provider: "cloudflare",
+		Steps:    []ipc.StepDTO{{Summary: "Create tunnel"}},
+	}
+	client := &fakeWizardClient{
+		createdID: "conn-new",
+		plan:      plan,
+		operation: &ipc.OperationDTO{ID: "op-1", State: "running"},
+	}
+	m := NewWizard(client, false, nil)
+	m.state = WizardState{
+		Step:          WizardStepReview,
+		SourceType:    "existing_service",
+		Name:          "test",
+		SourceAddress: "localhost",
+		Port:          "8080",
+		ExposureMode:  "temporary_public",
+		Protection:    "none",
+		Provider:      "cloudflare",
+	}
+
+	// Select "Save and open" (second option)
+	m.selected = 1
+	cmd := m.HandleKey("enter")
+	if cmd == nil {
+		t.Fatal("expected create command")
+	}
+	if m.Step() != WizardStepCreating {
+		t.Fatalf("step = %d, want creating", m.Step())
+	}
+
+	// Execute create command
+	msg := cmd()
+	created, ok := msg.(ConnectionCreatedMsg)
+	if !ok {
+		t.Fatalf("cmd returned %T, want ConnectionCreatedMsg", msg)
+	}
+
+	// Handle created — should transition to plan preview and request plan
+	planCmd := m.HandleCreated(created)
+	if m.Step() != WizardStepPlanPreview {
+		t.Fatalf("step after create = %d, want plan preview", m.Step())
+	}
+	if !m.openAfterCreate {
+		t.Fatal("openAfterCreate should be true")
+	}
+	if planCmd == nil {
+		t.Fatal("expected plan request command")
+	}
+
+	// Execute plan command
+	planMsg := planCmd()
+	planLoaded, ok := planMsg.(WizardPlanLoadedMsg)
+	if !ok {
+		t.Fatalf("plan cmd returned %T, want WizardPlanLoadedMsg", planMsg)
+	}
+	if client.planCalls != 1 {
+		t.Fatalf("plan calls = %d, want 1", client.planCalls)
+	}
+
+	// Handle plan loaded
+	m.HandlePlanLoaded(planLoaded)
+	if m.plan == nil || m.plan.ID != "plan-1" {
+		t.Fatal("plan not stored on wizard")
+	}
+
+	// Apply the plan
+	applyCmd := m.HandleKey("enter")
+	if applyCmd == nil {
+		t.Fatal("expected apply command")
+	}
+	if m.Step() != WizardStepApplying {
+		t.Fatalf("step after apply = %d, want applying", m.Step())
+	}
+
+	// Execute apply command
+	applyMsg := applyCmd()
+	applied, ok := applyMsg.(WizardPlanAppliedMsg)
+	if !ok {
+		t.Fatalf("apply cmd returned %T, want WizardPlanAppliedMsg", applyMsg)
+	}
+	if client.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1", client.applyCalls)
+	}
+
+	// Handle applied — should transition to operation wait and start polling
+	pollCmd := m.HandlePlanApplied(applied)
+	if m.Step() != WizardStepOperationWait {
+		t.Fatalf("step after apply = %d, want operation wait", m.Step())
+	}
+	if pollCmd == nil {
+		t.Fatal("expected poll command")
+	}
+
+	// Execute poll — operation succeeded
+	opMsg := pollCmd()
+	opLoaded, ok := opMsg.(WizardOperationLoadedMsg)
+	if !ok {
+		t.Fatalf("poll cmd returned %T, want WizardOperationLoadedMsg", opMsg)
+	}
+	m.operation.State = "succeeded"
+	m.HandleOperationLoaded(opLoaded)
+	if m.Step() != WizardStepComplete {
+		t.Fatalf("step after success = %d, want complete", m.Step())
+	}
+}
+
+func TestWizardSaveClosedSkipsPlan(t *testing.T) {
+	client := &fakeWizardClient{createdID: "conn-new"}
+	m := NewWizard(client, false, nil)
+	m.state = WizardState{
+		Step:          WizardStepReview,
+		SourceType:    "existing_service",
+		Name:          "test",
+		SourceAddress: "localhost",
+		Port:          "8080",
+		ExposureMode:  "temporary_public",
+		Protection:    "none",
+		Provider:      "cloudflare",
+	}
+
+	// Select "Save closed" (first option, default)
+	m.selected = 0
+	cmd := m.HandleKey("enter")
+	if cmd == nil {
+		t.Fatal("expected create command")
+	}
+
+	// Execute create command
+	msg := cmd()
+	created := msg.(ConnectionCreatedMsg)
+
+	// Handle created — should go directly to complete, no plan
+	planCmd := m.HandleCreated(created)
+	if m.Step() != WizardStepComplete {
+		t.Fatalf("step after create = %d, want complete", m.Step())
+	}
+	if m.openAfterCreate {
+		t.Fatal("openAfterCreate should be false")
+	}
+	if planCmd != nil {
+		t.Fatal("save closed should not request a plan")
+	}
+	if client.planCalls != 0 {
+		t.Fatalf("plan calls = %d, want 0", client.planCalls)
 	}
 }

@@ -39,7 +39,7 @@ func (nullHandler) HandlePlanOpen(string) (*PlanDTO, error)   { return nil, nil 
 func (nullHandler) HandlePlanClose(string) (*PlanDTO, error)  { return nil, nil }
 func (nullHandler) HandlePlanRepair(string) (*PlanDTO, error) { return nil, nil }
 func (nullHandler) HandlePlanDelete(string) (*PlanDTO, error) { return nil, nil }
-func (nullHandler) HandleApplyPlan(string) (*OperationDTO, error) {
+func (nullHandler) HandleApplyPlan(string, string) (*OperationDTO, error) {
 	return nil, nil
 }
 func (nullHandler) HandleListProviders() ([]ProviderDTO, error) { return nil, nil }

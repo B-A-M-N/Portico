@@ -40,7 +40,7 @@ type Model struct {
 	height     int
 	ready      bool
 	screen     ScreenID
-	selectedID int
+	selectedID string // stable connection ID, not a list index
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -51,9 +51,23 @@ type Model struct {
 	discoverySelected int
 	opEvents          []string
 
-	lastEventSeq int64
-	stream       *ipc.EventStream
-	streamCancel context.CancelFunc
+	// Repair verification state
+	preRepairDiagnostics      []ipc.DiagnosticDTO
+	repairConnectionID        string
+	awaitingRepairVerification bool
+
+	// Provider account setup state
+	providerSetupStep    int // 0: not in setup, 1: account ID, 2: label, 3: zone ID, 4: credential, 5: confirming
+	providerSetupID      string
+	providerSetupLabel   string
+	providerSetupZoneID  string
+	providerSetupCred    string
+	providerSetupError   string
+
+	lastEventSeq    int64
+	stream          *ipc.EventStream
+	streamCancel    context.CancelFunc
+	streamConnected bool
 
 	keys     KeyMap
 	theme    Theme
@@ -62,8 +76,13 @@ type Model struct {
 	wizard *screens.WizardModel
 
 	client SupervisorClient
-	err    error
-	status string
+	// rootCtx is the application lifetime context. It is cancelled when
+	// the Bubble Tea program exits, ensuring in-flight RPCs do not outlive
+	// the TUI.
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+	err        error
+	status     string
 }
 
 // New creates a new TUI model backed by the real IPC client.
@@ -81,23 +100,24 @@ func newModel(client SupervisorClient) Model {
 	if os.Getenv("NO_COLOR") != "" || os.Getenv("PORTICO_MONOCHROME") != "" {
 		theme = MonochromeTheme
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return Model{
-		screen:   ScreenHome,
-		keys:     DefaultKeyMap,
-		theme:    theme,
-		useASCII: os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
-		client:   client,
+		screen:     ScreenBoot, // Start in boot screen
+		keys:       DefaultKeyMap,
+		theme:      theme,
+		useASCII:   os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
+		client:     client,
+		rootCtx:    ctx,
+		rootCancel: cancel,
 	}
 }
 
 // --------------- Bubble Tea integration ---------------
 
 // Init returns the startup command (SPEC §17.4).
+// Sequenced: load snapshot first, then connect SSE after cursor is set.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
-		m.requestSnapshot(),
-		m.connectEventStream(),
-	)
+	return m.requestSnapshot()
 }
 
 // Update handles messages (SPEC §17.7).
@@ -114,8 +134,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case snapshotMsg:
 		if msg.Err != nil {
 			if !m.ready {
-				// No initial state yet — nothing else to show.
+				// Initial snapshot failed — transition to recovery screen
 				m.err = msg.Err
+				m.screen = ScreenRecovery
 			} else {
 				m.status = fmt.Sprintf("snapshot refresh failed: %v", msg.Err)
 			}
@@ -123,6 +144,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.snapshot = msg.Snapshot
 		m.ready = true
+		// Transition to home screen on successful initial load
+		if m.screen == ScreenBoot {
+			m.screen = ScreenHome
+		}
+		// Preserve selection by stable connection ID. If the previously
+		// selected connection was deleted, fall back to the first entry.
+		conns := m.ConnectionList()
+		if len(conns) > 0 && m.selectedID != "" {
+			found := false
+			for _, c := range conns {
+				if c.ID == m.selectedID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.selectedID = conns[0].ID
+			}
+		} else if len(conns) > 0 && m.selectedID == "" {
+			m.selectedID = conns[0].ID
+		} else if len(conns) == 0 {
+			m.selectedID = ""
+		}
+		// Advance the event cursor to the snapshot's LastSeq so that
+		// SSE replay starts after this point, closing the gap between
+		// snapshot capture and stream connection.
+		if msg.Snapshot.LastSeq > m.lastEventSeq {
+			m.lastEventSeq = msg.Snapshot.LastSeq
+		}
+		// On first boot, connect the event stream now that the cursor is set.
+		if !m.streamConnected {
+			m.streamConnected = true
+			return m, m.connectEventStream()
+		}
 		return m, nil
 
 	case planLoadedMsg:
@@ -160,6 +215,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.operation = msg.Operation
+		
+		// Check if operation completed and we need post-repair verification
+		if m.operation != nil && m.awaitingRepairVerification {
+			state := m.operation.State
+			if state == "succeeded" || state == "failed" || state == "cancelled" {
+				// Operation completed, re-run diagnostics to verify repair
+				m.awaitingRepairVerification = false
+				if m.repairConnectionID != "" {
+					m.status = "Verifying repair..."
+					return m, m.diagnosticsCmd(m.repairConnectionID)
+				}
+			}
+		}
 		return m, nil
 
 	case diagnosticsMsg:
@@ -169,6 +237,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.status = ""
 		m.diagnostics = msg.Findings
+		
+		// If we just completed repair verification, show the results
+		if len(m.preRepairDiagnostics) > 0 && m.repairConnectionID != "" {
+			m.screen = ScreenRepair
+			// Keep preRepairDiagnostics for comparison display
+		}
 		return m, nil
 
 	case discoveryMsg:
@@ -182,9 +256,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = ScreenDiscovery
 		return m, nil
 
+	case providerAccountConfiguredMsg:
+		if msg.Err != nil {
+			m.providerSetupError = msg.Err.Error()
+			m.providerSetupStep = 1 // Go back to account ID input
+			return m, nil
+		}
+		// Success - reset setup state and refresh snapshot
+		m.providerSetupStep = 0
+		m.providerSetupID = ""
+		m.providerSetupLabel = ""
+		m.providerSetupZoneID = ""
+		m.providerSetupCred = ""
+		m.providerSetupError = ""
+		if msg.Response != nil && msg.Response.RestartRequired {
+			m.status = "Account configured. Restart supervisor to activate."
+		} else {
+			m.status = "Account configured successfully."
+		}
+		return m, m.requestSnapshot()
+
 	case screens.ConnectionCreatedMsg:
 		if m.wizard != nil {
-			m.wizard.HandleCreated(msg)
+			cmd := m.wizard.HandleCreated(msg)
+			if msg.Err != nil {
+				m.status = fmt.Sprintf("create failed: %v", msg.Err)
+				return m, nil
+			}
+			m.status = ""
+			return m, tea.Batch(cmd, m.requestSnapshot())
 		}
 		if msg.Err != nil {
 			m.status = fmt.Sprintf("create failed: %v", msg.Err)
@@ -193,10 +293,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		return m, m.requestSnapshot()
 
+	case screens.WizardPlanLoadedMsg:
+		if m.wizard != nil {
+			cmd := m.wizard.HandlePlanLoaded(msg)
+			if msg.Err != nil {
+				m.status = fmt.Sprintf("plan failed: %v", msg.Err)
+			}
+			return m, cmd
+		}
+		return m, nil
+
+	case screens.WizardPlanAppliedMsg:
+		if m.wizard != nil {
+			cmd := m.wizard.HandlePlanApplied(msg)
+			if msg.Err != nil {
+				m.status = fmt.Sprintf("apply failed: %v", msg.Err)
+			}
+			return m, cmd
+		}
+		return m, nil
+
+	case screens.WizardOperationLoadedMsg:
+		if m.wizard != nil {
+			cmd := m.wizard.HandleOperationLoaded(msg)
+			return m, cmd
+		}
+		return m, nil
+
 	case eventMsg:
 		if msg.Event.Type == "resync_required" {
+			// Close the old stream and request a fresh snapshot.
+			// The snapshot handler will set lastEventSeq and reconnect SSE.
 			m.closeEventStream()
-			return m, tea.Batch(m.requestSnapshot(), m.reconnectEventStream())
+			m.streamConnected = false
+			return m, m.requestSnapshot()
+		}
+		// Deduplicate events by sequence monotonicity.
+		if msg.Event.Sequence > 0 && msg.Event.Sequence <= m.lastEventSeq {
+			return m, m.waitForEvent()
 		}
 		m.lastEventSeq = msg.Event.Sequence
 		cmd := m.handleEvent(msg.Event)
@@ -246,6 +380,10 @@ func (m Model) View() tea.View {
 
 	var content string
 	switch m.screen {
+	case ScreenBoot:
+		content = m.renderBoot()
+	case ScreenRecovery:
+		content = m.renderRecovery()
 	case ScreenHome:
 		content = m.renderHome()
 	case ScreenNewConnection:
@@ -322,6 +460,11 @@ type discoveryMsg struct {
 	Err      error
 }
 
+type providerAccountConfiguredMsg struct {
+	Response *ipc.ConfigureProviderAccountResponse
+	Err      error
+}
+
 type streamErrorMsg struct{ Err error }
 
 // --------------- commands ---------------
@@ -331,22 +474,31 @@ type streamErrorMsg struct{ Err error }
 
 func (m *Model) diagnosticsCmd(connID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return diagnosticsMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		findings, err := client.Diagnostics(context.Background(), connID)
+		// Diagnostics can take a while — use a bounded timeout.
+		diagCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		findings, err := client.Diagnostics(diagCtx, connID)
 		return diagnosticsMsg{Findings: findings, Err: err}
 	}
 }
 
 func (m *Model) discoveryCmd() tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return discoveryMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		result, err := client.Discovery(context.Background())
+		// Use RefreshDiscovery (POST) for explicit user-initiated scans
+		// so that newly launched services are detected immediately.
+		discCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		result, err := client.RefreshDiscovery(discCtx)
 		if err != nil {
 			return discoveryMsg{Err: err}
 		}
@@ -354,13 +506,30 @@ func (m *Model) discoveryCmd() tea.Cmd {
 	}
 }
 
+func (m *Model) configureProviderAccountCmd(providerID string, req ipc.ConfigureProviderAccountRequest) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return providerAccountConfiguredMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		configCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		resp, err := client.ConfigureProviderAccount(configCtx, providerID, req)
+		return providerAccountConfiguredMsg{Response: resp, Err: err}
+	}
+}
+
 func (m *Model) requestSnapshot() tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return snapshotMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		snap, err := client.GetSnapshot(context.Background())
+		snapCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		snap, err := client.GetSnapshot(snapCtx)
 		if err != nil {
 			return snapshotMsg{Err: err}
 		}
@@ -370,66 +539,86 @@ func (m *Model) requestSnapshot() tea.Cmd {
 
 func (m *Model) planOpenCmd(connID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		plan, err := client.PlanOpen(context.Background(), connID)
+		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		plan, err := client.PlanOpen(planCtx, connID)
 		return planLoadedMsg{Plan: plan, Err: err}
 	}
 }
 
 func (m *Model) planCloseCmd(connID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		plan, err := client.PlanClose(context.Background(), connID)
+		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		plan, err := client.PlanClose(planCtx, connID)
 		return planLoadedMsg{Plan: plan, Err: err}
 	}
 }
 
 func (m *Model) planRepairCmd(connID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		plan, err := client.PlanRepair(context.Background(), connID)
+		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		plan, err := client.PlanRepair(planCtx, connID)
 		return planLoadedMsg{Plan: plan, Err: err}
 	}
 }
 
 func (m *Model) planDeleteCmd(connID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		plan, err := client.PlanDelete(context.Background(), connID)
+		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		plan, err := client.PlanDelete(planCtx, connID)
 		return planLoadedMsg{Plan: plan, Err: err}
 	}
 }
 
 func (m *Model) applyPlanCmd(planID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return planAppliedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		op, err := client.ApplyPlan(context.Background(), planID)
+		// Apply is a mutation — use a longer timeout. The server-side
+		// operation continues even if this context is cancelled.
+		applyCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+		op, err := client.ApplyPlan(applyCtx, planID)
 		return planAppliedMsg{Operation: op, Err: err}
 	}
 }
 
 func (m *Model) getOperationCmd(operationID string) tea.Cmd {
 	client := m.client
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return operationLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		operation, err := client.GetOperation(context.Background(), operationID)
+		opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		operation, err := client.GetOperation(opCtx, operationID)
 		return operationLoadedMsg{Operation: operation, Err: err}
 	}
 }
@@ -437,12 +626,15 @@ func (m *Model) getOperationCmd(operationID string) tea.Cmd {
 func (m *Model) connectEventStream() tea.Cmd {
 	client := m.client
 	lastSeq := m.lastEventSeq
+	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return streamErrorMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		stream, err := client.ConnectEventStream(ctx, lastSeq)
+		// The event stream lives for the application lifetime — use rootCtx
+		// directly so it is cancelled when the TUI exits.
+		streamCtx, cancel := context.WithCancel(ctx)
+		stream, err := client.ConnectEventStream(streamCtx, lastSeq)
 		if err != nil {
 			cancel()
 			return streamErrorMsg{Err: fmt.Errorf("event stream: %w", err)}
@@ -491,17 +683,28 @@ func (m *Model) handleEvent(evt ipc.EventDTO) tea.Cmd {
 		return nil
 
 	case strings.HasPrefix(evt.Type, "operation."):
-		if data, ok := evt.Data.(map[string]interface{}); ok {
-			if summary, ok := data["summary"].(string); ok && summary != "" {
-				m.opEvents = append(m.opEvents, summary)
+		// Only update the visible operation log when the event belongs to
+		// the operation currently displayed. Unrelated operation events
+		// still trigger a snapshot refresh but must not pollute the
+		// active operation screen.
+		if m.operation != nil && evt.OperationID == m.operation.ID {
+			if data, ok := evt.Data.(map[string]interface{}); ok {
+				if summary, ok := data["summary"].(string); ok && summary != "" {
+					// Bound the in-memory event list to prevent unbounded growth.
+					if len(m.opEvents) < 500 {
+						m.opEvents = append(m.opEvents, summary)
+					}
+				}
 			}
+			// Operation progress changes connection state — reload both the
+			// connection snapshot and the operation itself so the progress view
+			// reaches a durable terminal state.
+			if m.operation != nil {
+				return tea.Batch(m.requestSnapshot(), m.getOperationCmd(m.operation.ID))
+			}
+			return m.requestSnapshot()
 		}
-		// Operation progress changes connection state — reload both the
-		// connection snapshot and the operation itself so the progress view
-		// reaches a durable terminal state.
-		if m.operation != nil {
-			return tea.Batch(m.requestSnapshot(), m.getOperationCmd(m.operation.ID))
-		}
+		// Unrelated operation event — refresh the connection list only.
 		return m.requestSnapshot()
 
 	case strings.HasPrefix(evt.Type, "connection."):
@@ -517,6 +720,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	key := msg.String()
 
 	if key == "ctrl+c" {
+		if m.rootCancel != nil {
+			m.rootCancel()
+		}
 		return m, tea.Quit
 	}
 
@@ -525,9 +731,17 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleWizardKey(key)
 	}
 
+	// While provider setup is active, handle it specially.
+	if m.providerSetupStep > 0 {
+		return m.handleProviderSetupKey(key)
+	}
+
 	switch key {
 	case "q":
 		if m.screen == ScreenHome {
+			if m.rootCancel != nil {
+				m.rootCancel()
+			}
 			return m, tea.Quit
 		}
 		m.screen = ScreenHome
@@ -535,6 +749,11 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 
 	case "esc":
 		if m.screen != ScreenHome {
+			// Clear repair verification state when leaving repair screen
+			if m.screen == ScreenRepair {
+				m.preRepairDiagnostics = nil
+				m.repairConnectionID = ""
+			}
 			m.screen = ScreenHome
 		}
 		return m, nil
@@ -542,8 +761,13 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case "up", "k":
 		if m.screen == ScreenDiscovery && m.discoverySelected > 0 {
 			m.discoverySelected--
-		} else if m.selectedID > 0 {
-			m.selectedID--
+		} else if m.screen == ScreenHome {
+			// Move selection up by finding the current index and decrementing.
+			conns := m.ConnectionList()
+			idx := m.selectedConnectionIndex()
+			if idx > 0 {
+				m.selectedID = conns[idx-1].ID
+			}
 		}
 
 	case "down", "j":
@@ -551,10 +775,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.discoverySelected < len(m.discovery)-1 {
 				m.discoverySelected++
 			}
-		} else {
+		} else if m.screen == ScreenHome {
+			// Move selection down by finding the current index and incrementing.
 			conns := m.ConnectionList()
-			if m.selectedID < len(conns)-1 {
-				m.selectedID++
+			idx := m.selectedConnectionIndex()
+			if idx >= 0 && idx < len(conns)-1 {
+				m.selectedID = conns[idx+1].ID
+			} else if idx < 0 && len(conns) > 0 {
+				m.selectedID = conns[0].ID
 			}
 		}
 
@@ -568,8 +796,16 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// Apply the previewed plan asynchronously.
 			m.applying = true
 			m.status = "Applying plan..."
+			// Track if this is a repair for post-repair verification
+			if m.plan.Intent == "repair" {
+				m.awaitingRepairVerification = true
+			}
 			return m, m.applyPlanCmd(m.plan.ID)
 		} else if m.screen == ScreenRepair && m.SelectedConnection() != nil && len(m.diagnostics) > 0 {
+			// Store pre-repair diagnostics for verification
+			m.preRepairDiagnostics = make([]ipc.DiagnosticDTO, len(m.diagnostics))
+			copy(m.preRepairDiagnostics, m.diagnostics)
+			m.repairConnectionID = m.SelectedConnection().ID
 			return m, m.planRepairCmd(m.SelectedConnection().ID)
 		} else if m.screen == ScreenDiscovery && len(m.discovery) > 0 {
 			svc := m.discovery[m.discoverySelected]
@@ -586,6 +822,19 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 
 	case "r":
+		if m.screen == ScreenRecovery {
+			// Retry connection to supervisor
+			m.err = nil
+			m.screen = ScreenBoot
+			return m, m.requestSnapshot()
+		}
+		if m.screen == ScreenRepair && m.SelectedConnection() != nil {
+			// Clear pre-repair diagnostics when manually re-running
+			m.preRepairDiagnostics = nil
+			m.repairConnectionID = ""
+			m.diagnostics = nil
+			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+		}
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
 			m.screen = ScreenRepair
 			m.diagnostics = nil
@@ -596,6 +845,16 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		if m.screen == ScreenHome {
 			m.status = "Discovering local services..."
 			return m, m.discoveryCmd()
+		}
+		if m.screen == ScreenProviders {
+			// Start provider account setup
+			m.providerSetupStep = 1
+			m.providerSetupID = ""
+			m.providerSetupLabel = ""
+			m.providerSetupZoneID = ""
+			m.providerSetupCred = ""
+			m.providerSetupError = ""
+			return m, nil
 		}
 
 	case "d":
@@ -676,6 +935,105 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 	return m, m.wizard.HandleKey(key)
 }
 
+func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
+	switch m.providerSetupStep {
+	case 1: // Account ID
+		if key == "esc" {
+			m.providerSetupStep = 0
+			m.providerSetupError = ""
+			return m, nil
+		}
+		if key == "enter" {
+			if m.providerSetupID == "" {
+				m.providerSetupError = "Account ID cannot be empty"
+				return m, nil
+			}
+			m.providerSetupStep = 2
+			m.providerSetupError = ""
+			return m, nil
+		}
+		m.providerSetupID = editString(m.providerSetupID, key)
+		return m, nil
+
+	case 2: // Label
+		if key == "esc" {
+			m.providerSetupStep = 1
+			m.providerSetupError = ""
+			return m, nil
+		}
+		if key == "enter" {
+			m.providerSetupStep = 3
+			m.providerSetupError = ""
+			return m, nil
+		}
+		m.providerSetupLabel = editString(m.providerSetupLabel, key)
+		return m, nil
+
+	case 3: // Zone ID
+		if key == "esc" {
+			m.providerSetupStep = 2
+			m.providerSetupError = ""
+			return m, nil
+		}
+		if key == "enter" {
+			m.providerSetupStep = 4
+			m.providerSetupError = ""
+			return m, nil
+		}
+		m.providerSetupZoneID = editString(m.providerSetupZoneID, key)
+		return m, nil
+
+	case 4: // Credential
+		if key == "esc" {
+			m.providerSetupStep = 3
+			m.providerSetupError = ""
+			return m, nil
+		}
+		if key == "enter" {
+			if m.providerSetupCred == "" {
+				m.providerSetupError = "Credential cannot be empty"
+				return m, nil
+			}
+			m.providerSetupStep = 5
+			m.providerSetupError = ""
+			return m, nil
+		}
+		m.providerSetupCred = editString(m.providerSetupCred, key)
+		return m, nil
+
+	case 5: // Confirm
+		if key == "esc" {
+			m.providerSetupStep = 4
+			m.providerSetupError = ""
+			return m, nil
+		}
+		if key == "enter" {
+			// Submit the configuration
+			req := ipc.ConfigureProviderAccountRequest{
+				AccountID:  m.providerSetupID,
+				Label:      m.providerSetupLabel,
+				ZoneID:     m.providerSetupZoneID,
+				Credential: m.providerSetupCred,
+			}
+			return m, m.configureProviderAccountCmd("cloudflare", req)
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// editString is a simple string editor for terminal input.
+func editString(s string, key string) string {
+	if len(key) == 1 {
+		return s + key
+	}
+	if key == "backspace" && len(s) > 0 {
+		return s[:len(s)-1]
+	}
+	return s
+}
+
 // --------------- view models ---------------
 
 func (m *Model) ConnectionList() []ipc.ConnectionDTO {
@@ -687,10 +1045,30 @@ func (m *Model) ConnectionList() []ipc.ConnectionDTO {
 
 func (m *Model) SelectedConnection() *ipc.ConnectionDTO {
 	conns := m.ConnectionList()
-	if m.selectedID < 0 || m.selectedID >= len(conns) {
+	if m.selectedID == "" {
 		return nil
 	}
-	return &conns[m.selectedID]
+	for i := range conns {
+		if conns[i].ID == m.selectedID {
+			return &conns[i]
+		}
+	}
+	return nil
+}
+
+// selectedConnectionIndex returns the index of the selected connection in the
+// current list, or -1 if not found or no selection.
+func (m *Model) selectedConnectionIndex() int {
+	if m.selectedID == "" {
+		return -1
+	}
+	conns := m.ConnectionList()
+	for i := range conns {
+		if conns[i].ID == m.selectedID {
+			return i
+		}
+	}
+	return -1
 }
 
 // --------------- rendering ---------------
@@ -707,6 +1085,49 @@ func (m *Model) renderError() string {
 		Render(fmt.Sprintf("Error: %s", m.err))
 }
 
+func (m *Model) renderBoot() string {
+	var b strings.Builder
+	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
+	b.WriteString("\n\n")
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Stable).
+		Render("Starting Portico...\n"))
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Muted).
+		Render("Connecting to supervisor..."))
+	return b.String()
+}
+
+func (m *Model) renderRecovery() string {
+	var b strings.Builder
+	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
+	b.WriteString("\n\n")
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Intervention).
+		Render("Unable to connect to supervisor\n"))
+	b.WriteString("\n")
+	if m.err != nil {
+		b.WriteString(lipgloss.NewStyle().
+			Foreground(m.theme.Muted).
+			Render(fmt.Sprintf("Error: %s\n\n", m.err)))
+	}
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Text).
+		Render("This usually means:\n"))
+	b.WriteString("  • The supervisor is not running\n")
+	b.WriteString("  • The socket file is missing or inaccessible\n")
+	b.WriteString("  • Permission denied\n")
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Stable).
+		Render("[r] Retry connection\n"))
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Muted).
+		Render("[q] Quit"))
+	return b.String()
+}
+
 func (m *Model) renderHome() string {
 	if m.width > 0 && Breakpoint(m.width) == LayoutEmergency {
 		return m.renderEmergencyHome()
@@ -717,7 +1138,32 @@ func (m *Model) renderHome() string {
 	b.WriteString("\n\n")
 	b.WriteString(m.theme.Style("header").Render(" CONNECTIONS "))
 	b.WriteString("\n")
-	b.WriteString(renderConnectionList(m.ConnectionList(), m.selectedID, m.width, m.theme, m.useASCII))
+	
+	// Calculate available height for connection list
+	// Reserve space for: header (1) + title (1) + route (3-5) + status (2) + help (2) = ~10 lines
+	availableHeight := m.height - 10
+	if availableHeight < 5 {
+		availableHeight = 5
+	}
+	
+	// Render connection list with height limit
+	conns := m.ConnectionList()
+	connListStr := renderConnectionList(conns, m.selectedID, m.width, m.theme, m.useASCII)
+	lines := strings.Split(connListStr, "\n")
+	
+	// Limit connection list to available height
+	if len(lines) > availableHeight {
+		lines = lines[:availableHeight]
+		// Add indicator if there are more connections
+		if len(conns) > availableHeight {
+			lines = append(lines, m.theme.Style("muted").Render(fmt.Sprintf("  ... and %d more", len(conns)-availableHeight)))
+		}
+	}
+	
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
 
 	if selected := m.SelectedConnection(); selected != nil {
 		state := route.RouteOpen
@@ -750,7 +1196,7 @@ func (m *Model) renderHome() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpRow(m.keys))
+	b.WriteString(helpRow(m.keys, m.theme))
 	return b.String()
 }
 
@@ -778,24 +1224,63 @@ func (m *Model) renderInspect() string {
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" %s ", conn.Name)))
 	b.WriteString("\n\n")
+	
+	// Basic Information
+	b.WriteString(m.theme.Style("header").Render(" BASIC "))
+	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("ID:       %s\n", conn.ID))
 	b.WriteString(fmt.Sprintf("State:    %s\n", conn.UserState))
 	b.WriteString(fmt.Sprintf("Provider: %s\n", conn.ProviderID))
 	if conn.ProviderAccountID != "" {
 		b.WriteString(fmt.Sprintf("Account:  %s\n", conn.ProviderAccountID))
 	}
+	
+	// Addresses
+	b.WriteString("\n")
+	b.WriteString(m.theme.Style("header").Render(" ADDRESSES "))
+	b.WriteString("\n")
 	if conn.PublicAddress != "" {
-		b.WriteString(fmt.Sprintf("Address:  %s\n", conn.PublicAddress))
+		b.WriteString(fmt.Sprintf("Public:   %s\n", conn.PublicAddress))
+	} else {
+		b.WriteString(m.theme.Style("muted").Render("Public:   (not assigned)\n"))
 	}
 	if conn.PrivateAddress != "" {
 		b.WriteString(fmt.Sprintf("Local:    %s\n", conn.PrivateAddress))
+	} else {
+		b.WriteString(m.theme.Style("muted").Render("Local:    (not configured)\n"))
+	}
+	
+	// Runtime Information
+	b.WriteString("\n")
+	b.WriteString(m.theme.Style("header").Render(" RUNTIME "))
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("Desired:  %s\n", conn.DesiredState))
+	b.WriteString(fmt.Sprintf("Actual:   %s\n", conn.RuntimeState))
+	if conn.ConnectorState != "" {
+		stateIcon := "○"
+		switch conn.ConnectorState {
+		case "running":
+			stateIcon = "●"
+		case "stopped":
+			stateIcon = "○"
+		case "failed":
+			stateIcon = "✗"
+		}
+		b.WriteString(fmt.Sprintf("Connector: %s %s\n", stateIcon, conn.ConnectorState))
 	}
 	if conn.ConnectorPID > 0 {
 		b.WriteString(fmt.Sprintf("PID:      %d\n", conn.ConnectorPID))
 	}
+	
+	// Error Information
 	if conn.Error != "" {
-		b.WriteString(fmt.Sprintf("\nError: %s\n", conn.Error))
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("header").Render(" ERROR "))
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("intervention").Render(conn.Error))
+		b.WriteString("\n")
 	}
+	
 	b.WriteString("\n[esc] back    [q] quit\n")
 	return b.String()
 }
@@ -805,15 +1290,68 @@ func (m *Model) renderPlanPreview() string {
 		return "No plan"
 	}
 	var b strings.Builder
-	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" PLAN: %s ", m.plan.Intent)))
+
+	// Title with explicit action
+	intent := m.plan.Intent
+	if intent == "" {
+		intent = "unknown"
+	}
+	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" [%s] ", strings.ToUpper(intent))))
 	b.WriteString("\n\n")
-	for _, step := range m.plan.Steps {
+
+	// Connection and provider/account
+	conn := m.SelectedConnection()
+	if conn != nil {
+		b.WriteString(fmt.Sprintf("Connection: %s\n", conn.Name))
+	}
+	b.WriteString(fmt.Sprintf("Provider:   %s\n", m.plan.Provider))
+	if conn != nil && conn.ProviderAccountID != "" {
+		b.WriteString(fmt.Sprintf("Account:    %s\n", conn.ProviderAccountID))
+	}
+
+	// Warnings
+	if len(m.plan.Warnings) > 0 {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("attention").Render("Warnings:"))
+		b.WriteString("\n")
+		for _, warning := range m.plan.Warnings {
+			b.WriteString(fmt.Sprintf("  ! %s\n", warning))
+		}
+	}
+
+	// Steps with safety annotations
+	b.WriteString("\nSteps:\n")
+	hasIrreversible := false
+	for i, step := range m.plan.Steps {
 		mark := " "
 		if step.Destructive {
 			mark = "!"
 		}
-		b.WriteString(fmt.Sprintf("  [%s] %s\n", mark, step.Summary))
+		if step.Irreversible {
+			mark = "X"
+			hasIrreversible = true
+		}
+		b.WriteString(fmt.Sprintf("  [%s] %d. %s", mark, i+1, step.Summary))
+		if step.Destructive {
+			b.WriteString(" [destructive]")
+		}
+		if step.Irreversible {
+			b.WriteString(" [irreversible]")
+		}
+		b.WriteString("\n")
 	}
+
+	// Plan fingerprint (for debugging/staleness detection)
+	if m.plan.Fingerprint != "" {
+		b.WriteString("\n")
+		fp := m.plan.Fingerprint
+		if len(fp) > 8 {
+			fp = fp[:8]
+		}
+		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("Fingerprint: %s", fp)))
+		b.WriteString("\n")
+	}
+
 	if m.status != "" {
 		b.WriteString("\n")
 		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
@@ -822,7 +1360,14 @@ func (m *Model) renderPlanPreview() string {
 	if m.applying {
 		b.WriteString("\nApplying...\n")
 	} else {
-		b.WriteString("\n[esc] cancel    [enter] apply    [q] quit\n")
+		b.WriteString("\n")
+		if hasIrreversible || intent == "delete" {
+			b.WriteString(m.theme.Style("intervention").Render("This operation cannot be undone."))
+			b.WriteString("\n")
+			b.WriteString("[esc] cancel    [enter] confirm    [q] quit\n")
+		} else {
+			b.WriteString("[esc] cancel    [enter] apply    [q] quit\n")
+		}
 	}
 	return b.String()
 }
@@ -834,15 +1379,60 @@ func (m *Model) renderOperationProgress() string {
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" OPERATION: %s ", m.operation.State)))
 	b.WriteString("\n\n")
+	
+	// Show steps with execution states
 	for _, step := range m.operation.Steps {
-		b.WriteString(fmt.Sprintf("  - %s\n", step.Summary))
+		// Determine step status icon
+		icon := "○" // pending
+		switch step.State {
+		case "running":
+			icon = "◐"
+		case "succeeded":
+			icon = "●"
+		case "failed":
+			icon = "✗"
+		case "compensated":
+			icon = "↩"
+		case "skipped":
+			icon = "⊘"
+		}
+		
+		// Apply color based on state
+		stepText := fmt.Sprintf("  %s %s", icon, step.Summary)
+		switch step.State {
+		case "succeeded":
+			stepText = m.theme.Style("stable").Render(stepText)
+		case "failed":
+			stepText = m.theme.Style("intervention").Render(stepText)
+		case "running":
+			stepText = m.theme.Style("attention").Render(stepText)
+		case "compensated", "skipped":
+			stepText = m.theme.Style("muted").Render(stepText)
+		}
+		
+		b.WriteString(stepText)
+		b.WriteString("\n")
+		
+		// Show error if present
+		if step.Error != "" {
+			b.WriteString(m.theme.Style("intervention").Render("      Error: " + step.Error))
+			b.WriteString("\n")
+		}
 	}
-	for _, evt := range m.opEvents {
-		b.WriteString(fmt.Sprintf("  * %s\n", evt))
+	
+	// Show operation events
+	if len(m.opEvents) > 0 {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render("Events:"))
+		b.WriteString("\n")
+		for _, evt := range m.opEvents {
+			b.WriteString(fmt.Sprintf("  * %s\n", evt))
+		}
 	}
+	
 	b.WriteString(fmt.Sprintf("\nState: %s\n", m.operation.State))
 	if m.operation.Error != "" {
-		b.WriteString(fmt.Sprintf("Error: %s\n", m.operation.Error))
+		b.WriteString(m.theme.Style("intervention").Render(fmt.Sprintf("Error: %s\n", m.operation.Error)))
 	}
 	if m.status != "" {
 		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
@@ -853,15 +1443,38 @@ func (m *Model) renderOperationProgress() string {
 }
 
 func (m *Model) renderProviders() string {
+	// If in provider setup mode, show the setup UI
+	if m.providerSetupStep > 0 {
+		return m.renderProviderSetup()
+	}
+
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(" PROVIDERS "))
 	b.WriteString("\n\n")
 	for _, p := range m.snapshot.Providers {
-		status := "✓"
-		if !p.Authenticated {
-			status = "✗"
+		// Show provider capabilities instead of just authenticated/unauthenticated
+		b.WriteString(fmt.Sprintf("  %s\n", p.DisplayName))
+		
+		// Quick Tunnels are always available (no auth required)
+		if p.ID == "cloudflare" {
+			b.WriteString(m.theme.Style("stable").Render("    ✓ Temporary addresses (Quick Tunnel)"))
+			b.WriteString("\n")
 		}
-		b.WriteString(fmt.Sprintf("  %s %s (%s)\n", status, p.DisplayName, p.ID))
+		
+		// Permanent features require authentication
+		if p.Authenticated {
+			b.WriteString(m.theme.Style("stable").Render("    ✓ Permanent hostnames"))
+			b.WriteString("\n")
+			b.WriteString(m.theme.Style("stable").Render("    ✓ Email protection"))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(m.theme.Style("muted").Render("    ○ Permanent hostnames (account setup required)"))
+			b.WriteString("\n")
+			b.WriteString(m.theme.Style("muted").Render("    ○ Email protection (account setup required)"))
+			b.WriteString("\n")
+		}
+		
+		// Show configured accounts
 		for _, account := range p.Accounts {
 			label := account.Label
 			if label == "" {
@@ -873,8 +1486,58 @@ func (m *Model) renderProviders() string {
 			}
 			b.WriteString(fmt.Sprintf("      • %s — %s\n", label, accountStatus))
 		}
+		b.WriteString("\n")
 	}
-	b.WriteString("\n[esc] back    [q] quit\n")
+	b.WriteString("[a] add account    [esc] back    [q] quit\n")
+	return b.String()
+}
+
+func (m *Model) renderProviderSetup() string {
+	var b strings.Builder
+	b.WriteString(m.theme.Style("header").Render(" ADD CLOUDFLARE ACCOUNT "))
+	b.WriteString("\n\n")
+
+	switch m.providerSetupStep {
+	case 1:
+		b.WriteString("Step 1/5: Account ID\n\n")
+		b.WriteString("Enter your Cloudflare account ID:\n")
+		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupID))
+	case 2:
+		b.WriteString("Step 2/5: Label\n\n")
+		b.WriteString("Enter a friendly label for this account:\n")
+		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupLabel))
+	case 3:
+		b.WriteString("Step 3/5: Zone ID\n\n")
+		b.WriteString("Enter your Cloudflare zone ID (optional, press enter to skip):\n")
+		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupZoneID))
+	case 4:
+		b.WriteString("Step 4/5: API Token\n\n")
+		b.WriteString("Enter your Cloudflare API token:\n")
+		// Mask the credential for security
+		maskedCred := ""
+		if len(m.providerSetupCred) > 0 {
+			maskedCred = "••••••••"
+		}
+		b.WriteString(fmt.Sprintf("> %s_\n", maskedCred))
+	case 5:
+		b.WriteString("Step 5/5: Confirm\n\n")
+		b.WriteString("Review your configuration:\n\n")
+		b.WriteString(fmt.Sprintf("  Account ID: %s\n", m.providerSetupID))
+		b.WriteString(fmt.Sprintf("  Label:      %s\n", m.providerSetupLabel))
+		if m.providerSetupZoneID != "" {
+			b.WriteString(fmt.Sprintf("  Zone ID:    %s\n", m.providerSetupZoneID))
+		}
+		b.WriteString("  API Token:  ••••••••\n\n")
+		b.WriteString("Press enter to confirm, or esc to go back and edit.\n")
+	}
+
+	if m.providerSetupError != "" {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("intervention").Render("Error: " + m.providerSetupError))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n[esc] back    [enter] continue\n")
 	return b.String()
 }
 
@@ -886,6 +1549,51 @@ func (m *Model) renderRepair() string {
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" REPAIR: %s ", conn.Name)))
 	b.WriteString("\n\n")
+	
+	// Show verification results if we have pre-repair diagnostics
+	if len(m.preRepairDiagnostics) > 0 && m.repairConnectionID == conn.ID {
+		b.WriteString(m.theme.Style("header").Render(" REPAIR VERIFICATION "))
+		b.WriteString("\n\n")
+		
+		preCount := len(m.preRepairDiagnostics)
+		postCount := len(m.diagnostics)
+		
+		if postCount == 0 {
+			b.WriteString(m.theme.Style("stable").Render("✓ All issues resolved!"))
+			b.WriteString("\n\n")
+			b.WriteString(fmt.Sprintf("Fixed %d issue(s):\n", preCount))
+			for _, d := range m.preRepairDiagnostics {
+				b.WriteString(fmt.Sprintf("  ✓ %s: %s\n", d.Segment, d.Summary))
+			}
+		} else if postCount < preCount {
+			b.WriteString(m.theme.Style("attention").Render("⚠ Partial repair"))
+			b.WriteString("\n\n")
+			b.WriteString(fmt.Sprintf("Fixed %d of %d issue(s)\n\n", preCount-postCount, preCount))
+			
+			b.WriteString("Remaining issues:\n")
+			for _, d := range m.diagnostics {
+				b.WriteString(fmt.Sprintf("  ✗ %s: %s\n", d.Segment, d.Summary))
+				if d.Explanation != "" {
+					b.WriteString("      " + d.Explanation + "\n")
+				}
+			}
+		} else {
+			b.WriteString(m.theme.Style("intervention").Render("✗ Repair did not resolve issues"))
+			b.WriteString("\n\n")
+			b.WriteString("Current issues:\n")
+			for _, d := range m.diagnostics {
+				b.WriteString(fmt.Sprintf("  ✗ %s: %s\n", d.Segment, d.Summary))
+				if d.Explanation != "" {
+					b.WriteString("      " + d.Explanation + "\n")
+				}
+			}
+		}
+		
+		b.WriteString("\n[r] run diagnostics again    [esc] back    [q] quit\n")
+		return b.String()
+	}
+	
+	// Normal diagnostic display
 	if m.diagnostics == nil {
 		b.WriteString("Running diagnostics...\n")
 	} else if len(m.diagnostics) == 0 {
@@ -934,23 +1642,64 @@ func (m *Model) renderDiscovery() string {
 }
 
 func (m *Model) renderHelp() string {
-	return `Portico — Connection Manager
-
-  n        New connection wizard
-  enter    Inspect selected connection
-  space    Open/close selected connection
-  r        Repair selected connection
-  a        Discover local services
-  d        Preview deletion of selected connection
-  p        Providers
-  up/k     Select previous
-  down/j   Select next
-  esc      Back
-  q        Quit
-  ?        Help
-
-[esc] back    [q] quit
-`
+	var b strings.Builder
+	b.WriteString(m.theme.Style("header").Render(" HELP "))
+	b.WriteString("\n\n")
+	
+	switch m.screen {
+	case ScreenHome:
+		b.WriteString("Home Screen:\n")
+		b.WriteString("  n        New connection wizard\n")
+		b.WriteString("  enter    Inspect selected connection\n")
+		b.WriteString("  space    Open/close selected connection\n")
+		b.WriteString("  r        Repair selected connection\n")
+		b.WriteString("  a        Discover local services\n")
+		b.WriteString("  d        Preview deletion of selected connection\n")
+		b.WriteString("  p        Providers\n")
+		b.WriteString("  up/k     Select previous\n")
+		b.WriteString("  down/j   Select next\n")
+	case ScreenInspect:
+		b.WriteString("Inspect Screen:\n")
+		b.WriteString("  ←/h      Previous tab\n")
+		b.WriteString("  →/l      Next tab\n")
+		b.WriteString("  esc      Back to home\n")
+	case ScreenPlanPreview:
+		b.WriteString("Plan Preview:\n")
+		b.WriteString("  enter    Apply plan\n")
+		b.WriteString("  esc      Cancel\n")
+	case ScreenOperationProgress:
+		b.WriteString("Operation Progress:\n")
+		b.WriteString("  esc      Back to home\n")
+	case ScreenRepair:
+		b.WriteString("Repair Screen:\n")
+		b.WriteString("  enter    Preview repair plan\n")
+		b.WriteString("  r        Re-run diagnostics\n")
+		b.WriteString("  esc      Back to home\n")
+	case ScreenDiscovery:
+		b.WriteString("Discovery Screen:\n")
+		b.WriteString("  up/k     Select previous service\n")
+		b.WriteString("  down/j   Select next service\n")
+		b.WriteString("  enter    Create connection from selected service\n")
+		b.WriteString("  esc      Back to home\n")
+	case ScreenProviders:
+		b.WriteString("Providers Screen:\n")
+		b.WriteString("  esc      Back to home\n")
+	case ScreenRecovery:
+		b.WriteString("Recovery Screen:\n")
+		b.WriteString("  r        Retry connection to supervisor\n")
+		b.WriteString("  q        Quit\n")
+	default:
+		b.WriteString("General:\n")
+	}
+	
+	b.WriteString("\nGlobal:\n")
+	b.WriteString("  esc      Back to home (from most screens)\n")
+	b.WriteString("  q        Quit (from home screen)\n")
+	b.WriteString("  ctrl+c   Force quit\n")
+	b.WriteString("  ?        This help screen\n")
+	
+	b.WriteString("\n[esc] back\n")
+	return b.String()
 }
 
 func (m *Model) renderEmergencyHome() string {
@@ -969,7 +1718,10 @@ func (m *Model) renderEmergencyHome() string {
 func renderHeader(width int, th Theme, useASCII bool) string {
 	header := " PORTICO "
 	if width > 40 {
-		padding := width - len(header) - 2
+		// Account for the prefix (2 chars) and suffix (2 chars) in the padding.
+		prefixLen := 2 // "┌─" or "+-"
+		suffixLen := 2 // "─┐" or "-+"
+		padding := width - len(header) - prefixLen - suffixLen
 		if padding < 0 {
 			padding = 0
 		}
@@ -985,7 +1737,7 @@ func renderHeader(width int, th Theme, useASCII bool) string {
 	return th.Style("header").Render("┌─" + header + "─┐")
 }
 
-func renderConnectionList(conns []ipc.ConnectionDTO, selected int, width int, th Theme, useASCII bool) string {
+func renderConnectionList(conns []ipc.ConnectionDTO, selectedID string, width int, th Theme, useASCII bool) string {
 	var b strings.Builder
 
 	if len(conns) == 0 {
@@ -994,10 +1746,10 @@ func renderConnectionList(conns []ipc.ConnectionDTO, selected int, width int, th
 		return b.String()
 	}
 
-	for i, c := range conns {
+	for _, c := range conns {
 		prefix := "  "
 		style := th.Style("normal")
-		if i == selected {
+		if c.ID == selectedID {
 			prefix = "▸ "
 			if useASCII {
 				prefix = "> "

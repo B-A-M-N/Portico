@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/B-A-M-N/portico/internal/core"
 	flareexec "github.com/B-A-M-N/portico/internal/exec"
 )
 
@@ -161,4 +162,12 @@ func (dc *DockerCompose) Healthy(ctx context.Context) error {
 		return fmt.Errorf("service state: %s", state)
 	}
 	return nil
+}
+
+func (dc *DockerCompose) Identity() (core.ProcessIdentity, bool) {
+	return core.ProcessIdentity{}, false
+}
+
+func (dc *DockerCompose) ProcessGroupID() int {
+	return 0
 }

@@ -95,6 +95,11 @@ type StepDTO struct {
 	Summary      string `json:"summary"`
 	Destructive  bool   `json:"destructive"`
 	Irreversible bool   `json:"irreversible"`
+	// Execution state (populated during operation execution)
+	State        string `json:"state,omitempty"` // pending, running, succeeded, failed, compensated, skipped
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // --------------- operations ---------------

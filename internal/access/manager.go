@@ -30,6 +30,7 @@ type Manager interface {
 	GetApp(ctx context.Context, accountID, appID string) (*AppState, error)
 	UpdatePolicy(ctx context.Context, accountID, appID, policyID string, policy Policy) error
 	DeleteApp(ctx context.Context, accountID, appID string) error
+	DeletePolicy(ctx context.Context, accountID, policyID string) error
 }
 
 // AppState represents the observed state of an Access application.
@@ -285,6 +286,15 @@ func (m *APIManager) DeleteApp(ctx context.Context, accountID, appID string) err
 	rc := cf.AccountIdentifier(accountID)
 	if err := m.client.DeleteAccessApplication(ctx, rc, appID); err != nil {
 		return fmt.Errorf("deleting Access application: %w", err)
+	}
+	return nil
+}
+
+// DeletePolicy removes an Access policy by its exact ID.
+func (m *APIManager) DeletePolicy(ctx context.Context, accountID, policyID string) error {
+	rc := cf.AccountIdentifier(accountID)
+	if err := m.client.DeleteAccessPolicy(ctx, rc, cf.DeleteAccessPolicyParams{PolicyID: policyID}); err != nil {
+		return fmt.Errorf("deleting Access policy: %w", err)
 	}
 	return nil
 }

@@ -732,3 +732,87 @@ func TestSavePlanRoundTrip(t *testing.T) {
 		t.Fatalf("Step[0].Technical.Type = %q, want %q", loaded.Steps[0].Technical.Type, "mock.create_tunnel")
 	}
 }
+
+func TestIdempotencyKey_LookupAndRecord(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Create a connection and operation so the foreign key is satisfied.
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	plan := &core.OperationPlan{
+		ID: "plan-idem-1", ConnectionID: profile.ID, ProfileRevision: 1,
+		Provider: profile.Provider.ProviderID, Intent: core.IntentOpen,
+		Steps: []core.PlanStep{{ID: "s1", Kind: core.StepCreateTunnel, Summary: "test"}},
+	}
+	_ = plan.ComputeFingerprint()
+	if err := s.SavePlan(ctx, plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+	opID1 := core.OperationID("op-idem-1")
+	if err := s.SaveOperation(ctx, opID1, plan.ID, profile.ID, "running", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("SaveOperation: %v", err)
+	}
+
+	// Lookup a non-existent key returns empty.
+	got, err := s.LookupIdempotentKey(ctx, "key-1")
+	if err != nil {
+		t.Fatalf("LookupIdempotentKey: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected empty for missing key, got %q", got)
+	}
+
+	// Record a key → operation mapping.
+	if err := s.RecordIdempotentKey(ctx, "key-1", opID1); err != nil {
+		t.Fatalf("RecordIdempotentKey: %v", err)
+	}
+
+	// Lookup returns the recorded operation.
+	got, err = s.LookupIdempotentKey(ctx, "key-1")
+	if err != nil {
+		t.Fatalf("LookupIdempotentKey after record: %v", err)
+	}
+	if got != opID1 {
+		t.Fatalf("got %q, want %q", got, opID1)
+	}
+
+	// Re-recording the same key with a different operation is a no-op (first-write-wins).
+	if err := s.RecordIdempotentKey(ctx, "key-1", opID1); err != nil {
+		t.Fatalf("RecordIdempotentKey duplicate: %v", err)
+	}
+	got, err = s.LookupIdempotentKey(ctx, "key-1")
+	if err != nil {
+		t.Fatalf("LookupIdempotentKey after duplicate: %v", err)
+	}
+	if got != opID1 {
+		t.Fatalf("after duplicate record: got %q, want %q (first-write-wins)", got, opID1)
+	}
+
+	// A second operation and a different key maps independently.
+	opID2 := core.OperationID("op-idem-2")
+	plan2 := &core.OperationPlan{
+		ID: "plan-idem-2", ConnectionID: profile.ID, ProfileRevision: 2,
+		Provider: profile.Provider.ProviderID, Intent: core.IntentClose,
+		Steps: []core.PlanStep{{ID: "s2", Kind: core.StepStopConnector, Summary: "test"}},
+	}
+	_ = plan2.ComputeFingerprint()
+	if err := s.SavePlan(ctx, plan2); err != nil {
+		t.Fatalf("SavePlan 2: %v", err)
+	}
+	if err := s.SaveOperation(ctx, opID2, plan2.ID, profile.ID, "running", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("SaveOperation 2: %v", err)
+	}
+	if err := s.RecordIdempotentKey(ctx, "key-2", opID2); err != nil {
+		t.Fatalf("RecordIdempotentKey key-2: %v", err)
+	}
+	got2, err := s.LookupIdempotentKey(ctx, "key-2")
+	if err != nil {
+		t.Fatalf("LookupIdempotentKey key-2: %v", err)
+	}
+	if got2 != opID2 {
+		t.Fatalf("key-2: got %q, want %q", got2, opID2)
+	}
+}

@@ -104,7 +104,7 @@ func TestBuiltinFileBrowser_DeletesOnlyPermittedFiles(t *testing.T) {
 	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 
 	// Delete with CSRF token (required)
-	token := browser.CSRFToken("/remove-me.txt")
+	token := browser.CSRFToken("/delete")
 	_, err = client.Post(endpoint+"/delete", "application/x-www-form-urlencoded",
 		strings.NewReader(url.Values{"path": {"/remove-me.txt"}, "_csrf": {token}}.Encode()))
 	if err != nil {

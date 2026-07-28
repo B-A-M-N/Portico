@@ -277,7 +277,22 @@ func (c *Client) StopSupervisor(ctx context.Context) error {
 
 // ApplyPlan applies a plan and returns the operation.
 func (c *Client) ApplyPlan(ctx context.Context, planID string) (*OperationDTO, error) {
-	resp, err := c.doRequest(ctx, "POST", "/v1/plans/"+planID+"/apply", nil)
+	return c.ApplyPlanWithIdempotency(ctx, planID, "")
+}
+
+// ApplyPlanWithIdempotency applies a plan with an optional idempotency key.
+// If the same key was used for a previous apply, the cached operation is returned.
+func (c *Client) ApplyPlanWithIdempotency(ctx context.Context, planID string, idempotencyKey string) (*OperationDTO, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://unix/v1/plans/"+planID+"/apply", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -487,6 +502,25 @@ func (es *EventStream) CloseWithContext() error {
 // Discovery performs service discovery.
 func (c *Client) Discovery(ctx context.Context) (*DiscoveryDTO, error) {
 	resp, err := c.doRequest(ctx, "GET", "/v1/discovery", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var result DiscoveryDTO
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// RefreshDiscovery forces a fresh service discovery scan.
+func (c *Client) RefreshDiscovery(ctx context.Context) (*DiscoveryDTO, error) {
+	resp, err := c.doRequest(ctx, "POST", "/v1/discovery", nil)
 	if err != nil {
 		return nil, err
 	}

@@ -3,22 +3,54 @@ package origin
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
-// LocalCommand launches a local command and exposes its HTTP port.
+// ErrIdentityPartial is returned when an adopted or owned process has only a
+// PID or other partially populated identity. Partial identities must never be
+// accepted for signaling or adoption.
+var ErrIdentityPartial = errors.New("origin: partial process identity")
+
+// LocalCommand launches a local command and exposes its HTTP port. The
+// started process is owned by the LocalCommand for its lifetime; the supplied
+// Start context is only used for startup cancellation. The process runs in a
+// dedicated process group so child listeners can be terminated atomically.
 type LocalCommand struct {
-	cfg   Config
-	cmd   *exec.Cmd
-	done  chan struct{}
-	logMu sync.Mutex
-	logs  []byte
+	cfg            Config
+	cmd            *exec.Cmd
+	done           chan struct{}
+	processGroupID int
+	identity       core.ProcessIdentity
+	logMu          sync.Mutex
+	logs           []byte
+}
+
+// configureProcessGroup sets SysProcAttr so the started process and any of
+// its descendants form a new process group whose leader is the direct child.
+func configureProcessGroup(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pgid = 0
+}
+
+// pidFromCmd returns the PID for an exec.Cmd (cross-platform-safe via Process).
+func pidFromCmd(cmd *exec.Cmd) int {
+	if cmd == nil || cmd.Process == nil {
+		return 0
+	}
+	return cmd.Process.Pid
 }
 
 const maxCommandLogBytes = 1 << 20
@@ -56,28 +88,37 @@ func (l *LocalCommand) Type() Type {
 	return TypeLocalCommand
 }
 
-// Start launches the command and waits until the port is ready.
+// Start launches the command and waits until the port is ready. The supplied
+// context is used only for startup cancellation and health polling; the
+// launched process is owned by the LocalCommand and is unaffected by the
+// caller's context cancellation once the start has succeeded.
+//
+// During startup, identity is not yet recorded so stopProcessGroupUnsafe
+// is used (which simply signals the known PID). After Start succeeds,
+// Stop uses full identity verification before signaling.
 func (l *LocalCommand) Start(ctx context.Context) (string, error) {
-	// Build the command.
+	// Build the command. Use exec.Command (NOT CommandContext) so the
+	// caller's context cannot terminate the process after Start returns.
 	var cmd *exec.Cmd
 	if l.cfg.Shell {
-		// Shell evaluation is opt-in only. It is never inferred from spaces in
-		// a command string because that would silently change user input into
-		// shell syntax.
-		cmd = exec.CommandContext(ctx, "sh", "-c", l.cfg.Command)
+		// When Shell is true, the full command line is in l.cfg.Command and
+		// l.cfg.Args must be empty.  This avoids the ambiguity of having two
+		// sources for the command text.
+		cmd = exec.Command("sh", "-c", l.cfg.Command)
 	} else {
-		cmd = exec.CommandContext(ctx, l.cfg.Command, l.cfg.Args...)
+		cmd = exec.Command(l.cfg.Command, l.cfg.Args...)
 	}
 
 	if l.cfg.Dir != "" {
 		cmd.Dir = l.cfg.Dir
 	}
 
-	// Set environment.
-	cmd.Env = os.Environ()
-	for k, v := range l.cfg.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Use the allowlisted environment built by the supervisor. Children
+	// must never inherit the supervisor's full environment.
+	cmd.Env = allowlistedEnv(l.cfg.Env)
+
+	// Run in a dedicated process group so stop can signal the entire group.
+	configureProcessGroup(cmd)
 
 	// Capture output.
 	pr, pw := io.Pipe()
@@ -93,6 +134,7 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("starting command: %w", err)
 	}
 	l.cmd = cmd
+	l.processGroupID = pidFromCmd(cmd)
 	l.done = make(chan struct{})
 
 	// Close write end when process exits.
@@ -125,6 +167,13 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode < 500 {
+				id, err := l.recordIdentity()
+				if err != nil {
+					// Identity is required for downstream signaling.
+					_ = l.stopProcessGroupUnsafe()
+					return "", fmt.Errorf("record identity: %w", err)
+				}
+				l.identity = id
 				return originURL, nil
 			}
 		}
@@ -142,30 +191,152 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 		}
 
 		if time.Now().After(deadline) {
-			l.Stop(ctx)
+			l.stopProcessGroupUnsafe()
 			return "", fmt.Errorf("command not ready on port %d after %s", l.cfg.Port, timeout)
 		}
 
 		select {
 		case <-ctx.Done():
-			l.Stop(ctx)
+			// Startup canceled before readiness: terminate the process group.
+			l.stopProcessGroupUnsafe()
 			return "", ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
 
-func (l *LocalCommand) Stop(_ context.Context) error {
-	if l.cmd != nil && l.cmd.Process != nil {
-		_ = l.cmd.Process.Signal(os.Interrupt)
-		select {
-		case <-l.done:
-		case <-time.After(10 * time.Second):
-			_ = l.cmd.Process.Kill()
-			<-l.done
-		}
+// Stop gracefully shuts down the origin by signaling the process group.
+// It honours ctx for the total bounded deadline.
+func (l *LocalCommand) Stop(ctx context.Context) error {
+	if l.cmd == nil || l.cmd.Process == nil {
+		return nil
 	}
-	return nil
+	// Already exited? Return immediately without spending five seconds.
+	select {
+	case <-l.done:
+		return nil
+	default:
+	}
+	return l.stopProcessGroup(ctx)
+}
+
+// stopProcessGroupUnsafe signals the known PID without identity verification.
+// This is used during startup when identity has not yet been recorded.
+// It is safe to signal the PID returned by exec.Cmd.Process because we just
+// started it and PID reuse within the milliseconds between Start() and
+// this call is effectively impossible. After identity is recorded, Stop()
+// uses full identity verification before signaling.
+func (l *LocalCommand) stopProcessGroupUnsafe() error {
+	if l.cmd == nil || l.cmd.Process == nil {
+		return nil
+	}
+	pid := pidFromCmd(l.cmd)
+	if pid <= 0 {
+		return nil
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	select {
+	case <-l.done:
+		return nil
+	case <-time.After(5 * time.Second):
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	_ = l.cmd.Process.Kill()
+	select {
+	case <-l.done:
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("cmd.Wait did not return within 5s after SIGKILL (pid %d)", pid)
+	}
+}
+
+// stopProcessGroup verifies the live process identity before signaling.
+// PID reuse cannot redirect the signal because /proc/[pid] stat is read
+// and compared against the stored identity (pid, start time, executable,
+// command hash, process group) before any signal is sent.
+func (l *LocalCommand) stopProcessGroup(ctx context.Context) error {
+	ident, ok := l.Identity()
+	if !ok || !ident.Complete() {
+		return fmt.Errorf("origin: cannot stop without complete process identity")
+	}
+	if err := verifyOriginIdentity(ident, l.processGroupID); err != nil {
+		return fmt.Errorf("origin identity mismatch, refusing to signal: %w", err)
+	}
+	pid := ident.PID
+	pgid := l.processGroupID
+	if pgid <= 0 {
+		return fmt.Errorf("origin: no valid process group ID recorded")
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(15 * time.Second)
+	}
+	termDeadline := deadline.Add(-2 * time.Second)
+	if time.Now().Before(termDeadline) {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	}
+
+	select {
+	case <-l.done:
+		return nil
+	case <-time.After(time.Until(termDeadline)):
+	}
+
+	// Escalate to SIGKILL on the group.
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	_ = l.cmd.Process.Kill()
+	select {
+	case <-l.done:
+		return nil
+	case <-time.After(time.Until(deadline)):
+		return fmt.Errorf("origin process %d did not exit within deadline", pid)
+	}
+}
+
+// Identity returns the recorded four-field process identity. The boolean is
+// false until successful readiness recording.
+func (l *LocalCommand) Identity() (core.ProcessIdentity, bool) {
+	if !l.identity.Complete() {
+		return core.ProcessIdentity{}, false
+	}
+	return l.identity, true
+}
+
+// ProcessGroupID returns the dedicated process group the origin runs in.
+func (l *LocalCommand) ProcessGroupID() int {
+	return l.processGroupID
+}
+
+// recordIdentity captures the four-field identity of the running process.
+// Partial identities are rejected as ErrIdentityPartial.
+func (l *LocalCommand) recordIdentity() (core.ProcessIdentity, error) {
+	if l.cmd == nil || l.cmd.Process == nil {
+		return core.ProcessIdentity{}, errors.New("command not started")
+	}
+	pid := pidFromCmd(l.cmd)
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return core.ProcessIdentity{}, fmt.Errorf("read exe: %w", err)
+	}
+	startTime, err := StartTimeOf(pid)
+	if err != nil {
+		return core.ProcessIdentity{}, fmt.Errorf("read start time: %w", err)
+	}
+	cmdHash, err := readCommandHash(pid)
+	if err != nil {
+		return core.ProcessIdentity{}, fmt.Errorf("read command hash: %w", err)
+	}
+	id := core.ProcessIdentity{
+		PID:            pid,
+		StartTime:      startTime,
+		ExecutablePath: exe,
+		CommandHash:    cmdHash,
+	}
+	if !id.Complete() {
+		return core.ProcessIdentity{}, ErrIdentityPartial
+	}
+	return id, nil
 }
 
 func (l *LocalCommand) Logs() io.ReadCloser {

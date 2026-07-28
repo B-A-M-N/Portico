@@ -109,6 +109,14 @@ func (f *fakeClient) Discovery(ctx context.Context) (*ipc.DiscoveryDTO, error) {
 	return &ipc.DiscoveryDTO{}, nil
 }
 
+func (f *fakeClient) RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, error) {
+	return &ipc.DiscoveryDTO{}, nil
+}
+
+func (f *fakeClient) ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
+	return &ipc.ConfigureProviderAccountResponse{RestartRequired: false}, nil
+}
+
 // --------------- helpers ---------------
 
 func keyMsg(key string) tea.KeyPressMsg {
@@ -344,7 +352,7 @@ func TestEmergencyHomeLayoutIsReadable(t *testing.T) {
 }
 
 func TestASCIIConnectionListUsesASCIIGlyphs(t *testing.T) {
-	got := renderConnectionList([]ipc.ConnectionDTO{{Name: "example", UserState: "Open"}}, 0, 80, MonochromeTheme, true)
+	got := renderConnectionList([]ipc.ConnectionDTO{{ID: "c1", Name: "example", UserState: "Open"}}, "c1", 80, MonochromeTheme, true)
 	if !strings.Contains(got, "> * example") {
 		t.Fatalf("ASCII list did not use fallback glyphs: %q", got)
 	}
@@ -434,11 +442,12 @@ func TestWizardCreateFlowIsAsync(t *testing.T) {
 	m, _ = press(t, m, "n")
 
 	// Walk the wizard: intent (existing service), name, address, port,
-	// exposure (temporary), protection (none), provider (cloudflare).
+	// protocol (http), exposure (temporary), protection (none), provider (cloudflare).
 	steps := []string{"enter"}                         // intent: existing service
 	steps = append(steps, "d", "e", "m", "o", "enter") // name: "demo"
 	steps = append(steps, "enter")                     // address: empty (port next)
 	steps = append(steps, "8", "0", "8", "0", "enter") // port: 8080
+	steps = append(steps, "enter")                     // protocol: http (default)
 	steps = append(steps, "enter")                     // exposure: temporary_public
 	steps = append(steps, "enter")                     // protection: none
 	steps = append(steps, "enter")                     // provider: cloudflare
@@ -488,5 +497,218 @@ func TestWizardCreateFlowIsAsync(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("expected snapshot refresh command on return home")
+	}
+}
+
+// --------------- Phase 1 correctness tests ---------------
+
+func TestSnapshotSetsEventCursorAndConnectsSSE(t *testing.T) {
+	m := newModel(&fakeClient{})
+	snap := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{{ID: "c1", Name: "web"}},
+		LastSeq:     42,
+	}
+	next, cmd := m.Update(snapshotMsg{Snapshot: snap})
+	m = next.(Model)
+
+	if m.lastEventSeq != 42 {
+		t.Fatalf("lastEventSeq = %d, want 42", m.lastEventSeq)
+	}
+	if !m.streamConnected {
+		t.Fatal("streamConnected should be true after first snapshot")
+	}
+	if cmd == nil {
+		t.Fatal("expected SSE connect command after first snapshot")
+	}
+}
+
+func TestSnapshotDoesNotReconnectSSEOnRefresh(t *testing.T) {
+	m := newModel(&fakeClient{})
+	snap := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{{ID: "c1", Name: "web"}},
+		LastSeq:     10,
+	}
+	next, _ := m.Update(snapshotMsg{Snapshot: snap})
+	m = next.(Model)
+
+	snap.LastSeq = 20
+	next, cmd := m.Update(snapshotMsg{Snapshot: snap})
+	m = next.(Model)
+
+	if m.lastEventSeq != 20 {
+		t.Fatalf("lastEventSeq = %d, want 20", m.lastEventSeq)
+	}
+	if cmd != nil {
+		t.Fatal("refresh snapshot should not trigger SSE reconnect")
+	}
+}
+
+func TestResyncClosesStreamAndRequestsSnapshot(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.lastEventSeq = 10
+	m.streamConnected = true
+
+	evt := ipc.EventDTO{Type: "resync_required", Sequence: 0}
+	next, cmd := m.Update(eventMsg{Event: evt})
+	m = next.(Model)
+
+	if m.streamConnected {
+		t.Fatal("streamConnected should be false after resync")
+	}
+	if cmd == nil {
+		t.Fatal("expected snapshot request command after resync")
+	}
+}
+
+func TestEventDeduplicationBySequence(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.lastEventSeq = 10
+
+	evt := ipc.EventDTO{
+		Type:     "operation.step",
+		Sequence: 5,
+		Data:     map[string]interface{}{"summary": "old event"},
+	}
+	next, _ := m.Update(eventMsg{Event: evt})
+	m = next.(Model)
+
+	if len(m.opEvents) != 0 {
+		t.Fatalf("duplicate event was not filtered, opEvents = %v", m.opEvents)
+	}
+}
+
+func TestOperationEventsFilteredByID(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.operation = &ipc.OperationDTO{ID: "op-1"}
+
+	evt := ipc.EventDTO{
+		Type:        "operation.step",
+		Sequence:    11,
+		OperationID: "op-other",
+		Data:        map[string]interface{}{"summary": "other op step"},
+	}
+	next, _ := m.Update(eventMsg{Event: evt})
+	m = next.(Model)
+
+	if len(m.opEvents) != 0 {
+		t.Fatalf("unrelated operation event entered opEvents: %v", m.opEvents)
+	}
+
+	evt2 := ipc.EventDTO{
+		Type:        "operation.step",
+		Sequence:    12,
+		OperationID: "op-1",
+		Data:        map[string]interface{}{"summary": "our op step"},
+	}
+	next, _ = m.Update(eventMsg{Event: evt2})
+	m = next.(Model)
+
+	if len(m.opEvents) != 1 || m.opEvents[0] != "our op step" {
+		t.Fatalf("expected matching operation event in opEvents, got %v", m.opEvents)
+	}
+}
+
+func TestUpDownOnlyAffectsHomeScreen(t *testing.T) {
+	snap := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{
+			{ID: "c1", Name: "alpha"},
+			{ID: "c2", Name: "beta"},
+			{ID: "c3", Name: "gamma"},
+		},
+	}
+	m := readyModel(&fakeClient{}, snap)
+	if m.selectedID != "c1" {
+		t.Fatalf("initial selectedID = %q, want c1", m.selectedID)
+	}
+
+	m, _ = press(t, m, "down")
+	if m.selectedID != "c2" {
+		t.Fatalf("after down on Home, selectedID = %q, want c2", m.selectedID)
+	}
+
+	m.screen = ScreenInspect
+	m, _ = press(t, m, "down")
+	if m.selectedID != "c2" {
+		t.Fatalf("down on Inspect changed selectedID to %q, want c2", m.selectedID)
+	}
+	m, _ = press(t, m, "up")
+	if m.selectedID != "c2" {
+		t.Fatalf("up on Inspect changed selectedID to %q, want c2", m.selectedID)
+	}
+
+	m.screen = ScreenPlanPreview
+	m, _ = press(t, m, "down")
+	if m.selectedID != "c2" {
+		t.Fatalf("down on PlanPreview changed selectedID to %q, want c2", m.selectedID)
+	}
+
+	m.screen = ScreenRepair
+	m, _ = press(t, m, "up")
+	if m.selectedID != "c2" {
+		t.Fatalf("up on Repair changed selectedID to %q, want c2", m.selectedID)
+	}
+}
+
+func TestSelectionPreservedByIDAcrossSnapshots(t *testing.T) {
+	snap := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{
+			{ID: "c1", Name: "alpha"},
+			{ID: "c2", Name: "beta"},
+			{ID: "c3", Name: "gamma"},
+		},
+		LastSeq: 1,
+	}
+	m := readyModel(&fakeClient{}, snap)
+	m.selectedID = "c2"
+
+	reordered := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{
+			{ID: "c3", Name: "gamma"},
+			{ID: "c1", Name: "alpha"},
+			{ID: "c2", Name: "beta"},
+		},
+		LastSeq: 2,
+	}
+	next, _ := m.Update(snapshotMsg{Snapshot: reordered})
+	m = next.(Model)
+
+	if m.selectedID != "c2" {
+		t.Fatalf("selection after reorder = %q, want c2", m.selectedID)
+	}
+}
+
+func TestSelectionFallsBackWhenConnectionDeleted(t *testing.T) {
+	snap := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{
+			{ID: "c1", Name: "alpha"},
+			{ID: "c2", Name: "beta"},
+		},
+		LastSeq: 1,
+	}
+	m := readyModel(&fakeClient{}, snap)
+	m.selectedID = "c2"
+
+	updated := ipc.SnapshotDTO{
+		Connections: []ipc.ConnectionDTO{
+			{ID: "c1", Name: "alpha"},
+		},
+		LastSeq: 2,
+	}
+	next, _ := m.Update(snapshotMsg{Snapshot: updated})
+	m = next.(Model)
+
+	if m.selectedID != "c1" {
+		t.Fatalf("selection after deletion = %q, want c1 (fallback)", m.selectedID)
+	}
+}
+
+func TestInitOnlyRequestsSnapshot(t *testing.T) {
+	m := newModel(&fakeClient{})
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init returned nil command")
+	}
+	if m.streamConnected {
+		t.Fatal("streamConnected should be false before first snapshot")
 	}
 }

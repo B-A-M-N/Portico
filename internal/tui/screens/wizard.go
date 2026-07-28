@@ -17,6 +17,9 @@ import (
 // The root model passes its client through; tests can pass a fake.
 type ConnectionCreator interface {
 	CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error)
+	PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error)
+	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
+	GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error)
 }
 
 // ConnectionCreatedMsg is delivered when the async create command finishes.
@@ -24,6 +27,24 @@ type ConnectionCreatedMsg struct {
 	ID         string
 	Connection *ipc.ConnectionDTO
 	Err        error
+}
+
+// WizardPlanLoadedMsg is delivered when the wizard's open plan request completes.
+type WizardPlanLoadedMsg struct {
+	Plan *ipc.PlanDTO
+	Err  error
+}
+
+// WizardPlanAppliedMsg is delivered when the wizard's apply command completes.
+type WizardPlanAppliedMsg struct {
+	Operation *ipc.OperationDTO
+	Err       error
+}
+
+// WizardOperationLoadedMsg is delivered when the wizard polls operation status.
+type WizardOperationLoadedMsg struct {
+	Operation *ipc.OperationDTO
+	Err       error
 }
 
 // WizardModel is the wizard for creating new connections.
@@ -35,6 +56,12 @@ type WizardModel struct {
 	err            error
 	fullCloudflare bool
 	accounts       []ipc.ProviderAccountDTO
+
+	// Post-creation flow state
+	createdID    string
+	plan         *ipc.PlanDTO
+	operation    *ipc.OperationDTO
+	openAfterCreate bool // true if user chose "Review and open"
 }
 
 // WizardState holds the state for the new connection wizard.
@@ -69,6 +96,7 @@ const (
 	WizardStepMCPMode
 	WizardStepSource
 	WizardStepPort
+	WizardStepProtocol
 	WizardStepCommandArgs
 	WizardStepCommandWorkingDir
 	WizardStepDirectoryMode
@@ -82,6 +110,10 @@ const (
 	WizardStepAccount
 	WizardStepReview
 	WizardStepCreating
+	WizardStepCreated         // Profile created, ask user what to do next
+	WizardStepPlanPreview     // Show the open plan for approval
+	WizardStepApplying        // Plan is being applied
+	WizardStepOperationWait   // Waiting for operation to complete
 	WizardStepComplete
 )
 
@@ -254,7 +286,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.input = m.state.Port
 			} else if m.state.SourceType == "directory" {
 				m.state.Step = WizardStepDirectoryMode
-				m.selected = directoryModeIndex(m.state)
+				m.selected = m.directoryModeIndex()
 			} else if m.state.SourceType == "mcp_server" {
 				m.state.Step = WizardStepMCPTransport
 				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
@@ -299,12 +331,35 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			if m.isCommandOrigin() {
 				m.state.Step = WizardStepCommandArgs
 				m.input = commandArgsInput(m.state.CommandArgs)
+			} else if m.state.SourceType == "existing_service" {
+				m.state.Step = WizardStepProtocol
+				m.selected = 0 // default to HTTP
 			} else {
 				m.state.Step = WizardStepExposure
 				m.selected = 0
 			}
 		default:
 			m.input = editInput(m.input, key)
+		}
+
+	case WizardStepProtocol:
+		protocols := []string{"http", "https"}
+		switch key {
+		case "esc":
+			m.state.Step = WizardStepPort
+			m.input = m.state.Port
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < len(protocols)-1 {
+				m.selected++
+			}
+		case "enter":
+			m.state.SourceProtocol = protocols[m.selected]
+			m.state.Step = WizardStepExposure
+			m.selected = 0
 		}
 
 	case WizardStepCommandArgs:
@@ -346,17 +401,18 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		}
 
 	case WizardStepDirectoryMode:
+		choices := m.directoryModeChoices()
 		switch key {
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(wizardDirectoryModes)-1 {
+			if m.selected < len(choices)-1 {
 				m.selected++
 			}
 		case "enter":
-			choice := wizardDirectoryModes[m.selected]
+			choice := choices[m.selected]
 			m.state.DirectoryMode = choice.mode
 			m.state.AllowUpload = choice.allowUpload
 			m.state.AllowDelete = choice.allowDelete
@@ -389,7 +445,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.selected = 0
 		case "esc":
 			m.state.Step = WizardStepDirectoryMode
-			m.selected = directoryModeIndex(m.state)
+			m.selected = m.directoryModeIndex()
 		}
 
 	case WizardStepMCPTransport:
@@ -441,7 +497,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 					m.selected = boolIndex(m.state.DirectorySPA)
 				} else {
 					m.state.Step = WizardStepDirectoryMode
-					m.selected = directoryModeIndex(m.state)
+					m.selected = m.directoryModeIndex()
 				}
 			} else if m.state.SourceType == "mcp_server" {
 				m.state.Step = WizardStepMCPTransport
@@ -580,11 +636,45 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepReview:
 		switch key {
 		case "enter":
+			// Two outcomes: save closed (default) or open (next step)
+			m.openAfterCreate = (m.selected == 1)
 			m.state.Step = WizardStepCreating
 			return createConnectionCmd(m.client, m.buildRequest())
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < 1 {
+				m.selected++
+			}
 		case "esc":
 			m.state.Step = WizardStepProvider
 			m.selected = 0
+		}
+
+	case WizardStepPlanPreview:
+		switch key {
+		case "enter":
+			// Apply the plan
+			if m.plan != nil {
+				m.state.Step = WizardStepApplying
+				return m.applyPlanCmd()
+			}
+		case "esc":
+			// Cancel — go to complete (connection is saved closed)
+			m.state.Step = WizardStepComplete
+		}
+
+	case WizardStepApplying:
+		// No input while applying — wait for the operation to start
+		return nil
+
+	case WizardStepOperationWait:
+		switch key {
+		case "esc":
+			// User can bail out of waiting — connection may still be opening
+			m.state.Step = WizardStepComplete
 		}
 	}
 
@@ -592,14 +682,78 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 }
 
 // HandleCreated applies the result of the async create command.
-func (m *WizardModel) HandleCreated(msg ConnectionCreatedMsg) {
+func (m *WizardModel) HandleCreated(msg ConnectionCreatedMsg) tea.Cmd {
 	if msg.Err != nil {
 		m.err = msg.Err
 		m.state.Step = WizardStepReview
-		return
+		return nil
 	}
 	m.err = nil
+	m.createdID = msg.ID
+
+	if m.openAfterCreate {
+		// Transition to plan preview — request the open plan asynchronously.
+		m.state.Step = WizardStepPlanPreview
+		return m.requestPlanCmd()
+	}
+
+	// Save closed — go directly to complete.
 	m.state.Step = WizardStepComplete
+	return nil
+}
+
+// HandlePlanLoaded applies the result of the plan request.
+func (m *WizardModel) HandlePlanLoaded(msg WizardPlanLoadedMsg) tea.Cmd {
+	if msg.Err != nil {
+		m.err = msg.Err
+		m.state.Step = WizardStepComplete
+		return nil
+	}
+	m.plan = msg.Plan
+	m.err = nil
+	if msg.Plan != nil && msg.Plan.Noop {
+		// Already open — skip apply
+		m.state.Step = WizardStepComplete
+		return nil
+	}
+	// Stay on plan preview — user must approve
+	return nil
+}
+
+// HandlePlanApplied applies the result of the apply command.
+func (m *WizardModel) HandlePlanApplied(msg WizardPlanAppliedMsg) tea.Cmd {
+	if msg.Err != nil {
+		m.err = msg.Err
+		m.state.Step = WizardStepComplete
+		return nil
+	}
+	m.operation = msg.Operation
+	m.err = nil
+	m.state.Step = WizardStepOperationWait
+	// Start polling the operation
+	return m.pollOperationCmd()
+}
+
+// HandleOperationLoaded applies the result of the operation poll.
+func (m *WizardModel) HandleOperationLoaded(msg WizardOperationLoadedMsg) tea.Cmd {
+	if msg.Err != nil {
+		m.err = msg.Err
+		m.state.Step = WizardStepComplete
+		return nil
+	}
+	m.operation = msg.Operation
+
+	// Check if the operation reached a terminal state
+	if msg.Operation != nil {
+		switch msg.Operation.State {
+		case "succeeded", "failed", "cancelled":
+			m.state.Step = WizardStepComplete
+			return nil
+		}
+	}
+
+	// Still running — schedule another poll
+	return m.pollOperationCmd()
 }
 
 // buildRequest assembles the create request from the wizard state.
@@ -672,6 +826,10 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 			ProviderID: s.Provider,
 			AccountID:  s.AccountID,
 		},
+		Lifecycle: ipc.LifecycleDTO{
+			AutoStart:    true,
+			OnDisconnect: "keep_alive",
+		},
 	}
 }
 
@@ -717,6 +875,66 @@ func createConnectionCmd(client ConnectionCreator, req ipc.CreateConnectionReque
 	}
 }
 
+// requestPlanCmd returns a command that requests an open plan for the created connection.
+func (m *WizardModel) requestPlanCmd() tea.Cmd {
+	client := m.client
+	connID := m.createdID
+	return func() tea.Msg {
+		if client == nil {
+			return WizardPlanLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		plan, err := client.PlanOpen(context.Background(), connID)
+		if err != nil {
+			return WizardPlanLoadedMsg{Err: err}
+		}
+		return WizardPlanLoadedMsg{Plan: plan}
+	}
+}
+
+// applyPlanCmd returns a command that applies the current plan.
+func (m *WizardModel) applyPlanCmd() tea.Cmd {
+	client := m.client
+	planID := ""
+	if m.plan != nil {
+		planID = m.plan.ID
+	}
+	return func() tea.Msg {
+		if client == nil {
+			return WizardPlanAppliedMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		if planID == "" {
+			return WizardPlanAppliedMsg{Err: fmt.Errorf("no plan to apply")}
+		}
+		op, err := client.ApplyPlan(context.Background(), planID)
+		if err != nil {
+			return WizardPlanAppliedMsg{Err: err}
+		}
+		return WizardPlanAppliedMsg{Operation: op}
+	}
+}
+
+// pollOperationCmd returns a command that polls the current operation status.
+func (m *WizardModel) pollOperationCmd() tea.Cmd {
+	client := m.client
+	opID := ""
+	if m.operation != nil {
+		opID = m.operation.ID
+	}
+	return func() tea.Msg {
+		if client == nil {
+			return WizardOperationLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		if opID == "" {
+			return WizardOperationLoadedMsg{Err: fmt.Errorf("no operation to poll")}
+		}
+		op, err := client.GetOperation(context.Background(), opID)
+		if err != nil {
+			return WizardOperationLoadedMsg{Err: err}
+		}
+		return WizardOperationLoadedMsg{Operation: op}
+	}
+}
+
 // editInput applies a single key press to a text input value.
 func editInput(value, key string) string {
 	switch key {
@@ -751,6 +969,8 @@ func (m *WizardModel) View() string {
 			return m.withError(renderInput("Local port for the command (required):", m.input))
 		}
 		return m.withError(renderInput("Local port (empty to skip):", m.input))
+	case WizardStepProtocol:
+		return m.renderProtocol()
 	case WizardStepCommandArgs:
 		return m.withError(renderInput("Command arguments (comma-separated; empty to skip):", m.input))
 	case WizardStepCommandWorkingDir:
@@ -777,8 +997,14 @@ func (m *WizardModel) View() string {
 		return m.renderReview()
 	case WizardStepCreating:
 		return "Creating connection..."
+	case WizardStepPlanPreview:
+		return m.renderPlanPreview()
+	case WizardStepApplying:
+		return "Applying plan..."
+	case WizardStepOperationWait:
+		return m.renderOperationWait()
 	case WizardStepComplete:
-		return "Connection created!\n\nEnter Return home"
+		return m.renderComplete()
 	}
 	return ""
 }
@@ -816,6 +1042,11 @@ func (m *WizardModel) renderIntent() string {
 	return renderMenu("What should be reachable?", options, m.selected)
 }
 
+func (m *WizardModel) renderProtocol() string {
+	options := []string{"HTTP", "HTTPS"}
+	return renderMenu("What protocol does your service use?", options, m.selected)
+}
+
 func (m *WizardModel) renderExposure() string {
 	options := make([]string, 0, len(m.exposures()))
 	for _, exposure := range m.exposures() {
@@ -845,11 +1076,27 @@ func (m *WizardModel) renderProvider() string {
 }
 
 func (m *WizardModel) renderDirectoryMode() string {
-	options := make([]string, 0, len(wizardDirectoryModes))
-	for _, choice := range wizardDirectoryModes {
+	options := make([]string, 0, len(m.directoryModeChoices()))
+	for _, choice := range m.directoryModeChoices() {
 		options = append(options, choice.label)
 	}
 	return renderMenu("How should Portico serve this directory?", options, m.selected)
+}
+
+// directoryModeChoices returns the directory mode options filtered by
+// provider capabilities. Without a configured Cloudflare account (Quick
+// Tunnel only), write-enabled modes are not viable because core validation
+// rejects uploads/deletes without protection, and protection requires a
+// permanent hostname.
+func (m *WizardModel) directoryModeChoices() []directoryModeChoice {
+	if !m.fullCloudflare {
+		// Quick Tunnel only — offer read-only modes.
+		return []directoryModeChoice{
+			{mode: "read", label: "Read-only static site"},
+			{mode: "writes", label: "File browser (read only)"},
+		}
+	}
+	return wizardDirectoryModes
 }
 
 func (m *WizardModel) renderMCPTransport() string {
@@ -928,16 +1175,108 @@ func (m *WizardModel) renderReview() string {
 	lines = append(lines,
 		fmt.Sprintf("Protection: %s", m.state.Protection),
 		fmt.Sprintf("Provider:   %s", m.state.Provider),
+		fmt.Sprintf("Lifecycle:  auto-start=%v, on-disconnect=%s", true, "keep_alive"),
 		"",
-		"Portico will:",
-		"  1. Create connection",
-		"  2. Start connector",
-		"  3. Verify endpoint",
+		"What should Portico do?",
 	)
+
+	// Two explicit outcomes
+	options := []string{
+		"Save connection (closed — you can open it later)",
+		"Save and open connection (review plan first)",
+	}
+	lines = append(lines, renderMenu("", options, m.selected))
+
 	if m.err != nil {
 		lines = append(lines, "", "Error: "+m.err.Error())
 	}
-	lines = append(lines, "", "Enter Create  Esc Back")
+	lines = append(lines, "", "Enter Confirm  Esc Back")
+	return strings.Join(lines, "\n")
+}
+
+func (m *WizardModel) renderPlanPreview() string {
+	lines := []string{"OPEN CONNECTION PLAN", ""}
+
+	if m.plan == nil {
+		lines = append(lines, "Loading plan...")
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines, fmt.Sprintf("Intent: %s", m.plan.Intent))
+	lines = append(lines, fmt.Sprintf("Provider: %s", m.plan.Provider))
+	lines = append(lines, "")
+	lines = append(lines, "Steps:")
+	for i, step := range m.plan.Steps {
+		prefix := "  "
+		if step.Destructive {
+			prefix = "  [DESTRUCTIVE] "
+		}
+		lines = append(lines, fmt.Sprintf("%s%d. %s", prefix, i+1, step.Summary))
+	}
+
+	if len(m.plan.Warnings) > 0 {
+		lines = append(lines, "", "Warnings:")
+		for _, w := range m.plan.Warnings {
+			lines = append(lines, "  - "+w)
+		}
+	}
+
+	if m.err != nil {
+		lines = append(lines, "", "Error: "+m.err.Error())
+	}
+	lines = append(lines, "", "Enter Apply plan  Esc Cancel")
+	return strings.Join(lines, "\n")
+}
+
+func (m *WizardModel) renderOperationWait() string {
+	lines := []string{"OPENING CONNECTION", ""}
+
+	if m.operation == nil {
+		lines = append(lines, "Waiting for operation to start...")
+		return strings.Join(lines, "\n")
+	}
+
+	lines = append(lines, fmt.Sprintf("State: %s", m.operation.State))
+
+	if len(m.operation.Steps) > 0 {
+		lines = append(lines, "", "Progress:")
+		for _, step := range m.operation.Steps {
+			lines = append(lines, "  - "+step.Summary)
+		}
+	}
+
+	if m.err != nil {
+		lines = append(lines, "", "Error: "+m.err.Error())
+	}
+	lines = append(lines, "", "Esc Return to home (connection may still be opening)")
+	return strings.Join(lines, "\n")
+}
+
+func (m *WizardModel) renderComplete() string {
+	lines := []string{"CONNECTION CREATED", ""}
+
+	if m.openAfterCreate && m.operation != nil {
+		switch m.operation.State {
+		case "succeeded":
+			lines = append(lines, "Connection opened successfully!")
+		case "failed":
+			lines = append(lines, "Connection created but opening failed.")
+			if m.err != nil {
+				lines = append(lines, "", "Error: "+m.err.Error())
+			}
+		case "cancelled":
+			lines = append(lines, "Connection created but opening was cancelled.")
+		default:
+			lines = append(lines, "Connection created. Opening is still in progress.")
+		}
+	} else if m.openAfterCreate && m.plan != nil && m.plan.Noop {
+		lines = append(lines, "Connection was already open.")
+	} else {
+		lines = append(lines, "Connection saved (closed).")
+		lines = append(lines, "Use Space on the home screen to open it when ready.")
+	}
+
+	lines = append(lines, "", "Enter Return home")
 	return strings.Join(lines, "\n")
 }
 
@@ -992,9 +1331,9 @@ func commandArgsInput(args []string) string {
 	return strings.Join(args, ", ")
 }
 
-func directoryModeIndex(state WizardState) int {
-	for i, choice := range wizardDirectoryModes {
-		if choice.mode == state.DirectoryMode && choice.allowUpload == state.AllowUpload && choice.allowDelete == state.AllowDelete {
+func (m *WizardModel) directoryModeIndex() int {
+	for i, choice := range m.directoryModeChoices() {
+		if choice.mode == m.state.DirectoryMode && choice.allowUpload == m.state.AllowUpload && choice.allowDelete == m.state.AllowDelete {
 			return i
 		}
 	}

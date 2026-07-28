@@ -19,11 +19,58 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	"golang.org/x/sys/unix"
 )
 
-// safePath resolves a relative path against root and ensures it stays within root.
-// It resolves symlinks component-by-component where possible to prevent symlink
-// and rename races that would allow escaping the root directory.
+// safePath resolves a relative path against root using fd-relative operations.
+// It uses openat() with the root file descriptor to prevent symlink retarget attacks.
+// The rootFd must be opened with O_PATH and kept open for the lifetime of the browser.
+func (fb *BuiltinFileBrowser) safePath(rel string) (string, error) {
+	// Strip leading slash to make it relative
+	rel = strings.TrimPrefix(rel, "/")
+	
+	// Clean the relative path
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return fb.canonicalRoot, nil
+	}
+
+	// Reject absolute paths (after stripping leading slash, should not have another)
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("absolute path not allowed")
+	}
+
+	// Reject path traversal attempts
+	if strings.HasPrefix(rel, "..") || strings.Contains(rel, "/..") {
+		return "", fmt.Errorf("path traversal rejected")
+	}
+
+	// Use openat to open the path relative to rootFd
+	// O_PATH allows us to get a fd without actually opening the file for I/O
+	fd, err := unix.Openat(fb.rootFd, rel, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", fmt.Errorf("opening path: %w", err)
+	}
+	defer unix.Close(fd)
+
+	// Get the actual path via /proc/self/fd/N
+	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	resolvedPath, err := os.Readlink(procPath)
+	if err != nil {
+		return "", fmt.Errorf("reading fd link: %w", err)
+	}
+
+	// Verify the resolved path is still within the canonical root
+	if !strings.HasPrefix(resolvedPath, fb.canonicalRoot+string(filepath.Separator)) && resolvedPath != fb.canonicalRoot {
+		return "", fmt.Errorf("path outside root")
+	}
+
+	return resolvedPath, nil
+}
+
+// safePathLegacy resolves a relative path against root using path-based resolution.
+// This is used by BuiltinStatic which has simpler security requirements.
+// For write operations, use the fd-relative safePath method on BuiltinFileBrowser.
 func safePath(root, rel string) (string, error) {
 	// Clean the root path
 	cleanRoot, err := filepath.Abs(filepath.Clean(root))
@@ -95,13 +142,14 @@ type BuiltinFileBrowser struct {
 	server        *http.Server
 	listener      net.Listener
 	canonicalRoot string // pinned canonical root at construction time
+	rootFd        int    // file descriptor for root directory (O_PATH)
 	serveDone     chan struct{}
 	csrfKey       [32]byte // random key for HMAC-based CSRF tokens
 }
 
 // NewBuiltinFileBrowser creates a file browser origin. The configured root is
-// canonicalised (symlinks followed) once at construction so the served root
-// cannot be redirected by a later symlink retarget.
+// canonicalised (symlinks followed) once at construction and pinned via a file
+// descriptor so the served root cannot be redirected by a later symlink retarget.
 func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("--path is required for builtin:file-browser origin")
@@ -124,13 +172,21 @@ func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 		return nil, fmt.Errorf("%s is not a directory", absPath)
 	}
 
+	// Open root directory with O_PATH to pin it. All subsequent operations
+	// will be relative to this fd, preventing symlink retarget attacks.
+	rootFd, err := unix.Open(absPath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening root fd: %w", err)
+	}
+
 	cfg.Path = absPath
 	var csrfKey [32]byte
 	if _, err := rand.Read(csrfKey[:]); err != nil {
+		unix.Close(rootFd)
 		return nil, fmt.Errorf("generating CSRF token key: %w", err)
 	}
 
-	return &BuiltinFileBrowser{cfg: cfg, canonicalRoot: absPath, csrfKey: csrfKey}, nil
+	return &BuiltinFileBrowser{cfg: cfg, canonicalRoot: absPath, rootFd: rootFd, csrfKey: csrfKey}, nil
 }
 
 // Root returns the pinned canonical root path.
@@ -160,7 +216,7 @@ func (fb *BuiltinFileBrowser) Start(_ context.Context) (string, error) {
 		mux.HandleFunc("/download/", fb.handleDownload)
 	}
 	if fb.cfg.AllowUpload && !fb.cfg.ReadOnly {
-		mux.HandleFunc("/upload", fb.handleUpload)
+		mux.HandleFunc("/upload", fb.requireCSRF(fb.handleUpload))
 	}
 	if fb.cfg.AllowDelete && !fb.cfg.ReadOnly {
 		mux.HandleFunc("/delete", fb.requireCSRF(fb.handleDelete))
@@ -192,7 +248,13 @@ func (fb *BuiltinFileBrowser) Stop(ctx context.Context) error {
 	if fb.server != nil {
 		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		return fb.server.Shutdown(shutdownCtx)
+		err := fb.server.Shutdown(shutdownCtx)
+		// Close the root file descriptor to release the pinned directory
+		if fb.rootFd >= 0 {
+			unix.Close(fb.rootFd)
+			fb.rootFd = -1
+		}
+		return err
 	}
 	return nil
 }
@@ -222,10 +284,21 @@ func (fb *BuiltinFileBrowser) CSRFToken(path string) string {
 
 // requireCSRF checks that the request includes a valid CSRF token
 // in the X-CSRF-Token header or in the form value _csrf.
+// The token is validated against the server-side HMAC key using the
+// request path as the message, ensuring tokens are scope-bound.
 func (fb *BuiltinFileBrowser) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-CSRF-Token") == "" && r.FormValue("_csrf") == "" {
+		token := r.Header.Get("X-CSRF-Token")
+		if token == "" {
+			token = r.FormValue("_csrf")
+		}
+		if token == "" {
 			http.Error(w, "CSRF token required", http.StatusForbidden)
+			return
+		}
+		expected := fb.CSRFToken(r.URL.Path)
+		if !hmac.Equal([]byte(token), []byte(expected)) {
+			http.Error(w, "invalid CSRF token", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -248,7 +321,7 @@ type fileEntry struct {
 }
 
 func (fb *BuiltinFileBrowser) listDir(relPath string) ([]fileEntry, error) {
-	absPath, err := safePath(fb.cfg.Path, relPath)
+	absPath, err := fb.safePath(relPath)
 	if err != nil {
 		return nil, fmt.Errorf("path check: %w", err)
 	}
@@ -286,6 +359,10 @@ func (fb *BuiltinFileBrowser) listDir(relPath string) ([]fileEntry, error) {
 }
 
 func (fb *BuiltinFileBrowser) handleAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	relPath := r.URL.Query().Get("path")
 	if relPath == "" {
 		relPath = "/"
@@ -304,8 +381,12 @@ func (fb *BuiltinFileBrowser) handleAPI(w http.ResponseWriter, r *http.Request) 
 }
 
 func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	relPath := strings.TrimPrefix(r.URL.Path, "/download")
-	absPath, err := safePath(fb.cfg.Path, relPath)
+	absPath, err := fb.safePath(relPath)
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -350,7 +431,7 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 		dir = "/"
 	}
 
-	destDir, err := safePath(fb.cfg.Path, dir)
+	destDir, err := fb.safePath(dir)
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -361,7 +442,7 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 	destPath := filepath.Join(destDir, cleanName)
 
 	// Verify dest is still within root
-	_, err = safePath(fb.cfg.Path, filepath.Join(dir, cleanName))
+	_, err = fb.safePath(filepath.Join(dir, cleanName))
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -431,7 +512,7 @@ func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	target, err := safePath(fb.cfg.Path, r.Form.Get("path"))
+	target, err := fb.safePath(r.Form.Get("path"))
 	if err != nil || target == fb.cfg.Path {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -474,19 +555,23 @@ func (fb *BuiltinFileBrowser) handleBrowse(w http.ResponseWriter, r *http.Reques
 	}
 
 	data := struct {
-		Path     string
-		Files    []fileEntry
-		Download bool
-		Upload   bool
-		Delete   bool
-		ReadOnly bool
+		Path          string
+		Files         []fileEntry
+		Download      bool
+		Upload        bool
+		Delete        bool
+		ReadOnly      bool
+		UploadCSRF    string
+		DeleteCSRF    string
 	}{
-		Path:     relPath,
-		Files:    files,
-		Download: fb.cfg.Download,
-		Upload:   fb.cfg.AllowUpload && !fb.cfg.ReadOnly,
-		Delete:   fb.cfg.AllowDelete && !fb.cfg.ReadOnly,
-		ReadOnly: fb.cfg.ReadOnly,
+		Path:       relPath,
+		Files:      files,
+		Download:   fb.cfg.Download,
+		Upload:     fb.cfg.AllowUpload && !fb.cfg.ReadOnly,
+		Delete:     fb.cfg.AllowDelete && !fb.cfg.ReadOnly,
+		ReadOnly:   fb.cfg.ReadOnly,
+		UploadCSRF: fb.CSRFToken("/upload"),
+		DeleteCSRF: fb.CSRFToken("/delete"),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -536,7 +621,7 @@ var fileBrowserTmpl = template.Must(template.New("browser").Parse(`<!DOCTYPE htm
   <td class="time">{{.ModTime}}</td>
   {{if or $.Download $.Delete}}<td class="actions">{{if not .IsDir}}
     {{if $.Download}}<a href="/download{{$.Path}}{{.Name}}">download</a>{{end}}
-    {{if $.Delete}}<form action="/delete" method="post" style="display:inline"><input type="hidden" name="path" value="{{$.Path}}{{.Name}}"><button type="submit">delete</button></form>{{end}}
+    {{if $.Delete}}<form action="/delete" method="post" style="display:inline"><input type="hidden" name="_csrf" value="{{$.DeleteCSRF}}"><input type="hidden" name="path" value="{{$.Path}}{{.Name}}"><button type="submit">delete</button></form>{{end}}
   {{end}}</td>{{end}}
 </tr>
 {{end}}
@@ -544,6 +629,7 @@ var fileBrowserTmpl = template.Must(template.New("browser").Parse(`<!DOCTYPE htm
 </table>
 {{if .Upload}}
 <form action="/upload" method="post" enctype="multipart/form-data">
+  <input type="hidden" name="_csrf" value="{{.UploadCSRF}}">
   <input type="hidden" name="path" value="{{.Path}}">
   <label>Upload <input type="file" name="file" required></label>
   <button type="submit">Upload</button>

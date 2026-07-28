@@ -4550,3 +4550,36 @@ func (s *Store) SetSequence(ctx context.Context, seq int64) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE event_sequence SET last_sequence = ?, updated_at = ? WHERE id = 1", seq, time.Now().UTC().Format(time.RFC3339))
 	return err
 }
+
+// LookupIdempotentKey returns the operation ID associated with the given
+// idempotency key, or empty string if no mapping exists.
+func (s *Store) LookupIdempotentKey(ctx context.Context, key string) (core.OperationID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var opID string
+	err := s.db.QueryRowContext(ctx,
+		"SELECT operation_id FROM idempotency_keys WHERE key = ?", key,
+	).Scan(&opID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("lookup idempotency key: %w", err)
+	}
+	return core.OperationID(opID), nil
+}
+
+// RecordIdempotentKey associates an idempotency key with an operation ID.
+// If the key already exists, the existing mapping is preserved (first-write-wins).
+func (s *Store) RecordIdempotentKey(ctx context.Context, key string, opID core.OperationID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.ExecContext(ctx,
+		"INSERT OR IGNORE INTO idempotency_keys (key, operation_id, created_at) VALUES (?, ?, ?)",
+		key, string(opID), time.Now().UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("record idempotency key: %w", err)
+	}
+	return nil
+}

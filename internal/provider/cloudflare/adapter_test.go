@@ -123,7 +123,8 @@ func (f *fakeAccessManager) UpdatePolicy(_ context.Context, accountID, appID, _ 
 	f.accountID, f.appID, f.policy = accountID, appID, policy
 	return nil
 }
-func (*fakeAccessManager) DeleteApp(context.Context, string, string) error { return nil }
+func (*fakeAccessManager) DeleteApp(context.Context, string, string) error    { return nil }
+func (*fakeAccessManager) DeletePolicy(context.Context, string, string) error { return nil }
 func (f *fakeAccessManager) UpdateApp(_ context.Context, accountID, appID, hostname string) error {
 	f.accountID, f.appID, f.hostname = accountID, appID, hostname
 	return nil

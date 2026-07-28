@@ -1,7 +1,5 @@
 package tui
 
-import "charm.land/lipgloss/v2"
-
 // KeyBinding describes a single key binding.
 type KeyBinding struct {
 	Key     string
@@ -63,7 +61,7 @@ var DefaultKeyMap = KeyMap{
 }
 
 // helpRow renders a help text row with context-sensitive bindings.
-func helpRow(km KeyMap) string {
+func helpRow(km KeyMap, th Theme) string {
 	help := "  ↑↓ Navigate  Enter Inspect  Space Open/Close  n New  a Discover  r Repair  d Delete  q Quit  ? Help"
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("#8a7f70")).Render(help)
+	return th.Style("help").Render(help)
 }
