@@ -41,6 +41,10 @@ type Supervisor struct {
 	serveWG      sync.WaitGroup // tracks the IPC serve goroutine
 	shutdownOnce sync.Once      // guards idempotent shutdown
 
+	// accountValidator checks a provider credential before the account is
+	// recorded. It is a field so tests can substitute a stub.
+	accountValidator AccountValidator
+
 	// Discovery, diagnostics, and origins
 	discoverer discovery.Discoverer
 	diagEngine *diagnostics.Engine
@@ -1203,12 +1207,66 @@ func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.Co
 	accountID := strings.TrimSpace(req.AccountID)
 	zoneID := strings.TrimSpace(req.ZoneID)
 	credential := strings.TrimSpace(req.Credential)
-	if accountID == "" || zoneID == "" || credential == "" {
-		return nil, core.ErrValidation("cloudflare account ID, zone ID, and credential are required")
+
+	// A zone is only required for DNS and custom-hostname work. Quick Tunnels
+	// need no account at all, and managed tunnels need only an account and a
+	// credential. Requiring a zone here contradicted the setup UI, which
+	// correctly offers to skip it.
+	if accountID == "" {
+		return nil, core.ErrValidation("a Cloudflare account ID is required")
 	}
+	if credential == "" {
+		return nil, core.ErrValidation("a Cloudflare API token is required")
+	}
+
+	secret := []byte(credential)
+	defer zeroBytes(secret)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Validate before persisting. Recording an account as authenticated on the
+	// strength of a non-empty string is how Portico came to advertise providers
+	// that could not perform a single operation.
+	validator := h.sup.accountValidator
+	if validator == nil {
+		validator = cloudflareAccountValidator{}
+	}
+	validation, err := validator.Validate(ctx, "cloudflare", accountID, credential)
+	if err != nil {
+		resp := &ipc.ConfigureProviderAccountResponse{}
+		if validation != nil {
+			resp.MissingPermissions = validation.MissingPermissions
+		}
+		return resp, core.ErrValidation(err.Error())
+	}
+	if validation == nil || !validation.AccountAccessible {
+		return nil, core.ErrValidation("the token could not be confirmed against that Cloudflare account")
+	}
+
+	// A supplied zone must actually belong to the account, otherwise DNS work
+	// would fail later with an error far from its cause.
+	if zoneID != "" && len(validation.Zones) > 0 {
+		known := false
+		for _, z := range validation.Zones {
+			if z.ID == zoneID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, core.ErrValidation(fmt.Sprintf(
+				"zone %s is not visible to this token; leave the zone blank to configure tunnels without DNS", zoneID))
+		}
+	}
+
 	label := strings.TrimSpace(req.Label)
 	if label == "" {
 		label = accountID
+	}
+	metadata := map[string]string{}
+	if zoneID != "" {
+		metadata["zone_id"] = zoneID
 	}
 	credentialRef := fmt.Sprintf("cloudflare:%s:api-token", accountID)
 	account := core.ProviderAccount{
@@ -1216,15 +1274,27 @@ func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.Co
 		Provider:      "cloudflare",
 		Label:         label,
 		CredentialRef: credentialRef,
-		Metadata:      map[string]string{"zone_id": zoneID},
+		Metadata:      metadata,
 		Status:        core.AccountAuthenticated,
 	}
-	secret := []byte(credential)
-	defer zeroBytes(secret)
-	if err := h.sup.store.UpsertProviderAccountCredential(context.Background(), account, secret); err != nil {
+	if err := h.sup.store.UpsertProviderAccountCredential(ctx, account, secret); err != nil {
 		return nil, fmt.Errorf("save Cloudflare account: %w", err)
 	}
-	return &ipc.ConfigureProviderAccountResponse{RestartRequired: true}, nil
+
+	resp := &ipc.ConfigureProviderAccountResponse{
+		RestartRequired:    true,
+		Validated:          true,
+		MissingPermissions: validation.MissingPermissions,
+	}
+	for _, z := range validation.Zones {
+		resp.Zones = append(resp.Zones, ipc.ZoneDTO{ID: z.ID, Name: z.Name})
+	}
+	if zoneID == "" {
+		resp.CapabilityLevel = "tunnels_without_dns"
+	} else {
+		resp.CapabilityLevel = "tunnels_with_dns"
+	}
+	return resp, nil
 }
 
 func zeroBytes(value []byte) {

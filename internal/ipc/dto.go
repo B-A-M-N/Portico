@@ -154,6 +154,23 @@ type ConfigureProviderAccountRequest struct {
 // is needed before newly persisted account adapters become available.
 type ConfigureProviderAccountResponse struct {
 	RestartRequired bool `json:"restart_required"`
+	// Validated reports that the credential was confirmed against the provider
+	// before the account was saved, rather than accepted on faith.
+	Validated bool `json:"validated,omitempty"`
+	// CapabilityLevel names what the saved account can actually do, since a
+	// zone is required only for DNS and custom hostnames.
+	CapabilityLevel string `json:"capability_level,omitempty"`
+	// Zones the credential can see, so a zone can be chosen rather than copied
+	// by hand.
+	Zones []ZoneDTO `json:"zones,omitempty"`
+	// MissingPermissions names the specific permissions the token lacks.
+	MissingPermissions []string `json:"missing_permissions,omitempty"`
+}
+
+// ZoneDTO is a DNS zone visible to a provider credential.
+type ZoneDTO struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // --------------- events ---------------

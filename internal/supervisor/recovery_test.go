@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -175,9 +176,26 @@ func TestSnapshotIncludesNonSecretProviderAccountSummaries(t *testing.T) {
 	}
 }
 
+// stubAccountValidator stands in for a live provider so account setup can be
+// tested without real credentials.
+type stubAccountValidator struct {
+	result *AccountValidation
+	err    error
+	calls  int
+}
+
+func (s *stubAccountValidator) Validate(context.Context, string, string, string) (*AccountValidation, error) {
+	s.calls++
+	return s.result, s.err
+}
+
 func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing.T) {
 	st := newRecoveryTestStore(t)
-	handler := &supervisorHandler{sup: &Supervisor{store: st}}
+	validator := &stubAccountValidator{result: &AccountValidation{
+		AccountAccessible: true,
+		Zones:             []ZoneSummary{{ID: "zone-a", Name: "example.com"}},
+	}}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
 	response, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Label: "Personal", ZoneID: "zone-a", Credential: "secret-token",
 	})
@@ -186,6 +204,12 @@ func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing
 	}
 	if !response.RestartRequired {
 		t.Fatal("account configuration must require adapter reconstruction")
+	}
+	if validator.calls != 1 {
+		t.Fatalf("credential validated %d times, want exactly 1 before persisting", validator.calls)
+	}
+	if !response.Validated {
+		t.Fatal("response does not report that the credential was validated")
 	}
 	accounts, err := st.ListProviderAccounts(context.Background())
 	if err != nil || len(accounts) != 1 || accounts[0].ID != "account-a" || accounts[0].Metadata["zone_id"] != "zone-a" {
@@ -827,5 +851,86 @@ func TestOperationHistoryEmptyIsMarkedAvailable(t *testing.T) {
 	}
 	if len(history.Operations) != 0 {
 		t.Fatalf("got %d operations, want 0", len(history.Operations))
+	}
+}
+
+// TestCloudflareSetupAcceptsAccountWithoutZone resolves the contradiction in
+// audit item 10: the setup UI offered to skip the zone while the backend
+// rejected an empty one. A zone is only needed for DNS and custom hostnames.
+func TestCloudflareSetupAcceptsAccountWithoutZone(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	validator := &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+
+	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
+		AccountID: "account-a", Label: "Personal", Credential: "secret-token",
+	})
+	if err != nil {
+		t.Fatalf("setup rejected an account with no zone: %v", err)
+	}
+	if resp.CapabilityLevel != "tunnels_without_dns" {
+		t.Fatalf("capability level = %q, want tunnels_without_dns", resp.CapabilityLevel)
+	}
+
+	accounts, err := st.ListProviderAccounts(context.Background())
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("ListProviderAccounts = %#v, %v", accounts, err)
+	}
+	if _, ok := accounts[0].Metadata["zone_id"]; ok {
+		t.Fatal("an empty zone was persisted as metadata")
+	}
+}
+
+// TestCloudflareSetupDoesNotPersistUnvalidatedCredentials ensures a rejected
+// credential is never recorded, and never recorded as authenticated. The
+// handler previously wrote Status: authenticated on the strength of a non-empty
+// string.
+func TestCloudflareSetupDoesNotPersistUnvalidatedCredentials(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	validator := &stubAccountValidator{
+		result: &AccountValidation{MissingPermissions: []string{"Zone: Read"}},
+		err:    errors.New("the token is valid but cannot see account account-a"),
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+
+	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
+		AccountID: "account-a", Credential: "bad-token", ZoneID: "zone-a",
+	})
+	if err == nil {
+		t.Fatal("setup accepted a credential the provider rejected")
+	}
+	// The specific missing permissions must reach the caller so the failure is
+	// actionable rather than merely reported.
+	if resp == nil || len(resp.MissingPermissions) == 0 {
+		t.Fatalf("missing permissions were not reported: %#v", resp)
+	}
+
+	accounts, listErr := st.ListProviderAccounts(context.Background())
+	if listErr != nil {
+		t.Fatalf("ListProviderAccounts: %v", listErr)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("a rejected credential was persisted: %#v", accounts)
+	}
+}
+
+// TestCloudflareSetupRejectsZoneNotVisibleToToken ensures a zone mismatch fails
+// at setup rather than much later during a DNS operation.
+func TestCloudflareSetupRejectsZoneNotVisibleToToken(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	validator := &stubAccountValidator{result: &AccountValidation{
+		AccountAccessible: true,
+		Zones:             []ZoneSummary{{ID: "zone-real", Name: "example.com"}},
+	}}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+
+	_, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
+		AccountID: "account-a", Credential: "token", ZoneID: "zone-typo",
+	})
+	if err == nil {
+		t.Fatal("setup accepted a zone the token cannot see")
+	}
+	if !strings.Contains(err.Error(), "zone-typo") {
+		t.Fatalf("error does not name the offending zone: %v", err)
 	}
 }

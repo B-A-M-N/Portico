@@ -309,8 +309,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case providerAccountConfiguredMsg:
 		if msg.Err != nil {
+			// Keep the answers that were accepted and return to the credential
+			// step, which is what validation almost always rejects. Restarting
+			// at step one discarded correct input for no reason.
 			m.providerSetupError = msg.Err.Error()
-			m.providerSetupStep = 1 // Go back to account ID input
+			if msg.Response != nil && len(msg.Response.MissingPermissions) > 0 {
+				m.providerSetupError += "\n\nThe token is missing:\n  • " +
+					strings.Join(msg.Response.MissingPermissions, "\n  • ")
+			}
+			// The rejected secret must not stay in memory while the user
+			// retypes it.
+			m.providerSetupCred = ""
+			m.providerSetupStep = 4
 			return m, nil
 		}
 		// Success - reset setup state and refresh snapshot
@@ -320,10 +330,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.providerSetupZoneID = ""
 		m.providerSetupCred = ""
 		m.providerSetupError = ""
+		// Report what the account can actually do, since a zone is required
+		// only for DNS and custom hostnames.
+		switch {
+		case msg.Response == nil:
+			m.status = "Account configured."
+		case msg.Response.CapabilityLevel == "tunnels_without_dns":
+			m.status = "Account verified. Tunnels are available; add a zone to use permanent hostnames."
+		case msg.Response.CapabilityLevel == "tunnels_with_dns":
+			m.status = "Account verified. Tunnels and permanent hostnames are available."
+		default:
+			m.status = "Account configured."
+		}
 		if msg.Response != nil && msg.Response.RestartRequired {
-			m.status = "Account configured. Restart supervisor to activate."
-		} else {
-			m.status = "Account configured successfully."
+			m.status += " Restart the supervisor to activate it."
 		}
 		return m, m.requestSnapshot()
 
@@ -1719,7 +1739,9 @@ func (m *Model) renderProviderSetup() string {
 		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupLabel))
 	case 3:
 		b.WriteString("Step 3/5: Zone ID\n\n")
-		b.WriteString("Enter your Cloudflare zone ID (optional, press enter to skip):\n")
+		b.WriteString("Enter your Cloudflare zone ID, or press enter to skip.\n")
+		b.WriteString("A zone is only needed for permanent hostnames and DNS.\n")
+		b.WriteString("Without one you can still create tunnels with temporary addresses.\n")
 		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupZoneID))
 	case 4:
 		b.WriteString("Step 4/5: API Token\n\n")
