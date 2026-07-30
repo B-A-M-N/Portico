@@ -99,7 +99,12 @@ type WizardState struct {
 
 // Wizard step constants
 const (
-	WizardStepIntent int = iota
+	// WizardStepOutcome asks what the user is trying to achieve before asking
+	// how. The wizard previously opened on "What should be reachable?", a
+	// source-type question, so a user had to know Portico's internal model
+	// before stating their goal.
+	WizardStepOutcome int = iota
+	WizardStepIntent
 	WizardStepName
 	WizardStepMCPMode
 	WizardStepSource
@@ -137,6 +142,64 @@ var (
 	}
 )
 
+// wizardRecipe is an outcome the user can pick, together with the answers that
+// outcome already determines. Choosing a recipe skips the questions it answers
+// rather than asking them again in provider terminology.
+type wizardRecipe struct {
+	Label string
+	// Explanation states, in plain language, what will happen and who will be
+	// able to reach the service.
+	Explanation string
+	SourceType  string
+	Exposure    string
+	Protection  string
+	// Advanced sends the user to the original source-type question instead of
+	// presetting anything.
+	Advanced bool
+	// Unavailable states why an outcome cannot be delivered yet. An outcome
+	// Portico cannot honour must say so rather than quietly producing a
+	// different one.
+	Unavailable string
+}
+
+// wizardRecipes are ordered by how commonly they are wanted.
+var wizardRecipes = []wizardRecipe{
+	{
+		Label:       "Share a web app on this computer, temporarily",
+		Explanation: "Portico creates a temporary address. Anyone with the link can reach the service while the connection is open, and the address changes each time you open it.",
+		SourceType:  "existing_service",
+		Exposure:    "temporary_public",
+		Protection:  "none",
+	},
+	{
+		Label:       "Publish a web app at a stable address",
+		Explanation: "Portico creates a tunnel and a DNS record for a hostname you choose. The address stays the same. You will be asked who should be allowed to reach it.",
+		SourceType:  "existing_service",
+		Exposure:    "permanent_public",
+	},
+	{
+		Label:       "Share a folder of files",
+		Explanation: "Portico serves a directory and publishes it. You choose whether it is read-only.",
+		SourceType:  "directory",
+	},
+	{
+		Label:       "Run a command and share what it serves",
+		Explanation: "Portico starts a command, waits for it to listen, and publishes it. Portico stops the command when the connection closes.",
+		SourceType:  "command",
+	},
+	{
+		Label:       "Connect an MCP server to ChatGPT",
+		Explanation: "A local MCP server should reach ChatGPT over a private, client-mediated tunnel rather than a public address.",
+		SourceType:  "mcp_server",
+		Unavailable: "Portico cannot do this yet. It has no Secure MCP Tunnel support, and publishing an MCP server at a public address instead would expose it to anyone who finds the URL. Choose \"Advanced\" only if a public address is genuinely what you want.",
+	},
+	{
+		Label:       "Something else (choose the source yourself)",
+		Explanation: "Pick the kind of source directly and answer every question.",
+		Advanced:    true,
+	},
+}
+
 type directoryModeChoice struct {
 	mode        string
 	label       string
@@ -151,7 +214,7 @@ func NewWizard(client ConnectionCreator, fullCloudflare bool, accounts []ipc.Pro
 		ctx:            context.Background(), // default; root model should call WithContext
 		fullCloudflare: fullCloudflare,
 		accounts:       append([]ipc.ProviderAccountDTO(nil), accounts...),
-		state:          WizardState{Step: WizardStepIntent, Provider: wizardProviders[0]},
+		state:          WizardState{Step: WizardStepOutcome, Provider: wizardProviders[0]},
 	}
 }
 
@@ -223,6 +286,38 @@ func (m *WizardModel) isCommandOrigin() bool {
 // itself; any side effect is returned as a tea.Cmd.
 func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	switch m.state.Step {
+	case WizardStepOutcome:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < len(wizardRecipes)-1 {
+				m.selected++
+			}
+		case "enter":
+			recipe := wizardRecipes[m.selected]
+			if recipe.Unavailable != "" {
+				m.err = fmt.Errorf("%s", recipe.Unavailable)
+				return nil
+			}
+			m.err = nil
+			if recipe.Advanced {
+				m.state.Step = WizardStepIntent
+				m.selected = 0
+				return nil
+			}
+			// Apply everything the outcome already determines so those
+			// questions are never asked again.
+			m.state.SourceType = recipe.SourceType
+			m.state.ExposureMode = recipe.Exposure
+			m.state.Protection = recipe.Protection
+			m.state.Step = WizardStepName
+			m.selected = 0
+			m.input = m.state.Name
+		}
+
 	case WizardStepIntent:
 		switch key {
 		case "up", "k":
@@ -243,7 +338,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepName:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepIntent
+			m.state.Step = WizardStepOutcome
 			m.selected = 0
 		case "enter":
 			if strings.TrimSpace(m.input) == "" {
@@ -1029,6 +1124,8 @@ func editInput(value, key string) string {
 // View renders the wizard screen.
 func (m *WizardModel) View() string {
 	switch m.state.Step {
+	case WizardStepOutcome:
+		return m.withError(m.renderOutcome())
 	case WizardStepIntent:
 		return m.renderIntent()
 	case WizardStepName:
@@ -1105,6 +1202,24 @@ func (m *WizardModel) sourcePrompt() string {
 	default:
 		return "Enter the address of your service (host or host:port):"
 	}
+}
+
+func (m *WizardModel) renderOutcome() string {
+	options := make([]string, 0, len(wizardRecipes))
+	for _, recipe := range wizardRecipes {
+		label := recipe.Label
+		if recipe.Unavailable != "" {
+			label += "  (not available yet)"
+		}
+		options = append(options, label)
+	}
+	view := renderMenu("What are you trying to do?", options, m.selected)
+
+	// Show the consequence of the highlighted choice before it is made.
+	if m.selected >= 0 && m.selected < len(wizardRecipes) {
+		view += "\n\n" + wizardRecipes[m.selected].Explanation + "\n"
+	}
+	return view
 }
 
 func (m *WizardModel) renderIntent() string {

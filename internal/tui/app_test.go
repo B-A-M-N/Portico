@@ -205,8 +205,9 @@ func TestPressNShowsNewConnectionScreen(t *testing.T) {
 	if !strings.Contains(content, "NEW CONNECTION") {
 		t.Errorf("view missing wizard header, got:\n%s", content)
 	}
-	if !strings.Contains(content, "What should be reachable?") {
-		t.Errorf("view missing wizard intent step, got:\n%s", content)
+	// The wizard opens on the outcome question, not a source-type question.
+	if !strings.Contains(content, "What are you trying to do?") {
+		t.Errorf("view missing wizard outcome step, got:\n%s", content)
 	}
 }
 

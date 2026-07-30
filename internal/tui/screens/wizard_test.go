@@ -612,3 +612,98 @@ func TestWizardExposesItsOperationForEventRouting(t *testing.T) {
 		t.Fatalf("OperationID = %q, want op-42", m.OperationID())
 	}
 }
+
+// TestWizardOpensOnAnOutcomeQuestion pins audit item 14. The wizard opened on
+// "What should be reachable?", a source-type question, so a user had to
+// understand Portico's internal model before stating a goal.
+func TestWizardOpensOnAnOutcomeQuestion(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	if m.Step() != WizardStepOutcome {
+		t.Fatalf("wizard opens on step %d, want the outcome step", m.Step())
+	}
+	view := m.View()
+	if !strings.Contains(view, "What are you trying to do?") {
+		t.Fatalf("first screen is not an outcome question:\n%s", view)
+	}
+	// The consequence of the highlighted choice must be visible before it is
+	// chosen, not after.
+	if !strings.Contains(view, "Anyone with the link") {
+		t.Fatalf("outcome screen does not explain the consequence:\n%s", view)
+	}
+}
+
+// TestChoosingAnOutcomeSkipsTheQuestionsItAnswers ensures a recipe presets what
+// it determines rather than asking again in provider terminology.
+func TestChoosingAnOutcomeSkipsTheQuestionsItAnswers(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	m.HandleKey("enter") // first recipe: temporary web app
+
+	if m.state.SourceType != "existing_service" {
+		t.Fatalf("source type = %q", m.state.SourceType)
+	}
+	if m.state.ExposureMode != "temporary_public" {
+		t.Fatalf("exposure = %q, want temporary_public", m.state.ExposureMode)
+	}
+	if m.state.Protection != "none" {
+		t.Fatalf("protection = %q, want none", m.state.Protection)
+	}
+	if m.Step() != WizardStepName {
+		t.Fatalf("step = %d, want the name step", m.Step())
+	}
+}
+
+// TestAdvancedOutcomeFallsBackToTheSourceQuestion keeps the original flow
+// reachable for users who want it.
+func TestAdvancedOutcomeFallsBackToTheSourceQuestion(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	for range len(wizardRecipes) - 1 {
+		m.HandleKey("down")
+	}
+	m.HandleKey("enter")
+
+	if m.Step() != WizardStepIntent {
+		t.Fatalf("step = %d, want the source-type step", m.Step())
+	}
+	if m.state.SourceType != "" {
+		t.Fatalf("advanced flow presets a source type: %q", m.state.SourceType)
+	}
+	if !strings.Contains(m.View(), "What should be reachable?") {
+		t.Fatal("advanced flow does not reach the source question")
+	}
+}
+
+// TestUnavailableOutcomeIsRefusedRatherThanSubstituted pins the safety rule
+// from audit item 5: an MCP server bound for ChatGPT must not be silently
+// published at a public address instead.
+func TestUnavailableOutcomeIsRefusedRatherThanSubstituted(t *testing.T) {
+	index := -1
+	for i, recipe := range wizardRecipes {
+		if strings.Contains(recipe.Label, "ChatGPT") {
+			index = i
+		}
+	}
+	if index < 0 {
+		t.Fatal("no ChatGPT outcome is offered")
+	}
+
+	m := NewWizard(nil, true, nil)
+	for range index {
+		m.HandleKey("down")
+	}
+	m.HandleKey("enter")
+
+	// It must not proceed into the ordinary public-exposure flow.
+	if m.Step() != WizardStepOutcome {
+		t.Fatalf("an unavailable outcome advanced the wizard to step %d", m.Step())
+	}
+	if m.state.ExposureMode == "temporary_public" || m.state.ExposureMode == "permanent_public" {
+		t.Fatalf("an unavailable private outcome fell back to public exposure: %q", m.state.ExposureMode)
+	}
+	view := m.View()
+	if !strings.Contains(view, "cannot do this yet") {
+		t.Fatalf("refusal does not explain itself:\n%s", view)
+	}
+	if !strings.Contains(view, "expose it to anyone who finds the URL") {
+		t.Fatalf("refusal does not explain the risk of the alternative:\n%s", view)
+	}
+}
