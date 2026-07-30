@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -1241,5 +1242,111 @@ func TestRemovingAnUnusedAccountDeletesItsCredential(t *testing.T) {
 	}
 	if secret != "" {
 		t.Fatal("credential survived account removal")
+	}
+}
+
+// TestSupportExportCarriesNoSecrets pins audit item 27. A diagnostic report is
+// meant to be attached to a bug report, so it must be safe to share.
+func TestSupportExportCarriesNoSecrets(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	const secret = "cf-token-MUST-NOT-APPEAR-7b21"
+	account := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Personal",
+		CredentialRef: "cloudflare:acct-1:api-token", Status: core.AccountAuthenticated,
+		Metadata: map[string]string{"zone_id": "zone-1"},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte(secret)); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+
+	connID := core.ConnectionID("conn-export")
+	profile := recoveryTestProfile(connID)
+	profile.Driver.AccountID = "acct-1"
+	profile.Spec.ServiceExposure.Protection = core.ProtectionSpec{
+		Kind:          core.ProtectionEmailOTP,
+		AllowedEmails: []string{"private.person@example.com"},
+	}
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	rt := recoveryTestRuntime(connID)
+	rt.Provider.Resources = []core.ProviderResource{{
+		Type: core.ResourceTunnel, ExternalID: "tun-1", Ownership: core.OwnershipManaged,
+		Metadata: map[string]string{"tunnel_token": secret, "region": "us-east"},
+	}}
+	ctrl.RestoreRuntime(rt)
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+	export, err := handler.HandleSupportExport()
+	if err != nil {
+		t.Fatalf("HandleSupportExport: %v", err)
+	}
+
+	blob, err := json.Marshal(export)
+	if err != nil {
+		t.Fatalf("marshal export: %v", err)
+	}
+	rendered := string(blob)
+
+	if strings.Contains(rendered, secret) {
+		t.Fatalf("support export leaked a credential:\n%s", rendered)
+	}
+	// Allowed identities are personal data and are reported as a count only.
+	if strings.Contains(rendered, "private.person@example.com") {
+		t.Fatalf("support export leaked an allowed identity:\n%s", rendered)
+	}
+
+	if len(export.Connections) != 1 {
+		t.Fatalf("export connections = %d, want 1", len(export.Connections))
+	}
+	conn := export.Connections[0]
+	if conn.AllowedIdentityCount != 1 {
+		t.Fatalf("allowed identity count = %d, want 1", conn.AllowedIdentityCount)
+	}
+	// The report must still be useful: external IDs are what a support
+	// conversation and a manual cleanup act on.
+	if len(conn.Resources) != 1 || conn.Resources[0].ExternalID != "tun-1" {
+		t.Fatalf("export dropped the resource identity: %#v", conn.Resources)
+	}
+	// A redacted field must still be visible as having existed.
+	if conn.Resources[0].Metadata["tunnel_token"] != "[redacted]" {
+		t.Fatalf("secret metadata was not marked redacted: %#v", conn.Resources[0].Metadata)
+	}
+	if conn.Resources[0].Metadata["region"] != "us-east" {
+		t.Fatalf("non-secret metadata was dropped: %#v", conn.Resources[0].Metadata)
+	}
+
+	if export.SchemaVersion == 0 {
+		t.Fatal("export does not record the database schema version")
+	}
+	if export.Reviewed {
+		t.Fatal("a freshly generated export must not claim to have been reviewed")
+	}
+	if len(export.Notes) == 0 {
+		t.Fatal("export does not state what it excludes")
+	}
+}
+
+// TestSupportExportRedactsBySubstringNotExactKey ensures the redaction rule
+// catches realistic key names.
+func TestSupportExportRedactsBySubstringNotExactKey(t *testing.T) {
+	for _, key := range []string{
+		"token", "api_token", "authToken", "SECRET", "client_secret",
+		"password", "credential_ref", "private_key", "Authorization", "cookie",
+	} {
+		if !isSecretKey(key) {
+			t.Fatalf("key %q was not treated as sensitive", key)
+		}
+	}
+	for _, key := range []string{"region", "hostname", "tunnel_id", "created_at"} {
+		if isSecretKey(key) {
+			t.Fatalf("key %q was needlessly redacted", key)
+		}
 	}
 }

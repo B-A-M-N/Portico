@@ -63,6 +63,7 @@ type RequestHandler interface {
 	HandleDiscovery() (*DiscoveryDTO, error)
 	HandleRefreshDiscovery() (*DiscoveryDTO, error)
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
+	HandleSupportExport() (*SupportExportDTO, error)
 	HandleSupervisorStop(ctx context.Context) error
 }
 
@@ -113,6 +114,7 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/discovery", s.handleDiscovery)
 	mux.HandleFunc("/v1/diagnostics/", s.handleDiagnostics)
 	mux.HandleFunc("/v1/supervisor/stop", s.handleSupervisorStop)
+	mux.HandleFunc("/v1/support/export", s.handleSupportExport)
 	s.mux = mux
 
 	return s, nil
@@ -821,4 +823,20 @@ func writeMethodNotAllowed(w http.ResponseWriter, allowed string) {
 		Code:    "PTO-METHOD",
 		Summary: "method not allowed",
 	})
+}
+
+// handleSupportExport serves a redacted diagnostic report.
+func (s *Server) handleSupportExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "PTO-SUPPORT-METHOD", "method not allowed")
+		return
+	}
+	export, err := s.handler.HandleSupportExport()
+	if err != nil {
+		writeHandlerError(w, "PTO-SUPPORT-EXPORT", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(export)
 }

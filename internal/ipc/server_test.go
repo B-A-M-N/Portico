@@ -71,6 +71,9 @@ func (nullHandler) HandleRefreshDiscovery() (*DiscoveryDTO, error) { return nil,
 func (nullHandler) HandleDiagnostics(string) ([]DiagnosticDTO, error) {
 	return nil, nil
 }
+func (nullHandler) HandleSupportExport() (*SupportExportDTO, error) {
+	return &SupportExportDTO{}, nil
+}
 func (nullHandler) HandleSupervisorStop(ctx context.Context) error { return nil }
 
 func newTestServer(t *testing.T, st *store.Store) *Server {

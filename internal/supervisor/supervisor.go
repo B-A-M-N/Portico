@@ -635,6 +635,20 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 		}
 	}
 
+	// Describe the route as a chain of segments. A single open/failed verdict
+	// cannot say which hop is broken, so each segment reports what the
+	// available evidence supports and no more.
+	var segmentResources []core.ProviderResource
+	if rt != nil {
+		segmentResources = rt.Provider.Resources
+	}
+	if len(segmentResources) == 0 {
+		if durable, err := h.sup.store.ListResourcesByConnection(context.Background(), cid); err == nil {
+			segmentResources = durable
+		}
+	}
+	detail.Segments = computeRouteSegments(p, rt, segmentResources)
+
 	// The runtime projection is not an authoritative record of what Portico
 	// created. Controller.RestoreResources drops restored resources when a
 	// connection has no runtime row, so a connection can hold managed provider

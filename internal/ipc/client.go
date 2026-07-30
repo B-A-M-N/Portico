@@ -657,3 +657,22 @@ func CheckAvailability(socketPath string) bool {
 	defer conn.Close()
 	return true
 }
+
+// SupportExport fetches a redacted diagnostic report suitable for a bug report.
+func (c *Client) SupportExport(ctx context.Context) (*SupportExportDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/support/export", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var export SupportExportDTO
+	if err := json.NewDecoder(resp.Body).Decode(&export); err != nil {
+		return nil, err
+	}
+	return &export, nil
+}

@@ -4883,3 +4883,19 @@ func (s *Store) ConnectionsUsingAccount(ctx context.Context, providerID core.Pro
 	}
 	return dependents, rows.Err()
 }
+
+// SchemaVersion returns the highest applied migration version. A support export
+// needs it to tell whether a reported problem belongs to a database that has
+// been upgraded.
+func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var version sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, "SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
+		return 0, fmt.Errorf("read schema version: %w", err)
+	}
+	if !version.Valid {
+		return 0, nil
+	}
+	return int(version.Int64), nil
+}

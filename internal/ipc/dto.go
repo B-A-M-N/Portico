@@ -538,3 +538,77 @@ type RemoveProviderAccountResponse struct {
 	RestartRequired      bool     `json:"restart_required,omitempty"`
 	DependentConnections []string `json:"dependent_connections,omitempty"`
 }
+
+// SupportExportDTO is a redacted diagnostic report intended to be attached to a
+// bug report. It carries no credentials, authorization headers, cookies,
+// private keys, command environments or full process environments.
+type SupportExportDTO struct {
+	GeneratedAt     string `json:"generated_at"`
+	OS              string `json:"os"`
+	Arch            string `json:"arch"`
+	GoVersion       string `json:"go_version"`
+	SchemaVersion   int    `json:"schema_version,omitempty"`
+	SocketPath      string `json:"socket_path,omitempty"`
+	DatabasePath    string `json:"database_path,omitempty"`
+	SupervisorReady bool   `json:"supervisor_ready"`
+	// Reviewed records whether a human has checked the report before sharing.
+	// It is always false when generated.
+	Reviewed bool `json:"reviewed"`
+
+	Providers        []SupportProviderDTO   `json:"providers,omitempty"`
+	Connections      []SupportConnectionDTO `json:"connections,omitempty"`
+	RecentOperations []SupportOperationDTO  `json:"recent_operations,omitempty"`
+	Notes            []string               `json:"notes,omitempty"`
+}
+
+// SupportProviderDTO is a provider's state in a support export.
+type SupportProviderDTO struct {
+	ID           string `json:"id"`
+	Availability string `json:"availability"`
+	Reason       string `json:"reason,omitempty"`
+	Accounts     int    `json:"accounts"`
+}
+
+// SupportConnectionDTO is a connection's configuration and observed state,
+// without secrets. Allowed identities are reported as a count because they are
+// personal data.
+type SupportConnectionDTO struct {
+	ID                   string               `json:"id"`
+	Kind                 string               `json:"kind"`
+	Revision             uint64               `json:"revision"`
+	DesiredState         string               `json:"desired_state"`
+	RuntimeState         string               `json:"runtime_state,omitempty"`
+	ProviderID           string               `json:"provider_id,omitempty"`
+	AccountID            string               `json:"account_id,omitempty"`
+	SourceKind           string               `json:"source_kind,omitempty"`
+	ExposureMode         string               `json:"exposure_mode,omitempty"`
+	RequestedAddress     string               `json:"requested_address,omitempty"`
+	ProtectionKind       string               `json:"protection_kind,omitempty"`
+	AllowedIdentityCount int                  `json:"allowed_identity_count,omitempty"`
+	ConnectorState       string               `json:"connector_state,omitempty"`
+	ConnectorPID         int                  `json:"connector_pid,omitempty"`
+	Restarts             int                  `json:"restarts,omitempty"`
+	LastError            string               `json:"last_error,omitempty"`
+	Resources            []SupportResourceDTO `json:"resources,omitempty"`
+	Findings             []string             `json:"findings,omitempty"`
+}
+
+// SupportResourceDTO is a provider resource in a support export.
+type SupportResourceDTO struct {
+	Type       string            `json:"type"`
+	ExternalID string            `json:"external_id"`
+	Ownership  string            `json:"ownership"`
+	Lifecycle  string            `json:"lifecycle,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+}
+
+// SupportOperationDTO is a recent operation in a support export.
+type SupportOperationDTO struct {
+	ID           string `json:"id"`
+	ConnectionID string `json:"connection_id"`
+	Intent       string `json:"intent,omitempty"`
+	State        string `json:"state"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
