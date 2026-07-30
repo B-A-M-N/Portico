@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
@@ -129,7 +130,7 @@ func TestWizardDoesNotOfferUnsupportedProtectionOrExposure(t *testing.T) {
 }
 
 func TestCommandWizardMapsArgumentsAndWorkingDirectory(t *testing.T) {
-	args, err := parseCommandArgs("serve, --host, 127.0.0.1, --title, hello world")
+	args, err := parseCommandArgs(`serve --host 127.0.0.1 --title "hello world"`)
 	if err != nil {
 		t.Fatalf("parseCommandArgs: %v", err)
 	}
@@ -147,9 +148,53 @@ func TestCommandWizardMapsArgumentsAndWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestCommandArgsRejectEmptyEntries(t *testing.T) {
-	if _, err := parseCommandArgs("serve,,--host"); err == nil {
-		t.Fatal("expected empty command argument to be rejected")
+// TestCommandArgsSupportValuesContainingCommas pins the replacement of the
+// comma separator. A comma was previously the argument delimiter, so an
+// argument containing one could not be expressed at all.
+func TestCommandArgsSupportValuesContainingCommas(t *testing.T) {
+	args, err := parseCommandArgs(`python -m my_server --name "Example, Inc."`)
+	if err != nil {
+		t.Fatalf("parseCommandArgs: %v", err)
+	}
+	want := []string{"python", "-m", "my_server", "--name", "Example, Inc."}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+}
+
+// TestCommandArgsRoundTripThroughTheInputLine ensures an argument survives being
+// rendered back into the editable line and parsed again.
+func TestCommandArgsRoundTripThroughTheInputLine(t *testing.T) {
+	original := []string{"serve", "--title", "hello world", "--name", "Example, Inc.", "--path", `C:\tmp`, "--empty", ""}
+	line := commandArgsInput(original)
+	parsed, err := parseCommandArgs(line)
+	if err != nil {
+		t.Fatalf("parseCommandArgs(%q): %v", line, err)
+	}
+	if !reflect.DeepEqual(parsed, original) {
+		t.Fatalf("round trip changed arguments:\n line   = %s\n parsed = %#v\n want   = %#v", line, parsed, original)
+	}
+}
+
+// TestCommandArgsRejectUnbalancedQuoting ensures a quoting mistake is reported
+// rather than silently producing the wrong argv.
+func TestCommandArgsRejectUnbalancedQuoting(t *testing.T) {
+	if _, err := parseCommandArgs(`serve --title "unclosed`); err == nil {
+		t.Fatal("expected an unclosed quote to be rejected")
+	}
+	if _, err := parseCommandArgs(`serve --path trailing\\`); err != nil {
+		t.Fatalf("an escaped backslash should be accepted: %v", err)
+	}
+}
+
+// TestArgvPreviewShowsExactArguments ensures the user can see the argument
+// vector before the command is created.
+func TestArgvPreviewShowsExactArguments(t *testing.T) {
+	preview := renderArgvPreview("python", []string{"-m", "my_server", "--name", "Example, Inc."})
+	for _, want := range []string{"Executable: python", "1. -m", "2. my_server", "4. Example, Inc."} {
+		if !strings.Contains(preview, want) {
+			t.Fatalf("preview missing %q:\n%s", want, preview)
+		}
 	}
 }
 
@@ -492,5 +537,29 @@ func TestWizardSaveClosedSkipsPlan(t *testing.T) {
 	}
 	if client.planCalls != 0 {
 		t.Fatalf("plan calls = %d, want 0", client.planCalls)
+	}
+}
+
+// TestWizardEditInputIsRuneAware pins the wizard's own text input against the
+// same byte-slicing defect as the root model's editor.
+func TestWizardEditInputIsRuneAware(t *testing.T) {
+	typed := ""
+	for _, r := range "café中🔥" {
+		typed = editInput(typed, string(r))
+	}
+	if typed != "café中🔥" {
+		t.Fatalf("typed %q, want café中🔥", typed)
+	}
+	for range utf8.RuneCountInString(typed) {
+		typed = editInput(typed, "backspace")
+		if !utf8.ValidString(typed) {
+			t.Fatalf("backspace produced invalid UTF-8: %q", typed)
+		}
+	}
+	if typed != "" {
+		t.Fatalf("field = %q after deleting every rune", typed)
+	}
+	if got := editInput("", "backspace"); got != "" {
+		t.Fatalf("backspace on empty field = %q", got)
 	}
 }

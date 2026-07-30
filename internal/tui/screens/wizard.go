@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -958,17 +959,26 @@ func (m *WizardModel) pollOperationCmd() tea.Cmd {
 }
 
 // editInput applies a single key press to a text input value.
+//
+// Backspace removes one whole rune. Slicing a byte off the end split multi-byte
+// code points, leaving invalid UTF-8 in the field for accented Latin, Arabic,
+// CJK and emoji input.
 func editInput(value, key string) string {
 	switch key {
 	case "backspace":
-		if len(value) > 0 {
-			return value[:len(value)-1]
+		if value == "" {
+			return value
 		}
-		return value
+		_, size := utf8.DecodeLastRuneInString(value)
+		return value[:len(value)-size]
 	case "space":
 		return value + " "
 	default:
-		if len([]rune(key)) == 1 {
+		if utf8.RuneCountInString(key) == 1 {
+			r, _ := utf8.DecodeRuneInString(key)
+			if r == utf8.RuneError || r < 0x20 || r == 0x7f {
+				return value
+			}
 			return value + key
 		}
 		return value
@@ -994,7 +1004,9 @@ func (m *WizardModel) View() string {
 	case WizardStepProtocol:
 		return m.renderProtocol()
 	case WizardStepCommandArgs:
-		return m.withError(renderInput("Command arguments (comma-separated; empty to skip):", m.input))
+		return m.withError(renderInput(
+			"Command arguments (space separated; quote any argument containing spaces; empty to skip):\n"+
+				renderArgvPreviewForInput(m.state.SourceAddress, m.input), m.input))
 	case WizardStepCommandWorkingDir:
 		return m.withError(renderInput("Working directory (empty to use Portico's):", m.input))
 	case WizardStepDirectoryMode:
@@ -1329,28 +1341,122 @@ func renderInput(prompt, value string) string {
 	return strings.Join(lines, "\n")
 }
 
-// parseCommandArgs uses commas as an unambiguous terminal-friendly separator.
-// Spaces remain part of one argument, so `--title, hello world` maps to two
-// arguments without requiring the user to understand shell quoting rules.
+// parseCommandArgs splits an argument line using familiar quoting rules.
+//
+// Commas used to be the separator, which made an argument containing a comma
+// impossible to express: "Example, Inc." became two arguments with no way to
+// escape it. Quoting is what users already expect from a terminal, and it can
+// represent every argument value.
+//
+// This parses the line into an argv slice only. It never implies shell
+// execution: whether the command runs through a shell is a separate explicit
+// choice, so quoting here does not silently change how the command is run.
 func parseCommandArgs(input string) ([]string, error) {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return nil, nil
-	}
-	parts := strings.Split(input, ",")
-	args := make([]string, 0, len(parts))
-	for _, part := range parts {
-		arg := strings.TrimSpace(part)
-		if arg == "" {
-			return nil, fmt.Errorf("command arguments cannot contain an empty entry")
+	var (
+		args    []string
+		current strings.Builder
+		quote   rune
+		escaped bool
+		started bool
+	)
+
+	for _, r := range input {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\' && quote != '\'':
+			// A backslash is literal inside single quotes, as in POSIX shells.
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			// An opening quote starts an argument even if it is empty, so ""
+			// yields one empty argument rather than none.
+			started = true
+		case r == ' ' || r == '\t':
+			if started {
+				args = append(args, current.String())
+				current.Reset()
+				started = false
+			}
+		default:
+			current.WriteRune(r)
+			started = true
 		}
-		args = append(args, arg)
+	}
+
+	if escaped {
+		return nil, fmt.Errorf("command arguments end with a trailing backslash")
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("command arguments have an unclosed %c quote", quote)
+	}
+	if started {
+		args = append(args, current.String())
 	}
 	return args, nil
 }
 
+// commandArgsInput renders an argv slice back into an editable line, quoting
+// any argument that would not survive a round trip unquoted.
 func commandArgsInput(args []string) string {
-	return strings.Join(args, ", ")
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, quoteCommandArg(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteCommandArg(arg string) string {
+	if arg == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(arg, " \t'\"\\") {
+		return arg
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range arg {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// renderArgvPreviewForInput previews the argv that the current input line
+// parses to, so quoting mistakes are visible while typing rather than after the
+// command has been created.
+func renderArgvPreviewForInput(executable, input string) string {
+	args, err := parseCommandArgs(input)
+	if err != nil {
+		return "\n" + err.Error() + "\n"
+	}
+	return "\n" + renderArgvPreview(executable, args)
+}
+
+// renderArgvPreview shows the exact argument vector that will be executed, one
+// argument per line, so quoting mistakes are visible before the command runs.
+func renderArgvPreview(executable string, args []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Executable: %s\n", executable)
+	if len(args) == 0 {
+		b.WriteString("Arguments: none\n")
+		return b.String()
+	}
+	b.WriteString("Arguments:\n")
+	for i, arg := range args {
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, arg)
+	}
+	return b.String()
 }
 
 func (m *WizardModel) directoryModeIndex() int {

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -1328,4 +1329,61 @@ func renderOperationStyleFor(t *testing.T, state string) string {
 	}
 	t.Fatalf("no rendered line contained state %q", state)
 	return ""
+}
+
+// TestEditStringIsRuneAware pins audit item 21. Text editing used byte
+// operations: len(key) == 1 discarded every multi-byte character outright, and
+// backspace sliced a single byte off the end, splitting code points and leaving
+// invalid UTF-8 in the field.
+func TestEditStringIsRuneAware(t *testing.T) {
+	for name, input := range map[string]string{
+		"accented latin": "é",
+		"arabic":         "ع",
+		"cjk":            "中",
+		"emoji":          "🔥",
+		"combining mark": "é",
+		"ascii":          "a",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := ""
+			for _, r := range input {
+				got = editString(got, string(r))
+			}
+			if got != input {
+				t.Fatalf("typing %q produced %q; multi-byte input was dropped", input, got)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("field holds invalid UTF-8: %q", got)
+			}
+		})
+	}
+}
+
+// TestEditStringBackspaceRemovesWholeRunes ensures deletion never splits a
+// multi-byte character.
+func TestEditStringBackspaceRemovesWholeRunes(t *testing.T) {
+	s := "aé中🔥"
+	for range utf8.RuneCountInString(s) {
+		s = editString(s, "backspace")
+		if !utf8.ValidString(s) {
+			t.Fatalf("backspace produced invalid UTF-8: %q", s)
+		}
+	}
+	if s != "" {
+		t.Fatalf("field = %q after deleting every rune, want empty", s)
+	}
+	// Backspace on an empty field must be a no-op, not a panic.
+	if got := editString("", "backspace"); got != "" {
+		t.Fatalf("backspace on empty field = %q", got)
+	}
+}
+
+// TestEditStringIgnoresNamedAndControlKeys ensures navigation keys are not
+// inserted as text.
+func TestEditStringIgnoresNamedAndControlKeys(t *testing.T) {
+	for _, key := range []string{"enter", "left", "right", "up", "down", "tab", "\x00", "\x7f"} {
+		if got := editString("abc", key); got != "abc" {
+			t.Fatalf("key %q was inserted as text: %q", key, got)
+		}
+	}
 }

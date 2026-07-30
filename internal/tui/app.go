@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -1222,12 +1223,30 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 }
 
 // editString is a simple string editor for terminal input.
+// editString applies one key press to a text field.
+//
+// Editing is rune-aware. The previous implementation tested len(key) == 1,
+// which silently discarded every multi-byte character, so accented Latin,
+// Arabic, CJK and emoji input did nothing at all. Backspace sliced a byte off
+// the end, which split multi-byte code points and produced invalid UTF-8.
 func editString(s string, key string) string {
-	if len(key) == 1 {
-		return s + key
+	if key == "backspace" {
+		if s == "" {
+			return s
+		}
+		_, size := utf8.DecodeLastRuneInString(s)
+		return s[:len(s)-size]
 	}
-	if key == "backspace" && len(s) > 0 {
-		return s[:len(s)-1]
+	// A printable key press is one rune, however many bytes it occupies.
+	// Named keys ("enter", "left", …) are longer than one rune and are not
+	// text input.
+	if utf8.RuneCountInString(key) == 1 {
+		r, _ := utf8.DecodeRuneInString(key)
+		// Control characters are commands, not content.
+		if r == utf8.RuneError || r < 0x20 || r == 0x7f {
+			return s
+		}
+		return s + key
 	}
 	return s
 }
