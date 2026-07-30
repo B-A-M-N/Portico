@@ -66,8 +66,12 @@ func TestProviderCapabilities(t *testing.T) {
 	if !caps.TemporaryAddresses.Supported {
 		t.Fatal("TemporaryAddresses should be supported")
 	}
-	if caps.TemporaryAddresses.Stability != core.StabilityStable {
-		t.Fatalf("TemporaryAddresses.Stability = %q, want %q", caps.TemporaryAddresses.Stability, core.StabilityStable)
+	// Every ngrok capability is experimental: the adapter synthesises tunnel
+	// identifiers, targets a hardcoded port and cannot rebuild observed state
+	// after a restart. Declaring temporary addresses stable contradicted both
+	// the rest of this descriptor and the documentation.
+	if caps.TemporaryAddresses.Stability != core.StabilityExperimental {
+		t.Fatalf("TemporaryAddresses.Stability = %q, want %q", caps.TemporaryAddresses.Stability, core.StabilityExperimental)
 	}
 	if !caps.CustomHostnames.Supported {
 		t.Fatal("CustomHostnames should be supported")

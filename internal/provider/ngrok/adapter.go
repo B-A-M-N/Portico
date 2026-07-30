@@ -64,7 +64,12 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 	return core.Capabilities{
 		TemporaryAddresses: core.CapabilitySupport{
 			Supported: true,
-			Stability: core.StabilityStable,
+			// Not stable: the adapter synthesises a tunnel identifier rather
+			// than creating a provider resource, targets a hardcoded local
+			// port, and cannot rebuild observed state after a restart. Declaring
+			// this stable contradicted every other capability on this adapter
+			// and the documentation that describes it.
+			Stability: core.StabilityExperimental,
 		},
 		CustomHostnames: core.CapabilitySupport{
 			Supported: true,
