@@ -60,6 +60,11 @@ type WizardModel struct {
 	fullCloudflare bool
 	accounts       []ipc.ProviderAccountDTO
 
+	// streamConnected reports whether the root model's event stream is live.
+	// When it is, operation progress arrives as events and polling is only a
+	// slow safety net; when it is not, polling is the sole source of progress.
+	streamConnected bool
+
 	// Post-creation flow state
 	createdID       string
 	plan            *ipc.PlanDTO
@@ -928,9 +933,39 @@ func (m *WizardModel) applyPlanCmd() tea.Cmd {
 	}
 }
 
-// pollOperationCmd returns a command that polls the current operation status
-// after a short delay to avoid tight-looping the local socket.
+// SetStreamConnected tells the wizard whether operation events are arriving.
+func (m *WizardModel) SetStreamConnected(connected bool) {
+	m.streamConnected = connected
+}
+
+// OperationID returns the operation the wizard is currently tracking, so the
+// root model can route matching events to it.
+func (m *WizardModel) OperationID() string {
+	if m.operation == nil {
+		return ""
+	}
+	return m.operation.ID
+}
+
+// RefreshOperationCmd fetches the authoritative operation state immediately.
+// It is issued in response to an operation event rather than on a timer.
+func (m *WizardModel) RefreshOperationCmd() tea.Cmd {
+	return m.operationFetchCmd(0)
+}
+
+// pollOperationCmd is the fallback path. While the event stream is connected it
+// backs off to a slow safety poll, because progress arrives as events; when the
+// stream is down it polls at the original interval so a disconnected wizard
+// still makes progress.
 func (m *WizardModel) pollOperationCmd() tea.Cmd {
+	delay := 750 * time.Millisecond
+	if m.streamConnected {
+		delay = 5 * time.Second
+	}
+	return m.operationFetchCmd(delay)
+}
+
+func (m *WizardModel) operationFetchCmd(delay time.Duration) tea.Cmd {
 	client := m.client
 	opID := ""
 	if m.operation != nil {
@@ -938,11 +973,17 @@ func (m *WizardModel) pollOperationCmd() tea.Cmd {
 	}
 	ctx := m.ctx
 	return func() tea.Msg {
-		// Delay before polling to avoid a tight request loop.
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return WizardOperationLoadedMsg{Err: ctx.Err()}
+			}
+		}
 		select {
-		case <-time.After(750 * time.Millisecond):
 		case <-ctx.Done():
 			return WizardOperationLoadedMsg{Err: ctx.Err()}
+		default:
 		}
 		if client == nil {
 			return WizardOperationLoadedMsg{Err: fmt.Errorf("no supervisor connection")}

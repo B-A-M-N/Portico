@@ -409,6 +409,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamErrorMsg:
+		if m.wizard != nil {
+			m.wizard.SetStreamConnected(false)
+		}
 		m.closeEventStream()
 		m.status = fmt.Sprintf("event stream interrupted: %v; reconnecting", msg.Err)
 		return m, m.reconnectEventStream()
@@ -419,6 +422,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case eventStreamReadyMsg:
 		m.stream = msg.Stream
 		m.streamCancel = msg.Cancel
+		if m.wizard != nil {
+			m.wizard.SetStreamConnected(true)
+		}
 		return m, m.waitForEvent()
 
 	case resyncMsg:
@@ -811,6 +817,12 @@ func (m *Model) handleEvent(evt ipc.EventDTO) tea.Cmd {
 		return nil
 
 	case strings.HasPrefix(evt.Type, "operation."):
+		// The wizard tracks its own operation. Deliver progress from the event
+		// stream rather than leaving it to poll, so the stream is the primary
+		// signal and polling is only a fallback.
+		if m.wizard != nil && evt.OperationID != "" && evt.OperationID == m.wizard.OperationID() {
+			return tea.Batch(m.requestSnapshot(), m.wizard.RefreshOperationCmd())
+		}
 		// Only update the visible operation log when the event belongs to
 		// the operation currently displayed. Unrelated operation events
 		// still trigger a snapshot refresh but must not pollute the

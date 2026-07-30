@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
@@ -561,5 +562,53 @@ func TestWizardEditInputIsRuneAware(t *testing.T) {
 	}
 	if got := editInput("", "backspace"); got != "" {
 		t.Fatalf("backspace on empty field = %q", got)
+	}
+}
+
+// TestWizardUsesEventStreamRatherThanTightPolling pins audit item 20. The
+// wizard polled the operation every 750ms regardless of the event stream that
+// already existed, so progress was driven by a timer rather than by events.
+func TestWizardUsesEventStreamRatherThanTightPolling(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	m.operation = &ipc.OperationDTO{ID: "op-1", State: "running"}
+
+	// With the stream live, polling backs off to a safety net.
+	m.SetStreamConnected(true)
+	connectedStart := time.Now()
+	cmd := m.pollOperationCmd()
+	if cmd == nil {
+		t.Fatal("no fallback poll command")
+	}
+
+	// The event-driven refresh must not wait on any timer.
+	refresh := m.RefreshOperationCmd()
+	if refresh == nil {
+		t.Fatal("no event-driven refresh command")
+	}
+	done := make(chan struct{})
+	go func() {
+		refresh()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("event-driven refresh waited on a timer instead of running immediately")
+	}
+	if elapsed := time.Since(connectedStart); elapsed > time.Second {
+		t.Fatalf("refresh path took %s", elapsed)
+	}
+}
+
+// TestWizardExposesItsOperationForEventRouting ensures the root model can match
+// incoming events to the wizard's operation.
+func TestWizardExposesItsOperationForEventRouting(t *testing.T) {
+	m := NewWizard(nil, true, nil)
+	if m.OperationID() != "" {
+		t.Fatalf("OperationID = %q before an operation exists", m.OperationID())
+	}
+	m.operation = &ipc.OperationDTO{ID: "op-42"}
+	if m.OperationID() != "op-42" {
+		t.Fatalf("OperationID = %q, want op-42", m.OperationID())
 	}
 }
