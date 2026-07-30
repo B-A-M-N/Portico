@@ -4,127 +4,292 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider"
 )
 
-// Recommendation contains the recommendation result.
-type Recommendation struct {
-	Provider core.ProviderID
-	Score    int
-	Reasons  []string
-	Filtered []provider.FilteredProvider
+// RecommendationInput describes what a connection actually needs. The engine
+// evaluates providers against these requirements rather than picking whichever
+// provider happens to be authenticated first.
+type RecommendationInput struct {
+	Kind             core.ConnectionKind
+	SourceKind       core.SourceKind
+	MCPTransport     core.MCPTransport
+	ExposureMode     core.ExposureMode
+	Protocol         core.Protocol
+	ProtectionKind   core.ProtectionKind
+	RequestedAddress string
+	PreferredAccount core.ProviderAccountID
 }
 
-// Recommend recommends the best provider for a desired connection.
-func (c *Controller) Recommend(ctx context.Context, profile *core.ConnectionProfile, accountIDs []core.ProviderAccountID) (*Recommendation, error) {
-	snapshots := c.registry.Snapshot()
+// ProviderEvaluation is the verdict for one provider against the requirements.
+//
+// An ineligible provider is returned with the reasons it cannot be used rather
+// than being dropped, so the caller can explain the absence instead of
+// presenting a shorter list with no justification.
+type ProviderEvaluation struct {
+	ProviderID      core.ProviderID
+	DisplayName     string
+	AccountID       core.ProviderAccountID
+	Eligible        bool
+	BlockingReasons []string
+	Strengths       []string
+	Tradeoffs       []string
+	SetupActions    []string
+	Score           int
+}
+
+// Recommendation is the result of evaluating every catalogued provider.
+type Recommendation struct {
+	Recommended  *ProviderEvaluation
+	Alternatives []ProviderEvaluation
+	Ineligible   []ProviderEvaluation
+	// Summary explains the outcome in plain language, including the case where
+	// nothing is eligible.
+	Summary string
+}
+
+// Recommend evaluates every catalogued provider against the requirements.
+//
+// Hard constraints are applied first: a provider that cannot satisfy a stated
+// requirement is ineligible regardless of how attractive it otherwise looks.
+// Scoring only orders the providers that remain.
+func (c *Controller) Recommend(ctx context.Context, input RecommendationInput) (*Recommendation, error) {
+	snapshots := c.registry.DiscoverIdentities(ctx)
 	if len(snapshots) == 0 {
-		return nil, fmt.Errorf("no providers available")
+		return &Recommendation{Summary: "No providers are catalogued."}, nil
 	}
 
-	var filtered []provider.FilteredProvider
-	var candidates []candidate
-
+	var eligible, ineligible []ProviderEvaluation
 	for _, prov := range snapshots {
-		caps := prov.Capabilities
-
-		// Hard filter: exposure mode
-		switch profile.GetExposure().Mode {
-		case core.ExposureTemporary:
-			if !caps.TemporaryAddresses.Supported {
-				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: "does not support temporary addresses"})
-				continue
-			}
-		case core.ExposurePermanent:
-			if !caps.CustomHostnames.Supported {
-				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: "does not support custom hostnames"})
-				continue
-			}
-		case core.ExposurePrivate:
-			if !caps.PrivateExposure.Supported {
-				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: "does not support private exposure"})
-				continue
-			}
+		eval := evaluateProvider(prov, input)
+		if eval.Eligible {
+			eligible = append(eligible, eval)
+		} else {
+			ineligible = append(ineligible, eval)
 		}
-
-		// Hard filter: protection
-		if profile.GetProtection().Kind != core.ProtectionNone {
-			hasProtection := false
-			for _, pc := range caps.BuiltInProtection {
-				if pc.Kind == profile.GetProtection().Kind && pc.Supported {
-					hasProtection = true
-					break
-				}
-			}
-			if !hasProtection {
-				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: fmt.Sprintf("does not support protection %s", profile.GetProtection().Kind)})
-				continue
-			}
-		}
-
-		// Hard filter: MCP transport
-		if profile.GetSource().Kind == core.SourceMCP && profile.GetSource().MCP != nil {
-			transport := profile.GetSource().MCP.Transport
-			if profile.GetExposure().Mode == core.ExposureTemporary && transport == core.MCPTransportSSE {
-				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: "SSE not supported with Quick Tunnel"})
-				continue
-			}
-		}
-
-		// Score the provider
-		score := 0
-		reasons := []string{}
-
-		if prov.Authenticated {
-			score += 10
-			reasons = append(reasons, "authenticated")
-		}
-
-		// Prefer matching account
-		for _, acc := range prov.Accounts {
-			for _, reqAcc := range accountIDs {
-				if acc.ID == reqAcc {
-					score += 5
-					reasons = append(reasons, "matching account")
-					break
-				}
-			}
-		}
-
-		// Prefer stable capabilities
-		if profile.GetExposure().Mode == core.ExposureTemporary && caps.TemporaryAddresses.Stability == core.StabilityStable {
-			score += 3
-			reasons = append(reasons, "stable temporary addresses")
-		}
-
-		candidates = append(candidates, candidate{prov, score, reasons})
 	}
 
-	// Sort by score (desc), then by ID (asc) for deterministic tie-breaking
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].score != candidates[j].score {
-			return candidates[i].score > candidates[j].score
+	// Deterministic ordering: score descending, then provider ID ascending so
+	// equal candidates never reorder between calls.
+	sort.Slice(eligible, func(i, j int) bool {
+		if eligible[i].Score != eligible[j].Score {
+			return eligible[i].Score > eligible[j].Score
 		}
-		return string(candidates[i].prov.ID) < string(candidates[j].prov.ID)
+		return string(eligible[i].ProviderID) < string(eligible[j].ProviderID)
+	})
+	sort.Slice(ineligible, func(i, j int) bool {
+		return string(ineligible[i].ProviderID) < string(ineligible[j].ProviderID)
 	})
 
-	if len(candidates) == 0 {
-		return &Recommendation{Filtered: filtered}, fmt.Errorf("no provider meets requirements")
+	result := &Recommendation{Ineligible: ineligible}
+	if len(eligible) == 0 {
+		result.Summary = summariseNoCandidate(input, ineligible)
+		return result, nil
 	}
 
-	best := candidates[0]
-	return &Recommendation{
-		Provider: best.prov.ID,
-		Score:    best.score,
-		Reasons:  best.reasons,
-		Filtered: filtered,
-	}, nil
+	best := eligible[0]
+	result.Recommended = &best
+	result.Alternatives = eligible[1:]
+	result.Summary = summariseChoice(best, input)
+	return result, nil
 }
 
-type candidate struct {
-	prov    provider.ProviderSnapshot
-	score   int
-	reasons []string
+// evaluateProvider applies hard constraints, then scores what survives.
+func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput) ProviderEvaluation {
+	eval := ProviderEvaluation{
+		ProviderID:   prov.ID,
+		DisplayName:  prov.DisplayName,
+		SetupActions: append([]string(nil), prov.SetupActions...),
+	}
+	if eval.DisplayName == "" {
+		eval.DisplayName = string(prov.ID)
+	}
+
+	// Constraint: the provider must actually be usable. A provider whose client
+	// is missing or that Portico does not implement cannot be recommended no
+	// matter how well its declared capabilities match.
+	switch prov.Availability {
+	case provider.AvailabilityNotImplemented:
+		eval.BlockingReasons = append(eval.BlockingReasons, "Portico does not implement this provider yet")
+	case provider.AvailabilityClientMissing:
+		eval.BlockingReasons = append(eval.BlockingReasons, "the provider's local client is not installed")
+	case provider.AvailabilityExperimental:
+		eval.BlockingReasons = append(eval.BlockingReasons, "the provider is experimental and not lifecycle-complete")
+	case provider.AvailabilityDegraded:
+		reason := "the provider is not responding"
+		if prov.CapabilityError != "" {
+			reason += ": " + prov.CapabilityError
+		}
+		eval.BlockingReasons = append(eval.BlockingReasons, reason)
+	}
+
+	caps := prov.Capabilities
+
+	// Constraint: connection kind. Only service exposure is executable today;
+	// recommending a provider for a kind nothing can run would be misleading.
+	if input.Kind != "" && input.Kind != core.ConnectionServiceExposure {
+		eval.BlockingReasons = append(eval.BlockingReasons,
+			fmt.Sprintf("connection kind %q is not executable yet", input.Kind))
+	}
+
+	// Constraint: exposure mode.
+	switch input.ExposureMode {
+	case core.ExposureTemporary:
+		if !caps.TemporaryAddresses.Supported {
+			eval.BlockingReasons = append(eval.BlockingReasons, "does not support temporary addresses")
+		}
+	case core.ExposurePermanent:
+		if !caps.CustomHostnames.Supported {
+			eval.BlockingReasons = append(eval.BlockingReasons, "does not support permanent custom hostnames")
+		}
+		if !caps.ManagedDNS.Supported {
+			eval.BlockingReasons = append(eval.BlockingReasons, "cannot manage DNS for a permanent hostname")
+		}
+	case core.ExposurePrivate:
+		if !caps.PrivateExposure.Supported {
+			eval.BlockingReasons = append(eval.BlockingReasons, "does not support private-only exposure")
+		}
+	}
+
+	// Constraint: a requested hostname requires custom hostname support even if
+	// the mode was not stated explicitly.
+	if input.RequestedAddress != "" && !caps.CustomHostnames.Supported {
+		eval.BlockingReasons = append(eval.BlockingReasons, "cannot serve a specific hostname")
+	}
+
+	// Constraint: protocol.
+	if input.Protocol != "" {
+		if pc, ok := caps.Protocols[input.Protocol]; !ok || !pc.Supported {
+			eval.BlockingReasons = append(eval.BlockingReasons,
+				fmt.Sprintf("does not support the %s protocol", input.Protocol))
+		}
+	}
+
+	// Constraint: protection.
+	if input.ProtectionKind != "" && input.ProtectionKind != core.ProtectionNone {
+		supported := false
+		for _, pc := range caps.BuiltInProtection {
+			if pc.Kind == input.ProtectionKind && pc.Supported {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			eval.BlockingReasons = append(eval.BlockingReasons,
+				fmt.Sprintf("does not support %s protection", input.ProtectionKind))
+		}
+	}
+
+	// Constraint: MCP over SSE cannot use a temporary address, because the
+	// address changes and an SSE client cannot follow it.
+	if input.SourceKind == core.SourceMCP &&
+		input.MCPTransport == core.MCPTransportSSE &&
+		input.ExposureMode == core.ExposureTemporary {
+		eval.BlockingReasons = append(eval.BlockingReasons,
+			"SSE transport cannot be used with a temporary address")
+	}
+
+	if len(eval.BlockingReasons) > 0 {
+		return eval
+	}
+	eval.Eligible = true
+
+	// Scoring. Only reached by providers that satisfy every hard constraint.
+	if prov.Authenticated {
+		eval.Score += 10
+		eval.Strengths = append(eval.Strengths, "already authenticated")
+	} else {
+		eval.Tradeoffs = append(eval.Tradeoffs, "needs account setup before it can be used")
+		if len(eval.SetupActions) == 0 {
+			eval.SetupActions = append(eval.SetupActions, "Add an account for this provider")
+		}
+	}
+
+	for _, acc := range prov.Accounts {
+		if input.PreferredAccount != "" && acc.ID == input.PreferredAccount {
+			eval.Score += 5
+			eval.AccountID = acc.ID
+			eval.Strengths = append(eval.Strengths, "uses the account you selected")
+			break
+		}
+	}
+	if eval.AccountID == "" && len(prov.Accounts) > 0 {
+		eval.AccountID = prov.Accounts[0].ID
+	}
+
+	switch input.ExposureMode {
+	case core.ExposureTemporary:
+		if caps.TemporaryAddresses.Stability == core.StabilityStable {
+			eval.Score += 3
+			eval.Strengths = append(eval.Strengths, "temporary addresses are a stable, supported feature")
+		}
+		eval.Tradeoffs = append(eval.Tradeoffs, "the address changes each time the connection is opened")
+	case core.ExposurePermanent:
+		if caps.CustomHostnames.Stability == core.StabilityStable {
+			eval.Score += 3
+			eval.Strengths = append(eval.Strengths, "custom hostnames are a stable, supported feature")
+		}
+	}
+
+	if input.ProtectionKind == "" || input.ProtectionKind == core.ProtectionNone {
+		if input.ExposureMode == core.ExposureTemporary || input.ExposureMode == core.ExposurePermanent {
+			eval.Tradeoffs = append(eval.Tradeoffs, "anyone with the address can reach the service")
+		}
+	}
+
+	if caps.Telemetry.Supported {
+		eval.Score++
+		eval.Strengths = append(eval.Strengths, "reports traffic telemetry")
+	}
+
+	return eval
+}
+
+func summariseChoice(best ProviderEvaluation, input RecommendationInput) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s is the best match", best.DisplayName)
+	switch input.ExposureMode {
+	case core.ExposureTemporary:
+		b.WriteString(" for a temporary public address")
+	case core.ExposurePermanent:
+		b.WriteString(" for a permanent public address")
+	case core.ExposurePrivate:
+		b.WriteString(" for private access")
+	}
+	b.WriteString(".")
+	if len(best.Strengths) > 0 {
+		fmt.Fprintf(&b, " It %s.", strings.Join(best.Strengths, ", and "))
+	}
+	return b.String()
+}
+
+// summariseNoCandidate explains an empty result. Returning no recommendation is
+// a legitimate outcome and must be stated as such, rather than falling back to
+// a provider that cannot meet the requirements.
+func summariseNoCandidate(input RecommendationInput, ineligible []ProviderEvaluation) string {
+	var b strings.Builder
+	b.WriteString("No provider can meet these requirements")
+	var needs []string
+	if input.ExposureMode != "" {
+		needs = append(needs, string(input.ExposureMode))
+	}
+	if input.Protocol != "" {
+		needs = append(needs, string(input.Protocol))
+	}
+	if input.ProtectionKind != "" && input.ProtectionKind != core.ProtectionNone {
+		needs = append(needs, string(input.ProtectionKind)+" protection")
+	}
+	if len(needs) > 0 {
+		fmt.Fprintf(&b, " (%s)", strings.Join(needs, ", "))
+	}
+	b.WriteString(".")
+	for _, e := range ineligible {
+		if len(e.BlockingReasons) > 0 {
+			fmt.Fprintf(&b, " %s: %s.", e.DisplayName, strings.Join(e.BlockingReasons, "; "))
+		}
+	}
+	return b.String()
 }

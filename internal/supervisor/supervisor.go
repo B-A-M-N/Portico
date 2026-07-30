@@ -657,28 +657,56 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 }
 
 func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecommendationRequest) (*ipc.ProviderRecommendationResponse, error) {
-	providers := h.sup.registry.List()
-	resp := &ipc.ProviderRecommendationResponse{}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
-	for _, p := range providers {
-		choice := ipc.ProviderChoiceDTO{ProviderID: string(p.ID)}
-		if len(p.Accounts) > 0 {
-			choice.AccountID = string(p.Accounts[0].ID)
-		}
+	// The request's stated requirements drive the result. The previous
+	// implementation ignored them entirely and returned whichever provider
+	// happened to be authenticated first.
+	input := controller.RecommendationInput{
+		Kind:             core.ConnectionKind(req.ConnectionKind),
+		SourceKind:       core.SourceKind(req.SourceKind),
+		MCPTransport:     core.MCPTransport(req.MCPTransport),
+		ExposureMode:     core.ExposureMode(req.ExposureMode),
+		Protocol:         core.Protocol(req.Protocol),
+		ProtectionKind:   core.ProtectionKind(req.ProtectionKind),
+		RequestedAddress: req.RequestedAddress,
+		PreferredAccount: core.ProviderAccountID(req.PreferredAccount),
+	}
 
-		if p.Authenticated {
-			choice.Reasons = append(choice.Reasons, "Provider is authenticated and ready")
-			if resp.Recommended == nil {
-				resp.Recommended = &choice
-			} else {
-				resp.Alternatives = append(resp.Alternatives, choice)
-			}
-		} else {
-			choice.Reasons = append(choice.Reasons, "Provider requires authentication")
-			resp.Alternatives = append(resp.Alternatives, choice)
+	rec, err := h.sup.controller.Recommend(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	toChoice := func(e controller.ProviderEvaluation) ipc.ProviderChoiceDTO {
+		return ipc.ProviderChoiceDTO{
+			ProviderID:   string(e.ProviderID),
+			DisplayName:  e.DisplayName,
+			AccountID:    string(e.AccountID),
+			Reasons:      e.Strengths,
+			Tradeoffs:    e.Tradeoffs,
+			SetupActions: e.SetupActions,
+			Score:        e.Score,
 		}
 	}
 
+	resp := &ipc.ProviderRecommendationResponse{Summary: rec.Summary}
+	if rec.Recommended != nil {
+		choice := toChoice(*rec.Recommended)
+		resp.Recommended = &choice
+	}
+	for _, alt := range rec.Alternatives {
+		resp.Alternatives = append(resp.Alternatives, toChoice(alt))
+	}
+	for _, bad := range rec.Ineligible {
+		resp.Filtered = append(resp.Filtered, ipc.FilteredChoiceDTO{
+			ProviderID:  string(bad.ProviderID),
+			DisplayName: bad.DisplayName,
+			Reason:      strings.Join(bad.BlockingReasons, "; "),
+			Reasons:     bad.BlockingReasons,
+		})
+	}
 	return resp, nil
 }
 

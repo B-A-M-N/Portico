@@ -384,10 +384,13 @@ type UpdateConnectionRequest struct {
 
 // ProviderRecommendationRequest asks the supervisor to recommend a driver.
 type ProviderRecommendationRequest struct {
+	ConnectionKind   string `json:"connection_kind,omitempty"`
 	SourceKind       string `json:"source_kind,omitempty"`
+	MCPTransport     string `json:"mcp_transport,omitempty"`
 	ExposureMode     string `json:"exposure_mode,omitempty"`
 	Protocol         string `json:"protocol,omitempty"`
 	ProtectionKind   string `json:"protection_kind,omitempty"`
+	RequestedAddress string `json:"requested_address,omitempty"`
 	PreferredAccount string `json:"preferred_account,omitempty"`
 }
 
@@ -396,19 +399,31 @@ type ProviderRecommendationResponse struct {
 	Recommended  *ProviderChoiceDTO  `json:"recommended,omitempty"`
 	Alternatives []ProviderChoiceDTO `json:"alternatives,omitempty"`
 	Filtered     []FilteredChoiceDTO `json:"filtered,omitempty"`
+	// Summary explains the outcome in plain language, including the case where
+	// no provider is eligible.
+	Summary string `json:"summary,omitempty"`
 }
 
 // ProviderChoiceDTO describes one viable provider choice.
 type ProviderChoiceDTO struct {
-	ProviderID string   `json:"provider_id"`
-	AccountID  string   `json:"account_id,omitempty"`
-	Reasons    []string `json:"reasons,omitempty"`
+	ProviderID  string   `json:"provider_id"`
+	DisplayName string   `json:"display_name,omitempty"`
+	AccountID   string   `json:"account_id,omitempty"`
+	Reasons     []string `json:"reasons,omitempty"`
+	// Tradeoffs state the consequences of this choice in plain language, so a
+	// recommendation explains what will happen rather than only naming a
+	// provider.
+	Tradeoffs    []string `json:"tradeoffs,omitempty"`
+	SetupActions []string `json:"setup_actions,omitempty"`
+	Score        int      `json:"score,omitempty"`
 }
 
 // FilteredChoiceDTO describes a provider that was filtered out and why.
 type FilteredChoiceDTO struct {
-	ProviderID string `json:"provider_id"`
-	Reason     string `json:"reason"`
+	ProviderID  string   `json:"provider_id"`
+	DisplayName string   `json:"display_name,omitempty"`
+	Reason      string   `json:"reason"`
+	Reasons     []string `json:"reasons,omitempty"`
 }
 
 // OperationHistoryDTO contains a list of past operations.
