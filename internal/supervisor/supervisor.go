@@ -484,16 +484,38 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 			dto.Capabilities.ExpirationMaxSecs = int(caps.Expiration.MaxDuration.Seconds())
 		}
 
-		// Determine availability and readiness
-		if p.Authenticated {
-			dto.Availability = "ready"
+		// Determine availability and readiness. The registry reports why a
+		// catalogued provider has no usable adapter; only fall back to
+		// account-based inference for entries that carry no verdict.
+		dto.Availability = string(p.Availability)
+		dto.LastError = p.Reason
+		dto.SetupActions = append([]string(nil), p.SetupActions...)
+
+		switch p.Availability {
+		case provider.AvailabilityReady:
 			dto.Readiness = "ready"
-		} else if len(p.Accounts) > 0 {
-			dto.Availability = "unconfigured"
-			dto.Readiness = "needs_auth"
-		} else {
-			dto.Availability = "unconfigured"
-			dto.Readiness = "needs_config"
+		case provider.AvailabilityUnconfigured:
+			if len(p.Accounts) > 0 {
+				dto.Readiness = "needs_auth"
+			} else {
+				dto.Readiness = "needs_config"
+			}
+		case provider.AvailabilityClientMissing:
+			dto.Readiness = "needs_client"
+		case provider.AvailabilityExperimental:
+			dto.Readiness = "experimental"
+		case provider.AvailabilityNotImplemented:
+			dto.Readiness = "not_implemented"
+		case provider.AvailabilityDegraded:
+			dto.Readiness = "error"
+		default:
+			if p.Authenticated {
+				dto.Availability, dto.Readiness = "ready", "ready"
+			} else if len(p.Accounts) > 0 {
+				dto.Availability, dto.Readiness = "unconfigured", "needs_auth"
+			} else {
+				dto.Availability, dto.Readiness = "unconfigured", "needs_config"
+			}
 		}
 
 		for _, account := range p.Accounts {

@@ -79,6 +79,7 @@ func RunSupervisor(ctx context.Context) error {
 	// Register production providers. Persisted account rows are loaded and
 	// validated against the concrete adapter during startup; doing it before
 	// adapter construction would advertise credentials it cannot actually use.
+	registerProviderCatalog(reg)
 	hasRealProvider := registerCloudflareWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st)
 	hasRealProvider = registerNgrokWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st) || hasRealProvider
 
@@ -108,6 +109,30 @@ func RunSupervisor(ctx context.Context) error {
 	return sup.Start(ctx)
 }
 
+// registerProviderCatalog records the providers Portico names but ships no
+// adapter for. Without these entries the UI cannot distinguish a provider that
+// does not exist from one that is merely unconfigured, and documentation
+// claiming support for them has nothing to contradict it.
+//
+// Entries are added before adapter construction so a successful registration
+// supersedes them.
+func registerProviderCatalog(reg provider.Registry) {
+	for _, entry := range []provider.CatalogEntry{
+		{
+			ID: "tailscale", Name: "tailscale", DisplayName: "Tailscale",
+			Availability: provider.AvailabilityNotImplemented,
+			Reason:       "Portico ships no Tailscale adapter yet",
+		},
+		{
+			ID: "zrok", Name: "zrok", DisplayName: "zrok",
+			Availability: provider.AvailabilityNotImplemented,
+			Reason:       "Portico ships no zrok adapter yet",
+		},
+	} {
+		reg.AddCatalogEntry(entry)
+	}
+}
+
 // registerCloudflareWithAccounts attempts to register the Cloudflare provider
 // using accounts loaded from the store. Returns true if the provider was
 // successfully registered.
@@ -117,9 +142,22 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 		cloudflaredBin = "cloudflared"
 	}
 
-	// Check if cloudflared is available
+	// Check if cloudflared is available. A missing client is a setup gap, not a
+	// reason for the provider to vanish: record it in the catalog so the UI can
+	// say "install cloudflared" instead of silently omitting Cloudflare.
 	if _, err := exec.LookPath(cloudflaredBin); err != nil {
-		slog.Info("cloudflared not found, skipping Cloudflare provider", "bin", cloudflaredBin)
+		slog.Info("cloudflared not found, Cloudflare provider unavailable", "bin", cloudflaredBin)
+		reg.AddCatalogEntry(provider.CatalogEntry{
+			ID:           "cloudflare",
+			Name:         "cloudflare",
+			DisplayName:  "Cloudflare",
+			Availability: provider.AvailabilityClientMissing,
+			Reason:       fmt.Sprintf("the %q client was not found on PATH", cloudflaredBin),
+			SetupActions: []string{
+				"Install cloudflared from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+				"Ensure cloudflared is on PATH, or set the cloudflared binary path in Portico's configuration",
+			},
+		})
 		return false
 	}
 
@@ -240,6 +278,19 @@ func registerNgrokWithAccounts(reg provider.Registry, paths app.Paths, procMgr c
 	if os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_NGROK") != "1" {
 		slog.Info("Ngrok provider is experimental and disabled; " +
 			"set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to register it")
+		reg.AddCatalogEntry(provider.CatalogEntry{
+			ID:           "ngrok",
+			Name:         "ngrok",
+			DisplayName:  "ngrok",
+			Availability: provider.AvailabilityExperimental,
+			Reason: "the ngrok adapter is experimental and not lifecycle-complete: " +
+				"it does not create real provider resources, targets a fixed local port, " +
+				"cannot rebuild observed state after a restart, and applies no protection",
+			SetupActions: []string{
+				"Set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to register it anyway",
+				"Do not rely on it for connections that matter",
+			},
+		})
 		return false
 	}
 
@@ -250,7 +301,15 @@ func registerNgrokWithAccounts(reg provider.Registry, paths app.Paths, procMgr c
 
 	// Check if ngrok is available
 	if _, err := exec.LookPath(ngrokBin); err != nil {
-		slog.Info("ngrok not found, skipping Ngrok provider", "bin", ngrokBin)
+		slog.Info("ngrok not found, Ngrok provider unavailable", "bin", ngrokBin)
+		reg.AddCatalogEntry(provider.CatalogEntry{
+			ID:           "ngrok",
+			Name:         "ngrok",
+			DisplayName:  "ngrok",
+			Availability: provider.AvailabilityClientMissing,
+			Reason:       fmt.Sprintf("the %q client was not found on PATH", ngrokBin),
+			SetupActions: []string{"Install ngrok and ensure it is on PATH"},
+		})
 		return false
 	}
 

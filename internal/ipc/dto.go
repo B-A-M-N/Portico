@@ -113,6 +113,10 @@ type ProviderDTO struct {
 	Capabilities    *CapabilitySetDTO    `json:"capabilities,omitempty"`
 	LastError       string               `json:"last_error,omitempty"`
 	RestartRequired bool                 `json:"restart_required,omitempty"`
+	// SetupActions are concrete steps that would make this provider usable.
+	// They accompany an unavailable provider so the UI can offer a next step
+	// instead of only reporting a gap.
+	SetupActions []string `json:"setup_actions,omitempty"`
 }
 
 // CapabilitySetDTO describes provider capabilities in a versioned, serializable form.

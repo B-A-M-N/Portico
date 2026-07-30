@@ -1613,6 +1613,29 @@ func (m *Model) renderOperationProgress() string {
 	return b.String()
 }
 
+// providerStateLabel maps a provider's availability to a plain-language label
+// and a theme style. Each state is named explicitly so a provider whose client
+// is missing is never presented the same way as one that is merely
+// unconfigured, or as one Portico does not implement at all.
+func providerStateLabel(availability string) (string, string) {
+	switch availability {
+	case "ready":
+		return "Ready", "stable"
+	case "unconfigured":
+		return "Setup required", "attention"
+	case "client_missing":
+		return "Client not installed", "attention"
+	case "experimental":
+		return "Experimental — not usable", "attention"
+	case "not_implemented":
+		return "Not implemented", "muted"
+	case "degraded":
+		return "Temporarily unavailable", "intervention"
+	default:
+		return "Unknown", "muted"
+	}
+}
+
 func (m *Model) renderProviders() string {
 	// If in provider setup mode, show the setup UI
 	if m.providerSetupStep > 0 {
@@ -1622,40 +1645,57 @@ func (m *Model) renderProviders() string {
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(" PROVIDERS "))
 	b.WriteString("\n\n")
+	if len(m.snapshot.Providers) == 0 {
+		b.WriteString("No providers are catalogued.\n\n")
+	}
 	for _, p := range m.snapshot.Providers {
-		// Show provider capabilities instead of just authenticated/unauthenticated
-		b.WriteString(fmt.Sprintf("  %s\n", p.DisplayName))
+		label, style := providerStateLabel(p.Availability)
+		b.WriteString(fmt.Sprintf("  %s  ", p.DisplayName))
+		b.WriteString(m.theme.Style(style).Render(label))
+		b.WriteString("\n")
 
-		// Quick Tunnels are always available (no auth required)
-		if p.ID == "cloudflare" {
-			b.WriteString(m.theme.Style("stable").Render("    ✓ Temporary addresses (Quick Tunnel)"))
+		// A provider that cannot be used must say why and what to do about it,
+		// rather than being omitted or shown as merely unconfigured.
+		if p.LastError != "" {
+			b.WriteString(m.theme.Style("muted").Render("    " + p.LastError))
+			b.WriteString("\n")
+		}
+		for _, action := range p.SetupActions {
+			b.WriteString(m.theme.Style("muted").Render("    → " + action))
 			b.WriteString("\n")
 		}
 
-		// Permanent features require authentication
-		if p.Authenticated {
-			b.WriteString(m.theme.Style("stable").Render("    ✓ Permanent hostnames"))
-			b.WriteString("\n")
-			b.WriteString(m.theme.Style("stable").Render("    ✓ Email protection"))
-			b.WriteString("\n")
-		} else {
-			b.WriteString(m.theme.Style("muted").Render("    ○ Permanent hostnames (account setup required)"))
-			b.WriteString("\n")
-			b.WriteString(m.theme.Style("muted").Render("    ○ Email protection (account setup required)"))
-			b.WriteString("\n")
+		// Capabilities are only meaningful for a provider with a live adapter.
+		if p.Capabilities != nil && p.Availability != "not_implemented" && p.Availability != "client_missing" {
+			if p.Capabilities.TemporaryAddresses {
+				b.WriteString(m.theme.Style("stable").Render("    ✓ Temporary addresses"))
+				b.WriteString("\n")
+			}
+			renderCapability := func(supported bool, name string) {
+				if supported && p.Authenticated {
+					b.WriteString(m.theme.Style("stable").Render("    ✓ " + name))
+				} else if supported {
+					b.WriteString(m.theme.Style("muted").Render("    ○ " + name + " (account setup required)"))
+				} else {
+					b.WriteString(m.theme.Style("muted").Render("    ✗ " + name + " (not supported)"))
+				}
+				b.WriteString("\n")
+			}
+			renderCapability(p.Capabilities.CustomHostnames, "Permanent hostnames")
+			renderCapability(len(p.Capabilities.ProtectionModes) > 0, "Access protection")
 		}
 
 		// Show configured accounts
 		for _, account := range p.Accounts {
-			label := account.Label
-			if label == "" {
-				label = account.ID
+			accLabel := account.Label
+			if accLabel == "" {
+				accLabel = account.ID
 			}
 			accountStatus := account.Status
 			if accountStatus == "" {
 				accountStatus = "configured"
 			}
-			b.WriteString(fmt.Sprintf("      • %s — %s\n", label, accountStatus))
+			b.WriteString(fmt.Sprintf("      • %s — %s\n", accLabel, accountStatus))
 		}
 		b.WriteString("\n")
 	}

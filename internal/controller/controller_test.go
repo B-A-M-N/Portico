@@ -71,6 +71,7 @@ func newTestRegistry(providers ...core.Provider) *testRegistry {
 func (r *testRegistry) Add(p core.Provider) error             { r.providers[p.Identity().ID] = p; return nil }
 func (r *testRegistry) Get(id core.ProviderID) core.Provider  { return r.providers[id] }
 func (r *testRegistry) List() []provider.ProviderSnapshot     { return nil }
+func (r *testRegistry) AddCatalogEntry(provider.CatalogEntry) {}
 func (r *testRegistry) Snapshot() []provider.ProviderSnapshot { return nil }
 func (r *testRegistry) SetAccounts(id core.ProviderID, accounts []core.ProviderAccountID) {
 	r.accounts[id] = append([]core.ProviderAccountID(nil), accounts...)

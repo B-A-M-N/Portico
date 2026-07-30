@@ -3,8 +3,10 @@ package provider
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 )
@@ -15,11 +17,40 @@ type Registry interface {
 	List() []ProviderSnapshot
 	Snapshot() []ProviderSnapshot
 	Add(provider core.Provider) error
+	// AddCatalogEntry keeps a provider visible when no adapter could be
+	// constructed for it, so the UI can explain the gap instead of omitting it.
+	AddCatalogEntry(entry CatalogEntry)
 	DiscoverIdentities(ctx context.Context) []ProviderSnapshot
 	SetAccounts(providerID core.ProviderID, accounts []core.ProviderAccountID)
 	SetAccountInfo(providerID core.ProviderID, accounts []AccountInfo)
 	GetAccounts(providerID core.ProviderID) []core.ProviderAccountID
 }
+
+// Availability describes whether a provider can currently be used, and when it
+// cannot, why. A provider that Portico knows about must remain visible with a
+// reason rather than disappearing from the catalog, otherwise the UI cannot
+// distinguish "this provider does not exist" from "its client is not installed".
+type Availability string
+
+const (
+	// AvailabilityReady means a live adapter is registered and usable.
+	AvailabilityReady Availability = "ready"
+	// AvailabilityUnconfigured means the adapter exists but has no usable
+	// account or credential yet.
+	AvailabilityUnconfigured Availability = "unconfigured"
+	// AvailabilityClientMissing means the provider's local client binary was
+	// not found, so no adapter could be constructed.
+	AvailabilityClientMissing Availability = "client_missing"
+	// AvailabilityExperimental means the adapter exists but is not
+	// lifecycle-complete and is gated behind an explicit opt-in.
+	AvailabilityExperimental Availability = "experimental"
+	// AvailabilityNotImplemented means Portico names the provider but ships no
+	// adapter for it.
+	AvailabilityNotImplemented Availability = "not_implemented"
+	// AvailabilityDegraded means an adapter is registered but reported an
+	// error when queried.
+	AvailabilityDegraded Availability = "degraded"
+)
 
 // ProviderSnapshot is a frozen provider summary for listing
 type ProviderSnapshot struct {
@@ -29,6 +60,29 @@ type ProviderSnapshot struct {
 	Capabilities  core.Capabilities
 	Authenticated bool
 	Accounts      []AccountInfo
+
+	// Availability and Reason explain why a catalogued provider is not usable.
+	// Registered adapters report ready or unconfigured; catalog-only entries
+	// report why no adapter exists.
+	Availability Availability
+	Reason       string
+	// SetupActions are the concrete steps a user can take to make this
+	// provider usable.
+	SetupActions []string
+	// CapabilityError records a failed capability query instead of silently
+	// presenting a zero-valued capability set as fact.
+	CapabilityError string
+}
+
+// CatalogEntry describes a provider Portico knows about but has no live adapter
+// for. Registering one keeps the provider visible with an explanation.
+type CatalogEntry struct {
+	ID           core.ProviderID
+	Name         string
+	DisplayName  string
+	Availability Availability
+	Reason       string
+	SetupActions []string
 }
 
 // AccountInfo describes a configured provider account
@@ -50,6 +104,7 @@ type registry struct {
 	providers   map[core.ProviderID]core.Provider
 	accounts    map[core.ProviderID][]core.ProviderAccountID
 	accountInfo map[core.ProviderID][]AccountInfo
+	catalog     map[core.ProviderID]CatalogEntry
 }
 
 // NewRegistry creates a new provider registry
@@ -58,7 +113,24 @@ func NewRegistry() *registry {
 		providers:   make(map[core.ProviderID]core.Provider),
 		accounts:    make(map[core.ProviderID][]core.ProviderAccountID),
 		accountInfo: make(map[core.ProviderID][]AccountInfo),
+		catalog:     make(map[core.ProviderID]CatalogEntry),
 	}
+}
+
+// AddCatalogEntry records a provider that Portico knows about but cannot
+// currently instantiate. A registered adapter always takes precedence, so an
+// entry added before registration succeeds is superseded rather than
+// duplicated.
+func (r *registry) AddCatalogEntry(entry CatalogEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry.Name == "" {
+		entry.Name = string(entry.ID)
+	}
+	if entry.DisplayName == "" {
+		entry.DisplayName = entry.Name
+	}
+	r.catalog[entry.ID] = entry
 }
 
 // Get returns a provider by ID
@@ -70,58 +142,113 @@ func (r *registry) Get(id core.ProviderID) core.Provider {
 
 // Snapshot returns all providers in deterministic ID order (alias for List)
 func (r *registry) Snapshot() []ProviderSnapshot {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.listInternalLocked()
-}
-
-func (r *registry) listInternalLocked() []ProviderSnapshot {
-	// Sort provider IDs for deterministic ordering
-	ids := make([]core.ProviderID, 0, len(r.providers))
-	for id := range r.providers {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		return string(ids[i]) < string(ids[j])
-	})
-
-	result := make([]ProviderSnapshot, 0, len(ids))
-	for _, id := range ids {
-		p := r.providers[id]
-		ident := p.Identity()
-
-		// Populate capabilities by calling the provider.
-		// Capabilities should be deterministic and not require network calls
-		// — I/O from this path would block the registry lock.
-		caps, _ := p.Capabilities(context.Background())
-
-		// Get account info
-		accounts := append([]AccountInfo(nil), r.accountInfo[id]...)
-		if len(accounts) == 0 {
-			accountIDs := r.accounts[id]
-			accounts = make([]AccountInfo, len(accountIDs))
-			for i, accID := range accountIDs {
-				accounts[i] = AccountInfo{ID: accID, Label: string(accID), Status: "configured"}
-			}
-		}
-
-		result = append(result, ProviderSnapshot{
-			ID:            ident.ID,
-			Name:          ident.Name,
-			DisplayName:   ident.DisplayName,
-			Capabilities:  caps,
-			Authenticated: len(accounts) > 0,
-			Accounts:      accounts,
-		})
-	}
-	return result
+	return r.snapshot(context.Background())
 }
 
 // List returns all providers in deterministic ID order
 func (r *registry) List() []ProviderSnapshot {
+	return r.snapshot(context.Background())
+}
+
+// capabilityQueryTimeout bounds a single provider capability query. Capabilities
+// are meant to be deterministic and local, but an adapter is free to do work
+// here, and the registry must not be held hostage by one.
+const capabilityQueryTimeout = 5 * time.Second
+
+// snapshot builds the provider catalog.
+//
+// Capability queries deliberately run after the registry lock is released. The
+// lock previously spanned p.Capabilities(context.Background()), so any adapter
+// that performed I/O there would block every other registry reader and writer
+// for the duration, with no timeout. References are copied under the lock and
+// queried outside it, with a bounded context per provider.
+func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
+	type held struct {
+		provider core.Provider
+		accounts []AccountInfo
+	}
+
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.listInternalLocked()
+	live := make(map[core.ProviderID]held, len(r.providers))
+	for id, p := range r.providers {
+		accounts := append([]AccountInfo(nil), r.accountInfo[id]...)
+		if len(accounts) == 0 {
+			for _, accID := range r.accounts[id] {
+				accounts = append(accounts, AccountInfo{ID: accID, Label: string(accID), Status: "configured"})
+			}
+		}
+		live[id] = held{provider: p, accounts: accounts}
+	}
+	catalog := make(map[core.ProviderID]CatalogEntry, len(r.catalog))
+	maps.Copy(catalog, r.catalog)
+	r.mu.RUnlock()
+
+	ids := make([]core.ProviderID, 0, len(live)+len(catalog))
+	for id := range live {
+		ids = append(ids, id)
+	}
+	for id := range catalog {
+		if _, registered := live[id]; !registered {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return string(ids[i]) < string(ids[j]) })
+
+	result := make([]ProviderSnapshot, 0, len(ids))
+	for _, id := range ids {
+		h, registered := live[id]
+		if !registered {
+			entry := catalog[id]
+			result = append(result, ProviderSnapshot{
+				ID:           entry.ID,
+				Name:         entry.Name,
+				DisplayName:  entry.DisplayName,
+				Availability: entry.Availability,
+				Reason:       entry.Reason,
+				SetupActions: append([]string(nil), entry.SetupActions...),
+			})
+			continue
+		}
+
+		ident := h.provider.Identity()
+		capCtx, cancel := context.WithTimeout(ctx, capabilityQueryTimeout)
+		caps, capErr := h.provider.Capabilities(capCtx)
+		cancel()
+
+		snap := ProviderSnapshot{
+			ID:            ident.ID,
+			Name:          ident.Name,
+			DisplayName:   ident.DisplayName,
+			Capabilities:  caps,
+			Authenticated: len(h.accounts) > 0,
+			Accounts:      h.accounts,
+		}
+		switch {
+		case capErr != nil:
+			// A failed capability query must not be reported as an empty but
+			// authoritative capability set.
+			snap.Availability = AvailabilityDegraded
+			snap.CapabilityError = capErr.Error()
+			snap.Reason = "provider capabilities could not be read: " + capErr.Error()
+		case len(h.accounts) > 0:
+			snap.Availability = AvailabilityReady
+		default:
+			snap.Availability = AvailabilityUnconfigured
+		}
+		// A catalog entry may still carry setup guidance for a registered but
+		// unconfigured provider.
+		if entry, ok := catalog[id]; ok {
+			snap.SetupActions = append([]string(nil), entry.SetupActions...)
+			if snap.Reason == "" {
+				snap.Reason = entry.Reason
+			}
+			if entry.Availability == AvailabilityExperimental {
+				snap.Availability = AvailabilityExperimental
+			}
+		}
+		result = append(result, snap)
+	}
+	return result
 }
 
 // Add adds a provider to the registry
@@ -183,17 +310,8 @@ func (r *registry) GetAccounts(providerID core.ProviderID) []core.ProviderAccoun
 	return result
 }
 
-// DiscoverIdentities returns providers with account information.
+// DiscoverIdentities returns providers with account information, using the
+// caller's context to bound capability queries.
 func (r *registry) DiscoverIdentities(ctx context.Context) []ProviderSnapshot {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	snaps := r.listInternalLocked()
-	for i := range snaps {
-		if p := r.providers[snaps[i].ID]; p != nil {
-			if caps, err := p.Capabilities(ctx); err == nil {
-				snaps[i].Capabilities = caps
-			}
-		}
-	}
-	return snaps
+	return r.snapshot(ctx)
 }
