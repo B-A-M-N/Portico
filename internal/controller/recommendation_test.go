@@ -20,6 +20,8 @@ func (r *snapshotRegistry) List() []provider.ProviderSnapshot                   
 func (r *snapshotRegistry) Snapshot() []provider.ProviderSnapshot                  { return r.snaps }
 func (r *snapshotRegistry) Add(core.Provider) error                                { return nil }
 func (r *snapshotRegistry) AddCatalogEntry(provider.CatalogEntry)                  {}
+func (r *snapshotRegistry) Replace(core.Provider)                                  {}
+func (r *snapshotRegistry) Remove(core.ProviderID)                                 {}
 func (r *snapshotRegistry) SetAccounts(core.ProviderID, []core.ProviderAccountID)  {}
 func (r *snapshotRegistry) SetAccountInfo(core.ProviderID, []provider.AccountInfo) {}
 func (r *snapshotRegistry) GetAccounts(core.ProviderID) []core.ProviderAccountID   { return nil }

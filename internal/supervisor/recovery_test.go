@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/B-A-M-N/portico/internal/app"
 	"github.com/B-A-M-N/portico/internal/controller"
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/process"
 	"github.com/B-A-M-N/portico/internal/provider"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
@@ -1434,5 +1437,71 @@ func TestPlanEditReportsANoOpAsSuch(t *testing.T) {
 	}
 	if !plan.Noop {
 		t.Fatalf("an unchanged edit was not reported as a no-op: %#v", plan.Steps)
+	}
+}
+
+// TestProviderRebuildMakesAnAccountUsableWithoutRestart pins the removal of the
+// restart requirement. Account changes previously took effect only at startup,
+// so a newly saved account was inert until the user restarted the supervisor.
+func TestProviderRebuildMakesAnAccountUsableWithoutRestart(t *testing.T) {
+	if _, err := exec.LookPath("cloudflared"); err != nil {
+		t.Skip("cloudflared is required to construct the Cloudflare adapter")
+	}
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	sup := &Supervisor{
+		store: st, controller: ctrl, registry: registry, mutating: true,
+		procMgr: process.NewManager(),
+		paths:   app.Paths{ConnectorDir: t.TempDir()},
+	}
+
+	if registry.Get("cloudflare") != nil {
+		t.Fatal("cloudflare adapter exists before any account is configured")
+	}
+
+	account := core.ProviderAccount{
+		ID: "acct-live", Provider: "cloudflare", Label: "Live",
+		CredentialRef: "cloudflare:acct-live:api-token", Status: core.AccountAuthenticated,
+		Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("token")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+
+	if err := sup.RebuildCloudflareProvider(); err != nil {
+		t.Fatalf("RebuildCloudflareProvider: %v", err)
+	}
+	// A zone-less account must still produce a usable adapter: a zone is
+	// required only for DNS and custom hostnames.
+	if registry.Get("cloudflare") == nil {
+		t.Fatal("a zone-less account produced no adapter")
+	}
+
+	// Removing the last account drops the adapter rather than leaving one that
+	// can no longer act.
+	if err := st.DeleteProviderAccount(ctx, "cloudflare", "acct-live"); err != nil {
+		t.Fatalf("DeleteProviderAccount: %v", err)
+	}
+	if err := sup.RebuildCloudflareProvider(); err != nil {
+		t.Fatalf("RebuildCloudflareProvider after removal: %v", err)
+	}
+	if registry.Get("cloudflare") != nil {
+		t.Fatal("adapter survived removal of its last account")
+	}
+	// It must remain visible in the catalog with a reason.
+	var seen bool
+	for _, snap := range registry.Snapshot() {
+		if snap.ID == "cloudflare" {
+			seen = true
+			if snap.Availability != provider.AvailabilityUnconfigured || snap.Reason == "" {
+				t.Fatalf("catalog entry after removal = %#v", snap)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("cloudflare vanished from the catalog after its account was removed")
 	}
 }

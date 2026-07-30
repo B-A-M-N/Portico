@@ -17,6 +17,12 @@ type Registry interface {
 	List() []ProviderSnapshot
 	Snapshot() []ProviderSnapshot
 	Add(provider core.Provider) error
+	// Replace installs a provider, superseding any existing adapter with the
+	// same ID. It exists so account changes can rebuild an adapter in place
+	// rather than requiring a supervisor restart.
+	Replace(provider core.Provider)
+	// Remove drops a provider, for when its last usable account is gone.
+	Remove(id core.ProviderID)
 	// AddCatalogEntry keeps a provider visible when no adapter could be
 	// constructed for it, so the UI can explain the gap instead of omitting it.
 	AddCatalogEntry(entry CatalogEntry)
@@ -265,6 +271,24 @@ func (r *registry) Add(provider core.Provider) error {
 
 	r.providers[identity.ID] = provider
 	return nil
+}
+
+// Replace installs a provider, superseding any existing adapter with the same
+// ID.
+func (r *registry) Replace(provider core.Provider) {
+	identity := provider.Identity()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers[identity.ID] = provider
+}
+
+// Remove drops a provider and the account projection that went with it.
+func (r *registry) Remove(id core.ProviderID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.providers, id)
+	delete(r.accounts, id)
+	delete(r.accountInfo, id)
 }
 
 // SetAccounts associates accounts with a provider

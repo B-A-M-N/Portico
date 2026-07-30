@@ -164,6 +164,117 @@ func registerOpenAITunnel(reg provider.Registry, procMgr core.ConnectorProcessSe
 	return true
 }
 
+// RebuildCloudflareProvider reconstructs the Cloudflare adapter from the
+// accounts currently in the store and installs it in place.
+//
+// Account changes used to take effect only at startup, so saving or removing an
+// account left the running supervisor using adapters built from the previous
+// account set and the response had to tell the user to restart.
+func (s *Supervisor) RebuildCloudflareProvider() error {
+	// A rebuild needs the process manager to construct adapters. Without one
+	// there is nothing to rebuild into, and the caller must fall back to
+	// reporting that a restart is required.
+	if s.procMgr == nil || s.registry == nil || s.store == nil {
+		return fmt.Errorf("the supervisor is not fully initialised; provider rebuild is unavailable")
+	}
+	cloudflaredBin := config.CloudflaredBin()
+	if cloudflaredBin == "" {
+		cloudflaredBin = "cloudflared"
+	}
+	if _, err := exec.LookPath(cloudflaredBin); err != nil {
+		return fmt.Errorf("%s is not installed", cloudflaredBin)
+	}
+
+	children, infos, err := buildCloudflareChildren(s.store, s.paths, &processManagerAdapter{mgr: s.procMgr}, cloudflaredBin)
+	if err != nil {
+		return err
+	}
+
+	if len(children) == 0 {
+		// The last usable account is gone. Drop the adapter and leave a catalog
+		// entry, rather than keeping a provider that can no longer act.
+		s.registry.Remove("cloudflare")
+		s.registry.AddCatalogEntry(provider.CatalogEntry{
+			ID: "cloudflare", Name: "cloudflare", DisplayName: "Cloudflare",
+			Availability: provider.AvailabilityUnconfigured,
+			Reason:       "no Cloudflare account is configured",
+			SetupActions: []string{"Add a Cloudflare account"},
+		})
+		return nil
+	}
+
+	accountsProvider, err := cloudflare.NewAccountsProvider(children)
+	if err != nil {
+		return fmt.Errorf("rebuild Cloudflare provider: %w", err)
+	}
+	s.registry.Replace(accountsProvider)
+	s.registry.SetAccountInfo("cloudflare", infos)
+	s.controller.SetAccounts(accountIDsOf(infos))
+	return nil
+}
+
+func accountIDsOf(infos []provider.AccountInfo) []core.ProviderAccountID {
+	ids := make([]core.ProviderAccountID, 0, len(infos))
+	for _, info := range infos {
+		ids = append(ids, info.ID)
+	}
+	return ids
+}
+
+// buildCloudflareChildren constructs one adapter per usable account. It is the
+// single construction path, shared by startup registration and rebuild, so the
+// two cannot drift.
+func buildCloudflareChildren(st *store.Store, paths app.Paths, procMgr core.ConnectorProcessService, cloudflaredBin string) (
+	map[core.ProviderAccountID]*cloudflare.Provider, []provider.AccountInfo, error,
+) {
+	accounts, err := st.ListProviderAccounts(context.Background())
+	if err != nil {
+		return nil, nil, fmt.Errorf("list Cloudflare accounts: %w", err)
+	}
+
+	children := make(map[core.ProviderAccountID]*cloudflare.Provider)
+	details := make(map[core.ProviderAccountID]core.ProviderAccount)
+	for _, account := range accounts {
+		if account.Provider != "cloudflare" || account.Status != core.AccountAuthenticated {
+			continue
+		}
+		if account.CredentialRef == "" {
+			slog.Warn("Cloudflare account is missing a credential reference", "account", account.ID)
+			continue
+		}
+		zone := strings.TrimSpace(account.Metadata["zone_id"])
+		token, loadErr := st.LoadProviderCredential(context.Background(), "cloudflare", account.CredentialRef)
+		if loadErr != nil || token == "" {
+			slog.Warn("Cloudflare account credential is unavailable", "account", account.ID, "err", loadErr)
+			continue
+		}
+		child, newErr := cloudflare.New(token, string(account.ID), zone, cloudflaredBin, paths.ConnectorDir, procMgr)
+		if newErr != nil {
+			slog.Warn("Cloudflare account adapter init failed", "account", account.ID, "err", newErr)
+			continue
+		}
+		child.SetCredentialStore(st)
+		children[account.ID] = child
+		details[account.ID] = account
+	}
+
+	ids := make([]core.ProviderAccountID, 0, len(children))
+	for id := range children {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	infos := make([]provider.AccountInfo, 0, len(ids))
+	for _, id := range ids {
+		account := details[id]
+		label := account.Label
+		if label == "" {
+			label = string(id)
+		}
+		infos = append(infos, provider.AccountInfo{ID: id, Label: label, Status: string(account.Status)})
+	}
+	return children, infos, nil
+}
+
 // registerCloudflareWithAccounts attempts to register the Cloudflare provider
 // using accounts loaded from the store. Returns true if the provider was
 // successfully registered.
@@ -233,10 +344,17 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 		if account.Provider != "cloudflare" || account.Status != core.AccountAuthenticated {
 			continue
 		}
+		// A zone is required only for DNS and custom hostnames. Skipping
+		// zone-less accounts here would silently discard an account that setup
+		// accepted, leaving the user with a saved account and no adapter.
 		zone := strings.TrimSpace(account.Metadata["zone_id"])
-		if account.CredentialRef == "" || zone == "" {
-			slog.Warn("Cloudflare account is missing a credential reference or zone", "account", account.ID)
+		if account.CredentialRef == "" {
+			slog.Warn("Cloudflare account is missing a credential reference", "account", account.ID)
 			continue
+		}
+		if zone == "" {
+			slog.Info("Cloudflare account has no zone; tunnels available without DNS or custom hostnames",
+				"account", account.ID)
 		}
 		token, loadErr := st.LoadProviderCredential(context.Background(), "cloudflare", account.CredentialRef)
 		if loadErr != nil || token == "" {

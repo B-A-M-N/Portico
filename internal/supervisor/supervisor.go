@@ -1464,7 +1464,15 @@ func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID st
 		core.ProviderID(providerID), core.ProviderAccountID(accountID)); err != nil {
 		return nil, err
 	}
-	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: true}, nil
+
+	restartRequired := false
+	if providerID == "cloudflare" {
+		if rebuildErr := h.sup.RebuildCloudflareProvider(); rebuildErr != nil {
+			slog.Warn("could not rebuild the Cloudflare provider in place", "err", rebuildErr)
+			restartRequired = true
+		}
+	}
+	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired}, nil
 }
 
 func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
@@ -1558,8 +1566,16 @@ func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.Co
 		return nil, fmt.Errorf("save Cloudflare account: %w", err)
 	}
 
+	// Rebuild the adapter in place so the account is usable immediately. Only
+	// report a restart if the rebuild could not be done.
+	restartRequired := false
+	if rebuildErr := h.sup.RebuildCloudflareProvider(); rebuildErr != nil {
+		slog.Warn("could not rebuild the Cloudflare provider in place", "err", rebuildErr)
+		restartRequired = true
+	}
+
 	resp := &ipc.ConfigureProviderAccountResponse{
-		RestartRequired:    true,
+		RestartRequired:    restartRequired,
 		Validated:          true,
 		MissingPermissions: validation.MissingPermissions,
 	}
