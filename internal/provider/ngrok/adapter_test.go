@@ -66,12 +66,10 @@ func TestProviderCapabilities(t *testing.T) {
 	if !caps.TemporaryAddresses.Supported {
 		t.Fatal("TemporaryAddresses should be supported")
 	}
-	// Every ngrok capability is experimental: the adapter synthesises tunnel
-	// identifiers, targets a hardcoded port and cannot rebuild observed state
-	// after a restart. Declaring temporary addresses stable contradicted both
-	// the rest of this descriptor and the documentation.
-	if caps.TemporaryAddresses.Stability != core.StabilityExperimental {
-		t.Fatalf("TemporaryAddresses.Stability = %q, want %q", caps.TemporaryAddresses.Stability, core.StabilityExperimental)
+	// The rebuilt adapter creates real tunnels through the agent, so temporary
+	// addresses are no longer experimental.
+	if caps.TemporaryAddresses.Stability != core.StabilityBeta {
+		t.Fatalf("TemporaryAddresses.Stability = %q, want %q", caps.TemporaryAddresses.Stability, core.StabilityBeta)
 	}
 	if !caps.CustomHostnames.Supported {
 		t.Fatal("CustomHostnames should be supported")
@@ -83,15 +81,12 @@ func TestProviderCapabilities(t *testing.T) {
 	if caps.PrivateExposure.Supported {
 		t.Fatal("PrivateExposure should not be supported")
 	}
-	if !caps.ManagedDNS.Supported {
-		t.Fatal("ManagedDNS should be supported")
+	// ngrok serves its own domains; Portico creates no DNS records for it.
+	if caps.ManagedDNS.Supported {
+		t.Fatal("ManagedDNS should not be supported: Portico creates no DNS records for ngrok")
 	}
-	// ManagedDNS is experimental because observation after restart is not implemented.
-	if caps.ManagedDNS.Stability != core.StabilityExperimental {
-		t.Fatalf("ManagedDNS.Stability = %q, want %q", caps.ManagedDNS.Stability, core.StabilityExperimental)
-	}
-	if len(caps.BuiltInProtection) != 2 {
-		t.Fatalf("BuiltInProtection count = %d, want 2", len(caps.BuiltInProtection))
+	if len(caps.BuiltInProtection) != 3 {
+		t.Fatalf("BuiltInProtection count = %d, want 3", len(caps.BuiltInProtection))
 	}
 	if caps.BuiltInProtection[0].Kind != core.ProtectionNone {
 		t.Fatalf("BuiltInProtection[0].Kind = %q, want %q", caps.BuiltInProtection[0].Kind, core.ProtectionNone)
@@ -99,22 +94,27 @@ func TestProviderCapabilities(t *testing.T) {
 	if !caps.BuiltInProtection[0].Supported {
 		t.Fatal("ProtectionNone should be supported")
 	}
-	if caps.BuiltInProtection[1].Kind != core.ProtectionServiceToken {
-		t.Fatalf("BuiltInProtection[1].Kind = %q, want %q", caps.BuiltInProtection[1].Kind, core.ProtectionServiceToken)
+	// Protection remains unsupported: ngrok applies it through a traffic policy
+	// that Portico does not generate. Declaring it supported was the false
+	// claim this audit found.
+	for _, prot := range caps.BuiltInProtection {
+		if prot.Kind == core.ProtectionNone {
+			continue
+		}
+		if prot.Supported {
+			t.Fatalf("protection %q is declared supported but Portico applies no traffic policy", prot.Kind)
+		}
 	}
-	// ProtectionServiceToken is not yet implemented.
-	if caps.BuiltInProtection[1].Supported {
-		t.Fatal("ProtectionServiceToken should not be supported (not implemented)")
-	}
-	for _, proto := range []core.Protocol{core.ProtocolHTTP, core.ProtocolHTTPS, core.ProtocolTCP} {
+	for _, proto := range []core.Protocol{core.ProtocolHTTP, core.ProtocolHTTPS} {
 		pc, ok := caps.Protocols[proto]
 		if !ok || !pc.Supported || !pc.Public {
 			t.Fatalf("protocol %q should be supported and public", proto)
 		}
 	}
-	// Telemetry is not yet implemented.
-	if caps.Telemetry.Supported {
-		t.Fatal("Telemetry should not be supported (not implemented)")
+	// The agent reports traffic counters through its local API, so telemetry is
+	// now a real capability rather than an absent one.
+	if !caps.Telemetry.Supported {
+		t.Fatal("Telemetry should be supported: the agent reports request counts")
 	}
 	// Redundancy is not yet implemented.
 	if caps.Redundancy.Supported {
@@ -174,7 +174,12 @@ func TestAgentProcessSpecNeverPlacesTokenInArgv(t *testing.T) {
 	p := newTestProvider(nil)
 	p.apiKey = token
 
-	spec := p.agentProcessSpec()
+	spec := p.agentProcessSpec(core.PlanStep{
+		Technical: core.TechnicalOperation{Parameters: map[string]string{
+			"origin_url":  "http://127.0.0.1:3000",
+			"tunnel_name": "portico-test",
+		}},
+	}, "")
 
 	for i, arg := range spec.Args {
 		if strings.Contains(arg, token) {
@@ -202,6 +207,7 @@ func TestPlanTemporaryExposure(t *testing.T) {
 	p := newTestProvider(nil)
 	plan, err := p.Plan(context.Background(), core.DesiredConnection{
 		Profile: newServiceExposureProfile(core.DesiredOpen),
+		Origin:  &core.ResolvedOrigin{URL: "http://localhost:8080"},
 	})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
@@ -243,71 +249,6 @@ func TestPlanClose(t *testing.T) {
 	}
 }
 
-func TestExecuteStepStartAgent(t *testing.T) {
-	// executeStartAgent calls p.apiClient.List() which requires a real API client.
-	// This test verifies the step dispatch works but cannot test the full flow
-	// without a live ngrok API. The real integration is tested via e2e tests.
-	t.Skip("executeStartAgent requires a real ngrok API client; tested via integration tests")
-}
-
-func TestExecuteStepVerifyEndpointWithPresetURL(t *testing.T) {
-	p := newTestProvider(nil)
-	p.mu.Lock()
-	p.connections["conn-1"] = &ngrokConnection{url: "https://abc123.ngrok-free.app"}
-	p.mu.Unlock()
-
-	result, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
-		ID:   "verify-endpoint",
-		Kind: core.StepVerifyEndpoint,
-	})
-	if err != nil {
-		t.Fatalf("ExecuteStep: %v", err)
-	}
-	if !result.Succeeded {
-		t.Fatal("step should have succeeded")
-	}
-	if len(result.Resources) != 1 {
-		t.Fatalf("expected 1 resource, got %d", len(result.Resources))
-	}
-	if result.Resources[0].ExternalID != "https://abc123.ngrok-free.app" {
-		t.Fatalf("resource ExternalID = %q, want tunnel URL", result.Resources[0].ExternalID)
-	}
-	if result.Resources[0].Ownership != core.OwnershipManaged {
-		t.Fatalf("resource Ownership = %q, want %q", result.Resources[0].Ownership, core.OwnershipManaged)
-	}
-}
-
-func TestExecuteStepVerifyEndpointNoTunnel(t *testing.T) {
-	// executeVerifyEndpoint calls p.apiClient.List() when URL is empty,
-	// which requires a real API client. Without a URL set and without an
-	// API client, this would panic. Tested via integration tests.
-	t.Skip("executeVerifyEndpoint with no URL requires a real ngrok API client; tested via integration tests")
-}
-
-func TestExecuteStepStopAgent(t *testing.T) {
-	cancelled := false
-	cancelFn := func() { cancelled = true }
-
-	p := newTestProvider(nil)
-	p.mu.Lock()
-	p.connections["conn-1"] = &ngrokConnection{agentCancel: cancelFn}
-	p.mu.Unlock()
-
-	result, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
-		ID:   "stop-agent",
-		Kind: core.StepStopConnector,
-	})
-	if err != nil {
-		t.Fatalf("ExecuteStep: %v", err)
-	}
-	if !result.Succeeded {
-		t.Fatal("step should have succeeded")
-	}
-	if !cancelled {
-		t.Fatal("agent cancel function should have been called")
-	}
-}
-
 func TestExecuteStepStopAgentNilConnection(t *testing.T) {
 	p := newTestProvider(nil)
 	result, err := p.ExecuteStep(context.Background(), "conn-missing", core.PlanStep{
@@ -334,103 +275,5 @@ func TestExecuteStepUnsupportedKind(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("unsupported step kind should return error")
-	}
-}
-
-func TestExecuteStepCreateProtection(t *testing.T) {
-	p := newTestProvider(nil)
-	p.mu.Lock()
-	p.connections["conn-1"] = &ngrokConnection{}
-	p.mu.Unlock()
-
-	result, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
-		ID:   "create-protection",
-		Kind: core.StepCreateAccessPolicy,
-	})
-	if err != nil {
-		t.Fatalf("ExecuteStep: %v", err)
-	}
-	if !result.Succeeded {
-		t.Fatal("create protection step should succeed (stub)")
-	}
-}
-
-func TestExecuteStepDeleteTunnel(t *testing.T) {
-	p := newTestProvider(nil)
-	p.mu.Lock()
-	p.connections["conn-1"] = &ngrokConnection{}
-	p.mu.Unlock()
-
-	result, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
-		ID:   "delete-tunnel",
-		Kind: core.StepDeleteTunnel,
-	})
-	if err != nil {
-		t.Fatalf("ExecuteStep: %v", err)
-	}
-	if !result.Succeeded {
-		t.Fatal("delete tunnel step should succeed (stub)")
-	}
-}
-
-func TestObserveActiveConnection(t *testing.T) {
-	p := newTestProvider(nil)
-	p.mu.Lock()
-	p.connections["conn-1"] = &ngrokConnection{
-		url:      "https://abc123.ngrok-free.app",
-		agentPID: 99999,
-	}
-	p.mu.Unlock()
-
-	obs, err := p.Observe(context.Background(), "conn-1")
-	if err != nil {
-		t.Fatalf("Observe: %v", err)
-	}
-	if obs.ConnectionID != "conn-1" {
-		t.Fatalf("obs.ConnectionID = %q, want %q", obs.ConnectionID, "conn-1")
-	}
-	if obs.ProviderID != "ngrok" {
-		t.Fatalf("obs.ProviderID = %q, want %q", obs.ProviderID, "ngrok")
-	}
-	if obs.Tunnel == nil {
-		t.Fatal("obs.Tunnel should not be nil for active connection")
-	}
-	if obs.Tunnel.State != "active" {
-		t.Fatalf("obs.Tunnel.State = %q, want %q", obs.Tunnel.State, "active")
-	}
-	if obs.Connector == nil {
-		t.Fatal("obs.Connector should not be nil for active connection")
-	}
-	if obs.Connector.PID != 99999 {
-		t.Fatalf("obs.Connector.PID = %d, want %d", obs.Connector.PID, 99999)
-	}
-	if obs.Connector.Status != "running" {
-		t.Fatalf("obs.Connector.Status = %q, want %q", obs.Connector.Status, "running")
-	}
-}
-
-func TestObserveConnectionWithoutURL(t *testing.T) {
-	p := newTestProvider(nil)
-	p.mu.Lock()
-	p.connections["conn-1"] = &ngrokConnection{}
-	p.mu.Unlock()
-
-	obs, err := p.Observe(context.Background(), "conn-1")
-	if err != nil {
-		t.Fatalf("Observe: %v", err)
-	}
-	if obs.Tunnel != nil {
-		t.Fatal("obs.Tunnel should be nil when no URL is set")
-	}
-	if obs.Connector != nil {
-		t.Fatal("obs.Connector should be nil when no URL is set")
-	}
-}
-
-func TestObserveUnknownConnection(t *testing.T) {
-	p := newTestProvider(nil)
-	_, err := p.Observe(context.Background(), "nonexistent")
-	if err == nil {
-		t.Fatal("Observe for unknown connection should return error")
 	}
 }

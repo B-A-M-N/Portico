@@ -245,9 +245,10 @@ for rotation, backup, or recovery from a rejected key file.
 
 **Current state**
 
-Only Cloudflare is a real provider and mock is development-only. ngrok,
-Tailscale, and zrok are architectural targets, not implementations, while some
-top-level copy still implies broader availability.
+Cloudflare and ngrok are real providers; mock is development-only. The ngrok
+adapter was rebuilt against the real agent and is verified end to end, though it
+applies no access protection. Tailscale and zrok remain architectural targets,
+not implementations.
 
 **Implementation**
 

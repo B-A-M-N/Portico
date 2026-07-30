@@ -124,25 +124,29 @@ portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp 
 | Provider | Status | Exposure Modes | Protection |
 |----------|--------|----------------|------------|
 | Cloudflare | ✅ Implemented | Temporary; Permanent when configured | None in the TUI; email OTP with explicit allow rules in the API |
-| Ngrok | ⚠️ Experimental — not usable | Temporary (ephemeral tunnels) | Not applied |
+| Ngrok | ✅ Implemented | Temporary; custom hostname with a reserved domain | Not applied — see below |
 | Tailscale | ❌ Not implemented | — | — |
 | zrok | ❌ Not implemented | — | — |
 | OpenAI Secure MCP Tunnel | ⚠️ Experimental — not usable | Private only (no public address) | Mediated by OpenAI; Portico applies none |
 
-> Cloudflare is the only provider suitable for use. Tailscale and zrok are
-> planned for future releases but have no implementation yet.
+> Cloudflare and ngrok are usable. Tailscale and zrok are planned for future
+> releases but have no implementation yet.
 
-**Ngrok is experimental and disabled by default.** The adapter is scaffolding,
-not a working provider, and reports every capability as experimental. It:
+**Ngrok is disabled by default and must be enabled explicitly** with
+`PORTICO_ENABLE_EXPERIMENTAL_NGROK=1`. The adapter drives the real ngrok agent
+and is verified against it end to end: it creates a real tunnel with the
+agent-assigned identifier, forwards to the connection's own origin, correlates
+by a per-connection tunnel name, reads the assigned URL from the agent's local
+API, removes the tunnel on close, rebuilds observed state after a supervisor
+restart, and reports the agent's traffic counters.
 
-- synthesises tunnel identifiers instead of creating real provider resources,
-- targets a hardcoded local port rather than the connection's origin,
-- cannot reconstruct observed state after a supervisor restart,
-- implements tunnel deletion and protection as successful no-ops.
+**Portico applies no access protection to ngrok connections.** ngrok applies
+protection through a traffic policy that Portico does not generate yet, so an
+ngrok connection is reachable by anyone with its URL. The capability is declared
+unsupported rather than advertised.
 
-It is registered only when `PORTICO_ENABLE_EXPERIMENTAL_NGROK=1` is set, and no
-protection policy is applied to ngrok connections regardless of configuration.
-Do not rely on it.
+The agent authenticates from `NGROK_AUTHTOKEN`, a Portico-configured ngrok
+account, or its own `ngrok config add-authtoken` configuration.
 
 **OpenAI Secure MCP Tunnel is experimental and disabled by default.** It connects
 a local MCP server to ChatGPT over an outbound-only tunnel, with no public
