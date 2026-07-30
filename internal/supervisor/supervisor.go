@@ -45,6 +45,9 @@ type Supervisor struct {
 	// recorded. It is a field so tests can substitute a stub.
 	accountValidator AccountValidator
 
+	// launch gates whether connections are armed at startup.
+	launch string
+
 	// Discovery, diagnostics, and origins
 	discoverer discovery.Discoverer
 	diagEngine *diagnostics.Engine

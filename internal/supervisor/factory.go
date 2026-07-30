@@ -438,12 +438,12 @@ func registerNgrokWithAccounts(reg provider.Registry, paths app.Paths, procMgr c
 			Name:         "ngrok",
 			DisplayName:  "ngrok",
 			Availability: provider.AvailabilityExperimental,
-			Reason: "the ngrok adapter is experimental and not lifecycle-complete: " +
-				"it does not create real provider resources, targets a fixed local port, " +
-				"cannot rebuild observed state after a restart, and applies no protection",
+			Reason: "ngrok is off by default. It creates real tunnels and rebuilds state after a " +
+				"restart, but Portico applies no access protection to ngrok connections, so anyone " +
+				"with the URL can reach them",
 			SetupActions: []string{
-				"Set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to register it anyway",
-				"Do not rely on it for connections that matter",
+				"Set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to enable it",
+				"Make sure a token is available: NGROK_AUTHTOKEN, or run: ngrok config add-authtoken <token>",
 			},
 		})
 		return false

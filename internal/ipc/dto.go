@@ -645,3 +645,52 @@ type LogLineDTO struct {
 	Stream string `json:"stream"`
 	Text   string `json:"text"`
 }
+
+// ReadinessDTO answers "what does Portico need, and what is already satisfied?"
+// in one response, so setup does not require assembling the answer from several
+// screens.
+type ReadinessDTO struct {
+	// Summary states the overall position in one sentence.
+	Summary string `json:"summary"`
+	// LaunchMode is "manual" or "auto".
+	LaunchMode  string                   `json:"launch_mode"`
+	Providers   []ProviderReadinessDTO   `json:"providers,omitempty"`
+	Connections []ConnectionReadinessDTO `json:"connections,omitempty"`
+}
+
+// ProviderReadinessDTO is one provider's position, with the credential sources
+// Portico found for it.
+type ProviderReadinessDTO struct {
+	ID           string                `json:"id"`
+	DisplayName  string                `json:"display_name"`
+	Availability string                `json:"availability"`
+	Summary      string                `json:"summary"`
+	Blocked      bool                  `json:"blocked"`
+	Reason       string                `json:"reason,omitempty"`
+	SetupActions []string              `json:"setup_actions,omitempty"`
+	Accounts     int                   `json:"accounts"`
+	Credentials  []CredentialSourceDTO `json:"credentials,omitempty"`
+}
+
+// CredentialSourceDTO is one place a credential can come from. It reports
+// presence and location only; the value is never read.
+type CredentialSourceDTO struct {
+	Kind        string `json:"kind"`
+	Location    string `json:"location"`
+	Present     bool   `json:"present"`
+	Description string `json:"description,omitempty"`
+	Action      string `json:"action,omitempty"`
+}
+
+// ConnectionReadinessDTO reports whether a connection can open, and what stands
+// in the way if not.
+type ConnectionReadinessDTO struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Kind      string   `json:"kind"`
+	Provider  string   `json:"provider"`
+	Desired   string   `json:"desired"`
+	AutoStart bool     `json:"auto_start"`
+	Ready     bool     `json:"ready"`
+	Blockers  []string `json:"blockers,omitempty"`
+}

@@ -65,6 +65,7 @@ type RequestHandler interface {
 	HandleRefreshDiscovery() (*DiscoveryDTO, error)
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
 	HandleConnectionLogs(id string, lines int) (*ConnectionLogsDTO, error)
+	HandleReadiness() (*ReadinessDTO, error)
 	HandleSupportExport() (*SupportExportDTO, error)
 	HandleSupervisorStop(ctx context.Context) error
 }
@@ -117,6 +118,7 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/diagnostics/", s.handleDiagnostics)
 	mux.HandleFunc("/v1/supervisor/stop", s.handleSupervisorStop)
 	mux.HandleFunc("/v1/support/export", s.handleSupportExport)
+	mux.HandleFunc("/v1/readiness", s.handleReadiness)
 	s.mux = mux
 
 	return s, nil
@@ -875,4 +877,20 @@ func (s *Server) handleSupportExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(export)
+}
+
+// handleReadiness serves the aggregated setup view.
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "PTO-READY-METHOD", "method not allowed")
+		return
+	}
+	readiness, err := s.handler.HandleReadiness()
+	if err != nil {
+		writeHandlerError(w, "PTO-READY", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(readiness)
 }

@@ -723,3 +723,22 @@ func (c *Client) SupportExport(ctx context.Context) (*SupportExportDTO, error) {
 	}
 	return &export, nil
 }
+
+// Readiness fetches the aggregated setup view.
+func (c *Client) Readiness(ctx context.Context) (*ReadinessDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/readiness", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var readiness ReadinessDTO
+	if err := json.NewDecoder(resp.Body).Decode(&readiness); err != nil {
+		return nil, err
+	}
+	return &readiness, nil
+}

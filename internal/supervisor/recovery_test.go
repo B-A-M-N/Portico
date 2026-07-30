@@ -1588,3 +1588,129 @@ func TestCreateConnectionSupportsPortForwardAndRefusesTheRest(t *testing.T) {
 		}
 	})
 }
+
+// TestReadinessAggregatesEverythingNeededToGetWorking pins the setup view: one
+// response answers what Portico needs and what is already satisfied, rather
+// than requiring the answer to be assembled from several screens.
+func TestReadinessAggregatesEverythingNeededToGetWorking(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	// A credential already on the machine must be reported as found.
+	t.Setenv("NGROK_AUTHTOKEN", "already-configured-token")
+
+	registry := provider.NewRegistry()
+	registry.AddCatalogEntry(provider.CatalogEntry{
+		ID: "ngrok", DisplayName: "ngrok",
+		Availability: provider.AvailabilityUnconfigured,
+		Reason:       "no account is configured",
+		SetupActions: []string{"Add an ngrok account"},
+	})
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock: %v", err)
+	}
+
+	ctrl := controller.New(registry, st)
+	profile := recoveryTestProfile("conn-readiness")
+	profile.Spec.ServiceExposure.Exposure.Mode = core.ExposurePermanent
+	profile.Spec.ServiceExposure.Exposure.RequestedAddress = "" // a blocker
+	ctrl.RestoreProfile(profile)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+	readiness, err := handler.HandleReadiness()
+	if err != nil {
+		t.Fatalf("HandleReadiness: %v", err)
+	}
+
+	if readiness.Summary == "" {
+		t.Fatal("readiness gives no overall summary")
+	}
+	if readiness.LaunchMode == "" {
+		t.Fatal("readiness does not report the launch mode")
+	}
+
+	var ngrokEntry *ipc.ProviderReadinessDTO
+	for i := range readiness.Providers {
+		if readiness.Providers[i].ID == "ngrok" {
+			ngrokEntry = &readiness.Providers[i]
+		}
+	}
+	if ngrokEntry == nil {
+		t.Fatal("a catalogued provider is missing from readiness")
+	}
+	// The credential already on the machine must be surfaced as found, and the
+	// summary must say the last step is what remains.
+	var foundCredential bool
+	for _, c := range ngrokEntry.Credentials {
+		if c.Present {
+			foundCredential = true
+		}
+	}
+	if !foundCredential {
+		t.Fatalf("an existing credential was not surfaced: %#v", ngrokEntry.Credentials)
+	}
+	if !strings.Contains(ngrokEntry.Summary, "found") {
+		t.Fatalf("summary does not mention the found credential: %q", ngrokEntry.Summary)
+	}
+
+	// A connection that cannot open must say why, in plain language.
+	if len(readiness.Connections) != 1 {
+		t.Fatalf("connections = %d, want 1", len(readiness.Connections))
+	}
+	conn := readiness.Connections[0]
+	if conn.Ready {
+		t.Fatal("a connection with no hostname was reported ready")
+	}
+	if len(conn.Blockers) == 0 {
+		t.Fatal("a blocked connection lists no blockers")
+	}
+	if !strings.Contains(strings.Join(conn.Blockers, " "), "hostname") {
+		t.Fatalf("blockers do not name the missing hostname: %v", conn.Blockers)
+	}
+}
+
+// TestManualLaunchModeArmsNothing pins the single gate in front of per
+// connection autostart.
+func TestManualLaunchModeArmsNothing(t *testing.T) {
+	sup := &Supervisor{}
+
+	sup.SetLaunchMode(LaunchAuto)
+	if sup.launchMode() != LaunchAuto {
+		t.Fatalf("launch mode = %q, want auto", sup.launchMode())
+	}
+
+	sup.SetLaunchMode(LaunchManual)
+	if sup.launchMode() != LaunchManual {
+		t.Fatalf("launch mode = %q, want manual", sup.launchMode())
+	}
+
+	// The environment override exists so the gate can be closed without
+	// changing stored state.
+	t.Setenv("PORTICO_LAUNCH_MODE", "manual")
+	sup.SetLaunchMode(LaunchAuto)
+	if sup.launchMode() != LaunchManual {
+		t.Fatal("the environment override did not close the gate")
+	}
+}
+
+// TestReadinessReportsAFailedCheckAsAFailure ensures a broken check never reads
+// as a clean bill of health.
+func TestReadinessReportsAFailedCheckAsAFailure(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	readiness, err := handler.HandleReadiness()
+	if err != nil {
+		t.Fatalf("HandleReadiness: %v", err)
+	}
+	// With no providers at all, the summary must say so rather than implying
+	// everything is fine.
+	if !strings.Contains(readiness.Summary, "No provider") {
+		t.Fatalf("summary with no providers = %q", readiness.Summary)
+	}
+}

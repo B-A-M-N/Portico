@@ -35,6 +35,7 @@ type fakeClient struct {
 	detailErr error
 	history   *ipc.OperationHistoryDTO
 	logs      *ipc.ConnectionLogsDTO
+	readiness *ipc.ReadinessDTO
 
 	snapshotCalls  int
 	planOpenCalls  int
@@ -43,6 +44,15 @@ type fakeClient struct {
 	createCalls    int
 	detailCalls    int
 	detailIDs      []string
+}
+
+func (f *fakeClient) Readiness(_ context.Context) (*ipc.ReadinessDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readiness != nil {
+		return f.readiness, nil
+	}
+	return &ipc.ReadinessDTO{Summary: "nothing configured", LaunchMode: "auto"}, nil
 }
 
 func (f *fakeClient) ConnectionLogs(_ context.Context, _ string, _ int) (*ipc.ConnectionLogsDTO, error) {
@@ -1599,4 +1609,84 @@ func findDetailMsg(msg tea.Msg) (connectionDetailMsg, bool) {
 		}
 	}
 	return connectionDetailMsg{}, false
+}
+
+// TestSetupScreenShowsWhatIsNeededAndWhatIsAlreadyThere pins the screen that
+// exists to make setup navigable: it must state the position, surface
+// credentials already present, and give a next action for what is missing.
+func TestSetupScreenShowsWhatIsNeededAndWhatIsAlreadyThere(t *testing.T) {
+	readiness := &ipc.ReadinessDTO{
+		Summary:    "1 provider ready. 1 of 2 connections need attention.",
+		LaunchMode: "manual",
+		Providers: []ipc.ProviderReadinessDTO{
+			{
+				ID: "ngrok", DisplayName: "ngrok", Blocked: true,
+				Availability: "unconfigured",
+				Summary:      "A credential was found on this machine. Finish setup to use it.",
+				Reason:       "no account is configured",
+				Credentials: []ipc.CredentialSourceDTO{
+					{Kind: "client_config", Location: "/home/u/.config/ngrok/ngrok.yml", Present: true,
+						Description: "The ngrok agent's own saved token."},
+					{Kind: "environment", Location: "NGROK_AUTHTOKEN", Present: false,
+						Action: "Export NGROK_AUTHTOKEN, or run: ngrok config add-authtoken <token>"},
+				},
+			},
+		},
+		Connections: []ipc.ConnectionReadinessDTO{
+			{ID: "c1", Name: "web", Ready: false, Blockers: []string{"A permanent address needs a hostname."}},
+		},
+	}
+
+	m := readyModel(&fakeClient{readiness: readiness}, testSnapshot())
+	next, cmd := m.Update(keyMsg("s"))
+	m = next.(Model)
+	if m.screen != ScreenSetup {
+		t.Fatalf("screen = %q, want setup", m.screen)
+	}
+	if cmd == nil {
+		t.Fatal("opening setup issued no command to load readiness")
+	}
+	next, _ = m.Update(readinessMsg{Readiness: readiness})
+	m = next.(Model)
+
+	view := m.View().Content
+
+	// The first thing shown must answer "can I use this yet?".
+	if !strings.Contains(view, "1 provider ready") {
+		t.Fatalf("setup view does not lead with the overall position:\n%s", view)
+	}
+	// A credential already on the machine must read as a finding, not a demand.
+	if !strings.Contains(view, "found") || !strings.Contains(view, "ngrok.yml") {
+		t.Fatalf("setup view does not surface the existing credential:\n%s", view)
+	}
+	// The missing one must come with something to do about it.
+	if !strings.Contains(view, "add-authtoken") {
+		t.Fatalf("setup view does not offer the next action:\n%s", view)
+	}
+	// A blocked connection must say why in plain language.
+	if !strings.Contains(view, "needs a hostname") {
+		t.Fatalf("setup view does not explain the connection blocker:\n%s", view)
+	}
+	// The launch gate must be legible rather than a bare mode name.
+	if !strings.Contains(view, "nothing opens by itself") {
+		t.Fatalf("setup view does not explain the launch mode:\n%s", view)
+	}
+}
+
+// TestSetupScreenReportsAFailedCheckAsAFailure ensures a failed readiness load
+// never renders as a healthy, empty setup.
+func TestSetupScreenReportsAFailedCheckAsAFailure(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	next, _ := m.Update(keyMsg("s"))
+	m = next.(Model)
+	next, _ = m.Update(readinessMsg{Err: errors.New("supervisor unreachable")})
+	m = next.(Model)
+
+	view := m.View().Content
+	if !strings.Contains(view, "could not work out what it needs") {
+		t.Fatalf("failed check does not report itself:\n%s", view)
+	}
+	if !strings.Contains(view, "does not mean everything is fine") {
+		t.Fatalf("failed check does not disclaim health:\n%s", view)
+	}
 }

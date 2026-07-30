@@ -33,6 +33,7 @@ const (
 	ScreenProviders         ScreenID = "providers"
 	ScreenSettings          ScreenID = "settings"
 	ScreenHelp              ScreenID = "help"
+	ScreenSetup             ScreenID = "setup"
 	ScreenQuit              ScreenID = "quit"
 )
 
@@ -93,6 +94,7 @@ type Model struct {
 
 	wizard  *screens.WizardModel
 	inspect *screens.InspectModel
+	setup   *screens.SetupModel
 
 	client SupervisorClient
 	// rootCtx is the application lifetime context. It is cancelled when
@@ -248,6 +250,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		return m, nil
+
+	case readinessMsg:
+		if m.setup == nil {
+			m.setup = screens.NewSetup()
+		}
+		// A failed check is reported as a failed check, never as a clean bill
+		// of health.
+		m.setup.Err = msg.Err
+		m.setup.Readiness = msg.Readiness
 		return m, nil
 
 	case connectionLogsMsg:
@@ -498,6 +510,12 @@ func (m Model) View() tea.View {
 		content = m.renderDiscovery()
 	case ScreenOperations:
 		content = m.renderOperations()
+	case ScreenSetup:
+		if m.setup != nil {
+			content = m.setup.View()
+		} else {
+			content = "Checking what Portico needs..."
+		}
 	case ScreenQuit:
 		content = ""
 	default:
@@ -574,6 +592,11 @@ type providerAccountConfiguredMsg struct {
 	Err      error
 }
 
+type readinessMsg struct {
+	Readiness *ipc.ReadinessDTO
+	Err       error
+}
+
 type connectionLogsMsg struct {
 	ConnectionID string
 	Logs         *ipc.ConnectionLogsDTO
@@ -612,6 +635,21 @@ func (m *Model) connectionDetailCmd(connID string) tea.Cmd {
 }
 
 // connectionLogsCmd loads a bounded, redacted tail of the connector's output.
+// readinessCmd loads the aggregated setup view.
+func (m *Model) readinessCmd() tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return readinessMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		readyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		readiness, err := client.Readiness(readyCtx)
+		return readinessMsg{Readiness: readiness, Err: err}
+	}
+}
+
 func (m *Model) connectionLogsCmd(connID string) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
@@ -947,6 +985,25 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleProviderSetupKey(key)
 	}
 
+	// While the setup screen is active, it owns navigation.
+	if m.screen == ScreenSetup && m.setup != nil {
+		switch key {
+		case "up", "k", "down", "j":
+			m.setup.HandleKey(key)
+			return m, nil
+		case "r":
+			return m, m.readinessCmd()
+		case "enter":
+			// Setting up the highlighted provider goes through the existing
+			// account flow rather than a second, parallel one.
+			if selected := m.setup.Selected(); selected != nil && selected.ID == "cloudflare" {
+				m.providerSetupStep = 1
+				m.pushScreen(ScreenProviders)
+			}
+			return m, nil
+		}
+	}
+
 	// While the inspect screen is active, delegate tab navigation to the InspectModel.
 	if m.screen == ScreenInspect && m.inspect != nil {
 		switch key {
@@ -1113,6 +1170,13 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.pushScreen(ScreenOperations)
 			return m, m.loadOperationsCmd()
 		}
+
+	case "s":
+		if m.setup == nil {
+			m.setup = screens.NewSetup()
+		}
+		m.pushScreen(ScreenSetup)
+		return m, m.readinessCmd()
 
 	case "p":
 		m.pushScreen(ScreenProviders)
@@ -2197,6 +2261,7 @@ func (m *Model) renderHelp() string {
 		b.WriteString("  d        Preview deletion of selected connection\n")
 		b.WriteString("  o        View operations\n")
 		b.WriteString("  p        Providers\n")
+		b.WriteString("  s        Setup — what Portico needs and what is already configured\n")
 		b.WriteString("  up/k     Select previous\n")
 		b.WriteString("  down/j   Select next\n")
 	case ScreenInspect:

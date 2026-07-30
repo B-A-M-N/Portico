@@ -490,6 +490,12 @@ func (s *Supervisor) loadRuntimes(ctx context.Context) error {
 // Uses the delta planner (computeReconcileDecision) to determine the smallest
 // action needed, avoiding unnecessary recreation of infrastructure.
 func (s *Supervisor) restartDesiredOpen(ctx context.Context) {
+	// A single gate in front of the per-connection flag: manual means nothing
+	// is armed at startup whatever the connections say.
+	if s.launchMode() == LaunchManual {
+		slog.Info("startup: launch mode is manual; no connection will be opened automatically")
+		return
+	}
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
 		if p.Desired == core.DesiredOpen && p.Lifecycle.AutoStart {
