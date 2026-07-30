@@ -166,6 +166,30 @@ func (c *Client) GetConnection(ctx context.Context, id string) (*ConnectionDTO, 
 	return &conn, nil
 }
 
+// GetConnectionDetail fetches the authoritative detail view of a connection:
+// its desired spec, observed endpoints, route segments, managed provider
+// resources with their external IDs, connector processes and open findings.
+//
+// The inspect screen must render from this rather than from the list summary,
+// which carries only enough state to draw a row.
+func (c *Client) GetConnectionDetail(ctx context.Context, id string) (*ConnectionDetailDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/connections/"+id+"/detail", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var detail ConnectionDetailDTO
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return nil, err
+	}
+	return &detail, nil
+}
+
 // CreateConnection creates a new connection.
 func (c *Client) CreateConnection(ctx context.Context, req CreateConnectionRequest) (*ConnectionDTO, error) {
 	body, err := json.Marshal(req)

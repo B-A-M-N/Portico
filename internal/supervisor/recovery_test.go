@@ -699,3 +699,57 @@ func TestClassifyOperationRecovery(t *testing.T) {
 		})
 	}
 }
+
+// TestConnectionDetailReportsDurableResourcesWithoutRuntime pins the inspect
+// screen's resource list to the durable record.
+//
+// Controller.RestoreResources drops restored resources when a connection has no
+// runtime row, so the in-memory projection can report none while the database
+// still tracks managed provider resources. Reporting an empty list there would
+// tell an operator there is nothing to clean up, hiding the exact external IDs
+// a provider-side cleanup has to act on.
+func TestConnectionDetailReportsDurableResourcesWithoutRuntime(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-durable-resources")
+
+	profile := recoveryTestProfile(connID)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	if err := st.SaveResource(ctx, &core.ProviderResource{
+		ConnectionID: connID,
+		ProviderID:   "cloudflare",
+		Type:         core.ResourceTunnel,
+		ExternalID:   "tun-durable-1",
+		Ownership:    core.OwnershipManaged,
+	}); err != nil {
+		t.Fatalf("SaveResource: %v", err)
+	}
+
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	// Deliberately no RestoreRuntime: this is the state in which the
+	// projection loses the resources.
+	ctrl.RestoreResources(connID, []core.ProviderResource{{
+		ConnectionID: connID, ProviderID: "cloudflare", Type: core.ResourceTunnel,
+		ExternalID: "tun-durable-1", Ownership: core.OwnershipManaged,
+	}})
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry}}
+	detail, err := handler.HandleGetConnectionDetail(string(connID))
+	if err != nil {
+		t.Fatalf("HandleGetConnectionDetail: %v", err)
+	}
+
+	if len(detail.Resources) != 1 {
+		t.Fatalf("detail reported %d resources, want 1 from the durable record", len(detail.Resources))
+	}
+	if detail.Resources[0].ExternalID != "tun-durable-1" {
+		t.Fatalf("external ID = %q, want tun-durable-1", detail.Resources[0].ExternalID)
+	}
+	if detail.Resources[0].Ownership != string(core.OwnershipManaged) {
+		t.Fatalf("ownership = %q, want managed", detail.Resources[0].Ownership)
+	}
+}

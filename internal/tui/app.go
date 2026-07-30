@@ -46,11 +46,6 @@ type Model struct {
 	selectedID string     // stable connection ID, not a list index
 	listOffset int        // scroll offset for connection list viewport
 
-	// Home screen state
-	searchQuery string
-	stateFilter []string
-	sortMode    string // "name", "state", "recent"
-
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
 	operation         *ipc.OperationDTO
@@ -89,9 +84,8 @@ type Model struct {
 	theme    Theme
 	useASCII bool
 
-	wizard      *screens.WizardModel
-	inspect     *screens.InspectModel
-	repairModel *screens.RepairModel
+	wizard  *screens.WizardModel
+	inspect *screens.InspectModel
 
 	client SupervisorClient
 	// rootCtx is the application lifetime context. It is cancelled when
@@ -246,6 +240,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.diagnosticsCmd(m.repairConnectionID)
 				}
 			}
+		}
+		return m, nil
+
+	case connectionDetailMsg:
+		// A late reply for a connection the user has already navigated away
+		// from must not overwrite the current one's detail.
+		if msg.ConnectionID != m.selectedID {
+			return m, nil
+		}
+		if msg.Err != nil {
+			// Keep whatever detail is already on screen; report the staleness
+			// rather than blanking the view.
+			m.status = fmt.Sprintf("connection detail unavailable: %v", msg.Err)
+			return m, nil
+		}
+		m.connectionDetail = msg.Detail
+		if m.inspect != nil {
+			m.inspect.Detail = msg.Detail
 		}
 		return m, nil
 
@@ -508,12 +520,36 @@ type providerAccountConfiguredMsg struct {
 	Err      error
 }
 
+type connectionDetailMsg struct {
+	ConnectionID string
+	Detail       *ipc.ConnectionDetailDTO
+	Err          error
+}
+
 type streamErrorMsg struct{ Err error }
 
 // --------------- commands ---------------
 //
 // Commands capture what they need before returning the closure so that
 // nothing running off the update loop reads or mutates the model.
+
+// connectionDetailCmd loads the authoritative detail view for a connection.
+// The inspect screen opens immediately from the list summary and fills in
+// detail when it arrives, so a slow supervisor delays content rather than
+// blocking navigation.
+func (m *Model) connectionDetailCmd(connID string) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return connectionDetailMsg{ConnectionID: connID, Err: fmt.Errorf("no supervisor connection")}
+		}
+		detailCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		detail, err := client.GetConnectionDetail(detailCtx, connID)
+		return connectionDetailMsg{ConnectionID: connID, Detail: detail, Err: err}
+	}
+}
 
 func (m *Model) diagnosticsCmd(connID string) tea.Cmd {
 	client := m.client
@@ -900,7 +936,11 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
 			conn := m.SelectedConnection()
 			m.inspect = screens.NewInspect(conn)
+			// Detail from the previous connection must not be shown against
+			// this one while the fetch is in flight.
+			m.connectionDetail = nil
 			m.pushScreen(ScreenInspect)
+			return m, m.connectionDetailCmd(conn.ID)
 		} else if m.screen == ScreenPlanPreview && m.plan != nil {
 			if m.applying {
 				return m, nil
@@ -1207,20 +1247,6 @@ func (m *Model) renderError() string {
 		Render(fmt.Sprintf("Error: %s", m.err))
 }
 
-func (m *Model) renderBoot() string {
-	var b strings.Builder
-	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
-	b.WriteString("\n\n")
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Stable).
-		Render("Starting Portico...\n"))
-	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Muted).
-		Render("Connecting to supervisor..."))
-	return b.String()
-}
-
 func (m *Model) renderRecovery() string {
 	var b strings.Builder
 	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
@@ -1381,6 +1407,7 @@ func (m *Model) renderInspect() string {
 		// Keep the InspectModel's connection data in sync with the snapshot.
 		m.inspect.Connection = conn
 		m.inspect.Diagnostics = m.diagnostics
+		m.inspect.Detail = m.connectionDetail
 
 		var b strings.Builder
 		b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" %s ", conn.Name)))

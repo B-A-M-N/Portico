@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -329,5 +330,76 @@ func TestDiagnosticsMapsTypedHandlerError(t *testing.T) {
 	s.handleDiagnostics(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("diagnostics status=%d, want %d", rr.Code, http.StatusNotFound)
+	}
+}
+
+// detailHandler serves a fixed connection detail so the route can be exercised
+// independently of the supervisor.
+type detailHandler struct {
+	nullHandler
+	detail *ConnectionDetailDTO
+	err    error
+	gotID  string
+}
+
+func (h *detailHandler) HandleGetConnectionDetail(id string) (*ConnectionDetailDTO, error) {
+	h.gotID = id
+	return h.detail, h.err
+}
+
+// TestConnectionDetailRouteIsServed pins the detail endpoint. The supervisor
+// implemented HandleGetConnectionDetail but no route exposed it and no client
+// called it, so the inspect screen had no way to obtain authoritative state.
+func TestConnectionDetailRouteIsServed(t *testing.T) {
+	st := openTestStore(t)
+	socket := filepath.Join(t.TempDir(), "test.sock")
+	h := &detailHandler{detail: &ConnectionDetailDTO{
+		Revision:  4,
+		Resources: []ManagedResourceDTO{{Type: "tunnel", ExternalID: "tun-1", Ownership: "managed"}},
+	}}
+	s, err := NewServer(socket, h, st)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/connections/conn-1/detail", nil)
+	rr := httptest.NewRecorder()
+	s.handleConnectionByID(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if h.gotID != "conn-1" {
+		t.Fatalf("handler received id %q, want conn-1", h.gotID)
+	}
+	var got ConnectionDetailDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Revision != 4 {
+		t.Fatalf("revision = %d, want 4", got.Revision)
+	}
+	if len(got.Resources) != 1 || got.Resources[0].ExternalID != "tun-1" {
+		t.Fatalf("resources did not survive the round trip: %+v", got.Resources)
+	}
+}
+
+// TestConnectionDetailRouteMapsTypedErrors ensures a missing connection is a
+// 404 rather than a 500.
+func TestConnectionDetailRouteMapsTypedErrors(t *testing.T) {
+	st := openTestStore(t)
+	socket := filepath.Join(t.TempDir(), "test.sock")
+	h := &detailHandler{err: core.ErrProfileNotFound("missing")}
+	s, err := NewServer(socket, h, st)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/connections/missing/detail", nil)
+	rr := httptest.NewRecorder()
+	s.handleConnectionByID(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
 	}
 }

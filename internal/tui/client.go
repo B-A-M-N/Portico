@@ -11,6 +11,7 @@ import (
 // a fake without a real socket; production passes *ipc.Client.
 type SupervisorClient interface {
 	GetSnapshot(ctx context.Context) (*ipc.SnapshotDTO, error)
+	GetConnectionDetail(ctx context.Context, id string) (*ipc.ConnectionDetailDTO, error)
 	PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanClose(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanRepair(ctx context.Context, connID string) (*ipc.PlanDTO, error)

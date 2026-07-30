@@ -527,6 +527,16 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		// Do not let a conventional DELETE bypass the destructive preview.
 		writeMethodNotAllowed(w, "GET, PATCH")
 
+	case len(parts) == 2 && parts[1] == "detail" && r.Method == http.MethodGet:
+		detail, err := s.handler.HandleGetConnectionDetail(id)
+		if err != nil {
+			writeHandlerError(w, "PTO-CONN-DETAIL", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(detail)
+
 	case len(parts) == 3 && parts[1] == "plan" && r.Method == http.MethodPost:
 		action := parts[2]
 		var plan *PlanDTO

@@ -30,11 +30,24 @@ type fakeClient struct {
 	created     *ipc.ConnectionDTO
 	createErr   error
 
+	detail    *ipc.ConnectionDetailDTO
+	detailErr error
+
 	snapshotCalls  int
 	planOpenCalls  int
 	planCloseCalls int
 	applyCalls     int
 	createCalls    int
+	detailCalls    int
+	detailIDs      []string
+}
+
+func (f *fakeClient) GetConnectionDetail(_ context.Context, id string) (*ipc.ConnectionDetailDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detailCalls++
+	f.detailIDs = append(f.detailIDs, id)
+	return f.detail, f.detailErr
 }
 
 func (f *fakeClient) GetSnapshot(ctx context.Context) (*ipc.SnapshotDTO, error) {
@@ -1069,5 +1082,136 @@ func TestOperationsScreen(t *testing.T) {
 	m, _ = press(t, m, "esc")
 	if m.screen != ScreenHome {
 		t.Fatalf("screen after esc = %q, want %q", m.screen, ScreenHome)
+	}
+}
+
+// TestEnterOnConnectionLoadsAuthoritativeDetail pins the inspect screen to the
+// supervisor's detail view. The root model previously declared a
+// connectionDetail field that nothing ever populated, because no IPC route or
+// client method existed to fetch it, so inspect rendered placeholders.
+func TestEnterOnConnectionLoadsAuthoritativeDetail(t *testing.T) {
+	fake := &fakeClient{
+		detail: &ipc.ConnectionDetailDTO{
+			Revision:  7,
+			Resources: []ipc.ManagedResourceDTO{{Type: "tunnel", ExternalID: "tun-abc", Ownership: "managed"}},
+			Processes: []ipc.ProcessDTO{{PID: 4242, Status: "running"}},
+		},
+	}
+	m := readyModel(fake, testSnapshot())
+
+	next, cmd := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	if m.screen != ScreenInspect {
+		t.Fatalf("screen = %q, want inspect", m.screen)
+	}
+	if cmd == nil {
+		t.Fatal("entering inspect issued no command to load connection detail")
+	}
+
+	msg := cmd()
+	detailMsg, ok := msg.(connectionDetailMsg)
+	if !ok {
+		t.Fatalf("command produced %T, want connectionDetailMsg", msg)
+	}
+	if detailMsg.ConnectionID != "conn-1" {
+		t.Fatalf("detail requested for %q, want conn-1", detailMsg.ConnectionID)
+	}
+	if fake.detailCalls != 1 {
+		t.Fatalf("GetConnectionDetail called %d times, want 1", fake.detailCalls)
+	}
+
+	next, _ = m.Update(detailMsg)
+	m = next.(Model)
+	if m.connectionDetail == nil {
+		t.Fatal("connectionDetail was not stored on the model")
+	}
+	if m.inspect == nil || m.inspect.Detail == nil {
+		t.Fatal("inspect screen did not receive the detail")
+	}
+	if m.inspect.Detail.Revision != 7 {
+		t.Fatalf("inspect detail revision = %d, want 7", m.inspect.Detail.Revision)
+	}
+
+	// External identifiers live on the Technical tab.
+	for i := 0; i < 3; i++ {
+		next, _ = m.Update(keyMsg("right"))
+		m = next.(Model)
+	}
+	view := m.View().Content
+	for _, want := range []string{"tun-abc", "4242"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("inspect view does not show %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestStaleConnectionDetailIsIgnored ensures a slow reply for a connection the
+// user already navigated away from cannot overwrite the current one's detail.
+func TestStaleConnectionDetailIsIgnored(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	next, _ := m.Update(keyMsg("enter"))
+	m = next.(Model)
+
+	next, _ = m.Update(connectionDetailMsg{
+		ConnectionID: "some-other-connection",
+		Detail:       &ipc.ConnectionDetailDTO{Revision: 99},
+	})
+	m = next.(Model)
+
+	if m.connectionDetail != nil {
+		t.Fatal("detail for a different connection was applied to the current one")
+	}
+}
+
+// TestConnectionDetailErrorKeepsPreviousDetail ensures a failed refresh reports
+// staleness instead of blanking a view that is still showing real state.
+func TestConnectionDetailErrorKeepsPreviousDetail(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	next, _ := m.Update(keyMsg("enter"))
+	m = next.(Model)
+
+	next, _ = m.Update(connectionDetailMsg{
+		ConnectionID: "conn-1",
+		Detail:       &ipc.ConnectionDetailDTO{Revision: 3},
+	})
+	m = next.(Model)
+
+	next, _ = m.Update(connectionDetailMsg{
+		ConnectionID: "conn-1",
+		Err:          errors.New("supervisor unreachable"),
+	})
+	m = next.(Model)
+
+	if m.connectionDetail == nil || m.connectionDetail.Revision != 3 {
+		t.Fatal("a failed detail refresh discarded the last known state")
+	}
+	if !strings.Contains(m.status, "unavailable") {
+		t.Fatalf("status %q does not report that detail is unavailable", m.status)
+	}
+}
+
+// TestActivityTabDoesNotFabricateMetrics ensures the inspect screen never
+// presents traffic telemetry it does not collect as merely-empty data.
+func TestActivityTabDoesNotFabricateMetrics(t *testing.T) {
+	m := readyModel(&fakeClient{detail: &ipc.ConnectionDetailDTO{}}, testSnapshot())
+	next, _ := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	next, _ = m.Update(connectionDetailMsg{ConnectionID: "conn-1", Detail: &ipc.ConnectionDetailDTO{}})
+	m = next.(Model)
+
+	// Move to the Activity tab.
+	next, _ = m.Update(keyMsg("right"))
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("right"))
+	m = next.(Model)
+
+	view := m.View().Content
+	for _, forbidden := range []string{"Request rate: --", "Error count:  --", "Latency:      --"} {
+		if strings.Contains(view, forbidden) {
+			t.Fatalf("activity view still fabricates a metrics table: %q", forbidden)
+		}
+	}
+	if !strings.Contains(view, "not collected") {
+		t.Fatalf("activity view does not state that telemetry is unavailable:\n%s", view)
 	}
 }

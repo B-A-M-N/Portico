@@ -609,6 +609,28 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 		}
 	}
 
+	// The runtime projection is not an authoritative record of what Portico
+	// created. Controller.RestoreResources drops restored resources when a
+	// connection has no runtime row, so a connection can hold managed provider
+	// resources in the database while the projection reports none.
+	//
+	// Reporting an empty resource list in that case would tell the operator
+	// that nothing exists to clean up, which is exactly wrong: these are the
+	// external IDs a manual provider-side cleanup has to act on. Fall back to
+	// the durable record.
+	if len(detail.Resources) == 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if durable, err := h.sup.store.ListResourcesByConnection(ctx, cid); err == nil {
+			for _, r := range durable {
+				detail.Resources = append(detail.Resources, ipc.ManagedResourceDTO{
+					ID: string(r.ID), Type: string(r.Type), ExternalID: r.ExternalID,
+					Ownership: string(r.Ownership), Metadata: r.Metadata,
+				})
+			}
+		}
+	}
+
 	return detail, nil
 }
 
