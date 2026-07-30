@@ -4387,6 +4387,82 @@ func (s *Store) RecordCleanupItem(ctx context.Context, item CleanupItem) error {
 	return err
 }
 
+// OperationSummary is one entry of operation history: the durable operation row
+// joined to the identity of the plan it executed.
+//
+// Intent, provider and fingerprint live on the plan rather than the operation,
+// so history must join them. Without the join a caller can only see an opaque
+// plan ID and has to guess what the operation was actually doing.
+type OperationSummary struct {
+	ID              core.OperationID
+	PlanID          core.PlanID
+	ConnectionID    core.ConnectionID
+	ProviderID      string
+	Intent          string
+	Fingerprint     string
+	ProfileRevision uint64
+	State           string
+	StartedAt       string
+	CompletedAt     string
+	Error           string
+}
+
+// defaultOperationHistoryLimit bounds history reads when a caller does not
+// specify one. Operation history is unbounded on disk; a UI listing must not
+// load all of it.
+const defaultOperationHistoryLimit = 100
+
+// ListRecentOperations returns operation history newest first, bounded by limit.
+func (s *Store) ListRecentOperations(ctx context.Context, limit int) ([]OperationSummary, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = defaultOperationHistoryLimit
+	}
+
+	// LEFT JOIN: an operation whose plan row has been pruned is still real
+	// history and must not vanish from the list.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT o.id, o.plan_id, o.connection_id, o.state, o.started_at, o.completed_at, o.error_json,
+		       COALESCE(p.provider_id, ''), COALESCE(p.intent, ''), COALESCE(p.fingerprint, ''),
+		       COALESCE(p.profile_revision, 0)
+		FROM operations o
+		LEFT JOIN operation_plans p ON p.id = o.plan_id
+		ORDER BY o.started_at DESC, o.id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list recent operations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []OperationSummary
+	for rows.Next() {
+		var op OperationSummary
+		var completedAt sql.NullString
+		var errorJSON []byte
+		if err := rows.Scan(
+			&op.ID, &op.PlanID, &op.ConnectionID, &op.State, &op.StartedAt, &completedAt, &errorJSON,
+			&op.ProviderID, &op.Intent, &op.Fingerprint, &op.ProfileRevision,
+		); err != nil {
+			return nil, fmt.Errorf("scan operation history row: %w", err)
+		}
+		op.CompletedAt = completedAt.String
+		if len(errorJSON) > 0 {
+			// A malformed error blob must not hide the operation itself: the
+			// row is still evidence that the operation ran and failed.
+			var failure core.PorticoError
+			if err := json.Unmarshal(errorJSON, &failure); err == nil {
+				op.Error = failure.Message
+			} else {
+				op.Error = "failure detail could not be decoded"
+			}
+		}
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
 // GetOperation returns one operation from the durable journal.
 func (s *Store) GetOperation(ctx context.Context, opID core.OperationID) (*StoredOperation, error) {
 	s.mu.RLock()

@@ -661,11 +661,38 @@ func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecomme
 }
 
 func (h *supervisorHandler) HandleOperationHistory() (*ipc.OperationHistoryDTO, error) {
-	// For now, return an empty history since ListOperations doesn't exist yet
-	// This can be implemented when the store method is added
-	return &ipc.OperationHistoryDTO{
-		Operations: []ipc.OperationDTO{},
-	}, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	summaries, err := h.sup.store.ListRecentOperations(ctx, 0)
+	if err != nil {
+		// Report the subsystem as unavailable rather than returning an empty
+		// list. An empty list is an authoritative claim that no work has
+		// happened, which is exactly what a caller must not conclude here.
+		return &ipc.OperationHistoryDTO{
+			Operations:  []ipc.OperationDTO{},
+			Available:   false,
+			Unavailable: err.Error(),
+		}, nil
+	}
+
+	operations := make([]ipc.OperationDTO, 0, len(summaries))
+	for _, s := range summaries {
+		operations = append(operations, ipc.OperationDTO{
+			ID:              string(s.ID),
+			PlanID:          string(s.PlanID),
+			ConnectionID:    string(s.ConnectionID),
+			State:           s.State,
+			StartedAt:       s.StartedAt,
+			CompletedAt:     s.CompletedAt,
+			Error:           s.Error,
+			Intent:          s.Intent,
+			ProviderID:      s.ProviderID,
+			Fingerprint:     s.Fingerprint,
+			ProfileRevision: s.ProfileRevision,
+		})
+	}
+	return &ipc.OperationHistoryDTO{Operations: operations, Available: true}, nil
 }
 
 func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, error) {

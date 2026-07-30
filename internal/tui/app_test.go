@@ -32,6 +32,7 @@ type fakeClient struct {
 
 	detail    *ipc.ConnectionDetailDTO
 	detailErr error
+	history   *ipc.OperationHistoryDTO
 
 	snapshotCalls  int
 	planOpenCalls  int
@@ -101,7 +102,12 @@ func (f *fakeClient) GetOperation(ctx context.Context, operationID string) (*ipc
 }
 
 func (f *fakeClient) GetOperationHistory(ctx context.Context) (*ipc.OperationHistoryDTO, error) {
-	return &ipc.OperationHistoryDTO{Operations: []ipc.OperationDTO{}}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.history != nil {
+		return f.history, nil
+	}
+	return &ipc.OperationHistoryDTO{Operations: []ipc.OperationDTO{}, Available: true}, nil
 }
 
 func (f *fakeClient) CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
@@ -1214,4 +1220,112 @@ func TestActivityTabDoesNotFabricateMetrics(t *testing.T) {
 	if !strings.Contains(view, "not collected") {
 		t.Fatalf("activity view does not state that telemetry is unavailable:\n%s", view)
 	}
+}
+
+// TestOperationsScreenDistinguishesEmptyFromUnavailable pins the operations
+// screen against reporting an unreadable history as an authoritative empty one.
+func TestOperationsScreenDistinguishesEmptyFromUnavailable(t *testing.T) {
+	t.Run("available and empty", func(t *testing.T) {
+		m := readyModel(&fakeClient{}, testSnapshot())
+		next, _ := m.Update(operationsLoadedMsg{Operations: nil, Available: true})
+		m = next.(Model)
+		m.screen = ScreenOperations
+
+		view := m.View().Content
+		if !strings.Contains(view, "No operations have run yet") {
+			t.Fatalf("empty history not reported as authoritative:\n%s", view)
+		}
+		if strings.Contains(view, "unavailable") {
+			t.Fatalf("readable empty history was reported as unavailable:\n%s", view)
+		}
+	})
+
+	t.Run("unavailable", func(t *testing.T) {
+		m := readyModel(&fakeClient{}, testSnapshot())
+		next, _ := m.Update(operationsLoadedMsg{
+			Operations:  nil,
+			Available:   false,
+			Unavailable: "database is locked",
+		})
+		m = next.(Model)
+		m.screen = ScreenOperations
+
+		view := m.View().Content
+		if !strings.Contains(view, "unavailable") {
+			t.Fatalf("unreadable history was not reported as unavailable:\n%s", view)
+		}
+		if !strings.Contains(view, "database is locked") {
+			t.Fatalf("unavailability reason was not shown:\n%s", view)
+		}
+		if strings.Contains(view, "No operations have run yet") {
+			t.Fatalf("unreadable history claimed no operations have run:\n%s", view)
+		}
+	})
+}
+
+// TestOperationsScreenShowsIntentNotPlanID pins the fix for the operations list
+// rendering the opaque plan ID in place of the operation's intent.
+func TestOperationsScreenShowsIntentNotPlanID(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	next, _ := m.Update(operationsLoadedMsg{
+		Available: true,
+		Operations: []ipc.OperationDTO{{
+			ID: "op-1", PlanID: "plan-7f3a9c", ConnectionID: "conn-1",
+			State: "completed", Intent: "open", ProviderID: "cloudflare",
+			StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:00:09Z",
+		}},
+	})
+	m = next.(Model)
+	m.screen = ScreenOperations
+
+	view := m.View().Content
+	if !strings.Contains(view, "open") {
+		t.Fatalf("operation intent not shown:\n%s", view)
+	}
+	if !strings.Contains(view, "cloudflare") {
+		t.Fatalf("operation provider not shown:\n%s", view)
+	}
+	if !strings.Contains(view, "9s") {
+		t.Fatalf("operation duration not shown:\n%s", view)
+	}
+}
+
+// TestOperationsScreenStylesCompletedAsSuccess pins the operation-state
+// vocabulary. Operations reach "completed"; only steps reach "succeeded". The
+// list styled on "succeeded", so a successful operation was rendered muted,
+// indistinguishable from an unknown state.
+func TestOperationsScreenStylesCompletedAsSuccess(t *testing.T) {
+	completed := renderOperationStyleFor(t, "completed")
+	failed := renderOperationStyleFor(t, "failed")
+	unknown := renderOperationStyleFor(t, "some-unknown-state")
+
+	if completed == unknown {
+		t.Fatal("a completed operation renders identically to an unknown state")
+	}
+	if completed == failed {
+		t.Fatal("a completed operation renders identically to a failed one")
+	}
+}
+
+// renderOperationStyleFor renders the operations list for a single operation in
+// the given state and returns the styled line.
+func renderOperationStyleFor(t *testing.T, state string) string {
+	t.Helper()
+	m := readyModel(&fakeClient{}, testSnapshot())
+	next, _ := m.Update(operationsLoadedMsg{
+		Available: true,
+		Operations: []ipc.OperationDTO{{
+			ID: "op-1", PlanID: "plan-1", ConnectionID: "conn-1",
+			State: state, Intent: "open", StartedAt: "2026-01-01T00:00:00Z",
+		}},
+	})
+	m = next.(Model)
+	m.screen = ScreenOperations
+	for _, line := range strings.Split(m.View().Content, "\n") {
+		if strings.Contains(line, state) {
+			return line
+		}
+	}
+	t.Fatalf("no rendered line contained state %q", state)
+	return ""
 }

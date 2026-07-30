@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1009,5 +1010,112 @@ func TestIdempotencyKey_LookupAndRecord(t *testing.T) {
 	}
 	if got2 != opID2 {
 		t.Fatalf("key-2: got %q, want %q", got2, opID2)
+	}
+}
+
+// TestListRecentOperationsJoinsPlanIdentity verifies that operation history is
+// readable from the durable journal and carries the plan's identity.
+//
+// The supervisor previously returned an unconditional empty list because no
+// store query existed, so the operations screen showed "No operations found"
+// no matter how much work had happened. The intent, provider and fingerprint
+// live on the plan, not the operation row, so history must join them rather
+// than leave the UI to guess from a plan ID.
+func TestListRecentOperationsJoinsPlanIdentity(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	mkPlan := func(id core.PlanID, intent core.OperationIntent) *core.OperationPlan {
+		p := &core.OperationPlan{
+			ID: id, ConnectionID: profile.ID, ProfileRevision: 1,
+			Provider: profile.Driver.ProviderID, Intent: intent,
+			Steps: []core.PlanStep{{ID: "s1", Kind: core.StepCreateTunnel, Summary: "test"}},
+		}
+		_ = p.ComputeFingerprint()
+		if err := s.SavePlan(ctx, p); err != nil {
+			t.Fatalf("SavePlan %s: %v", id, err)
+		}
+		return p
+	}
+
+	openPlan := mkPlan("plan-open", core.IntentOpen)
+	closePlan := mkPlan("plan-close", core.IntentClose)
+
+	if err := s.SaveOperation(ctx, "op-older", openPlan.ID, profile.ID, "succeeded", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("SaveOperation older: %v", err)
+	}
+	if err := s.SaveOperation(ctx, "op-newer", closePlan.ID, profile.ID, "running", "2026-01-02T00:00:00Z"); err != nil {
+		t.Fatalf("SaveOperation newer: %v", err)
+	}
+
+	ops, err := s.ListRecentOperations(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentOperations: %v", err)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("got %d operations, want 2", len(ops))
+	}
+
+	// Most recent first: history is read newest-first.
+	if ops[0].ID != "op-newer" {
+		t.Fatalf("first operation = %q, want op-newer (newest first)", ops[0].ID)
+	}
+	if ops[0].Intent != string(core.IntentClose) {
+		t.Fatalf("intent = %q, want %q", ops[0].Intent, core.IntentClose)
+	}
+	if ops[0].ProviderID != string(profile.Driver.ProviderID) {
+		t.Fatalf("provider = %q, want %q", ops[0].ProviderID, profile.Driver.ProviderID)
+	}
+	if ops[0].Fingerprint == "" {
+		t.Fatal("fingerprint was not joined from the plan")
+	}
+	if ops[0].State != "running" {
+		t.Fatalf("state = %q, want running", ops[0].State)
+	}
+	if ops[1].Intent != string(core.IntentOpen) {
+		t.Fatalf("second intent = %q, want %q", ops[1].Intent, core.IntentOpen)
+	}
+}
+
+// TestListRecentOperationsRespectsLimit ensures history is bounded.
+func TestListRecentOperationsRespectsLimit(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	plan := &core.OperationPlan{
+		ID: "plan-limit", ConnectionID: profile.ID, ProfileRevision: 1,
+		Provider: profile.Driver.ProviderID, Intent: core.IntentOpen,
+		Steps: []core.PlanStep{{ID: "s1", Kind: core.StepCreateTunnel}},
+	}
+	_ = plan.ComputeFingerprint()
+	if err := s.SavePlan(ctx, plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+	for i := range 5 {
+		opID := core.OperationID(fmt.Sprintf("op-%d", i))
+		startedAt := fmt.Sprintf("2026-01-0%dT00:00:00Z", i+1)
+		if err := s.SaveOperation(ctx, opID, plan.ID, profile.ID, "succeeded", startedAt); err != nil {
+			t.Fatalf("SaveOperation %s: %v", opID, err)
+		}
+	}
+
+	ops, err := s.ListRecentOperations(ctx, 3)
+	if err != nil {
+		t.Fatalf("ListRecentOperations: %v", err)
+	}
+	if len(ops) != 3 {
+		t.Fatalf("got %d operations, want 3 (limit)", len(ops))
+	}
+	if ops[0].ID != "op-4" {
+		t.Fatalf("newest = %q, want op-4", ops[0].ID)
 	}
 }

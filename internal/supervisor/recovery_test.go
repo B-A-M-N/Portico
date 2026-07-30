@@ -753,3 +753,79 @@ func TestConnectionDetailReportsDurableResourcesWithoutRuntime(t *testing.T) {
 		t.Fatalf("ownership = %q, want managed", detail.Resources[0].Ownership)
 	}
 }
+
+// TestOperationHistoryReadsDurableJournal pins the history endpoint to the
+// durable journal. It previously returned an unconditional empty list with a
+// comment saying the store method did not exist, so the operations screen
+// reported "No operations found" regardless of how much work had run.
+func TestOperationHistoryReadsDurableJournal(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-history")
+
+	profile := recoveryTestProfile(connID)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	plan := &core.OperationPlan{
+		ID: "plan-history", ConnectionID: connID, ProfileRevision: 1,
+		Provider: core.ProviderID("mock"), Intent: core.IntentOpen,
+		Steps: []core.PlanStep{{ID: "s1", Kind: core.StepCreateTunnel}},
+	}
+	_ = plan.ComputeFingerprint()
+	if err := st.SavePlan(ctx, plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+	if err := st.SaveOperation(ctx, "op-history", plan.ID, connID, "succeeded", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("SaveOperation: %v", err)
+	}
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st}}
+	history, err := handler.HandleOperationHistory()
+	if err != nil {
+		t.Fatalf("HandleOperationHistory: %v", err)
+	}
+	if !history.Available {
+		t.Fatalf("history reported unavailable: %s", history.Unavailable)
+	}
+	if len(history.Operations) != 1 {
+		t.Fatalf("got %d operations, want 1", len(history.Operations))
+	}
+
+	op := history.Operations[0]
+	if op.ID != "op-history" {
+		t.Fatalf("operation ID = %q", op.ID)
+	}
+	// Intent is what makes the entry meaningful; it lives on the plan.
+	if op.Intent != string(core.IntentOpen) {
+		t.Fatalf("intent = %q, want %q", op.Intent, core.IntentOpen)
+	}
+	if op.ProviderID != "mock" {
+		t.Fatalf("provider = %q, want mock", op.ProviderID)
+	}
+	if op.Fingerprint == "" {
+		t.Fatal("plan fingerprint was not carried into history")
+	}
+	if op.State != "succeeded" {
+		t.Fatalf("state = %q, want succeeded", op.State)
+	}
+}
+
+// TestOperationHistoryEmptyIsMarkedAvailable ensures a genuinely empty journal
+// is reported as authoritative, so the UI can say "none yet" rather than
+// "unavailable".
+func TestOperationHistoryEmptyIsMarkedAvailable(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	handler := &supervisorHandler{sup: &Supervisor{store: st}}
+
+	history, err := handler.HandleOperationHistory()
+	if err != nil {
+		t.Fatalf("HandleOperationHistory: %v", err)
+	}
+	if !history.Available {
+		t.Fatalf("empty history was reported unavailable: %s", history.Unavailable)
+	}
+	if len(history.Operations) != 0 {
+		t.Fatalf("got %d operations, want 0", len(history.Operations))
+	}
+}

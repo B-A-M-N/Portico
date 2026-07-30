@@ -61,6 +61,11 @@ type Model struct {
 	// Operations screen state
 	operations     []ipc.OperationDTO
 	opsSelectedIdx int
+	// operationsAvailable distinguishes "history read, none yet" from
+	// "history could not be read". Only the former may be shown as an
+	// authoritative empty list.
+	operationsAvailable   bool
+	operationsUnavailable string
 
 	// Repair verification state
 	preRepairDiagnostics       []ipc.DiagnosticDTO
@@ -290,10 +295,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case operationsLoadedMsg:
 		if msg.Err != nil {
+			m.operationsAvailable = false
+			m.operationsUnavailable = msg.Err.Error()
+			m.operations = nil
 			m.status = fmt.Sprintf("operations load failed: %v", msg.Err)
 			return m, nil
 		}
 		m.operations = msg.Operations
+		m.operationsAvailable = msg.Available
+		m.operationsUnavailable = msg.Unavailable
 		m.opsSelectedIdx = 0
 		return m, nil
 
@@ -484,8 +494,10 @@ type operationLoadedMsg struct {
 }
 
 type operationsLoadedMsg struct {
-	Operations []ipc.OperationDTO
-	Err        error
+	Operations  []ipc.OperationDTO
+	Available   bool
+	Unavailable string
+	Err         error
 }
 
 type errorMsg struct {
@@ -598,7 +610,11 @@ func (m *Model) loadOperationsCmd() tea.Cmd {
 		if err != nil {
 			return operationsLoadedMsg{Err: err}
 		}
-		return operationsLoadedMsg{Operations: history.Operations}
+		return operationsLoadedMsg{
+			Operations:  history.Operations,
+			Available:   history.Available,
+			Unavailable: history.Unavailable,
+		}
 	}
 }
 
@@ -1796,13 +1812,45 @@ func (m *Model) renderDiscovery() string {
 	return b.String()
 }
 
+// operationDuration reports how long a completed operation took. It returns
+// false when either timestamp is missing or unparseable, so the caller omits
+// the field rather than rendering a misleading zero.
+func operationDuration(op ipc.OperationDTO) (time.Duration, bool) {
+	if op.StartedAt == "" || op.CompletedAt == "" {
+		return 0, false
+	}
+	started, err := time.Parse(time.RFC3339, op.StartedAt)
+	if err != nil {
+		return 0, false
+	}
+	completed, err := time.Parse(time.RFC3339, op.CompletedAt)
+	if err != nil {
+		return 0, false
+	}
+	d := completed.Sub(started)
+	if d < 0 {
+		return 0, false
+	}
+	return d, true
+}
+
 func (m *Model) renderOperations() string {
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(" OPERATIONS "))
 	b.WriteString("\n\n")
 
 	if len(m.operations) == 0 {
-		b.WriteString("No operations found.\n")
+		// "No operations found" is an authoritative claim that no work has
+		// happened. Only make it when history was actually read.
+		if !m.operationsAvailable {
+			b.WriteString(m.theme.Style("intervention").Render("Operation history is unavailable.\n"))
+			if m.operationsUnavailable != "" {
+				b.WriteString(fmt.Sprintf("\nReason: %s\n", m.operationsUnavailable))
+			}
+			b.WriteString("\nThis does not mean no operations have run.\n")
+		} else {
+			b.WriteString("No operations have run yet.\n")
+		}
 		b.WriteString("\n[esc] back    [q] quit\n")
 		return b.String()
 	}
@@ -1814,20 +1862,27 @@ func (m *Model) renderOperations() string {
 			prefix = "> "
 		}
 
-		// Format operation status
+		// Format operation status.
+		//
+		// Operations and steps use different vocabularies: an operation reaches
+		// "completed" (controller.OperationStateCompleted) while a step reaches
+		// "succeeded" (store.StepSucceeded). This switch previously tested for
+		// "succeeded", which an operation is never set to, so a successful
+		// operation was never styled as one.
 		status := op.State
 		statusStyle := "muted"
 		switch op.State {
-		case "running":
+		case "running", "pending":
 			statusStyle = "attention"
-		case "succeeded":
+		case "completed":
 			statusStyle = "stable"
 		case "failed":
 			statusStyle = "intervention"
 		}
 
-		// Format intent from plan ID
-		intent := op.PlanID
+		// The operation's intent comes from the plan it executed. This used to
+		// display the plan ID, which is an opaque identifier, not an intent.
+		intent := op.Intent
 		if intent == "" {
 			intent = "unknown"
 		}
@@ -1849,6 +1904,10 @@ func (m *Model) renderOperations() string {
 			b.WriteString("\n")
 			b.WriteString(fmt.Sprintf("  ID:         %s\n", op.ID))
 			b.WriteString(fmt.Sprintf("  Connection: %s\n", op.ConnectionID))
+			b.WriteString(fmt.Sprintf("  Intent:     %s\n", intent))
+			if op.ProviderID != "" {
+				b.WriteString(fmt.Sprintf("  Provider:   %s\n", op.ProviderID))
+			}
 			b.WriteString(fmt.Sprintf("  Plan:       %s\n", op.PlanID))
 			b.WriteString(fmt.Sprintf("  State:      %s\n", op.State))
 			if op.StartedAt != "" {
@@ -1856,6 +1915,12 @@ func (m *Model) renderOperations() string {
 			}
 			if op.CompletedAt != "" {
 				b.WriteString(fmt.Sprintf("  Completed:  %s\n", op.CompletedAt))
+			}
+			if d, ok := operationDuration(op); ok {
+				b.WriteString(fmt.Sprintf("  Duration:   %s\n", d))
+			}
+			if op.Fingerprint != "" {
+				b.WriteString(fmt.Sprintf("  Plan hash:  %s\n", op.Fingerprint))
 			}
 			if op.Error != "" {
 				b.WriteString(m.theme.Style("intervention").Render(fmt.Sprintf("  Error:      %s\n", op.Error)))

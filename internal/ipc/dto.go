@@ -249,6 +249,14 @@ type OperationDTO struct {
 	StartedAt    string    `json:"started_at"`
 	CompletedAt  string    `json:"completed_at,omitempty"`
 	Error        string    `json:"error,omitempty"`
+
+	// Identity of the plan this operation executed. These live on the plan
+	// rather than the operation row, so a caller that only has an operation
+	// cannot otherwise say what the operation was doing.
+	Intent          string `json:"intent,omitempty"`
+	ProviderID      string `json:"provider_id,omitempty"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
+	ProfileRevision uint64 `json:"profile_revision,omitempty"`
 }
 
 // --------------- errors ---------------
@@ -400,8 +408,14 @@ type FilteredChoiceDTO struct {
 }
 
 // OperationHistoryDTO contains a list of past operations.
+//
+// Available distinguishes "history was read and there is none" from "history
+// could not be read". An empty list with Available=false must never be
+// presented as an authoritative statement that no work has occurred.
 type OperationHistoryDTO struct {
-	Operations []OperationDTO `json:"operations"`
+	Operations  []OperationDTO `json:"operations"`
+	Available   bool           `json:"available"`
+	Unavailable string         `json:"unavailable,omitempty"`
 }
 
 // --------------- discovery ---------------
