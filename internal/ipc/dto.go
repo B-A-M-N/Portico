@@ -511,3 +511,30 @@ type CloneConnectionRequest struct {
 	// since a hostname cannot be shared by two connections.
 	RequestedAddress string `json:"requested_address,omitempty"`
 }
+
+// SetupFlowDTO is a provider's declarative setup description, rendered by the
+// UI without provider-specific knowledge.
+type SetupFlowDTO struct {
+	ProviderID      string          `json:"provider_id"`
+	Summary         string          `json:"summary,omitempty"`
+	Fields          []SetupFieldDTO `json:"fields,omitempty"`
+	CapabilityNotes []string        `json:"capability_notes,omitempty"`
+}
+
+// SetupFieldDTO is one input in a provider setup flow.
+type SetupFieldDTO struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Secret      bool   `json:"secret,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+	Placeholder string `json:"placeholder,omitempty"`
+}
+
+// RemoveProviderAccountResponse reports whether an account was removed and, if
+// not, which connections still depend on it.
+type RemoveProviderAccountResponse struct {
+	Removed              bool     `json:"removed"`
+	RestartRequired      bool     `json:"restart_required,omitempty"`
+	DependentConnections []string `json:"dependent_connections,omitempty"`
+}

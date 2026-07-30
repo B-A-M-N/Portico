@@ -1271,9 +1271,83 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 // supervisor-owned secret store. Provider instances are built at supervisor
 // startup, so the caller must restart after a successful write before this
 // account becomes selectable for operations.
-func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
-	if id != "cloudflare" {
+// HandleProviderSetupFlow returns a provider's declarative setup requirements.
+// A provider that declares none cannot be configured, which the caller must
+// state rather than presenting an empty form.
+func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDTO, error) {
+	prov := h.sup.registry.Get(core.ProviderID(id))
+	if prov == nil {
 		return nil, core.ErrProviderNotFound(core.ProviderID(id))
+	}
+	setup, ok := prov.(core.ProviderSetup)
+	if !ok {
+		return nil, core.ErrValidation(fmt.Sprintf("provider %q cannot be configured through Portico", id))
+	}
+	flow := setup.SetupFlow()
+	dto := &ipc.SetupFlowDTO{
+		ProviderID:      id,
+		Summary:         flow.Summary,
+		CapabilityNotes: flow.CapabilityNotes,
+	}
+	for _, field := range flow.Fields {
+		dto.Fields = append(dto.Fields, ipc.SetupFieldDTO{
+			ID:          field.ID,
+			Label:       field.Label,
+			Description: field.Description,
+			Secret:      field.Secret,
+			Required:    field.Required,
+			Placeholder: field.Placeholder,
+		})
+	}
+	return dto, nil
+}
+
+// HandleRemoveProviderAccount removes an account after reporting what depends
+// on it. An account still selected by a connection is never removed silently,
+// because doing so strands that connection with an unexplained
+// "provider account unavailable" error.
+func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID string) (*ipc.RemoveProviderAccountResponse, error) {
+	if !h.sup.mutating {
+		return nil, fmt.Errorf("supervisor is shutting down and not accepting mutations")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	dependents, err := h.sup.store.ConnectionsUsingAccount(ctx,
+		core.ProviderID(providerID), core.ProviderAccountID(accountID))
+	if err != nil {
+		return nil, err
+	}
+	if len(dependents) > 0 {
+		resp := &ipc.RemoveProviderAccountResponse{Removed: false}
+		for _, id := range dependents {
+			resp.DependentConnections = append(resp.DependentConnections, string(id))
+		}
+		return resp, core.ErrValidation(fmt.Sprintf(
+			"%d connection(s) still use this account; reassign or delete them before removing it",
+			len(dependents)))
+	}
+
+	if err := h.sup.store.DeleteProviderAccount(ctx,
+		core.ProviderID(providerID), core.ProviderAccountID(accountID)); err != nil {
+		return nil, err
+	}
+	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: true}, nil
+}
+
+func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
+	// Provider setup is no longer gated on a hardcoded provider ID. A provider
+	// that declares a setup flow can be configured; one that does not cannot.
+	prov := h.sup.registry.Get(core.ProviderID(id))
+	if prov == nil {
+		return nil, core.ErrProviderNotFound(core.ProviderID(id))
+	}
+	if _, ok := prov.(core.ProviderSetup); !ok {
+		return nil, core.ErrValidation(fmt.Sprintf("provider %q cannot be configured through Portico", id))
+	}
+	if id != "cloudflare" {
+		return nil, core.ErrValidation(fmt.Sprintf(
+			"provider %q declares a setup flow but Portico has no validator for it yet", id))
 	}
 	accountID := strings.TrimSpace(req.AccountID)
 	zoneID := strings.TrimSpace(req.ZoneID)

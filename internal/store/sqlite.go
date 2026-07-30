@@ -4809,3 +4809,77 @@ func (s *Store) RecordIdempotentKey(ctx context.Context, key string, opID core.O
 	}
 	return nil
 }
+
+// DeleteProviderAccount removes an account row and its stored credential.
+//
+// Callers must confirm no connection depends on the account first;
+// CountConnectionsUsingAccount exists for exactly that check. Removing an
+// account still referenced by a profile would strand that connection with an
+// opaque "provider account unavailable" error and no way to see why.
+func (s *Store) DeleteProviderAccount(ctx context.Context, providerID core.ProviderID, accountID core.ProviderAccountID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete account: %w", err)
+	}
+	defer tx.Rollback()
+
+	var credentialRef sql.NullString
+	err = tx.QueryRowContext(ctx,
+		"SELECT credential_ref FROM provider_accounts WHERE id = ? AND provider_id = ?",
+		string(accountID), string(providerID)).Scan(&credentialRef)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("provider account not found: %s/%s", providerID, accountID)
+	}
+	if err != nil {
+		return fmt.Errorf("read account: %w", err)
+	}
+
+	if credentialRef.Valid && credentialRef.String != "" {
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM provider_credentials WHERE credential_ref = ?", credentialRef.String); err != nil {
+			return fmt.Errorf("delete account credential: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM provider_accounts WHERE id = ? AND provider_id = ?",
+		string(accountID), string(providerID)); err != nil {
+		return fmt.Errorf("delete account: %w", err)
+	}
+	return tx.Commit()
+}
+
+// ConnectionsUsingAccount returns the connections whose driver selects the
+// given provider account, so account removal can report what it would strand
+// instead of failing later with an unexplained error.
+func (s *Store) ConnectionsUsingAccount(ctx context.Context, providerID core.ProviderID, accountID core.ProviderAccountID) ([]core.ConnectionID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.QueryContext(ctx, "SELECT id, driver_json FROM connection_profiles")
+	if err != nil {
+		return nil, fmt.Errorf("list profiles for account dependency check: %w", err)
+	}
+	defer rows.Close()
+
+	var dependents []core.ConnectionID
+	for rows.Next() {
+		var id core.ConnectionID
+		var driverJSON []byte
+		if err := rows.Scan(&id, &driverJSON); err != nil {
+			return nil, fmt.Errorf("scan profile driver: %w", err)
+		}
+		var driver core.DriverSelection
+		if err := json.Unmarshal(driverJSON, &driver); err != nil {
+			// A profile whose driver cannot be decoded must not be silently
+			// treated as independent of the account.
+			return nil, fmt.Errorf("profile %s: decode driver: %w", id, err)
+		}
+		if driver.ProviderID == providerID && driver.AccountID == accountID {
+			dependents = append(dependents, id)
+		}
+	}
+	return dependents, rows.Err()
+}

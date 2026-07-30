@@ -12,6 +12,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
 	"github.com/B-A-M-N/portico/internal/store"
 )
@@ -176,6 +177,18 @@ func TestSnapshotIncludesNonSecretProviderAccountSummaries(t *testing.T) {
 	}
 }
 
+// cloudflareTestRegistry returns a registry containing the Cloudflare adapter,
+// which setup now requires because configurability is decided by the provider's
+// declared setup flow rather than by a hardcoded provider ID.
+func cloudflareTestRegistry(t *testing.T) provider.Registry {
+	t.Helper()
+	reg := provider.NewRegistry()
+	if err := reg.Add(&cloudflare.Provider{}); err != nil {
+		t.Fatalf("register cloudflare: %v", err)
+	}
+	return reg
+}
+
 // stubAccountValidator stands in for a live provider so account setup can be
 // tested without real credentials.
 type stubAccountValidator struct {
@@ -195,7 +208,9 @@ func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing
 		AccountAccessible: true,
 		Zones:             []ZoneSummary{{ID: "zone-a", Name: "example.com"}},
 	}}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+	handler := &supervisorHandler{sup: &Supervisor{
+		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
+	}}
 	response, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Label: "Personal", ZoneID: "zone-a", Credential: "secret-token",
 	})
@@ -860,7 +875,9 @@ func TestOperationHistoryEmptyIsMarkedAvailable(t *testing.T) {
 func TestCloudflareSetupAcceptsAccountWithoutZone(t *testing.T) {
 	st := newRecoveryTestStore(t)
 	validator := &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+	handler := &supervisorHandler{sup: &Supervisor{
+		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
+	}}
 
 	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Label: "Personal", Credential: "secret-token",
@@ -891,7 +908,9 @@ func TestCloudflareSetupDoesNotPersistUnvalidatedCredentials(t *testing.T) {
 		result: &AccountValidation{MissingPermissions: []string{"Zone: Read"}},
 		err:    errors.New("the token is valid but cannot see account account-a"),
 	}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+	handler := &supervisorHandler{sup: &Supervisor{
+		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
+	}}
 
 	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Credential: "bad-token", ZoneID: "zone-a",
@@ -922,7 +941,9 @@ func TestCloudflareSetupRejectsZoneNotVisibleToToken(t *testing.T) {
 		AccountAccessible: true,
 		Zones:             []ZoneSummary{{ID: "zone-real", Name: "example.com"}},
 	}}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, accountValidator: validator}}
+	handler := &supervisorHandler{sup: &Supervisor{
+		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
+	}}
 
 	_, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Credential: "token", ZoneID: "zone-typo",
@@ -1085,5 +1106,140 @@ func TestCloneRequiresANewHostnameForPermanentConnections(t *testing.T) {
 		RequestedAddress: "copy.example.com",
 	}); err != nil {
 		t.Fatalf("clone with a new hostname was rejected: %v", err)
+	}
+}
+
+// TestProviderSetupIsDeclarative pins audit item 23. Setup was hardcoded to
+// Cloudflare in both the TUI and the backend, so adding a provider meant
+// editing the UI and the handler rejected every other provider by ID.
+func TestProviderSetupIsDeclarative(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	cf := &cloudflare.Provider{}
+	if err := registry.Add(cf); err != nil {
+		t.Fatalf("register cloudflare: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+
+	flow, err := handler.HandleProviderSetupFlow("cloudflare")
+	if err != nil {
+		t.Fatalf("HandleProviderSetupFlow: %v", err)
+	}
+	if len(flow.Fields) == 0 {
+		t.Fatal("provider declared no setup fields")
+	}
+
+	byID := map[string]ipc.SetupFieldDTO{}
+	for _, f := range flow.Fields {
+		byID[f.ID] = f
+	}
+	// The credential must be declared secret so the UI knows to mask it and
+	// clear it, rather than the UI knowing which field happens to be a token.
+	if cred, ok := byID["credential"]; !ok || !cred.Secret || !cred.Required {
+		t.Fatalf("credential field = %#v", cred)
+	}
+	// The zone must be declared optional, matching the capability split.
+	if zone, ok := byID["zone_id"]; !ok || zone.Required {
+		t.Fatalf("zone field = %#v", zone)
+	}
+	if len(flow.CapabilityNotes) == 0 {
+		t.Fatal("setup flow does not explain what each level of configuration enables")
+	}
+}
+
+// TestUnknownProviderSetupIsRefusedByCapabilityNotByName ensures the refusal is
+// based on whether the provider declares a setup flow.
+func TestUnknownProviderSetupIsRefusedByCapabilityNotByName(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+
+	_, err := handler.HandleProviderSetupFlow("mock")
+	if err == nil {
+		t.Fatal("a provider declaring no setup flow was accepted for configuration")
+	}
+	if !strings.Contains(err.Error(), "cannot be configured") {
+		t.Fatalf("error does not explain why: %v", err)
+	}
+}
+
+// TestRemovingAnAccountReportsDependentConnections pins audit item 24. Removing
+// an account still selected by a connection would strand it with an opaque
+// "provider account unavailable" error.
+func TestRemovingAnAccountReportsDependentConnections(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	account := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Personal",
+		CredentialRef: "cloudflare:acct-1:api-token", Status: core.AccountAuthenticated,
+		Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("secret")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+
+	profile := recoveryTestProfile("conn-dependent")
+	profile.Driver.ProviderID = "cloudflare"
+	profile.Driver.AccountID = "acct-1"
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, mutating: true}}
+	resp, err := handler.HandleRemoveProviderAccount("cloudflare", "acct-1")
+	if err == nil {
+		t.Fatal("an account with a dependent connection was removed")
+	}
+	if resp == nil || len(resp.DependentConnections) != 1 || resp.DependentConnections[0] != "conn-dependent" {
+		t.Fatalf("dependent connections were not reported: %#v", resp)
+	}
+
+	// The account and its credential must survive the refusal.
+	accounts, listErr := st.ListProviderAccounts(ctx)
+	if listErr != nil || len(accounts) != 1 {
+		t.Fatalf("refused removal still deleted the account: %#v, %v", accounts, listErr)
+	}
+}
+
+// TestRemovingAnUnusedAccountDeletesItsCredential ensures removal is complete
+// once nothing depends on it.
+func TestRemovingAnUnusedAccountDeletesItsCredential(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	account := core.ProviderAccount{
+		ID: "acct-unused", Provider: "cloudflare", Label: "Unused",
+		CredentialRef: "cloudflare:acct-unused:api-token", Status: core.AccountAuthenticated,
+		Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("secret")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, mutating: true}}
+	resp, err := handler.HandleRemoveProviderAccount("cloudflare", "acct-unused")
+	if err != nil {
+		t.Fatalf("HandleRemoveProviderAccount: %v", err)
+	}
+	if !resp.Removed {
+		t.Fatal("account was not removed")
+	}
+
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil || len(accounts) != 0 {
+		t.Fatalf("account survived removal: %#v, %v", accounts, err)
+	}
+	// The credential must not outlive the account that referenced it. A missing
+	// credential is reported as an empty value rather than an error.
+	secret, err := st.LoadProviderCredential(ctx, "cloudflare", "cloudflare:acct-unused:api-token")
+	if err != nil {
+		t.Fatalf("LoadProviderCredential: %v", err)
+	}
+	if secret != "" {
+		t.Fatal("credential survived account removal")
 	}
 }

@@ -1560,3 +1560,45 @@ func splitNonEmpty(value string) []string {
 	}
 	return result
 }
+
+// SetupFlow declares what Cloudflare needs in order to configure an account.
+//
+// The fields are declared here rather than hardcoded in the TUI, so the setup
+// screen renders a form it does not have to understand and a new provider does
+// not require a UI change.
+func (p *Provider) SetupFlow() core.SetupFlow {
+	return core.SetupFlow{
+		Summary: "Configure a Cloudflare account so Portico can create managed tunnels for you.",
+		Fields: []core.SetupField{
+			{
+				ID:          "account_id",
+				Label:       "Account ID",
+				Description: "Found on the Cloudflare dashboard overview page.",
+				Required:    true,
+			},
+			{
+				ID:          "label",
+				Label:       "Label",
+				Description: "A name for this account inside Portico. Defaults to the account ID.",
+			},
+			{
+				ID:    "zone_id",
+				Label: "Zone ID",
+				Description: "Only needed for permanent hostnames and DNS. " +
+					"Leave blank to use tunnels with temporary addresses.",
+			},
+			{
+				ID:          "credential",
+				Label:       "API token",
+				Description: "A token that can read your account and manage tunnels.",
+				Secret:      true,
+				Required:    true,
+			},
+		},
+		CapabilityNotes: []string{
+			"Without any account: temporary addresses using Quick Tunnels.",
+			"With an account and token: managed tunnels that survive restarts.",
+			"With a zone as well: permanent hostnames, DNS records and Access protection.",
+		},
+	}
+}
