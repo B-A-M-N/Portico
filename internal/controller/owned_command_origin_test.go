@@ -25,12 +25,7 @@ func TestController_OwnedCommandOriginLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is required for command-origin lifecycle test")
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
+	port := freeLoopbackPort(t)
 
 	controller := New(newTestRegistry(mock.New()), newTestJournal())
 	controller.SetOriginManager(origin.NewManager())
@@ -120,12 +115,7 @@ func TestOriginManager_StopAllTerminatesProcessGroup(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh is required for process-group termination test")
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
+	port := freeLoopbackPort(t)
 
 	manager := origin.NewManager()
 	connID := core.ConnectionID("pgroup-" + strconv.Itoa(port))
@@ -171,4 +161,36 @@ func TestOriginManager_StopAllTerminatesProcessGroup(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// freeLoopbackPort reserves a loopback port for a child process to bind.
+//
+// Asking the kernel for :0 and closing the listener leaves a window in which
+// another test — including one in a package running concurrently — can take the
+// port before the child binds it, which surfaced as an intermittent
+// "address already in use" failure under go test -race ./...
+//
+// The port is re-checked immediately before being returned, and a taken port is
+// discarded rather than handed out, which closes all but a vanishingly small
+// window.
+func freeLoopbackPort(t *testing.T) int {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
+
+		// Confirm the port is still claimable before handing it out.
+		probe, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+		if err != nil {
+			continue
+		}
+		probe.Close()
+		return port
+	}
+	t.Fatal("could not reserve a free loopback port")
+	return 0
 }
