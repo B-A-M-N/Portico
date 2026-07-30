@@ -283,6 +283,29 @@ func (c *Client) PlanClose(ctx context.Context, connID string) (*PlanDTO, error)
 	return &plan, nil
 }
 
+// PlanEdit previews an edit as a change plan without applying it.
+func (c *Client) PlanEdit(ctx context.Context, connID string, req UpdateConnectionRequest) (*PlanDTO, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/connections/"+connID+"/plan/edit", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var plan PlanDTO
+	if err := json.NewDecoder(resp.Body).Decode(&plan); err != nil {
+		return nil, err
+	}
+	return &plan, nil
+}
+
 // PlanRepair creates a repair plan.
 func (c *Client) PlanRepair(ctx context.Context, connID string) (*PlanDTO, error) {
 	resp, err := c.doRequest(ctx, "POST", "/v1/connections/"+connID+"/plan/repair", nil)

@@ -80,6 +80,9 @@ const (
 	IntentClose  OperationIntent = "close"
 	IntentRepair OperationIntent = "repair"
 	IntentDelete OperationIntent = "delete"
+	// IntentEdit changes a connection's desired state and reconciles the
+	// provider resources the change invalidates, in one operation.
+	IntentEdit OperationIntent = "edit"
 )
 
 // OperationPlan represents an immutable operation plan
@@ -147,6 +150,10 @@ const (
 	StepUpdateAccessPolicy    StepKind = "update_access_policy"
 	StepRecreateTunnel        StepKind = "recreate_tunnel"
 	StepFinalizeLocalDeletion StepKind = "finalize_local_deletion"
+	// StepApplyProfile commits an edited profile. It is the commit boundary of
+	// an edit: every step before it operates on the previous profile, which
+	// stays readable until this step succeeds.
+	StepApplyProfile StepKind = "apply_profile"
 )
 
 // TechnicalOperation describes the technical operation details

@@ -1069,10 +1069,14 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 		unsupported = append(unsupported, "lifecycle")
 	}
 	if len(unsupported) > 0 {
+		// These changes are applied through the edit plan, which pauses the
+		// connection, removes the provider resources the new profile no longer
+		// describes, commits the profile and reopens. Applying them here would
+		// change the profile while leaving those resources behind.
 		return nil, core.ErrValidation(fmt.Sprintf(
-			"changing %s is not supported yet because it requires a change plan that migrates the existing provider resources; "+
-				"delete this connection and create a replacement, or clone it and edit the copy",
-			strings.Join(unsupported, " and ")))
+			"changing %s must go through an edit plan so the affected provider resources are reconciled; "+
+				"preview it with POST /v1/connections/%s/plan/edit and apply the returned plan",
+			strings.Join(unsupported, " and "), id))
 	}
 
 	if req.Name != nil {
@@ -1164,6 +1168,120 @@ func (h *supervisorHandler) HandleCloneConnection(id string, req ipc.CloneConnec
 		}
 	}
 	return h.HandleGetConnection(string(created.ID))
+}
+
+// HandlePlanEdit previews an edit as a change plan.
+//
+// The plan is a preview only: the proposed profile is not written until its
+// apply-profile step runs, so a caller that never applies the plan leaves the
+// connection exactly as it was.
+func (h *supervisorHandler) HandlePlanEdit(id string, req ipc.UpdateConnectionRequest) (*ipc.PlanDTO, error) {
+	if !h.sup.mutating {
+		return nil, fmt.Errorf("supervisor is shutting down and not accepting mutations")
+	}
+	cid := core.ConnectionID(id)
+	current, ok := h.sup.controller.GetProfile(cid)
+	if !ok {
+		return nil, core.ErrProfileNotFound(cid)
+	}
+
+	proposed, err := applyEditRequest(current, req)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	plan, delta, err := h.sup.controller.PlanEdit(ctx, cid, proposed)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(plan.Steps) == 0 {
+		dto := planToDTO(plan, current)
+		dto.Noop = true
+		dto.Outcome = "Nothing would change."
+		return dto, nil
+	}
+
+	canonicalPlan, err := h.sup.persistCanonicalPlan(ctx, plan)
+	if err != nil {
+		return nil, err
+	}
+	// PlanEdit recorded the proposed profile against the plan it built; the
+	// canonical plan may carry a different ID, so re-associate it.
+	h.sup.controller.RebindPendingEdit(plan.ID, canonicalPlan.ID)
+
+	dto := planToDTO(canonicalPlan, proposed)
+	dto.Outcome = describeEditOutcome(delta, current, proposed)
+	return dto, nil
+}
+
+// applyEditRequest builds the proposed profile from the current one plus the
+// requested changes. Only the fields the request carries are altered.
+func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionRequest) (*core.ConnectionProfile, error) {
+	proposed := current.DeepCopy()
+
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			return nil, core.ErrValidation("connection name cannot be empty")
+		}
+		proposed.Name = name
+	}
+	if req.Driver != nil {
+		proposed.Driver.ProviderID = core.ProviderID(req.Driver.ProviderID)
+		proposed.Driver.AccountID = core.ProviderAccountID(req.Driver.AccountID)
+		if req.Driver.Options != nil {
+			proposed.Driver.Options = req.Driver.Options
+		}
+	}
+	if req.Lifecycle != nil {
+		proposed.Lifecycle.AutoStart = req.Lifecycle.AutoStart
+		proposed.Lifecycle.OnDisconnect = core.DisconnectPolicy(req.Lifecycle.OnDisconnect)
+	}
+	if req.Spec != nil {
+		if proposed.Spec.ServiceExposure == nil {
+			return nil, core.ErrValidation("only service exposure connections can have their spec edited")
+		}
+		spec := proposed.Spec.ServiceExposure
+		if req.Spec.Exposure.Mode != "" {
+			spec.Exposure.Mode = core.ExposureMode(req.Spec.Exposure.Mode)
+		}
+		if req.Spec.Exposure.Protocol != "" {
+			spec.Exposure.Protocol = core.Protocol(req.Spec.Exposure.Protocol)
+		}
+		spec.Exposure.RequestedAddress = req.Spec.Exposure.RequestedAddress
+		if req.Spec.Protection.Kind != "" {
+			spec.Protection.Kind = core.ProtectionKind(req.Spec.Protection.Kind)
+			spec.Protection.AllowedEmails = req.Spec.Protection.AllowedEmails
+			spec.Protection.AllowedDomains = req.Spec.Protection.AllowedDomains
+		}
+		if req.Spec.Source.Existing != nil {
+			spec.Source.Kind = core.SourceExisting
+			spec.Source.Existing = &core.ExistingServiceSpec{
+				Network:  req.Spec.Source.Existing.Network,
+				Address:  req.Spec.Source.Existing.Address,
+				Protocol: core.Protocol(req.Spec.Source.Existing.Protocol),
+			}
+		}
+	}
+	return proposed, nil
+}
+
+// describeEditOutcome states what the edit achieves in plain language.
+func describeEditOutcome(delta controller.ProfileDelta, current, proposed *core.ConnectionProfile) string {
+	if delta.Empty() {
+		return "Nothing would change."
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "This changes %s.", joinWithAnd(delta.Changes))
+	if len(delta.InvalidatedResources) > 0 {
+		b.WriteString(" Provider resources that no longer match will be removed and recreated.")
+	}
+	if current.Desired == core.DesiredOpen {
+		b.WriteString(" The connection is paused while this happens and reopened afterwards.")
+	}
+	return b.String()
 }
 
 func (h *supervisorHandler) HandlePlanRepair(id string) (*ipc.PlanDTO, error) {

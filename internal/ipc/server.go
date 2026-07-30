@@ -50,6 +50,7 @@ type RequestHandler interface {
 	HandleUpdateConnection(id string, req UpdateConnectionRequest) (*ConnectionDTO, error)
 	HandlePlanOpen(id string) (*PlanDTO, error)
 	HandlePlanClose(id string) (*PlanDTO, error)
+	HandlePlanEdit(id string, req UpdateConnectionRequest) (*PlanDTO, error)
 	HandlePlanRepair(id string) (*PlanDTO, error)
 	HandlePlanDelete(id string) (*PlanDTO, error)
 	HandleApplyPlan(planID string, idempotencyKey string) (*OperationDTO, error)
@@ -558,6 +559,24 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(detail)
+
+	case len(parts) == 3 && parts[1] == "plan" && parts[2] == "edit" && r.Method == http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var req UpdateConnectionRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "PTO-PLAN-EDIT", "invalid request body")
+			return
+		}
+		plan, err := s.handler.HandlePlanEdit(id, req)
+		if err != nil {
+			writeHandlerError(w, "PTO-PLAN-EDIT", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(plan)
 
 	case len(parts) == 3 && parts[1] == "plan" && r.Method == http.MethodPost:
 		action := parts[2]

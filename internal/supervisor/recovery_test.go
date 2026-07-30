@@ -976,10 +976,16 @@ func TestUpdateConnectionRefusesSilentlyIgnoredChanges(t *testing.T) {
 	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
 
 	driver := ipc.DriverSelectionDTO{ProviderID: "someone-else"}
-	if _, err := handler.HandleUpdateConnection(string(connID), ipc.UpdateConnectionRequest{
-		Driver: &driver,
-	}); err == nil {
+	err := func() error {
+		_, e := handler.HandleUpdateConnection(string(connID), ipc.UpdateConnectionRequest{Driver: &driver})
+		return e
+	}()
+	if err == nil {
 		t.Fatal("a provider change was accepted and silently discarded")
+	}
+	// The refusal must point at the workflow that does apply the change.
+	if !strings.Contains(err.Error(), "plan/edit") {
+		t.Fatalf("refusal does not point at the edit plan: %v", err)
 	}
 
 	spec := ipc.ConnectionSpecDTO{}
@@ -1348,5 +1354,85 @@ func TestSupportExportRedactsBySubstringNotExactKey(t *testing.T) {
 		if isSecretKey(key) {
 			t.Fatalf("key %q was needlessly redacted", key)
 		}
+	}
+}
+
+// TestPlanEditPreviewsWithoutApplying pins the retain-previous property at the
+// handler boundary: previewing an edit must not change the connection.
+func TestPlanEditPreviewsWithoutApplying(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-edit-preview")
+
+	profile := recoveryTestProfile(connID)
+	profile.Spec.ServiceExposure.Exposure.Mode = core.ExposurePermanent
+	profile.Spec.ServiceExposure.Exposure.RequestedAddress = "old.example.com"
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.SetConnectionStorer(st)
+	ctrl.SetProfileUpdater(st)
+	ctrl.RestoreProfile(profile)
+	ctrl.RestoreRuntime(&core.ConnectionRuntime{ConnectionID: connID, State: core.RuntimeClosed})
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	spec := ipc.ConnectionSpecDTO{
+		Exposure: ipc.ExposureDTO{Mode: "permanent_public", RequestedAddress: "new.example.com"},
+	}
+	plan, err := handler.HandlePlanEdit(string(connID), ipc.UpdateConnectionRequest{Spec: &spec})
+	if err != nil {
+		t.Fatalf("HandlePlanEdit: %v", err)
+	}
+	if plan.Noop {
+		t.Fatal("a hostname change was reported as a no-op")
+	}
+	if plan.Outcome == "" {
+		t.Fatal("edit plan does not state what it changes")
+	}
+
+	// Previewing must not have written anything.
+	stored, err := st.LoadProfile(ctx, connID)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if stored.Spec.ServiceExposure.Exposure.RequestedAddress != "old.example.com" {
+		t.Fatalf("previewing an edit already changed the stored hostname to %q",
+			stored.Spec.ServiceExposure.Exposure.RequestedAddress)
+	}
+}
+
+// TestPlanEditReportsANoOpAsSuch ensures an edit that changes nothing does not
+// become a preview-and-confirm workflow.
+func TestPlanEditReportsANoOpAsSuch(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-edit-noop")
+	profile := recoveryTestProfile(connID)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	same := profile.Name
+	plan, err := handler.HandlePlanEdit(string(connID), ipc.UpdateConnectionRequest{Name: &same})
+	if err != nil {
+		t.Fatalf("HandlePlanEdit: %v", err)
+	}
+	if !plan.Noop {
+		t.Fatalf("an unchanged edit was not reported as a no-op: %#v", plan.Steps)
 	}
 }

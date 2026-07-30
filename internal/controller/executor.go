@@ -804,6 +804,28 @@ func applyResourceOutcome(existing, additions []core.ProviderResource, lifecycle
 // executor path preserves journaling, persistence, and compensation behavior.
 func (c *Controller) executeStep(ctx context.Context, plan *core.OperationPlan, prov core.Provider, step core.PlanStep) (core.StepResult, error) {
 	switch step.Kind {
+	case core.StepApplyProfile:
+		// The commit boundary of an edit. Everything before this step operated
+		// on the previous profile, which is still what a reader sees; from here
+		// on the connection is its edited self.
+		proposed, ok := c.pendingEdits.take(plan.ID)
+		if !ok || proposed == nil {
+			return core.StepResult{}, fmt.Errorf("edit plan %s has no proposed profile to apply", plan.ID)
+		}
+		c.mu.RLock()
+		currentRevision := uint64(0)
+		if existing, found := c.profiles[plan.ConnectionID]; found {
+			currentRevision = existing.Revision
+		}
+		c.mu.RUnlock()
+
+		applied := proposed.DeepCopy()
+		applied.UpdatedAt = time.Now().UTC()
+		if err := c.UpdateProfile(ctx, applied, currentRevision); err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, err
+		}
+		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
+
 	case core.StepStartOrigin, core.StepStopOrigin:
 		c.mu.RLock()
 		profile := c.profiles[plan.ConnectionID]

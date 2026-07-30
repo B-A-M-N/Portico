@@ -33,6 +33,9 @@ type Controller struct {
 	deleteFinalizer  DeleteConnectionFinalizer
 	connectionStorer ConnectionStorer
 	profileUpdater   ProfileUpdater
+	// pendingEdits holds proposed profiles for edit plans until their
+	// apply-profile step commits.
+	pendingEdits     pendingEdits
 	resourceSaver    ResourceSaver
 	resourceRemover  ResourceRemover
 	credentialStorer CredentialStorer
