@@ -386,18 +386,19 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 	case core.DesiredOpen:
 		plan.Intent = core.IntentOpen
 
-		if profile.Exposure.Mode == core.ExposureTemporary {
+		if profile.GetExposure().Mode == core.ExposureTemporary {
 			// Quick Tunnel — no named tunnel, no DNS, no Access
 			// Reject SSE
-			if profile.Source.MCP != nil && profile.Source.MCP.Transport == core.MCPTransportSSE {
+			source := profile.GetSource()
+			if source.MCP != nil && source.MCP.Transport == core.MCPTransportSSE {
 				return nil, fmt.Errorf("SSE transport is not supported with Quick Tunnels (temporary exposure)")
 			}
 			// Reject custom hostname requests
-			if profile.Exposure.RequestedAddress != "" {
+			if profile.GetExposure().RequestedAddress != "" {
 				return nil, fmt.Errorf("quick tunnels do not support custom hostnames")
 			}
 			// Reject unsupported protection for temporary mode
-			if profile.Protection.Kind != core.ProtectionNone {
+			if profile.GetProtection().Kind != core.ProtectionNone {
 				return nil, fmt.Errorf("quick tunnels do not support access protection")
 			}
 
@@ -413,9 +414,9 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			plan.Expected.State = core.RuntimeOpen
 			plan.Expected.PublicAddress = "temporary (assigned by Cloudflare)"
 
-		} else if profile.Exposure.Mode == core.ExposurePermanent {
+		} else if profile.GetExposure().Mode == core.ExposurePermanent {
 			// Permanent exposure — named tunnel + DNS + optional Access
-			if profile.Exposure.RequestedAddress == "" {
+			if profile.GetExposure().RequestedAddress == "" {
 				return nil, fmt.Errorf("permanent exposure requires a requested hostname")
 			}
 			if p.zoneID == "" {
@@ -426,18 +427,19 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			// Identity Provider, Service Token, and Private Network protection
 			// are not implemented — only email/email-domain Access rules are
 			// generated. Refuse rather than falsely advertise protection.
-			switch profile.Protection.Kind {
+			prot := profile.GetProtection()
+			switch prot.Kind {
 			case core.ProtectionIdentity, core.ProtectionServiceToken, core.ProtectionPrivateNet:
-				return nil, fmt.Errorf("protection %s is not supported by the Cloudflare provider yet", profile.Protection.Kind)
+				return nil, fmt.Errorf("protection %s is not supported by the Cloudflare provider yet", prot.Kind)
 			}
-			if profile.Protection.Kind != core.ProtectionNone {
-				if len(profile.Protection.AllowedEmails) == 0 && len(profile.Protection.AllowedDomains) == 0 {
-					return nil, fmt.Errorf("protection %s requires at least one allowed email or domain", profile.Protection.Kind)
+			if prot.Kind != core.ProtectionNone {
+				if len(prot.AllowedEmails) == 0 && len(prot.AllowedDomains) == 0 {
+					return nil, fmt.Errorf("protection %s requires at least one allowed email or domain", prot.Kind)
 				}
 			}
 
 			tunnelName := fmt.Sprintf("portico-%s", safeShortID(string(profile.ID), 8))
-			hostname := profile.Exposure.RequestedAddress
+			hostname := profile.GetExposure().RequestedAddress
 
 			plan.Steps = append(plan.Steps,
 				core.PlanStep{ID: "cf-validate", Kind: core.StepValidateAccount, Summary: "Validate Cloudflare account and zone",
@@ -481,16 +483,16 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			)
 
 			// Add Access steps based on protection kind
-			if profile.Protection.Kind != core.ProtectionNone {
-				authMode := protectionToAuthMode(profile.Protection.Kind)
+			if profile.GetProtection().Kind != core.ProtectionNone {
+				authMode := protectionToAuthMode(profile.GetProtection().Kind)
 				plan.Steps = append(plan.Steps,
 					core.PlanStep{ID: "cf-access-app", Kind: core.StepCreateAccessApp, Summary: "Create Access application and policy",
 						Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "create_access_app", Parameters: map[string]string{
 							"hostname":         hostname,
 							"auth_mode":        authMode,
-							"allowed_emails":   strings.Join(profile.Protection.AllowedEmails, ","),
-							"allowed_domains":  strings.Join(profile.Protection.AllowedDomains, ","),
-							"session_duration": profile.Protection.SessionTTL.String(),
+							"allowed_emails":   strings.Join(profile.GetProtection().AllowedEmails, ","),
+							"allowed_domains":  strings.Join(profile.GetProtection().AllowedDomains, ","),
+							"session_duration": profile.GetProtection().SessionTTL.String(),
 						}},
 						Destructive: false, Irreversible: false,
 						Ownership: core.OwnershipManaged,

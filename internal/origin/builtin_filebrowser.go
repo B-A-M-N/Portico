@@ -28,7 +28,7 @@ import (
 func (fb *BuiltinFileBrowser) safePath(rel string) (string, error) {
 	// Strip leading slash to make it relative
 	rel = strings.TrimPrefix(rel, "/")
-	
+
 	// Clean the relative path
 	rel = filepath.Clean(rel)
 	if rel == "." || rel == "" {
@@ -555,14 +555,14 @@ func (fb *BuiltinFileBrowser) handleBrowse(w http.ResponseWriter, r *http.Reques
 	}
 
 	data := struct {
-		Path          string
-		Files         []fileEntry
-		Download      bool
-		Upload        bool
-		Delete        bool
-		ReadOnly      bool
-		UploadCSRF    string
-		DeleteCSRF    string
+		Path       string
+		Files      []fileEntry
+		Download   bool
+		Upload     bool
+		Delete     bool
+		ReadOnly   bool
+		UploadCSRF string
+		DeleteCSRF string
 	}{
 		Path:       relPath,
 		Files:      files,

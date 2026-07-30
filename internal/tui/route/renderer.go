@@ -3,6 +3,7 @@ package route
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/B-A-M-N/portico/internal/core"
 )
@@ -111,9 +112,15 @@ func (c *Canvas) Set(x, y int, r rune, style StyleID) {
 }
 
 // Text places a string at (x, y), clipping to canvas width.
+// Uses display-width-aware positioning to handle multi-byte runes correctly.
 func (c *Canvas) Text(x, y int, s string, style StyleID) {
-	for i, r := range s {
-		c.Set(x+i, y, r, style)
+	col := x
+	for _, r := range s {
+		if col < 0 || col >= c.Width {
+			break
+		}
+		c.Set(col, y, r, style)
+		col++
 	}
 }
 
@@ -191,23 +198,25 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 		cornerTopRight, cornerTopLeft, cornerBottomLeft, cornerBottomLine = '+', '+', '+', '='
 		breakMark = 'X'
 	}
+	// Use state-appropriate style for route lines instead of always active.
+	lineStyle := styleForState(vm.State)
 	if topRouteEnd > localX+1 {
-		canvas.HLine(localX+1, topRouteEnd, 0, line, StyleActive)
+		canvas.HLine(localX+1, topRouteEnd, 0, line, lineStyle)
 		// Corner
-		canvas.Set(topRouteEnd, 1, cornerTopRight, StyleActive)
-		canvas.Set(topRouteEnd, 0, cornerTopLeft, StyleActive)
+		canvas.Set(topRouteEnd, 1, cornerTopRight, lineStyle)
+		canvas.Set(topRouteEnd, 0, cornerTopLeft, lineStyle)
 	} else {
-		canvas.Set(localX+1, 1, line, StyleActive)
+		canvas.Set(localX+1, 1, line, lineStyle)
 	}
 
 	// Draw bottom route: gateway → endpoint
 	bottomRouteStart := gw + 1
 	if bottomRouteStart < endX {
-		canvas.HLine(bottomRouteStart, endX-1, 2, line, StyleActive)
-		canvas.Set(gw, 2, cornerBottomLeft, StyleActive)
-		canvas.Set(gw+1, 2, cornerBottomLine, StyleActive)
+		canvas.HLine(bottomRouteStart, endX-1, 2, line, lineStyle)
+		canvas.Set(gw, 2, cornerBottomLeft, lineStyle)
+		canvas.Set(gw+1, 2, cornerBottomLine, lineStyle)
 	} else {
-		canvas.Set(gw, 2, cornerBottomLeft, StyleActive)
+		canvas.Set(gw, 2, cornerBottomLeft, lineStyle)
 	}
 
 	// Handle finding overlay
@@ -229,7 +238,7 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 
 	if vm.ProviderLabel != "" {
 		provLabel := fmt.Sprintf(" %s ", vm.ProviderLabel)
-		provX := gw - len(provLabel)/2
+		provX := gw - utf8.RuneCountInString(provLabel)/2
 		if provX < 0 {
 			provX = 0
 		}
@@ -238,7 +247,7 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 
 	if vm.EndpointLabel != "" {
 		endLabel := fmt.Sprintf(" %s ", vm.EndpointLabel)
-		endX2 := endX - len(endLabel)
+		endX2 := endX - utf8.RuneCountInString(endLabel)
 		if endX2 < 0 {
 			endX2 = 0
 		}
@@ -278,11 +287,13 @@ func renderCompactRoute(vm RouteVM, useASCII bool) string {
 	}
 	route := fmt.Sprintf("%s%s%s%s%s", localStr, line, gateway, line, endStr)
 	if vm.EndpointLabel != "" {
-		parts := len(vm.EndpointLabel)
+		// Truncate by rune count to avoid splitting multi-byte characters.
+		runes := []rune(vm.EndpointLabel)
+		parts := len(runes)
 		if parts > 10 {
 			parts = 10
 		}
-		route += " " + vm.EndpointLabel[:parts]
+		route += " " + string(runes[:parts])
 	}
 	return route
 }

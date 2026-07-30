@@ -61,7 +61,7 @@ func (p *AccountsProvider) Plan(ctx context.Context, desired core.DesiredConnect
 	if desired.Profile == nil {
 		return nil, fmt.Errorf("cloudflare profile is required")
 	}
-	child, err := p.ProviderForAccount(desired.Profile.Provider.AccountID)
+	child, err := p.ProviderForAccount(desired.Profile.GetProvider().AccountID)
 	if err != nil {
 		return nil, err
 	}

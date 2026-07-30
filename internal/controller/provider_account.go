@@ -10,13 +10,14 @@ func (c *Controller) providerForProfile(profile *core.ConnectionProfile) (core.P
 	if profile == nil {
 		return nil, core.ErrValidation("profile is required")
 	}
-	providerID := profile.Provider.ProviderID
+	provider := profile.GetProvider()
+	providerID := provider.ProviderID
 	prov := c.registry.Get(providerID)
 	if prov == nil {
 		return nil, core.ErrProviderNotFound(providerID)
 	}
 
-	selectedAccount := profile.Provider.AccountID
+	selectedAccount := provider.AccountID
 	if scoped, ok := prov.(core.AccountScopedProvider); ok {
 		child, err := scoped.ProviderForAccount(selectedAccount)
 		if err != nil {

@@ -9,3 +9,7 @@ __debug_bin
 .vscode/
 *.test
 *.db.backup-*
+# Workflow state (per-session, machine-specific)
+.claude/workflow/state.json
+.claude/workflow/receipts/
+.claude/settings.local.json

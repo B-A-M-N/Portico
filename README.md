@@ -123,10 +123,25 @@ portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp 
 
 | Provider | Status | Exposure Modes | Protection |
 |----------|--------|----------------|------------|
-| Cloudflare | ✅ | Temporary; Permanent when configured | None in the TUI; email OTP with explicit allow rules in the API |
-| ngrok | 🔄 Planned | | |
-| Tailscale | 🔄 Planned | | |
-| zrok | 🔄 Planned | | |
+| Cloudflare | ✅ Implemented | Temporary; Permanent when configured | None in the TUI; email OTP with explicit allow rules in the API |
+| Ngrok | ⚠️ Experimental — not usable | Temporary (ephemeral tunnels) | Not applied |
+| Tailscale | ❌ Not implemented | — | — |
+| zrok | ❌ Not implemented | — | — |
+
+> Cloudflare is the only provider suitable for use. Tailscale and zrok are
+> planned for future releases but have no implementation yet.
+
+**Ngrok is experimental and disabled by default.** The adapter is scaffolding,
+not a working provider, and reports every capability as experimental. It:
+
+- synthesises tunnel identifiers instead of creating real provider resources,
+- targets a hardcoded local port rather than the connection's origin,
+- cannot reconstruct observed state after a supervisor restart,
+- implements tunnel deletion and protection as successful no-ops.
+
+It is registered only when `PORTICO_ENABLE_EXPERIMENTAL_NGROK=1` is set, and no
+protection policy is applied to ngrok connections regardless of configuration.
+Do not rely on it.
 
 ## Development
 
@@ -154,10 +169,24 @@ portico supervisor run
 
 - Go 1.25.12+ (earlier 1.25 patch releases have known standard-library vulnerabilities)
 - Linux (for Unix sockets, process identity via /proc)
-- `cloudflared` in `PATH`
+- `cloudflared` in `PATH` (for Cloudflare provider)
+- `ngrok` in `PATH` (only for the experimental, disabled-by-default Ngrok provider)
 - For permanent Cloudflare connections: `CLOUDFLARE_API_TOKEN`, an account ID,
   and a zone ID. Run `portico provider login cloudflare --account-id … --zone-id …`
   to encrypt and persist this setup locally, then restart the supervisor.
+
+### XDG Directory Fallback
+
+Portico follows the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/latest/). When environment variables are not set, it falls back to these defaults:
+
+| Variable | Fallback | Purpose |
+|----------|----------|---------|
+| `XDG_RUNTIME_DIR` | `/tmp/portico-$UID/` | Unix socket (supervisor IPC) |
+| `XDG_DATA_HOME` | `$HOME/.local/share` | SQLite database, persistent state |
+| `XDG_CONFIG_HOME` | `$HOME/.config` | Configuration file (`config.toml`) |
+| `XDG_STATE_HOME` | `$HOME/.local/state` | Logs, connector output |
+
+> **Note:** If `XDG_RUNTIME_DIR` is unset (common on non-systemd systems or some WSL configurations), the Unix socket will be created in `/tmp/portico-$UID/`. This directory is cleared on reboot, meaning clients must reconnect to the supervisor after restart. The supervisor daemon itself survives because it's managed by systemd user service or similar.
 
 ## Testing
 

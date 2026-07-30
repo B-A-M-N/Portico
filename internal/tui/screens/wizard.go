@@ -7,6 +7,7 @@ import (
 	"net/mail"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -50,6 +51,7 @@ type WizardOperationLoadedMsg struct {
 // WizardModel is the wizard for creating new connections.
 type WizardModel struct {
 	client         ConnectionCreator
+	ctx            context.Context // application lifetime context for IPC calls
 	state          WizardState
 	selected       int
 	input          string
@@ -58,9 +60,9 @@ type WizardModel struct {
 	accounts       []ipc.ProviderAccountDTO
 
 	// Post-creation flow state
-	createdID    string
-	plan         *ipc.PlanDTO
-	operation    *ipc.OperationDTO
+	createdID       string
+	plan            *ipc.PlanDTO
+	operation       *ipc.OperationDTO
 	openAfterCreate bool // true if user chose "Review and open"
 }
 
@@ -110,10 +112,10 @@ const (
 	WizardStepAccount
 	WizardStepReview
 	WizardStepCreating
-	WizardStepCreated         // Profile created, ask user what to do next
-	WizardStepPlanPreview     // Show the open plan for approval
-	WizardStepApplying        // Plan is being applied
-	WizardStepOperationWait   // Waiting for operation to complete
+	WizardStepCreated       // Profile created, ask user what to do next
+	WizardStepPlanPreview   // Show the open plan for approval
+	WizardStepApplying      // Plan is being applied
+	WizardStepOperationWait // Waiting for operation to complete
 	WizardStepComplete
 )
 
@@ -140,10 +142,20 @@ type directoryModeChoice struct {
 func NewWizard(client ConnectionCreator, fullCloudflare bool, accounts []ipc.ProviderAccountDTO) *WizardModel {
 	return &WizardModel{
 		client:         client,
+		ctx:            context.Background(), // default; root model should call WithContext
 		fullCloudflare: fullCloudflare,
 		accounts:       append([]ipc.ProviderAccountDTO(nil), accounts...),
 		state:          WizardState{Step: WizardStepIntent, Provider: wizardProviders[0]},
 	}
+}
+
+// WithContext sets the application context for IPC calls made by the wizard.
+// This ensures commands are cancelled when the TUI exits.
+func (m *WizardModel) WithContext(ctx context.Context) *WizardModel {
+	if ctx != nil {
+		m.ctx = ctx
+	}
+	return m
 }
 
 // NewWizardForService starts the normal wizard with a discovery result already
@@ -639,7 +651,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			// Two outcomes: save closed (default) or open (next step)
 			m.openAfterCreate = (m.selected == 1)
 			m.state.Step = WizardStepCreating
-			return createConnectionCmd(m.client, m.buildRequest())
+			return createConnectionCmd(m.client, m.ctx, m.buildRequest())
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
@@ -862,12 +874,12 @@ func existingServiceAddress(address, port string) (string, error) {
 // createConnectionCmd returns a command that performs the IPC call off the
 // update loop. The request is built before the closure runs so the command
 // never reads or mutates wizard state.
-func createConnectionCmd(client ConnectionCreator, req ipc.CreateConnectionRequest) tea.Cmd {
+func createConnectionCmd(client ConnectionCreator, ctx context.Context, req ipc.CreateConnectionRequest) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return ConnectionCreatedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		conn, err := client.CreateConnection(context.Background(), req)
+		conn, err := client.CreateConnection(ctx, req)
 		if err != nil {
 			return ConnectionCreatedMsg{Err: err}
 		}
@@ -879,11 +891,12 @@ func createConnectionCmd(client ConnectionCreator, req ipc.CreateConnectionReque
 func (m *WizardModel) requestPlanCmd() tea.Cmd {
 	client := m.client
 	connID := m.createdID
+	ctx := m.ctx
 	return func() tea.Msg {
 		if client == nil {
 			return WizardPlanLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		plan, err := client.PlanOpen(context.Background(), connID)
+		plan, err := client.PlanOpen(ctx, connID)
 		if err != nil {
 			return WizardPlanLoadedMsg{Err: err}
 		}
@@ -898,6 +911,7 @@ func (m *WizardModel) applyPlanCmd() tea.Cmd {
 	if m.plan != nil {
 		planID = m.plan.ID
 	}
+	ctx := m.ctx
 	return func() tea.Msg {
 		if client == nil {
 			return WizardPlanAppliedMsg{Err: fmt.Errorf("no supervisor connection")}
@@ -905,7 +919,7 @@ func (m *WizardModel) applyPlanCmd() tea.Cmd {
 		if planID == "" {
 			return WizardPlanAppliedMsg{Err: fmt.Errorf("no plan to apply")}
 		}
-		op, err := client.ApplyPlan(context.Background(), planID)
+		op, err := client.ApplyPlan(ctx, planID)
 		if err != nil {
 			return WizardPlanAppliedMsg{Err: err}
 		}
@@ -913,21 +927,29 @@ func (m *WizardModel) applyPlanCmd() tea.Cmd {
 	}
 }
 
-// pollOperationCmd returns a command that polls the current operation status.
+// pollOperationCmd returns a command that polls the current operation status
+// after a short delay to avoid tight-looping the local socket.
 func (m *WizardModel) pollOperationCmd() tea.Cmd {
 	client := m.client
 	opID := ""
 	if m.operation != nil {
 		opID = m.operation.ID
 	}
+	ctx := m.ctx
 	return func() tea.Msg {
+		// Delay before polling to avoid a tight request loop.
+		select {
+		case <-time.After(750 * time.Millisecond):
+		case <-ctx.Done():
+			return WizardOperationLoadedMsg{Err: ctx.Err()}
+		}
 		if client == nil {
 			return WizardOperationLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
 		if opID == "" {
 			return WizardOperationLoadedMsg{Err: fmt.Errorf("no operation to poll")}
 		}
-		op, err := client.GetOperation(context.Background(), opID)
+		op, err := client.GetOperation(ctx, opID)
 		if err != nil {
 			return WizardOperationLoadedMsg{Err: err}
 		}

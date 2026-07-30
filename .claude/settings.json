@@ -1,0 +1,78 @@
+{
+  "agent": "portico-implementer",
+  "mainAgent": {
+    "model": "default"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py session-start"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py pre-tool-use Edit"
+          },
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py pre-tool-use Write"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py pre-tool-commit"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py post-tool-edit Edit"
+          },
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py post-tool-edit Write"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py pre-subagent-start"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/claude/workflow_gate.py post-subagent-stop"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {}
+}

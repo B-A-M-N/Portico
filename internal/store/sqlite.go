@@ -1067,19 +1067,23 @@ func (s *Store) CreateConnection(
 	}
 
 	// Persist profile.
-	sourceJSON, err := json.Marshal(profile.Source)
+	spec, err := serviceExposureForPersist(profile)
+	if err != nil {
+		return err
+	}
+	sourceJSON, err := json.Marshal(spec.Source)
 	if err != nil {
 		return fmt.Errorf("marshal source: %w", err)
 	}
-	exposureJSON, err := json.Marshal(profile.Exposure)
+	exposureJSON, err := json.Marshal(spec.Exposure)
 	if err != nil {
 		return fmt.Errorf("marshal exposure: %w", err)
 	}
-	protectionJSON, err := json.Marshal(profile.Protection)
+	protectionJSON, err := json.Marshal(spec.Protection)
 	if err != nil {
 		return fmt.Errorf("marshal protection: %w", err)
 	}
-	providerJSON, err := json.Marshal(profile.Provider)
+	providerJSON, err := json.Marshal(profile.Driver)
 	if err != nil {
 		return fmt.Errorf("marshal provider: %w", err)
 	}
@@ -1164,32 +1168,75 @@ func (s *Store) CreateConnection(
 
 // --------------- profile CRUD ---------------
 
+// serviceExposureForPersist returns the service-exposure arm of a profile's
+// tagged spec union, or an error when the profile cannot be represented by the
+// current connection_profiles columns.
+//
+// The v1 schema stores service exposure only: it has source_json, exposure_json
+// and protection_json columns and no connection kind or versioned spec column.
+// Port-forward and private-network profiles therefore must be refused here
+// rather than dereferenced into a nil arm (a panic) or written as a partial
+// service-exposure row (silent corruption).
+func serviceExposureForPersist(p *core.ConnectionProfile) (*core.ServiceExposureSpec, error) {
+	if p == nil {
+		return nil, fmt.Errorf("profile is nil")
+	}
+	if p.Kind != "" && p.Kind != core.ConnectionServiceExposure {
+		return nil, fmt.Errorf(
+			"connection %s: cannot persist connection kind %q; the current schema stores %q only",
+			p.ID, p.Kind, core.ConnectionServiceExposure)
+	}
+	if p.Spec.ServiceExposure == nil {
+		return nil, fmt.Errorf("connection %s: service exposure spec is required", p.ID)
+	}
+	return p.Spec.ServiceExposure, nil
+}
+
+// hydrateServiceExposure prepares a profile decoded from the v1 profile columns.
+// Those columns can only describe a service exposure, so the kind is restored
+// explicitly and the union arm allocated before any field is decoded into it.
+func hydrateServiceExposure(p *core.ConnectionProfile) *core.ServiceExposureSpec {
+	p.Kind = core.ConnectionServiceExposure
+	if p.Spec.ServiceExposure == nil {
+		p.Spec.ServiceExposure = &core.ServiceExposureSpec{}
+	}
+	return p.Spec.ServiceExposure
+}
+
 // SaveProfile persists a connection profile.
 func (s *Store) SaveProfile(ctx context.Context, p *core.ConnectionProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sourceJSON, err := json.Marshal(p.Source)
+	spec, err := serviceExposureForPersist(p)
+	if err != nil {
+		return err
+	}
+
+	sourceJSON, err := json.Marshal(spec.Source)
 	if err != nil {
 		return fmt.Errorf("marshal source: %w", err)
 	}
-	exposureJSON, err := json.Marshal(p.Exposure)
+	exposureJSON, err := json.Marshal(spec.Exposure)
 	if err != nil {
 		return fmt.Errorf("marshal exposure: %w", err)
 	}
-	protectionJSON, err := json.Marshal(p.Protection)
+	protectionJSON, err := json.Marshal(spec.Protection)
 	if err != nil {
 		return fmt.Errorf("marshal protection: %w", err)
 	}
-	providerJSON, err := json.Marshal(p.Provider)
+	driverJSON, err := json.Marshal(p.Driver)
 	if err != nil {
-		return fmt.Errorf("marshal provider: %w", err)
+		return fmt.Errorf("marshal driver: %w", err)
 	}
 	lifecycleJSON, err := json.Marshal(p.Lifecycle)
 	if err != nil {
 		return fmt.Errorf("marshal lifecycle: %w", err)
 	}
 
+	// provider_json is the legacy column name for the driver selection. The
+	// column was never renamed, so writing driver_json here fails against the
+	// declared schema for every profile.
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO connection_profiles
 			(id, name, revision, source_json, exposure_json, protection_json,
@@ -1203,7 +1250,7 @@ func (s *Store) SaveProfile(ctx context.Context, p *core.ConnectionProfile) erro
 			created_at=excluded.created_at, updated_at=excluded.updated_at`,
 		p.ID, p.Name, p.Revision,
 		sourceJSON, exposureJSON, protectionJSON,
-		providerJSON, lifecycleJSON,
+		driverJSON, lifecycleJSON,
 		string(p.Desired),
 		p.CreatedAt.Format(time.RFC3339),
 		p.UpdatedAt.Format(time.RFC3339),
@@ -1226,19 +1273,23 @@ func (s *Store) UpdateProfile(ctx context.Context, profile *core.ConnectionProfi
 	defer s.mu.Unlock()
 
 	// Serialize profile fields
-	sourceJSON, err := json.Marshal(profile.Source)
+	spec, err := serviceExposureForPersist(profile)
+	if err != nil {
+		return nil, err
+	}
+	sourceJSON, err := json.Marshal(spec.Source)
 	if err != nil {
 		return nil, fmt.Errorf("marshal source: %w", err)
 	}
-	exposureJSON, err := json.Marshal(profile.Exposure)
+	exposureJSON, err := json.Marshal(spec.Exposure)
 	if err != nil {
 		return nil, fmt.Errorf("marshal exposure: %w", err)
 	}
-	protectionJSON, err := json.Marshal(profile.Protection)
+	protectionJSON, err := json.Marshal(spec.Protection)
 	if err != nil {
 		return nil, fmt.Errorf("marshal protection: %w", err)
 	}
-	providerJSON, err := json.Marshal(profile.Provider)
+	providerJSON, err := json.Marshal(profile.Driver)
 	if err != nil {
 		return nil, fmt.Errorf("marshal provider: %w", err)
 	}
@@ -1324,17 +1375,18 @@ func (s *Store) loadProfileLocked(ctx context.Context, id core.ConnectionID) (*c
 		return nil, err
 	}
 
-	if err := json.Unmarshal(sourceJSON, &p.Source); err != nil {
+	spec := hydrateServiceExposure(&p)
+	if err := json.Unmarshal(sourceJSON, &spec.Source); err != nil {
 		return nil, fmt.Errorf("profile %s: unmarshal source: %w", id, err)
 	}
-	if err := json.Unmarshal(exposureJSON, &p.Exposure); err != nil {
+	if err := json.Unmarshal(exposureJSON, &spec.Exposure); err != nil {
 		return nil, fmt.Errorf("profile %s: unmarshal exposure: %w", id, err)
 	}
-	if err := json.Unmarshal(protectionJSON, &p.Protection); err != nil {
+	if err := json.Unmarshal(protectionJSON, &spec.Protection); err != nil {
 		return nil, fmt.Errorf("profile %s: unmarshal protection: %w", id, err)
 	}
-	if err := json.Unmarshal(providerJSON, &p.Provider); err != nil {
-		return nil, fmt.Errorf("profile %s: unmarshal provider: %w", id, err)
+	if err := json.Unmarshal(providerJSON, &p.Driver); err != nil {
+		return nil, fmt.Errorf("profile %s: unmarshal driver: %w", id, err)
 	}
 	if err := json.Unmarshal(lifecycleJSON, &p.Lifecycle); err != nil {
 		return nil, fmt.Errorf("profile %s: unmarshal lifecycle: %w", id, err)
@@ -1449,17 +1501,18 @@ func readSnapshotProfiles(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionPr
 			&providerJSON, &lifecycleJSON, &desiredState, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan snapshot profile: %w", err)
 		}
-		if err := json.Unmarshal(sourceJSON, &p.Source); err != nil {
+		spec := hydrateServiceExposure(&p)
+		if err := json.Unmarshal(sourceJSON, &spec.Source); err != nil {
 			return nil, fmt.Errorf("snapshot profile %s source: %w", p.ID, err)
 		}
-		if err := json.Unmarshal(exposureJSON, &p.Exposure); err != nil {
+		if err := json.Unmarshal(exposureJSON, &spec.Exposure); err != nil {
 			return nil, fmt.Errorf("snapshot profile %s exposure: %w", p.ID, err)
 		}
-		if err := json.Unmarshal(protectionJSON, &p.Protection); err != nil {
+		if err := json.Unmarshal(protectionJSON, &spec.Protection); err != nil {
 			return nil, fmt.Errorf("snapshot profile %s protection: %w", p.ID, err)
 		}
-		if err := json.Unmarshal(providerJSON, &p.Provider); err != nil {
-			return nil, fmt.Errorf("snapshot profile %s provider: %w", p.ID, err)
+		if err := json.Unmarshal(providerJSON, &p.Driver); err != nil {
+			return nil, fmt.Errorf("snapshot profile %s driver: %w", p.ID, err)
 		}
 		if err := json.Unmarshal(lifecycleJSON, &p.Lifecycle); err != nil {
 			return nil, fmt.Errorf("snapshot profile %s lifecycle: %w", p.ID, err)

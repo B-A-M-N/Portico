@@ -31,7 +31,7 @@ func (c *Controller) Recommend(ctx context.Context, profile *core.ConnectionProf
 		caps := prov.Capabilities
 
 		// Hard filter: exposure mode
-		switch profile.Exposure.Mode {
+		switch profile.GetExposure().Mode {
 		case core.ExposureTemporary:
 			if !caps.TemporaryAddresses.Supported {
 				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: "does not support temporary addresses"})
@@ -50,24 +50,24 @@ func (c *Controller) Recommend(ctx context.Context, profile *core.ConnectionProf
 		}
 
 		// Hard filter: protection
-		if profile.Protection.Kind != core.ProtectionNone {
+		if profile.GetProtection().Kind != core.ProtectionNone {
 			hasProtection := false
 			for _, pc := range caps.BuiltInProtection {
-				if pc.Kind == profile.Protection.Kind && pc.Supported {
+				if pc.Kind == profile.GetProtection().Kind && pc.Supported {
 					hasProtection = true
 					break
 				}
 			}
 			if !hasProtection {
-				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: fmt.Sprintf("does not support protection %s", profile.Protection.Kind)})
+				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: fmt.Sprintf("does not support protection %s", profile.GetProtection().Kind)})
 				continue
 			}
 		}
 
 		// Hard filter: MCP transport
-		if profile.Source.Kind == core.SourceMCP && profile.Source.MCP != nil {
-			transport := profile.Source.MCP.Transport
-			if profile.Exposure.Mode == core.ExposureTemporary && transport == core.MCPTransportSSE {
+		if profile.GetSource().Kind == core.SourceMCP && profile.GetSource().MCP != nil {
+			transport := profile.GetSource().MCP.Transport
+			if profile.GetExposure().Mode == core.ExposureTemporary && transport == core.MCPTransportSSE {
 				filtered = append(filtered, provider.FilteredProvider{Provider: prov.ID, Reason: "SSE not supported with Quick Tunnel"})
 				continue
 			}
@@ -94,7 +94,7 @@ func (c *Controller) Recommend(ctx context.Context, profile *core.ConnectionProf
 		}
 
 		// Prefer stable capabilities
-		if profile.Exposure.Mode == core.ExposureTemporary && caps.TemporaryAddresses.Stability == core.StabilityStable {
+		if profile.GetExposure().Mode == core.ExposureTemporary && caps.TemporaryAddresses.Stability == core.StabilityStable {
 			score += 3
 			reasons = append(reasons, "stable temporary addresses")
 		}

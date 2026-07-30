@@ -12,6 +12,7 @@ import (
 	"time"
 
 	flareexec "github.com/B-A-M-N/portico/internal/exec"
+	"github.com/natefinch/lumberjack"
 )
 
 // quickTunnelURLRe matches the trycloudflare.com URL that cloudflared prints.
@@ -90,11 +91,18 @@ func (c *ProcessConnector) Run(ctx context.Context, token string) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Build log file path with timestamp for easy identification.
-	logFile := ""
+	// Build log file path with rotation: max 10MB, keep 5 backups, compress
+	var logWriter io.Writer
 	if c.logDir != "" {
-		ts := time.Now().Format("20060102-150405")
-		logFile = filepath.Join(c.logDir, fmt.Sprintf("cloudflared-%s.log", ts))
+		logFile := filepath.Join(c.logDir, "cloudflared.log")
+		_ = os.MkdirAll(c.logDir, 0700)
+		logWriter = &lumberjack.Logger{
+			Filename:   logFile,
+			MaxSize:    10, // megabytes
+			MaxBackups: 5,
+			MaxAge:     30, // days
+			Compress:   true,
+		}
 	}
 
 	runner, err := flareexec.Start(ctx, flareexec.RunOpts{
@@ -105,7 +113,7 @@ func (c *ProcessConnector) Run(ctx context.Context, token string) (int, error) {
 			"run",
 			"--token", token,
 		},
-		LogFile: logFile,
+		LogWriter: logWriter,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("starting cloudflared: %w", err)
@@ -122,10 +130,19 @@ func (c *ProcessConnector) RunQuick(ctx context.Context, url string) (QuickTunne
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	logFile := ""
+	// Build log file path with rotation: max 10MB, keep 5 backups, compress
+	var logWriter io.Writer
+	var logFile string
 	if c.logDir != "" {
-		ts := time.Now().Format("20060102-150405")
-		logFile = filepath.Join(c.logDir, fmt.Sprintf("cloudflared-quick-%s.log", ts))
+		logFile = filepath.Join(c.logDir, "cloudflared-quick.log")
+		_ = os.MkdirAll(c.logDir, 0700)
+		logWriter = &lumberjack.Logger{
+			Filename:   logFile,
+			MaxSize:    10, // megabytes
+			MaxBackups: 5,
+			MaxAge:     30, // days
+			Compress:   true,
+		}
 	}
 
 	runner, err := flareexec.Start(ctx, flareexec.RunOpts{
@@ -135,7 +152,7 @@ func (c *ProcessConnector) RunQuick(ctx context.Context, url string) (QuickTunne
 			"--no-autoupdate",
 			"--url", url,
 		},
-		LogFile: logFile,
+		LogWriter: logWriter,
 	})
 	if err != nil {
 		return QuickTunnelResult{}, fmt.Errorf("starting cloudflared quick tunnel: %w", err)

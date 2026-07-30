@@ -412,10 +412,10 @@ func originAddress(profile *core.ConnectionProfile, rt *core.ConnectionRuntime) 
 	if rt != nil && rt.Origin.Ownership == core.OriginOwnershipOwned && rt.Origin.URL != "" {
 		return rt.Origin.URL
 	}
-	switch profile.Source.Kind {
+	switch profile.GetSource().Kind {
 	case core.SourceExisting:
-		if profile.Source.Existing != nil {
-			return profile.Source.Existing.Address
+		if profile.GetSource().Existing != nil {
+			return profile.GetSource().Existing.Address
 		}
 	case core.SourceDirectory, core.SourceCommand, core.SourceMCP:
 		if rt != nil && rt.Origin.URL != "" {

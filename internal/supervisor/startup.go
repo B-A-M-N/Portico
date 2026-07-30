@@ -493,7 +493,7 @@ func (s *Supervisor) restartDesiredOpen(ctx context.Context) {
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
 		if p.Desired == core.DesiredOpen && p.Lifecycle.AutoStart {
-			if s.registry.Get(p.Provider.ProviderID) == nil {
+			if s.registry.Get(p.GetProvider().ProviderID) == nil {
 				s.markProviderUnavailable(ctx, p)
 				continue
 			}
@@ -1036,7 +1036,7 @@ func (s *Supervisor) observeProviderResources(ctx context.Context) {
 	// provenance: created by Portico, explicitly adopted, or externally observed.
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		if s.registry.Get(p.Provider.ProviderID) == nil {
+		if s.registry.Get(p.GetProvider().ProviderID) == nil {
 			s.markProviderUnavailable(ctx, p)
 			continue
 		}
@@ -1195,10 +1195,10 @@ func (s *Supervisor) markProviderUnavailable(ctx context.Context, profile *core.
 		Segment:      core.SegmentProviderEdge,
 		Severity:     core.SeverityError,
 		Summary:      "Selected provider is unavailable",
-		Explanation:  fmt.Sprintf("Portico cannot load the %q provider selected by this connection. The profile and its resources are retained, but opening, repair, and automatic reconciliation are paused until that provider is configured.", profile.Provider.ProviderID),
+		Explanation:  fmt.Sprintf("Portico cannot load the %q provider selected by this connection. The profile and its resources are retained, but opening, repair, and automatic reconciliation are paused until that provider is configured.", profile.GetProvider().ProviderID),
 		Evidence: []core.Evidence{{
 			Type: "provider_registry", Source: "supervisor", Message: "provider adapter is not registered",
-			Data: map[string]string{"provider_id": string(profile.Provider.ProviderID)},
+			Data: map[string]string{"provider_id": string(profile.GetProvider().ProviderID)},
 		}},
 		ObservedAt: now,
 	}
@@ -1210,7 +1210,7 @@ func (s *Supervisor) markProviderUnavailable(ctx context.Context, profile *core.
 		if profile.Desired == core.DesiredOpen {
 			rt.State = core.RuntimeError
 			rt.LastTransition = now
-			rt.Error = core.ErrProviderNotFound(profile.Provider.ProviderID)
+			rt.Error = core.ErrProviderNotFound(profile.GetProvider().ProviderID)
 		}
 		if !hasFinding(rt.Diagnostics, finding.ID) {
 			rt.Diagnostics = append(rt.Diagnostics, finding)
@@ -1251,7 +1251,7 @@ func ownershipForObserved(existing map[string]core.ResourceOwnership, providerID
 func (s *Supervisor) rehydrateTunnelCredentials(ctx context.Context) {
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		prov := s.registry.Get(p.Provider.ProviderID)
+		prov := s.registry.Get(p.GetProvider().ProviderID)
 		if prov == nil {
 			continue
 		}
@@ -1292,7 +1292,7 @@ func (s *Supervisor) classifyResourceState(ctx context.Context) {
 	// by comparing observed resources with stored provider resources.
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		if s.registry.Get(p.Provider.ProviderID) == nil {
+		if s.registry.Get(p.GetProvider().ProviderID) == nil {
 			s.markProviderUnavailable(ctx, p)
 			continue
 		}

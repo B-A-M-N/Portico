@@ -152,7 +152,7 @@ func resourceDeltaRepairPlan(input ReconcileInput) *core.OperationPlan {
 	// needs a narrow application-and-policy recreation; do not recreate the
 	// tunnel or touch DNS. If only the policy is absent, retain the exact
 	// observed application and restore only that policy.
-	if profile.Protection.Kind != core.ProtectionNone {
+	if profile.GetProtection().Kind != core.ProtectionNone {
 		if app := missingTrackedResource(input, core.ResourceAccessApp); app != nil {
 			var oldPolicyID string
 			if policy := missingTrackedResource(input, core.ResourceAccessPolicy); policy != nil {
@@ -165,7 +165,7 @@ func resourceDeltaRepairPlan(input ReconcileInput) *core.OperationPlan {
 				return buildAccessPolicyCreatePlan(profile, app.ExternalID, policy.ExternalID)
 			}
 		}
-		if app := driftedAccessAppResource(input); app != nil && profile.Exposure.RequestedAddress != "" {
+		if app := driftedAccessAppResource(input); app != nil && profile.GetExposure().RequestedAddress != "" {
 			return buildAccessAppUpdatePlan(profile, app.ExternalID)
 		}
 		if policy, appID := driftedAccessPolicyResource(input); policy != nil {
@@ -175,13 +175,13 @@ func resourceDeltaRepairPlan(input ReconcileInput) *core.OperationPlan {
 	// A present DNS record can still point at the wrong tunnel. Compare the
 	// authoritative exact-record observation to the durable tunnel ID and
 	// update only that record when it has drifted.
-	if dns, tunnel := driftedDNSResource(input); dns != nil && tunnel != nil && profile.Exposure.RequestedAddress != "" {
+	if dns, tunnel := driftedDNSResource(input); dns != nil && tunnel != nil && profile.GetExposure().RequestedAddress != "" {
 		return buildDNSUpdatePlan(profile, dns.ExternalID, tunnel.ExternalID)
 	}
 	// An authoritative missing DNS record with an intact tunnel is a narrow
 	// repair. Transient, unauthorized, and rate-limited observations never
 	// enter missingTrackedResource.
-	if dns := missingTrackedResource(input, core.ResourceDNSRecord); dns != nil && liveTunnelResource(input.Resources) != nil && profile.Exposure.RequestedAddress != "" {
+	if dns := missingTrackedResource(input, core.ResourceDNSRecord); dns != nil && liveTunnelResource(input.Resources) != nil && profile.GetExposure().RequestedAddress != "" {
 		return buildDNSCreatePlan(profile, dns.ExternalID, liveTunnelResource(input.Resources).ExternalID)
 	}
 	return nil
@@ -247,7 +247,7 @@ func driftedAccessAppResource(input ReconcileInput) *core.ProviderResource {
 	if input.Observed == nil {
 		return nil
 	}
-	wantDomain := normalizeAccessDomain(input.Profile.Exposure.RequestedAddress)
+	wantDomain := normalizeAccessDomain(input.Profile.GetExposure().RequestedAddress)
 	if wantDomain == "" {
 		return nil
 	}
@@ -290,7 +290,7 @@ func driftedAccessPolicyResource(input ReconcileInput) (*core.ProviderResource, 
 			if policy.ID != resource.ExternalID || policy.AppID != appID {
 				continue
 			}
-			if accessPolicyDrifted(input.Profile.Protection, policy) {
+			if accessPolicyDrifted(input.Profile.GetProtection(), policy) {
 				return resource, appID
 			}
 		}
@@ -353,12 +353,12 @@ func buildDNSCreatePlan(profile *core.ConnectionProfile, previousRecordID, tunne
 	now := time.Now().UTC()
 	plan := &core.OperationPlan{
 		ID: core.NewPlanID(), ConnectionID: profile.ID, ProfileRevision: profile.Revision,
-		Provider: profile.Provider.ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		Provider: profile.GetProvider().ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
 		Steps: []core.PlanStep{{
 			ID: "repair-dns-" + previousRecordID, Kind: core.StepCreateDNSRecord,
-			Summary: fmt.Sprintf("Recreate DNS CNAME for %s", profile.Exposure.RequestedAddress),
-			Technical: core.TechnicalOperation{Provider: profile.Provider.ProviderID, Type: "create_dns", Parameters: map[string]string{
-				"hostname":  profile.Exposure.RequestedAddress,
+			Summary: fmt.Sprintf("Recreate DNS CNAME for %s", profile.GetExposure().RequestedAddress),
+			Technical: core.TechnicalOperation{Provider: profile.GetProvider().ProviderID, Type: "create_dns", Parameters: map[string]string{
+				"hostname":  profile.GetExposure().RequestedAddress,
 				"tunnel_id": tunnelID,
 			}},
 		}},
@@ -371,12 +371,12 @@ func buildDNSUpdatePlan(profile *core.ConnectionProfile, recordID, tunnelID stri
 	now := time.Now().UTC()
 	plan := &core.OperationPlan{
 		ID: core.NewPlanID(), ConnectionID: profile.ID, ProfileRevision: profile.Revision,
-		Provider: profile.Provider.ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		Provider: profile.GetProvider().ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
 		Steps: []core.PlanStep{{
 			ID: "repair-dns-target-" + recordID, Kind: core.StepUpdateDNSRecord,
-			Summary: "Correct DNS CNAME target for " + profile.Exposure.RequestedAddress,
-			Technical: core.TechnicalOperation{Provider: profile.Provider.ProviderID, Type: "update_dns", ResourceID: recordID, Parameters: map[string]string{
-				"hostname":  profile.Exposure.RequestedAddress,
+			Summary: "Correct DNS CNAME target for " + profile.GetExposure().RequestedAddress,
+			Technical: core.TechnicalOperation{Provider: profile.GetProvider().ProviderID, Type: "update_dns", ResourceID: recordID, Parameters: map[string]string{
+				"hostname":  profile.GetExposure().RequestedAddress,
 				"tunnel_id": tunnelID,
 			}},
 		}},
@@ -386,12 +386,13 @@ func buildDNSUpdatePlan(profile *core.ConnectionProfile, recordID, tunnelID stri
 }
 
 func accessRepairParameters(profile *core.ConnectionProfile) map[string]string {
+	prot := profile.GetProtection()
 	return map[string]string{
-		"hostname":         profile.Exposure.RequestedAddress,
-		"protection_kind":  string(profile.Protection.Kind),
-		"allowed_emails":   strings.Join(profile.Protection.AllowedEmails, ","),
-		"allowed_domains":  strings.Join(profile.Protection.AllowedDomains, ","),
-		"session_duration": profile.Protection.SessionTTL.String(),
+		"hostname":         profile.GetExposure().RequestedAddress,
+		"protection_kind":  string(prot.Kind),
+		"allowed_emails":   strings.Join(prot.AllowedEmails, ","),
+		"allowed_domains":  strings.Join(prot.AllowedDomains, ","),
+		"session_duration": prot.SessionTTL.String(),
 	}
 }
 
@@ -422,7 +423,7 @@ func buildAccessPolicyCreatePlan(profile *core.ConnectionProfile, appID, oldPoli
 func buildAccessAppUpdatePlan(profile *core.ConnectionProfile, appID string) *core.OperationPlan {
 	return buildAccessRepairPlan(profile, "repair-access-app-domain-"+appID, core.StepUpdateAccessApp,
 		"Correct Access application hostname", "update_access_app", appID, map[string]string{
-			"hostname": profile.Exposure.RequestedAddress,
+			"hostname": profile.GetExposure().RequestedAddress,
 		})
 }
 
@@ -437,10 +438,10 @@ func buildAccessRepairPlan(profile *core.ConnectionProfile, stepID string, kind 
 	now := time.Now().UTC()
 	plan := &core.OperationPlan{
 		ID: core.NewPlanID(), ConnectionID: profile.ID, ProfileRevision: profile.Revision,
-		Provider: profile.Provider.ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		Provider: profile.GetProvider().ProviderID, Intent: core.IntentRepair, CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
 		Steps: []core.PlanStep{{
 			ID: stepID, Kind: kind, Summary: summary,
-			Technical: core.TechnicalOperation{Provider: profile.Provider.ProviderID, Type: operationType, ResourceID: resourceID, Parameters: params},
+			Technical: core.TechnicalOperation{Provider: profile.GetProvider().ProviderID, Type: operationType, ResourceID: resourceID, Parameters: params},
 		}},
 	}
 	_ = plan.ComputeFingerprint()

@@ -244,15 +244,15 @@ func TestCommandOriginRequiresPortBeforeAdvancing(t *testing.T) {
 func TestWizardBuildRequestSetsLifecycleDefaults(t *testing.T) {
 	m := NewWizard(nil, false, nil)
 	m.state = WizardState{
-		Step:          WizardStepReview,
-		SourceType:    "existing_service",
-		Name:          "test",
-		SourceAddress: "localhost",
-		Port:          "8080",
+		Step:           WizardStepReview,
+		SourceType:     "existing_service",
+		Name:           "test",
+		SourceAddress:  "localhost",
+		Port:           "8080",
 		SourceProtocol: "https",
-		ExposureMode:  "temporary_public",
-		Protection:    "none",
-		Provider:      "cloudflare",
+		ExposureMode:   "temporary_public",
+		Protection:     "none",
+		Provider:       "cloudflare",
 	}
 	req := m.buildRequest()
 	if !req.Lifecycle.AutoStart {

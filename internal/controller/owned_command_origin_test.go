@@ -36,14 +36,19 @@ func TestController_OwnedCommandOriginLifecycle(t *testing.T) {
 	controller.SetOriginManager(origin.NewManager())
 	profile := &core.ConnectionProfile{
 		Name: "owned-command",
-		Source: core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
-			Executable: "python3",
-			Args:       []string{"-m", "http.server", strconv.Itoa(port)},
-			Port:       port,
-		}},
-		Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
-		Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
-		Provider:   core.ProviderSelection{ProviderID: "mock"},
+		Kind: core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
+					Executable: "python3",
+					Args:       []string{"-m", "http.server", strconv.Itoa(port)},
+					Port:       port,
+				}},
+				Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+			},
+		},
+		Driver: core.DriverSelection{ProviderID: "mock"},
 		Desired:    core.DesiredClosed,
 	}
 	if _, _, err := controller.CreateProfile(context.Background(), profile); err != nil {

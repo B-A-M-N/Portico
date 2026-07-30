@@ -9,12 +9,17 @@ func TestConnectionProfileRejectsCredentialLikeCommandEnvironment(t *testing.T) 
 	profile := &ConnectionProfile{
 		ID:   "command-env",
 		Name: "command-env",
-		Source: SourceSpec{Kind: SourceCommand, Command: &CommandSpec{
-			Executable: "server", Port: 8080, Env: map[string]string{"API_TOKEN": "not-persisted"},
-		}},
-		Exposure:   ExposureSpec{Mode: ExposureTemporary},
-		Protection: ProtectionSpec{Kind: ProtectionNone},
-		Provider:   ProviderSelection{ProviderID: "mock"},
+		Kind: ConnectionServiceExposure,
+		Spec: ConnectionSpec{
+			ServiceExposure: &ServiceExposureSpec{
+				Source: SourceSpec{Kind: SourceCommand, Command: &CommandSpec{
+					Executable: "server", Port: 8080, Env: map[string]string{"API_TOKEN": "not-persisted"},
+				}},
+				Exposure:   ExposureSpec{Mode: ExposureTemporary},
+				Protection: ProtectionSpec{Kind: ProtectionNone},
+			},
+		},
+		Driver: DriverSelection{ProviderID: "mock"},
 	}
 	err := profile.Validate()
 	if err == nil || !strings.Contains(err.Error(), "credential") {
@@ -26,12 +31,17 @@ func TestConnectionProfileAllowsNonSensitiveCommandEnvironment(t *testing.T) {
 	profile := &ConnectionProfile{
 		ID:   "command-env-safe",
 		Name: "command-env-safe",
-		Source: SourceSpec{Kind: SourceCommand, Command: &CommandSpec{
-			Executable: "server", Port: 8080, Env: map[string]string{"LOG_LEVEL": "debug"},
-		}},
-		Exposure:   ExposureSpec{Mode: ExposureTemporary},
-		Protection: ProtectionSpec{Kind: ProtectionNone},
-		Provider:   ProviderSelection{ProviderID: "mock"},
+		Kind: ConnectionServiceExposure,
+		Spec: ConnectionSpec{
+			ServiceExposure: &ServiceExposureSpec{
+				Source: SourceSpec{Kind: SourceCommand, Command: &CommandSpec{
+					Executable: "server", Port: 8080, Env: map[string]string{"LOG_LEVEL": "debug"},
+				}},
+				Exposure:   ExposureSpec{Mode: ExposureTemporary},
+				Protection: ProtectionSpec{Kind: ProtectionNone},
+			},
+		},
+		Driver: DriverSelection{ProviderID: "mock"},
 	}
 	if err := profile.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -42,14 +52,19 @@ func TestConnectionProfileRejectsWriteDirectoryWithoutProtection(t *testing.T) {
 	profile := &ConnectionProfile{
 		ID:   "write-dir-no-protection",
 		Name: "write-dir-no-protection",
-		Source: SourceSpec{Kind: SourceDirectory, Directory: &DirectorySpec{
-			Path:      "/tmp/upload",
-			Mode:      DirectoryModeWrites,
-			AllowUpload: true,
-		}},
-		Exposure:   ExposureSpec{Mode: ExposureTemporary},
-		Protection: ProtectionSpec{Kind: ProtectionNone},
-		Provider:   ProviderSelection{ProviderID: "mock"},
+		Kind: ConnectionServiceExposure,
+		Spec: ConnectionSpec{
+			ServiceExposure: &ServiceExposureSpec{
+				Source: SourceSpec{Kind: SourceDirectory, Directory: &DirectorySpec{
+					Path:        "/tmp/upload",
+					Mode:        DirectoryModeWrites,
+					AllowUpload: true,
+				}},
+				Exposure:   ExposureSpec{Mode: ExposureTemporary},
+				Protection: ProtectionSpec{Kind: ProtectionNone},
+			},
+		},
+		Driver: DriverSelection{ProviderID: "mock"},
 	}
 	err := profile.Validate()
 	if err == nil || !strings.Contains(err.Error(), "protection") {
@@ -61,14 +76,19 @@ func TestConnectionProfileAllowsWriteDirectoryWithProtection(t *testing.T) {
 	profile := &ConnectionProfile{
 		ID:   "write-dir-protected",
 		Name: "write-dir-protected",
-		Source: SourceSpec{Kind: SourceDirectory, Directory: &DirectorySpec{
-			Path:      "/tmp/upload",
-			Mode:      DirectoryModeWrites,
-			AllowUpload: true,
-		}},
-		Exposure:   ExposureSpec{Mode: ExposureTemporary},
-		Protection: ProtectionSpec{Kind: ProtectionEmailOTP},
-		Provider:   ProviderSelection{ProviderID: "mock"},
+		Kind: ConnectionServiceExposure,
+		Spec: ConnectionSpec{
+			ServiceExposure: &ServiceExposureSpec{
+				Source: SourceSpec{Kind: SourceDirectory, Directory: &DirectorySpec{
+					Path:        "/tmp/upload",
+					Mode:        DirectoryModeWrites,
+					AllowUpload: true,
+				}},
+				Exposure:   ExposureSpec{Mode: ExposureTemporary},
+				Protection: ProtectionSpec{Kind: ProtectionEmailOTP},
+			},
+		},
+		Driver: DriverSelection{ProviderID: "mock"},
 	}
 	if err := profile.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)

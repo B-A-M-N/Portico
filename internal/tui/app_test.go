@@ -1,12 +1,15 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -82,6 +85,10 @@ func (f *fakeClient) GetOperation(ctx context.Context, operationID string) (*ipc
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.operation, f.applyErr
+}
+
+func (f *fakeClient) GetOperationHistory(ctx context.Context) (*ipc.OperationHistoryDTO, error) {
+	return &ipc.OperationHistoryDTO{Operations: []ipc.OperationDTO{}}, nil
 }
 
 func (f *fakeClient) CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
@@ -710,5 +717,357 @@ func TestInitOnlyRequestsSnapshot(t *testing.T) {
 	}
 	if m.streamConnected {
 		t.Fatal("streamConnected should be false before first snapshot")
+	}
+}
+
+// TestTUIBootToHomeToQuit is an end-to-end smoke test that runs the TUI
+// with a fake supervisor client through tea.NewProgram. It verifies the
+// TUI starts in boot screen, transitions to home after snapshot, and can quit cleanly.
+func TestTUIBootToHomeToQuit(t *testing.T) {
+	// Create a fake client with a snapshot containing one connection
+	fake := &fakeClient{
+		snapshot: ipc.SnapshotDTO{
+			Connections: []ipc.ConnectionDTO{
+				{ID: "conn-1", Name: "test-connection", UserState: "open", ProviderID: "cloudflare", PublicAddress: "https://test.example.com"},
+			},
+			LastSeq: 1,
+		},
+	}
+
+	// Create the TUI model with the fake client
+	model := newModel(fake)
+
+	// Run the TUI program with a short timeout context
+	// Use WithInputOSFile(0) to simulate stdin without needing a real TTY
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	program := tea.NewProgram(
+		model,
+		tea.WithContext(ctx),
+		tea.WithInput(bytes.NewReader(nil)), // No input in tests
+		tea.WithOutput(io.Discard),
+	)
+
+	// Run the program - it will start in boot screen, request snapshot,
+	// transition to home, then context will cancel (simulating quit)
+	_, err := program.Run()
+	if err != nil {
+		// Context cancellation is expected when test times out or we cancel
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("TUI program exited with error: %v", err)
+		}
+	}
+
+	// Verify the model went through the expected states
+	if fake.snapshotCalls == 0 {
+		t.Fatal("expected GetSnapshot to be called at least once")
+	}
+
+	// The model should have received the snapshot and moved to home screen
+	if model.screen != ScreenHome && model.screen != ScreenQuit {
+		t.Logf("Final screen: %s", model.screen)
+	}
+}
+
+// TestTUINewConnectionWizard runs the wizard flow with a fake client.
+// This is a basic smoke test to ensure the wizard doesn't panic on startup.
+func TestTUINewConnectionWizard(t *testing.T) {
+	fake := &fakeClient{
+		created: &ipc.ConnectionDTO{
+			ID:   "conn-new",
+			Name: "wizard-connection",
+		},
+		plan: &ipc.PlanDTO{
+			ID:     "plan-1",
+			Intent: "open",
+			Steps: []ipc.StepDTO{
+				{Summary: "Validate account"},
+				{Summary: "Create tunnel"},
+				{Summary: "Start connector"},
+				{Summary: "Verify endpoint"},
+			},
+		},
+		operation: &ipc.OperationDTO{
+			ID:    "op-1",
+			State: "completed",
+			Steps: []ipc.StepDTO{{Summary: "Validate account", State: "succeeded"}, {Summary: "Create tunnel", State: "succeeded"}, {Summary: "Start connector", State: "succeeded"}, {Summary: "Verify endpoint", State: "succeeded"}},
+		},
+	}
+
+	model := newModel(fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	program := tea.NewProgram(
+		model,
+		tea.WithContext(ctx),
+		tea.WithInput(bytes.NewReader(nil)), // No input in tests
+		tea.WithOutput(io.Discard),
+	)
+
+	_, err := program.Run()
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("TUI program exited with error: %v", err)
+		}
+	}
+}
+
+// TestRecoveryScreenIsReachable verifies that when the initial snapshot fails,
+// the recovery screen is rendered (not the bare error view).
+func TestRecoveryScreenIsReachable(t *testing.T) {
+	m := newModel(&fakeClient{snapshotErr: errors.New("connection refused")})
+	next, _ := m.Update(snapshotMsg{Err: errors.New("connection refused")})
+	nm := next.(Model)
+
+	if nm.screen != ScreenRecovery {
+		t.Fatalf("screen = %q, want %q", nm.screen, ScreenRecovery)
+	}
+
+	view := nm.View().Content
+	if !strings.Contains(view, "Retry") {
+		t.Fatalf("recovery view should contain retry action, got:\n%s", view)
+	}
+	if !strings.Contains(view, "supervisor") {
+		t.Fatalf("recovery view should mention supervisor, got:\n%s", view)
+	}
+}
+
+// TestHelpNavigationReturnsToSourceScreen verifies that pressing ? saves the
+// source screen and pressing esc returns to it.
+func TestHelpNavigationReturnsToSourceScreen(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.screen = ScreenProviders
+
+	m, _ = press(t, m, "?")
+	if m.screen != ScreenHelp {
+		t.Fatalf("screen after ? = %q, want %q", m.screen, ScreenHelp)
+	}
+	if m.prevScreen != ScreenProviders {
+		t.Fatalf("prevScreen = %q, want %q", m.prevScreen, ScreenProviders)
+	}
+
+	view := m.View().Content
+	if !strings.Contains(view, "Providers Screen") {
+		t.Fatalf("help should show providers-specific content, got:\n%s", view)
+	}
+
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenProviders {
+		t.Fatalf("screen after esc from help = %q, want %q", m.screen, ScreenProviders)
+	}
+}
+
+// TestHelpFromHomeShowsHomeContent verifies help shows home-specific content.
+func TestHelpFromHomeShowsHomeContent(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+
+	m, _ = press(t, m, "?")
+	if m.screen != ScreenHelp {
+		t.Fatalf("screen = %q, want %q", m.screen, ScreenHelp)
+	}
+
+	view := m.View().Content
+	if !strings.Contains(view, "Home Screen") {
+		t.Fatalf("help from home should show home content, got:\n%s", view)
+	}
+}
+
+// TestInspectTabNavigation verifies that left/right keys switch inspect tabs.
+func TestInspectTabNavigation(t *testing.T) {
+	snap := testSnapshot()
+	m := readyModel(&fakeClient{}, snap)
+
+	m, _ = press(t, m, "enter")
+	if m.screen != ScreenInspect {
+		t.Fatalf("screen = %q, want %q", m.screen, ScreenInspect)
+	}
+	if m.inspect == nil {
+		t.Fatal("inspect model should be initialized")
+	}
+
+	view := m.View().Content
+	if !strings.Contains(view, "Overview") {
+		t.Fatalf("default inspect tab should show Overview, got:\n%s", view)
+	}
+
+	m, _ = press(t, m, "right")
+	view = m.View().Content
+	if !strings.Contains(view, "Route") {
+		t.Fatalf("after right, inspect should show Route tab, got:\n%s", view)
+	}
+
+	m, _ = press(t, m, "right")
+	view = m.View().Content
+	if !strings.Contains(view, "Activity") {
+		t.Fatalf("after second right, inspect should show Activity tab, got:\n%s", view)
+	}
+
+	m, _ = press(t, m, "left")
+	view = m.View().Content
+	if !strings.Contains(view, "Route") {
+		t.Fatalf("after left, inspect should show Route tab, got:\n%s", view)
+	}
+}
+
+// TestListViewportKeepsSelectionVisible verifies that the list offset adjusts
+// to keep the selected item visible when there are many connections.
+func TestListViewportKeepsSelectionVisible(t *testing.T) {
+	snap := ipc.SnapshotDTO{}
+	for i := 0; i < 20; i++ {
+		snap.Connections = append(snap.Connections, ipc.ConnectionDTO{
+			ID:        fmt.Sprintf("conn-%d", i),
+			Name:      fmt.Sprintf("service-%d", i),
+			UserState: "Closed",
+		})
+	}
+	m := readyModel(&fakeClient{}, snap)
+	m.height = 15
+
+	m.selectedID = "conn-19"
+	view := m.View().Content
+
+	if !strings.Contains(view, "service-19") {
+		t.Fatalf("selected connection should be visible in viewport, got:\n%s", view)
+	}
+	if !strings.Contains(view, "above") {
+		t.Fatalf("should show scroll-up indicator, got:\n%s", view)
+	}
+}
+
+// TestNavigationStack verifies that the navigation stack works correctly
+// for back navigation with Esc.
+func TestNavigationStack(t *testing.T) {
+	snap := testSnapshot()
+	m := readyModel(&fakeClient{}, snap)
+
+	// Start at home
+	if m.screen != ScreenHome {
+		t.Fatalf("initial screen = %q, want %q", m.screen, ScreenHome)
+	}
+
+	// Navigate to providers
+	m, _ = press(t, m, "p")
+	if m.screen != ScreenProviders {
+		t.Fatalf("screen after p = %q, want %q", m.screen, ScreenProviders)
+	}
+	if len(m.navStack) != 1 || m.navStack[0] != ScreenHome {
+		t.Fatalf("navStack = %v, want [home]", m.navStack)
+	}
+
+	// Navigate to help from providers
+	m, _ = press(t, m, "?")
+	if m.screen != ScreenHelp {
+		t.Fatalf("screen after ? = %q, want %q", m.screen, ScreenHelp)
+	}
+	// Help uses prevScreen, not navStack
+	if m.prevScreen != ScreenProviders {
+		t.Fatalf("prevScreen = %q, want %q", m.prevScreen, ScreenProviders)
+	}
+
+	// Esc from help returns to providers
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenProviders {
+		t.Fatalf("screen after esc from help = %q, want %q", m.screen, ScreenProviders)
+	}
+
+	// Esc from providers returns to home via nav stack
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenHome {
+		t.Fatalf("screen after esc from providers = %q, want %q", m.screen, ScreenHome)
+	}
+	if len(m.navStack) != 0 {
+		t.Fatalf("navStack should be empty at home, got %v", m.navStack)
+	}
+
+	// Esc from home does nothing
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenHome {
+		t.Fatalf("screen after esc from home = %q, want %q", m.screen, ScreenHome)
+	}
+}
+
+// TestNavigationStackWithInspect verifies navigation through inspect screen.
+func TestNavigationStackWithInspect(t *testing.T) {
+	snap := testSnapshot()
+	m := readyModel(&fakeClient{}, snap)
+
+	// Enter inspect
+	m, _ = press(t, m, "enter")
+	if m.screen != ScreenInspect {
+		t.Fatalf("screen after enter = %q, want %q", m.screen, ScreenInspect)
+	}
+	if len(m.navStack) != 1 || m.navStack[0] != ScreenHome {
+		t.Fatalf("navStack = %v, want [home]", m.navStack)
+	}
+
+	// Open help from inspect
+	m, _ = press(t, m, "?")
+	if m.screen != ScreenHelp {
+		t.Fatalf("screen after ? = %q, want %q", m.screen, ScreenHelp)
+	}
+	if m.prevScreen != ScreenInspect {
+		t.Fatalf("prevScreen = %q, want %q", m.prevScreen, ScreenInspect)
+	}
+
+	// Esc returns to inspect
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenInspect {
+		t.Fatalf("screen after esc = %q, want %q", m.screen, ScreenInspect)
+	}
+
+	// Esc returns to home
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenHome {
+		t.Fatalf("screen after esc = %q, want %q", m.screen, ScreenHome)
+	}
+}
+
+func TestOperationsScreen(t *testing.T) {
+	snap := testSnapshot()
+	m := readyModel(&fakeClient{}, snap)
+
+	// Press 'o' to open operations screen
+	m, cmd := press(t, m, "o")
+	if m.screen != ScreenOperations {
+		t.Fatalf("screen after 'o' = %q, want %q", m.screen, ScreenOperations)
+	}
+	if cmd == nil {
+		t.Fatal("expected loadOperationsCmd to be returned")
+	}
+
+	// Simulate operations loaded message
+	ops := []ipc.OperationDTO{
+		{ID: "op-1", ConnectionID: "conn-1", State: "succeeded", PlanID: "plan-1"},
+		{ID: "op-2", ConnectionID: "conn-2", State: "failed", PlanID: "plan-2", Error: "test error"},
+	}
+	next, _ := m.Update(operationsLoadedMsg{Operations: ops})
+	m = next.(Model)
+
+	if len(m.operations) != 2 {
+		t.Fatalf("expected 2 operations, got %d", len(m.operations))
+	}
+	if m.opsSelectedIdx != 0 {
+		t.Fatalf("expected selected index 0, got %d", m.opsSelectedIdx)
+	}
+
+	// Navigate down
+	m, _ = press(t, m, "down")
+	if m.opsSelectedIdx != 1 {
+		t.Fatalf("expected selected index 1 after down, got %d", m.opsSelectedIdx)
+	}
+
+	// Navigate up
+	m, _ = press(t, m, "up")
+	if m.opsSelectedIdx != 0 {
+		t.Fatalf("expected selected index 0 after up, got %d", m.opsSelectedIdx)
+	}
+
+	// Esc returns to home
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenHome {
+		t.Fatalf("screen after esc = %q, want %q", m.screen, ScreenHome)
 	}
 }

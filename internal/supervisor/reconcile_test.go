@@ -37,13 +37,28 @@ func (*repairObservationProvider) Remove(context.Context, core.RemovePlan) (<-ch
 	return nil, nil
 }
 
-func TestBuildDNSCreatePlanMaterializesTrackedTunnelID(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-1",
+// newReconcileProfile builds a service-exposure ConnectionProfile for
+// reconciliation tests using the tagged connection union. Tests construct the
+// union explicitly so that unsupported connection kinds fail at compile time
+// rather than silently falling through zero-value compatibility accessors.
+func newReconcileProfile(id core.ConnectionID, desired core.DesiredConnectionState, protection core.ProtectionSpec) *core.ConnectionProfile {
+	return &core.ConnectionProfile{
+		ID:       id,
 		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
+		Kind:     core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Exposure:   core.ExposureSpec{RequestedAddress: "service.example.com"},
+				Protection: protection,
+			},
+		},
+		Driver:  core.DriverSelection{ProviderID: "cloudflare"},
+		Desired: desired,
 	}
+}
+
+func TestBuildDNSCreatePlanMaterializesTrackedTunnelID(t *testing.T) {
+	profile := newReconcileProfile("conn-1", "", core.ProtectionSpec{})
 	plan := buildDNSCreatePlan(profile, "missing-dns-id", "persisted-tunnel-id")
 	if len(plan.Steps) != 1 {
 		t.Fatalf("plan steps = %d, want 1", len(plan.Steps))
@@ -58,13 +73,7 @@ func TestBuildDNSCreatePlanMaterializesTrackedTunnelID(t *testing.T) {
 }
 
 func TestReconcileOpenConnectionRepairsOnlyMissingDNS(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-1",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Desired:  core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-1", core.DesiredOpen, core.ProtectionSpec{})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -93,13 +102,7 @@ func TestReconcileOpenConnectionRepairsOnlyMissingDNS(t *testing.T) {
 }
 
 func TestReconcileWithoutRuntimeRepairsMissingDNSBeforeStartingConnector(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-without-runtime",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Desired:  core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-without-runtime", core.DesiredOpen, core.ProtectionSpec{})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Resources: []core.ProviderResource{
@@ -120,13 +123,7 @@ func TestReconcileWithoutRuntimeRepairsMissingDNSBeforeStartingConnector(t *test
 }
 
 func TestReconcileOpenConnectionUpdatesOnlyDriftedDNSTarget(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-1",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Desired:  core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-1", core.DesiredOpen, core.ProtectionSpec{})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -158,16 +155,9 @@ func TestReconcileOpenConnectionUpdatesOnlyDriftedDNSTarget(t *testing.T) {
 }
 
 func TestReconcileOpenConnectionRepairsOnlyMissingAccessApplication(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-access-app",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
-		},
-		Desired: core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-access-app", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+	})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -201,16 +191,9 @@ func TestReconcileOpenConnectionRepairsOnlyMissingAccessApplication(t *testing.T
 }
 
 func TestReconcileOpenConnectionRepairsOnlyMissingAccessPolicy(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-access-policy",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionEmailOTP, AllowedDomains: []string{"example.com"},
-		},
-		Desired: core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-access-policy", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedDomains: []string{"example.com"},
+	})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -239,16 +222,9 @@ func TestReconcileOpenConnectionRepairsOnlyMissingAccessPolicy(t *testing.T) {
 }
 
 func TestReconcileOpenConnectionUpdatesOnlyDriftedAccessApplicationDomain(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-access-domain",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
-		},
-		Desired: core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-access-domain", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+	})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -277,16 +253,9 @@ func TestReconcileOpenConnectionUpdatesOnlyDriftedAccessApplicationDomain(t *tes
 }
 
 func TestReconcileErrorConnectionStillRepairsAuthoritativelyMissingAccessPolicy(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-error-access-policy",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
-		},
-		Desired: core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-error-access-policy", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+	})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -311,16 +280,9 @@ func TestReconcileErrorConnectionStillRepairsAuthoritativelyMissingAccessPolicy(
 }
 
 func TestReconcileOpenConnectionUpdatesOnlyDriftedAccessPolicy(t *testing.T) {
-	profile := &core.ConnectionProfile{
-		ID:       "conn-access-policy-drift",
-		Revision: 1,
-		Provider: core.ProviderSelection{ProviderID: "cloudflare"},
-		Exposure: core.ExposureSpec{RequestedAddress: "service.example.com"},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
-		},
-		Desired: core.DesiredOpen,
-	}
+	profile := newReconcileProfile("conn-access-policy-drift", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+	})
 	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
 		Profile: profile,
 		Runtime: &core.ConnectionRuntime{
@@ -358,9 +320,9 @@ func TestRepairPreviewUsesAuthoritativeDNSDelta(t *testing.T) {
 	st := newRecoveryTestStore(t)
 	connID := core.ConnectionID("conn-repair-preview")
 	profile := recoveryTestProfile(connID)
-	profile.Provider.ProviderID = "repair-observer"
-	profile.Exposure.Mode = core.ExposurePermanent
-	profile.Exposure.RequestedAddress = "service.example.com"
+	profile.Driver.ProviderID = "repair-observer"
+	profile.Spec.ServiceExposure.Exposure.Mode = core.ExposurePermanent
+	profile.Spec.ServiceExposure.Exposure.RequestedAddress = "service.example.com"
 	if err := st.SaveProfile(ctx, profile); err != nil {
 		t.Fatal(err)
 	}

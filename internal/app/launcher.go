@@ -16,6 +16,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/lock"
 	"github.com/B-A-M-N/portico/internal/tui"
 	"github.com/charmbracelet/x/term"
+	"github.com/natefinch/lumberjack"
 )
 
 // Launcher provides shared application bootstrapping for TUI and supervisor.
@@ -104,6 +105,18 @@ func (l *Launcher) StartSupervisor(ctx context.Context) error {
 		return fmt.Errorf("create log dir: %w", err)
 	}
 	logFile := filepath.Join(logDir, "supervisor.log")
+
+	// Use lumberjack for log rotation: max 10MB per file, keep 5 files, compress old files
+	lumberjackLogger := &lumberjack.Logger{
+		Filename:   logFile,
+		MaxSize:    10, // megabytes
+		MaxBackups: 5,
+		MaxAge:     30, // days
+		Compress:   true,
+	}
+	// Ensure slog uses the rotating logger
+	logHandler := slog.NewJSONHandler(lumberjackLogger, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(logHandler))
 
 	logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {

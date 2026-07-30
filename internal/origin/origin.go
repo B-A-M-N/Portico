@@ -145,12 +145,12 @@ const (
 // counter, and status tracking. Only methods on managedOrigin may transition
 // state; external code reads state atomically through Accessor methods.
 type managedOrigin struct {
-	mu       sync.Mutex
+	mu         sync.Mutex
 	generation uint64
-	state    OriginLifecycleState
-	origin   Origin
-	url      string
-	lastErr  error
+	state      OriginLifecycleState
+	origin     Origin
+	url        string
+	lastErr    error
 }
 
 // newManagedOrigin creates a new managed origin entry.

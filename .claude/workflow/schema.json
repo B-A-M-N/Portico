@@ -1,0 +1,56 @@
+{
+  "name": "workflow-schema",
+  "version": "1",
+  "stateFile": ".claude/workflow/state.json",
+  "tiers": {
+    "1": {
+      "description": "mechanical — one file, one function, clear fix",
+      "subagents": [],
+      "review_required": false,
+      "architect_required": false,
+      "full_gate_set": false,
+      "max_attempts": 2
+    },
+    "2": {
+      "description": "package-level — multi-file within a cluster or cross-package state transition",
+      "subagents": ["portico-recon"],
+      "review_required": true,
+      "review_conditional": "affects concurrency/process/signing/transactions/security/cross-package state transitions",
+      "architect_required": false,
+      "full_gate_set": false,
+      "max_attempts": 2
+    },
+    "3": {
+      "description": "architectural — top-level invariant, schema migration, lifecycle boundary, cross-package invariant",
+      "subagents": ["portico-recon", "portico-architect", "portico-auditor"],
+      "review_required": true,
+      "architect_required": true,
+      "architect_contract_file": "docs/<PACKAGE>_DESIGN.md",
+      "full_gate_set": true,
+      "full_gate_commands": ["go test ./...", "go test -race ./...", "go vet ./...", "staticcheck ./..."],
+      "max_attempts": 6
+    }
+  },
+  "escalation": {
+    "tier_1_2": [
+      "first implementation attempt",
+      "one evidence-driven correction",
+      "same failure again → portico-auditor TRIAGE",
+      "TRIAGE identifies local defect → one corrected attempt",
+      "TRIAGE identifies broken invariant or corrected attempt fails → portico-architect CORRECTED_CONTRACT",
+      "one reimplementation",
+      "still failing → stop and report"
+    ],
+    "tier_3": [
+      "architect contract before any source edit",
+      "implementation and targeted tests",
+      "targeted race tests",
+      "portico-auditor REVIEW",
+      "correct evidence-backed findings",
+      "full gate set once",
+      "commit"
+    ]
+  },
+  "allowed_edit_packages": ["portico-implementer"],
+  "allowed_edit_agents": []
+}

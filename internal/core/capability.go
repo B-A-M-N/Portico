@@ -78,8 +78,9 @@ func (c *CapabilityConstraint) Matches(profile *ConnectionProfile) bool {
 	// Check source kinds
 	if len(c.SourceKinds) > 0 {
 		matchesSource := false
+		source := profile.GetSource()
 		for _, sk := range c.SourceKinds {
-			if profile.Source.Kind == sk {
+			if source.Kind == sk {
 				matchesSource = true
 				break
 			}
@@ -92,8 +93,9 @@ func (c *CapabilityConstraint) Matches(profile *ConnectionProfile) bool {
 	// Check protocols
 	if len(c.Protocols) > 0 {
 		matchesProtocol := false
+		exposure := profile.GetExposure()
 		for _, p := range c.Protocols {
-			if profile.Exposure.Protocol == p {
+			if exposure.Protocol == p {
 				matchesProtocol = true
 				break
 			}
@@ -104,24 +106,28 @@ func (c *CapabilityConstraint) Matches(profile *ConnectionProfile) bool {
 	}
 
 	// Check MCP transports
-	if len(c.MCPTransports) > 0 && profile.Source.MCP != nil {
-		matchesMCP := false
-		for _, mt := range c.MCPTransports {
-			if profile.Source.MCP.Transport == mt {
-				matchesMCP = true
-				break
+	if len(c.MCPTransports) > 0 {
+		source := profile.GetSource()
+		if source.MCP != nil {
+			matchesMCP := false
+			for _, mt := range c.MCPTransports {
+				if source.MCP.Transport == mt {
+					matchesMCP = true
+					break
+				}
 			}
-		}
-		if !matchesMCP {
-			return false
+			if !matchesMCP {
+				return false
+			}
 		}
 	}
 
 	// Check exposure modes
 	if len(c.ExposureModes) > 0 {
 		matchesExposure := false
+		exposure := profile.GetExposure()
 		for _, em := range c.ExposureModes {
-			if profile.Exposure.Mode == em {
+			if exposure.Mode == em {
 				matchesExposure = true
 				break
 			}
@@ -134,8 +140,9 @@ func (c *CapabilityConstraint) Matches(profile *ConnectionProfile) bool {
 	// Check protection kinds
 	if len(c.Protection) > 0 {
 		matchesProtection := false
+		protection := profile.GetProtection()
 		for _, pk := range c.Protection {
-			if profile.Protection.Kind == pk {
+			if protection.Kind == pk {
 				matchesProtection = true
 				break
 			}

@@ -25,7 +25,17 @@ const (
 	KeyDefaultHostTemplate = "defaults.hostname_template"
 	KeyDefaultReuseTunnel  = "defaults.reuse_tunnel"
 	KeyLogLevel            = "log_level"
+	KeyConfigVersion       = "config_version"
+
+	// Ngrok config keys
+	KeyNgrokAPITokenEnv = "ngrok.api_token_env"
+	KeyNgrokAccountID   = "ngrok.account_id"
+	KeyNgrokBin         = "paths.ngrok_bin"
 )
+
+// CurrentConfigVersion is the latest config schema version.
+// Increment this when adding new required fields or changing semantics.
+const CurrentConfigVersion = 1
 
 // Init initializes viper with defaults, config file, and env bindings.
 func Init() error {
@@ -61,6 +71,12 @@ func Init() error {
 		}
 		return fmt.Errorf("reading config: %w", err)
 	}
+
+	// Config version migration
+	if err := migrateConfig(); err != nil {
+		return fmt.Errorf("config migration: %w", err)
+	}
+
 	return nil
 }
 
@@ -73,6 +89,53 @@ func setDefaults(stateDir string) {
 	viper.SetDefault(KeyDefaultHostTemplate, "{app}-{id}.{domain}")
 	viper.SetDefault(KeyDefaultReuseTunnel, true)
 	viper.SetDefault(KeyLogLevel, "info")
+	viper.SetDefault(KeyConfigVersion, CurrentConfigVersion)
+
+	// Ngrok defaults
+	viper.SetDefault(KeyNgrokAPITokenEnv, "NGROK_AUTHTOKEN")
+	viper.SetDefault(KeyNgrokBin, "ngrok")
+}
+
+// migrateConfig handles config schema migrations.
+// It reads the config_version field and applies migrations to bring
+// the config up to CurrentConfigVersion.
+func migrateConfig() error {
+	version := viper.GetInt(KeyConfigVersion)
+	if version == 0 {
+		// No version set - treat as version 1 (first version with explicit versioning)
+		version = 1
+		viper.Set(KeyConfigVersion, CurrentConfigVersion)
+	}
+
+	// Apply migrations sequentially
+	for v := version; v < CurrentConfigVersion; v++ {
+		if err := applyMigration(v, v+1); err != nil {
+			return fmt.Errorf("migration v%d->v%d: %w", v, v+1, err)
+		}
+		viper.Set(KeyConfigVersion, v+1)
+	}
+
+	// Persist updated config version
+	configFile := viper.ConfigFileUsed()
+	if configFile != "" {
+		if err := viper.WriteConfig(); err != nil {
+			return fmt.Errorf("writing migrated config: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// applyMigration applies a single version migration.
+// Add new migration cases here when incrementing CurrentConfigVersion.
+func applyMigration(from, to int) error {
+	// Migration v1 -> v2 (example template for future migrations)
+	// switch from {
+	// case 1:
+	//     // Migrate v1 config to v2
+	//     return migrateV1toV2()
+	// }
+	return nil
 }
 
 // CloudflaredBin returns the configured cloudflared binary path.
@@ -289,4 +352,31 @@ func Validate() error {
 		return fmt.Errorf("no API token found (run 'portico legacy auth login' or set CLOUDFLARE_API_TOKEN)")
 	}
 	return nil
+}
+
+// NgrokAPIToken retrieves the Ngrok API token from environment or credentials.
+func NgrokAPIToken() string {
+	envName := viper.GetString(KeyNgrokAPITokenEnv)
+	if envName == "" {
+		envName = "NGROK_AUTHTOKEN"
+	}
+	if token := os.Getenv(envName); token != "" {
+		return token
+	}
+	// Could add credential loading here similar to Cloudflare
+	return ""
+}
+
+// NgrokBin returns the configured ngrok binary path.
+func NgrokBin() string {
+	bin := viper.GetString(KeyNgrokBin)
+	if bin == "" {
+		return "ngrok"
+	}
+	return bin
+}
+
+// NgrokAccountID returns the configured Ngrok account ID.
+func NgrokAccountID() string {
+	return viper.GetString(KeyNgrokAccountID)
 }

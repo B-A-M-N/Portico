@@ -68,11 +68,12 @@ func (rb *ringBuffer) Bytes() []byte {
 
 // RunOpts configures a subprocess.
 type RunOpts struct {
-	Name    string            // Binary name or path.
-	Args    []string          // Command arguments.
-	Dir     string            // Working directory (optional).
-	Env     map[string]string // Additional environment variables.
-	LogFile string            // Optional path to persist subprocess logs to disk.
+	Name      string            // Binary name or path.
+	Args      []string          // Command arguments.
+	Dir       string            // Working directory (optional).
+	Env       map[string]string // Additional environment variables.
+	LogFile   string            // Optional path to persist subprocess logs to disk (legacy, no rotation).
+	LogWriter io.Writer         // Optional writer for logs (e.g., lumberjack for rotation). Takes precedence over LogFile.
 }
 
 // Start launches a subprocess with its own process group.
@@ -136,8 +137,12 @@ func Start(_ /* ctx not used intentionally */ interface{}, opts RunOpts) (*Runne
 	}
 
 	// Open persistent log file if requested.
+	// If LogWriter is provided, use it (e.g., for rotation with lumberjack).
+	// Otherwise, fall back to LogFile path.
 	var logFileWriter io.Writer
-	if opts.LogFile != "" {
+	if opts.LogWriter != nil {
+		logFileWriter = opts.LogWriter
+	} else if opts.LogFile != "" {
 		f, err := os.OpenFile(opts.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			// Non-fatal: log to ring buffer only.

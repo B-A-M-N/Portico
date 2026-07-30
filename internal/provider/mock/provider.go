@@ -140,7 +140,7 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 		ID:              core.NewPlanID(),
 		ConnectionID:    profile.ID,
 		ProfileRevision: profile.Revision,
-		Provider:        profile.Provider.ProviderID,
+		Provider:        profile.GetProvider().ProviderID,
 		Intent:          intent,
 		Steps:           steps,
 		Preconditions:   []core.Precondition{},

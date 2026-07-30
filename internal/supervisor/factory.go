@@ -18,6 +18,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/provider"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
+	"github.com/B-A-M-N/portico/internal/provider/ngrok"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -79,6 +80,7 @@ func RunSupervisor(ctx context.Context) error {
 	// validated against the concrete adapter during startup; doing it before
 	// adapter construction would advertise credentials it cannot actually use.
 	hasRealProvider := registerCloudflareWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st)
+	hasRealProvider = registerNgrokWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st) || hasRealProvider
 
 	// Register mock provider only in explicit development mode.
 	// Never silently fall back to mock when no real provider is configured,
@@ -223,6 +225,101 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 
 	slog.Info("cloudflare provider registered (Quick Tunnels only — no API token)")
 	return true
+}
+
+// registerNgrokWithAccounts attempts to register the Ngrok provider
+// using accounts loaded from the store. Returns true if the provider was
+// successfully registered.
+func registerNgrokWithAccounts(reg provider.Registry, paths app.Paths, procMgr core.ConnectorProcessService, st *store.Store) bool {
+	// The Ngrok adapter is experimental and is not lifecycle-complete: it
+	// synthesises tunnel identifiers rather than creating provider resources,
+	// targets a hardcoded local port, cannot reconstruct observed state after a
+	// supervisor restart, and implements delete and protection as no-ops. It
+	// must therefore stay out of standard flows until it is rebuilt, and is
+	// registered only when the operator opts in explicitly.
+	if os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_NGROK") != "1" {
+		slog.Info("Ngrok provider is experimental and disabled; " +
+			"set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to register it")
+		return false
+	}
+
+	ngrokBin := config.NgrokBin()
+	if ngrokBin == "" {
+		ngrokBin = "ngrok"
+	}
+
+	// Check if ngrok is available
+	if _, err := exec.LookPath(ngrokBin); err != nil {
+		slog.Info("ngrok not found, skipping Ngrok provider", "bin", ngrokBin)
+		return false
+	}
+
+	slog.Warn("registering EXPERIMENTAL Ngrok provider; " +
+		"it is not lifecycle-complete and must not be relied on")
+
+	// Environment/configured token credentials are a one-time bootstrap path.
+	// Move them to the supervisor's encrypted account store before constructing
+	// adapters, so subsequent operations resolve the account selected by the
+	// profile rather than a process-global environment token.
+	apiToken := config.NgrokAPIToken()
+	accountID := os.Getenv("NGROK_ACCOUNT_ID")
+	if accountID == "" {
+		accountID = config.NgrokAccountID()
+	}
+
+	if apiToken != "" && accountID != "" {
+		credentialRef := fmt.Sprintf("ngrok:%s:api-token", accountID)
+		if err := st.SaveProviderCredential(context.Background(), "ngrok", credentialRef, []byte(apiToken)); err != nil {
+			slog.Warn("persist Ngrok bootstrap credential", "err", err)
+		} else if err := st.UpsertProviderAccount(context.Background(), core.ProviderAccount{
+			ID:            core.ProviderAccountID(accountID),
+			Provider:      "ngrok",
+			Label:         accountID,
+			CredentialRef: credentialRef,
+			Metadata:      map[string]string{},
+			Status:        core.AccountAuthenticated,
+		}); err != nil {
+			slog.Warn("persist Ngrok bootstrap account", "err", err)
+		}
+	}
+
+	accounts, err := st.ListProviderAccounts(context.Background())
+	if err != nil {
+		slog.Warn("list Ngrok accounts", "err", err)
+		accounts = nil
+	}
+
+	for _, account := range accounts {
+		if account.Provider != "ngrok" || account.Status != core.AccountAuthenticated {
+			continue
+		}
+		if account.CredentialRef == "" {
+			slog.Warn("Ngrok account is missing a credential reference", "account", account.ID)
+			continue
+		}
+		token, loadErr := st.LoadProviderCredential(context.Background(), "ngrok", account.CredentialRef)
+		if loadErr != nil || token == "" {
+			slog.Warn("Ngrok account credential is unavailable", "account", account.ID, "err", loadErr)
+			continue
+		}
+		child, newErr := ngrok.New(token, ngrokBin, procMgr)
+		if newErr != nil {
+			slog.Warn("Ngrok account adapter init failed", "account", account.ID, "err", newErr)
+			continue
+		}
+		// Ngrok doesn't need multi-account routing like Cloudflare
+		if err := reg.Add(child); err != nil {
+			slog.Warn("Ngrok provider register failed", "err", err)
+			return false
+		}
+		reg.SetAccountInfo("ngrok", []provider.AccountInfo{{ID: account.ID, Label: account.Label, Status: string(account.Status)}})
+		slog.Info("Ngrok provider registered", "account", account.ID)
+		return true
+	}
+
+	// No API token — register with default config (will fail at Authenticate)
+	slog.Info("Ngrok provider registered without API token (requires configuration)")
+	return false
 }
 
 // isDevMode returns true when PORTICO_DEV=true is set.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,21 +30,26 @@ func testProfile() *core.ConnectionProfile {
 		ID:       "test-conn-1",
 		Name:     "test-connection",
 		Revision: 1,
-		Source: core.SourceSpec{
-			Kind: core.SourceExisting,
-			Existing: &core.ExistingServiceSpec{
-				Network:  "tcp",
-				Address:  "localhost",
-				Protocol: core.ProtocolHTTP,
+		Kind:     core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{
+					Kind: core.SourceExisting,
+					Existing: &core.ExistingServiceSpec{
+						Network:  "tcp",
+						Address:  "localhost",
+						Protocol: core.ProtocolHTTP,
+					},
+				},
+				Exposure: core.ExposureSpec{
+					Mode: core.ExposureTemporary,
+				},
+				Protection: core.ProtectionSpec{
+					Kind: core.ProtectionNone,
+				},
 			},
 		},
-		Exposure: core.ExposureSpec{
-			Mode: core.ExposureTemporary,
-		},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionNone,
-		},
-		Provider: core.ProviderSelection{
+		Driver: core.DriverSelection{
 			ProviderID: core.ProviderID("mock"),
 		},
 		Lifecycle: core.LifecycleSpec{
@@ -52,6 +58,99 @@ func testProfile() *core.ConnectionProfile {
 		Desired:   core.DesiredOpen,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+}
+
+// TestSaveProfileRoundTripPreservesTaggedUnion pins the store against the
+// tagged connection union. It covers three defects that the connection-model
+// migration left behind in the store layer: SaveProfile writing to a column the
+// schema does not declare, the load paths decoding into an unallocated
+// ServiceExposure arm, and the load paths never restoring Kind.
+func TestSaveProfileRoundTripPreservesTaggedUnion(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	loaded, err := s.LoadProfile(ctx, profile.ID)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if loaded.Kind != core.ConnectionServiceExposure {
+		t.Fatalf("loaded Kind = %q, want %q", loaded.Kind, core.ConnectionServiceExposure)
+	}
+	if loaded.Spec.ServiceExposure == nil {
+		t.Fatal("loaded Spec.ServiceExposure is nil")
+	}
+	if got := loaded.Spec.ServiceExposure.Source.Existing; got == nil || got.Address != "localhost" {
+		t.Fatalf("loaded source existing = %+v, want address localhost", got)
+	}
+	if loaded.Driver.ProviderID != profile.Driver.ProviderID {
+		t.Fatalf("loaded Driver.ProviderID = %q, want %q", loaded.Driver.ProviderID, profile.Driver.ProviderID)
+	}
+	// A profile that survives a persistence round trip must still validate.
+	if err := loaded.Validate(); err != nil {
+		t.Fatalf("loaded profile failed validation: %v", err)
+	}
+
+	// The snapshot read path decodes profiles independently of LoadProfile and
+	// must hydrate the union identically.
+	snap, err := s.ReadSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if len(snap.Profiles) != 1 {
+		t.Fatalf("snapshot profiles = %d, want 1", len(snap.Profiles))
+	}
+	snapped := snap.Profiles[0]
+	if snapped.Kind != core.ConnectionServiceExposure {
+		t.Fatalf("snapshot Kind = %q, want %q", snapped.Kind, core.ConnectionServiceExposure)
+	}
+	if snapped.Spec.ServiceExposure == nil {
+		t.Fatal("snapshot Spec.ServiceExposure is nil")
+	}
+	if err := snapped.Validate(); err != nil {
+		t.Fatalf("snapshot profile failed validation: %v", err)
+	}
+}
+
+// TestSaveProfileRejectsKindTheSchemaCannotRepresent ensures a connection kind
+// the v1 profile columns cannot store is refused with a typed error rather than
+// panicking or being silently written as a partial service-exposure row.
+func TestSaveProfileRejectsKindTheSchemaCannotRepresent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	portForward := &core.ConnectionProfile{
+		ID:       "test-conn-pf",
+		Name:     "port-forward",
+		Revision: 1,
+		Kind:     core.ConnectionPortForward,
+		Spec: core.ConnectionSpec{
+			PortForward: &core.PortForwardSpec{
+				LocalPort:  8080,
+				RemoteHost: "example.com",
+				RemotePort: 80,
+				Protocol:   core.ProtocolTCP,
+				Direction:  core.PortForwardLocal,
+			},
+		},
+		Driver:    core.DriverSelection{ProviderID: core.ProviderID("mock")},
+		Desired:   core.DesiredOpen,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	err := s.SaveProfile(ctx, portForward)
+	if err == nil {
+		t.Fatal("SaveProfile accepted a port_forward profile the schema cannot represent")
+	}
+	if !strings.Contains(err.Error(), string(core.ConnectionPortForward)) {
+		t.Fatalf("error %q does not name the unsupported kind", err)
 	}
 }
 
@@ -744,7 +843,7 @@ func TestIdempotencyKey_LookupAndRecord(t *testing.T) {
 	}
 	plan := &core.OperationPlan{
 		ID: "plan-idem-1", ConnectionID: profile.ID, ProfileRevision: 1,
-		Provider: profile.Provider.ProviderID, Intent: core.IntentOpen,
+		Provider: profile.Driver.ProviderID, Intent: core.IntentOpen,
 		Steps: []core.PlanStep{{ID: "s1", Kind: core.StepCreateTunnel, Summary: "test"}},
 	}
 	_ = plan.ComputeFingerprint()
@@ -795,7 +894,7 @@ func TestIdempotencyKey_LookupAndRecord(t *testing.T) {
 	opID2 := core.OperationID("op-idem-2")
 	plan2 := &core.OperationPlan{
 		ID: "plan-idem-2", ConnectionID: profile.ID, ProfileRevision: 2,
-		Provider: profile.Provider.ProviderID, Intent: core.IntentClose,
+		Provider: profile.Driver.ProviderID, Intent: core.IntentClose,
 		Steps: []core.PlanStep{{ID: "s2", Kind: core.StepStopConnector, Summary: "test"}},
 	}
 	_ = plan2.ComputeFingerprint()

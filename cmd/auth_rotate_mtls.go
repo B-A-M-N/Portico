@@ -34,8 +34,8 @@ var authRotateMTLSCmd = &cobra.Command{
 			return fmt.Errorf("--ca-id is required")
 		}
 
-		// TODO: Implement mTLS certificate rotation via Cloudflare Access API.
-		// This requires:
+		// mTLS certificate rotation is not yet implemented.
+		// This requires the Cloudflare Access mTLS certificates API:
 		// 1. Upload new CA cert via Access mTLS certificates API
 		// 2. Update the Access application to reference the new CA
 		// 3. Optionally update the policy to require mTLS
@@ -43,7 +43,7 @@ var authRotateMTLSCmd = &cobra.Command{
 		ui.PrintInfo("CA ID: %s", caID)
 		ui.PrintInfo("Session: %s", sess.ShortID())
 
-		return fmt.Errorf("not yet implemented")
+		return fmt.Errorf("mTLS certificate rotation is not yet implemented (session %s, CA %s)", sess.ShortID(), caID)
 	},
 }
 

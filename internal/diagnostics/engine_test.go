@@ -111,9 +111,17 @@ func healthyFixture() *fixture {
 		ID:      "conn-1",
 		Name:    "test",
 		Desired: core.DesiredOpen,
-		Source: core.SourceSpec{
-			Kind:     core.SourceExisting,
-			Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP},
+		Kind:    core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{
+					Kind:     core.SourceExisting,
+					Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP},
+				},
+			},
+		},
+		Driver: core.DriverSelection{
+			ProviderID: core.ProviderID("mock"),
 		},
 	}
 	f.runtime = &core.ConnectionRuntime{

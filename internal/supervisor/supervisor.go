@@ -317,7 +317,7 @@ func (s *Supervisor) reconcileOne(ctx context.Context, connID core.ConnectionID)
 	if !ok {
 		return
 	}
-	if s.registry.Get(p.Provider.ProviderID) == nil {
+	if s.registry.Get(p.GetProvider().ProviderID) == nil {
 		s.markProviderUnavailable(ctx, p)
 		return
 	}
@@ -360,7 +360,7 @@ func (s *Supervisor) reconcileOne(ctx context.Context, connID core.ConnectionID)
 func (s *Supervisor) reconcileAll(ctx context.Context) {
 	profiles := s.controller.ListProfiles()
 	for _, p := range profiles {
-		if s.registry.Get(p.Provider.ProviderID) == nil {
+		if s.registry.Get(p.GetProvider().ProviderID) == nil {
 			s.markProviderUnavailable(ctx, p)
 			continue
 		}
@@ -431,8 +431,8 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 			ID:                string(p.ID),
 			Name:              p.Name,
 			DesiredState:      string(p.Desired),
-			ProviderID:        string(p.Provider.ProviderID),
-			ProviderAccountID: string(p.Provider.AccountID),
+			ProviderID:        string(p.GetProvider().ProviderID),
+			ProviderAccountID: string(p.GetProvider().AccountID),
 		}
 		if rt != nil {
 			dto.RuntimeState = string(rt.State)
@@ -457,6 +457,45 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 			DisplayName:   p.DisplayName,
 			Authenticated: p.Authenticated,
 		}
+
+		// Map capabilities to DTO
+		caps := p.Capabilities
+		dto.Capabilities = &ipc.CapabilitySetDTO{
+			TemporaryAddresses: caps.TemporaryAddresses.Supported,
+			CustomHostnames:    caps.CustomHostnames.Supported,
+			PrivateExposure:    caps.PrivateExposure.Supported,
+			ManagedDNS:         caps.ManagedDNS.Supported,
+			TelemetrySupported: caps.Telemetry.Supported,
+			MaxConnectors:      caps.Redundancy.MaxConnectors,
+		}
+		// Map protection modes
+		for _, prot := range caps.BuiltInProtection {
+			if prot.Supported {
+				dto.Capabilities.ProtectionModes = append(dto.Capabilities.ProtectionModes, string(prot.Kind))
+			}
+		}
+		// Map protocols
+		for proto, pc := range caps.Protocols {
+			if pc.Supported {
+				dto.Capabilities.Protocols = append(dto.Capabilities.Protocols, string(proto))
+			}
+		}
+		if caps.Expiration.Supported && caps.Expiration.MaxDuration > 0 {
+			dto.Capabilities.ExpirationMaxSecs = int(caps.Expiration.MaxDuration.Seconds())
+		}
+
+		// Determine availability and readiness
+		if p.Authenticated {
+			dto.Availability = "ready"
+			dto.Readiness = "ready"
+		} else if len(p.Accounts) > 0 {
+			dto.Availability = "unconfigured"
+			dto.Readiness = "needs_auth"
+		} else {
+			dto.Availability = "unconfigured"
+			dto.Readiness = "needs_config"
+		}
+
 		for _, account := range p.Accounts {
 			dto.Accounts = append(dto.Accounts, ipc.ProviderAccountDTO{
 				ID: string(account.ID), Label: account.Label, Status: account.Status,
@@ -480,6 +519,133 @@ func (h *supervisorHandler) HandleListConnections() ([]ipc.ConnectionDTO, error)
 	return snap.Connections, nil
 }
 
+func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.ConnectionDetailDTO, error) {
+	cid := core.ConnectionID(id)
+	p, ok := h.sup.controller.GetProfile(cid)
+	if !ok {
+		return nil, core.ErrProfileNotFound(cid)
+	}
+	rt, _ := h.sup.controller.GetRuntime(cid)
+
+	summary, err := h.HandleGetConnection(id)
+	if err != nil {
+		return nil, err
+	}
+
+	detail := &ipc.ConnectionDetailDTO{
+		Summary:  *summary,
+		Revision: p.Revision,
+		DesiredSpec: ipc.ConnectionSpecDTO{
+			Source: ipc.SourceDTO{Kind: string(p.GetSource().Kind)},
+			Exposure: ipc.ExposureDTO{
+				Mode:             string(p.GetExposure().Mode),
+				Protocol:         string(p.GetExposure().Protocol),
+				RequestedAddress: p.GetExposure().RequestedAddress,
+			},
+			Protection: ipc.ProtectionDTO{
+				Kind:           string(p.GetProtection().Kind),
+				AllowedEmails:  p.GetProtection().AllowedEmails,
+				AllowedDomains: p.GetProtection().AllowedDomains,
+			},
+		},
+		Lifecycle: ipc.LifecycleDTO{
+			AutoStart:    p.Lifecycle.AutoStart,
+			OnDisconnect: string(p.Lifecycle.OnDisconnect),
+		},
+		Driver: ipc.DriverSelectionDTO{
+			ProviderID: string(p.GetProvider().ProviderID),
+			AccountID:  string(p.GetProvider().AccountID),
+			Options:    p.Driver.Options,
+		},
+		CreatedAt: p.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: p.UpdatedAt.Format(time.RFC3339),
+	}
+
+	if p.GetSource().Existing != nil {
+		detail.DesiredSpec.Source.Existing = &ipc.ExistingSourceDTO{Address: p.GetSource().Existing.Address}
+	}
+	if p.GetSource().Directory != nil {
+		detail.DesiredSpec.Source.Directory = &ipc.DirectorySourceDTO{
+			Path: p.GetSource().Directory.Path, Mode: string(p.GetSource().Directory.Mode),
+			SPAFallback: p.GetSource().Directory.SPAFallback, AllowUpload: p.GetSource().Directory.AllowUpload, AllowDelete: p.GetSource().Directory.AllowDelete,
+		}
+	}
+	if p.GetSource().Command != nil {
+		detail.DesiredSpec.Source.Command = &ipc.CommandSourceDTO{
+			Executable: p.GetSource().Command.Executable, Args: p.GetSource().Command.Args, WorkingDir: p.GetSource().Command.WorkingDir,
+			Env: p.GetSource().Command.Env, Port: p.GetSource().Command.Port, Protocol: string(p.GetSource().Command.Protocol), UseShell: p.GetSource().Command.UseShell,
+		}
+	}
+	if p.GetSource().MCP != nil {
+		detail.DesiredSpec.Source.MCP = &ipc.MCPSourceDTO{Transport: string(p.GetSource().MCP.Transport), Endpoint: p.GetSource().MCP.Endpoint}
+		if p.GetSource().MCP.Command != nil {
+			detail.DesiredSpec.Source.MCP.Command = &ipc.CommandSourceDTO{
+				Executable: p.GetSource().MCP.Command.Executable, Args: p.GetSource().MCP.Command.Args, WorkingDir: p.GetSource().MCP.Command.WorkingDir,
+				Env: p.GetSource().MCP.Command.Env, Port: p.GetSource().MCP.Command.Port, Protocol: string(p.GetSource().MCP.Command.Protocol), UseShell: p.GetSource().MCP.Command.UseShell,
+			}
+		}
+	}
+
+	if rt != nil {
+		detail.LastVerified = rt.LastObservedAt.Format(time.RFC3339)
+		if rt.Endpoint.PublicAddress != "" {
+			detail.Endpoints = append(detail.Endpoints, ipc.EndpointDTO{Address: rt.Endpoint.PublicAddress, Public: true})
+		}
+		if rt.Endpoint.PrivateAddress != "" {
+			detail.Endpoints = append(detail.Endpoints, ipc.EndpointDTO{Address: rt.Endpoint.PrivateAddress, Public: false})
+		}
+		for _, r := range rt.Provider.Resources {
+			detail.Resources = append(detail.Resources, ipc.ManagedResourceDTO{
+				ID: string(r.ID), Type: string(r.Type), ExternalID: r.ExternalID, Ownership: string(r.Ownership), Metadata: r.Metadata,
+			})
+		}
+		if rt.Connector.PID > 0 {
+			detail.Processes = append(detail.Processes, ipc.ProcessDTO{PID: rt.Connector.PID, ConnectionID: string(cid), Status: string(rt.Connector.Status)})
+		}
+		for _, f := range rt.Diagnostics {
+			detail.Findings = append(detail.Findings, ipc.DiagnosticDTO{
+				ID: string(f.ID), Segment: string(f.Segment), Severity: string(f.Severity), Summary: f.Summary, Explanation: f.Explanation,
+			})
+		}
+	}
+
+	return detail, nil
+}
+
+func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecommendationRequest) (*ipc.ProviderRecommendationResponse, error) {
+	providers := h.sup.registry.List()
+	resp := &ipc.ProviderRecommendationResponse{}
+
+	for _, p := range providers {
+		choice := ipc.ProviderChoiceDTO{ProviderID: string(p.ID)}
+		if len(p.Accounts) > 0 {
+			choice.AccountID = string(p.Accounts[0].ID)
+		}
+
+		if p.Authenticated {
+			choice.Reasons = append(choice.Reasons, "Provider is authenticated and ready")
+			if resp.Recommended == nil {
+				resp.Recommended = &choice
+			} else {
+				resp.Alternatives = append(resp.Alternatives, choice)
+			}
+		} else {
+			choice.Reasons = append(choice.Reasons, "Provider requires authentication")
+			resp.Alternatives = append(resp.Alternatives, choice)
+		}
+	}
+
+	return resp, nil
+}
+
+func (h *supervisorHandler) HandleOperationHistory() (*ipc.OperationHistoryDTO, error) {
+	// For now, return an empty history since ListOperations doesn't exist yet
+	// This can be implemented when the store method is added
+	return &ipc.OperationHistoryDTO{
+		Operations: []ipc.OperationDTO{},
+	}, nil
+}
+
 func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, error) {
 	cid := core.ConnectionID(id)
 	p, ok := h.sup.controller.GetProfile(cid)
@@ -492,8 +658,8 @@ func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, 
 		ID:                string(p.ID),
 		Name:              p.Name,
 		DesiredState:      string(p.Desired),
-		ProviderID:        string(p.Provider.ProviderID),
-		ProviderAccountID: string(p.Provider.AccountID),
+		ProviderID:        string(p.GetProvider().ProviderID),
+		ProviderAccountID: string(p.GetProvider().AccountID),
 	}
 	if rt != nil {
 		dto.RuntimeState = string(rt.State)
@@ -513,16 +679,21 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 	// Convert IPC DTO to core profile.
 	profile := &core.ConnectionProfile{
 		Name: req.Name,
-		Source: core.SourceSpec{
-			Kind: core.SourceKind(req.Source.Kind),
+		Kind: core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{
+					Kind: core.SourceKind(req.Source.Kind),
+				},
+				Exposure: core.ExposureSpec{
+					Mode: core.ExposureMode(req.Exposure.Mode),
+				},
+				Protection: core.ProtectionSpec{
+					Kind: core.ProtectionKind(req.Protection.Kind),
+				},
+			},
 		},
-		Exposure: core.ExposureSpec{
-			Mode: core.ExposureMode(req.Exposure.Mode),
-		},
-		Protection: core.ProtectionSpec{
-			Kind: core.ProtectionKind(req.Protection.Kind),
-		},
-		Provider: core.ProviderSelection{
+		Driver: core.DriverSelection{
 			ProviderID: core.ProviderID(req.Provider.ProviderID),
 		},
 		Desired: core.DesiredClosed,
@@ -530,17 +701,17 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 
 	// Map source fields.
 	if req.Source.Existing != nil {
-		profile.Source.Existing = &core.ExistingServiceSpec{
+		profile.Spec.ServiceExposure.Source.Existing = &core.ExistingServiceSpec{
 			Network:  req.Source.Existing.Network,
 			Address:  req.Source.Existing.Address,
 			Protocol: core.Protocol(req.Source.Existing.Protocol),
 		}
-		if profile.Source.Existing.Protocol == "" {
-			profile.Source.Existing.Protocol = core.ProtocolHTTP
+		if profile.Spec.ServiceExposure.Source.Existing.Protocol == "" {
+			profile.Spec.ServiceExposure.Source.Existing.Protocol = core.ProtocolHTTP
 		}
 	}
 	if req.Source.Directory != nil {
-		profile.Source.Directory = &core.DirectorySpec{
+		profile.Spec.ServiceExposure.Source.Directory = &core.DirectorySpec{
 			Path:        req.Source.Directory.Path,
 			Mode:        core.DirectoryMode(req.Source.Directory.Mode),
 			SPAFallback: req.Source.Directory.SPAFallback,
@@ -549,7 +720,7 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 		}
 	}
 	if req.Source.Command != nil {
-		profile.Source.Command = &core.CommandSpec{
+		profile.Spec.ServiceExposure.Source.Command = &core.CommandSpec{
 			Executable: req.Source.Command.Executable,
 			Args:       req.Source.Command.Args,
 			WorkingDir: req.Source.Command.WorkingDir,
@@ -558,8 +729,8 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 			Protocol:   core.Protocol(req.Source.Command.Protocol),
 			UseShell:   req.Source.Command.UseShell,
 		}
-		if profile.Source.Command.Protocol == "" {
-			profile.Source.Command.Protocol = core.ProtocolHTTP
+		if profile.Spec.ServiceExposure.Source.Command.Protocol == "" {
+			profile.Spec.ServiceExposure.Source.Command.Protocol = core.ProtocolHTTP
 		}
 	}
 	if req.Source.MCP != nil {
@@ -578,22 +749,26 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 				UseShell:   req.Source.MCP.Command.UseShell,
 			}
 		}
-		profile.Source.MCP = mc
+		profile.Spec.ServiceExposure.Source.MCP = mc
 	}
 
 	// Map exposure fields.
-	if req.Exposure.Protocol != "" {
-		profile.Exposure.Protocol = core.Protocol(req.Exposure.Protocol)
+	if profile.Spec.ServiceExposure != nil {
+		if req.Exposure.Protocol != "" {
+			profile.Spec.ServiceExposure.Exposure.Protocol = core.Protocol(req.Exposure.Protocol)
+		}
+		profile.Spec.ServiceExposure.Exposure.RequestedAddress = req.Exposure.RequestedAddress
 	}
-	profile.Exposure.RequestedAddress = req.Exposure.RequestedAddress
 
 	// Map protection fields.
-	profile.Protection.AllowedEmails = req.Protection.AllowedEmails
-	profile.Protection.AllowedDomains = req.Protection.AllowedDomains
+	if profile.Spec.ServiceExposure != nil {
+		profile.Spec.ServiceExposure.Protection.AllowedEmails = req.Protection.AllowedEmails
+		profile.Spec.ServiceExposure.Protection.AllowedDomains = req.Protection.AllowedDomains
+	}
 
 	// Map provider fields.
-	profile.Provider.AccountID = core.ProviderAccountID(req.Provider.AccountID)
-	profile.Provider.Options = req.Provider.Options
+	profile.Driver.AccountID = core.ProviderAccountID(req.Provider.AccountID)
+	profile.Driver.Options = req.Provider.Options
 
 	// Map lifecycle fields.
 	profile.Lifecycle.AutoStart = req.Lifecycle.AutoStart
@@ -602,17 +777,17 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 	}
 
 	// Apply defaults for empty fields.
-	if profile.Source.Kind == "" {
-		profile.Source.Kind = core.SourceExisting
+	if profile.Spec.ServiceExposure.Source.Kind == "" {
+		profile.Spec.ServiceExposure.Source.Kind = core.SourceExisting
 	}
-	if profile.Source.Existing == nil && profile.Source.Kind == core.SourceExisting {
-		profile.Source.Existing = &core.ExistingServiceSpec{Protocol: core.ProtocolHTTP}
+	if profile.Spec.ServiceExposure.Source.Existing == nil && profile.Spec.ServiceExposure.Source.Kind == core.SourceExisting {
+		profile.Spec.ServiceExposure.Source.Existing = &core.ExistingServiceSpec{Protocol: core.ProtocolHTTP}
 	}
-	if profile.Exposure.Mode == "" {
-		profile.Exposure.Mode = core.ExposureTemporary
+	if profile.GetExposure().Mode == "" {
+		profile.Spec.ServiceExposure.Exposure.Mode = core.ExposureTemporary
 	}
-	if profile.Protection.Kind == "" {
-		profile.Protection.Kind = core.ProtectionNone
+	if profile.Spec.ServiceExposure.Protection.Kind == "" {
+		profile.Spec.ServiceExposure.Protection.Kind = core.ProtectionNone
 	}
 	if profile.Lifecycle.OnDisconnect == "" {
 		profile.Lifecycle.OnDisconnect = core.DisconnectKeepAlive

@@ -1,0 +1,32 @@
+# Portico — systemd user service
+# Install: cp scripts/portico-supervisor.service ~/.config/systemd/user/portico-supervisor.service
+# Enable:  systemctl --user enable --now portico-supervisor.service
+
+[Unit]
+Description=Portico connection manager supervisor
+Documentation=https://github.com/B-A-M-N/portico
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/portico supervisor run
+ExecStop=%h/.local/bin/portico supervisor stop
+Restart=on-failure
+RestartSec=5
+
+# XDG paths — override these if you use non-standard locations.
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=XDG_DATA_HOME=%h/.local/share
+Environment=XDG_CONFIG_HOME=%h/.config
+Environment=XDG_STATE_HOME=%h/.local/state
+
+# Hardening
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/portico %h/.local/state/portico /run/user/%U/portico
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -7,22 +7,141 @@ import (
 	"time"
 )
 
+// ConnectionKind identifies the type of connection.
+type ConnectionKind string
+
+const (
+	// ConnectionServiceExposure exposes a local service through a tunnel provider.
+	ConnectionServiceExposure ConnectionKind = "service_exposure"
+	
+	// ConnectionPortForward forwards a local port to a remote endpoint.
+	ConnectionPortForward ConnectionKind = "port_forward"
+	
+	// ConnectionPrivateNetwork joins or exposes through a private network.
+	ConnectionPrivateNetwork ConnectionKind = "private_network"
+)
+
 // ConnectionProfile represents the desired state of a connection.
 // A profile does not contain runtime data such as connector PID,
 // public address, provider resource IDs, last error, traffic samples,
 // current health, or progress state.
 type ConnectionProfile struct {
-	ID         ConnectionID
-	Name       string
-	Revision   uint64
-	Source     SourceSpec
-	Exposure   ExposureSpec
-	Protection ProtectionSpec
-	Provider   ProviderSelection
-	Lifecycle  LifecycleSpec
-	Desired    DesiredConnectionState
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID         ConnectionID     `json:"id"`
+	Name       string           `json:"name"`
+	Revision   uint64           `json:"revision"`
+	Kind       ConnectionKind   `json:"kind"`
+	Spec       ConnectionSpec   `json:"spec"`
+	Driver     DriverSelection  `json:"driver"`
+	Lifecycle  LifecycleSpec    `json:"lifecycle"`
+	Desired    DesiredConnectionState `json:"desired"`
+	CreatedAt  time.Time        `json:"created_at"`
+	UpdatedAt  time.Time        `json:"updated_at"`
+}
+
+// ConnectionSpec is a tagged union containing kind-specific specifications.
+type ConnectionSpec struct {
+	ServiceExposure *ServiceExposureSpec `json:"service_exposure,omitempty"`
+	PortForward     *PortForwardSpec     `json:"port_forward,omitempty"`
+	PrivateNetwork  *PrivateNetworkSpec  `json:"private_network,omitempty"`
+}
+
+// ServiceExposureSpec describes a service exposure connection.
+// This is the original connection type that exposes a local service through a tunnel.
+type ServiceExposureSpec struct {
+	Source     SourceSpec     `json:"source"`
+	Exposure   ExposureSpec   `json:"exposure"`
+	Protection ProtectionSpec `json:"protection"`
+}
+
+// PortForwardSpec describes a port forward connection.
+type PortForwardSpec struct {
+	LocalPort  int       `json:"local_port"`
+	RemoteHost string    `json:"remote_host"`
+	RemotePort int       `json:"remote_port"`
+	Protocol   Protocol  `json:"protocol"`
+	Direction  PortForwardDirection `json:"direction"`
+}
+
+// PortForwardDirection indicates the direction of port forwarding.
+type PortForwardDirection string
+
+const (
+	// PortForwardLocal forwards a local port to a remote endpoint.
+	PortForwardLocal PortForwardDirection = "local"
+	
+	// PortForwardRemote forwards a remote port to a local endpoint.
+	PortForwardRemote PortForwardDirection = "remote"
+)
+
+// PrivateNetworkSpec describes a private network connection.
+type PrivateNetworkSpec struct {
+	NetworkID   string             `json:"network_id"`
+	Mode        PrivateNetworkMode `json:"mode"`
+	ExposeLocal bool               `json:"expose_local"`
+}
+
+// PrivateNetworkMode indicates how the connection interacts with the private network.
+type PrivateNetworkMode string
+
+const (
+	// PrivateNetworkJoin joins an existing private network.
+	PrivateNetworkJoin PrivateNetworkMode = "join"
+	
+	// PrivateNetworkExpose exposes local services to the private network.
+	PrivateNetworkExpose PrivateNetworkMode = "expose"
+)
+
+// DriverSelection describes the driver choice for a connection.
+type DriverSelection struct {
+	DriverID   DriverID           `json:"driver_id"`
+	ProviderID ProviderID         `json:"provider_id"`
+	AccountID  ProviderAccountID  `json:"account_id"`
+	Options    map[string]string  `json:"options,omitempty"`
+}
+
+// DriverID identifies a connection driver.
+type DriverID string
+
+// Backward compatibility accessors for the old flat profile structure.
+// These allow existing code to continue working while we migrate to the new structure.
+// Note: renamed to GetSource, GetExposure, etc. to avoid JSON serialization conflicts.
+
+// GetSource returns the source spec for service exposure connections.
+// Returns a zero-value SourceSpec for non-service-exposure connections.
+func (p *ConnectionProfile) GetSource() SourceSpec {
+	if p == nil || p.Spec.ServiceExposure == nil {
+		return SourceSpec{}
+	}
+	return p.Spec.ServiceExposure.Source
+}
+
+// GetExposure returns the exposure spec for service exposure connections.
+func (p *ConnectionProfile) GetExposure() ExposureSpec {
+	if p == nil || p.Spec.ServiceExposure == nil {
+		return ExposureSpec{}
+	}
+	return p.Spec.ServiceExposure.Exposure
+}
+
+// GetProtection returns the protection spec for service exposure connections.
+func (p *ConnectionProfile) GetProtection() ProtectionSpec {
+	if p == nil || p.Spec.ServiceExposure == nil {
+		return ProtectionSpec{}
+	}
+	return p.Spec.ServiceExposure.Protection
+}
+
+// GetProvider returns the provider selection for service exposure connections.
+// For backward compatibility, this maps Driver to ProviderSelection.
+func (p *ConnectionProfile) GetProvider() ProviderSelection {
+	if p == nil {
+		return ProviderSelection{}
+	}
+	return ProviderSelection{
+		ProviderID: p.Driver.ProviderID,
+		AccountID:  p.Driver.AccountID,
+		Options:    p.Driver.Options,
+	}
 }
 
 // DeepCopy returns a deep copy of the profile.
@@ -31,67 +150,87 @@ func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 		return nil
 	}
 	cp := *p
-	if p.Source.Existing != nil {
-		existing := *p.Source.Existing
-		cp.Source.Existing = &existing
-	}
-	if p.Source.Directory != nil {
-		dir := *p.Source.Directory
-		cp.Source.Directory = &dir
-	}
-	if p.Source.Command != nil {
-		cmd := *p.Source.Command
-		cp.Source.Command = &cmd
-		if len(p.Source.Command.Args) > 0 {
-			args := make([]string, len(p.Source.Command.Args))
-			copy(args, p.Source.Command.Args)
-			cp.Source.Command.Args = args
+	
+	// Deep copy the spec
+	if p.Spec.ServiceExposure != nil {
+		se := *p.Spec.ServiceExposure
+		cp.Spec.ServiceExposure = &se
+		
+		if p.Spec.ServiceExposure.Source.Existing != nil {
+			existing := *p.Spec.ServiceExposure.Source.Existing
+			cp.Spec.ServiceExposure.Source.Existing = &existing
 		}
-		if p.Source.Command.Env != nil {
-			env := make(map[string]string, len(p.Source.Command.Env))
-			for k, v := range p.Source.Command.Env {
-				env[k] = v
-			}
-			cp.Source.Command.Env = env
+		if p.Spec.ServiceExposure.Source.Directory != nil {
+			dir := *p.Spec.ServiceExposure.Source.Directory
+			cp.Spec.ServiceExposure.Source.Directory = &dir
 		}
-	}
-	if p.Source.MCP != nil {
-		mcp := *p.Source.MCP
-		cp.Source.MCP = &mcp
-		if mcp.Command != nil {
-			cmd := *mcp.Command
-			if mcp.Command.Args != nil {
-				cmd.Args = append([]string(nil), mcp.Command.Args...)
+		if p.Spec.ServiceExposure.Source.Command != nil {
+			cmd := *p.Spec.ServiceExposure.Source.Command
+			cp.Spec.ServiceExposure.Source.Command = &cmd
+			if len(p.Spec.ServiceExposure.Source.Command.Args) > 0 {
+				args := make([]string, len(p.Spec.ServiceExposure.Source.Command.Args))
+				copy(args, p.Spec.ServiceExposure.Source.Command.Args)
+				cp.Spec.ServiceExposure.Source.Command.Args = args
 			}
-			if mcp.Command.Env != nil {
-				cmd.Env = make(map[string]string, len(mcp.Command.Env))
-				for key, value := range mcp.Command.Env {
-					cmd.Env[key] = value
+			if p.Spec.ServiceExposure.Source.Command.Env != nil {
+				env := make(map[string]string, len(p.Spec.ServiceExposure.Source.Command.Env))
+				for k, v := range p.Spec.ServiceExposure.Source.Command.Env {
+					env[k] = v
 				}
+				cp.Spec.ServiceExposure.Source.Command.Env = env
 			}
-			cp.Source.MCP.Command = &cmd
+		}
+		if p.Spec.ServiceExposure.Source.MCP != nil {
+			mcp := *p.Spec.ServiceExposure.Source.MCP
+			cp.Spec.ServiceExposure.Source.MCP = &mcp
+			if mcp.Command != nil {
+				cmd := *mcp.Command
+				if mcp.Command.Args != nil {
+					cmd.Args = append([]string(nil), mcp.Command.Args...)
+				}
+				if mcp.Command.Env != nil {
+					cmd.Env = make(map[string]string, len(mcp.Command.Env))
+					for key, value := range mcp.Command.Env {
+						cmd.Env[key] = value
+					}
+				}
+				cp.Spec.ServiceExposure.Source.MCP.Command = &cmd
+			}
+		}
+		if p.Spec.ServiceExposure.Exposure.RequestedAddress != "" {
+			cp.Spec.ServiceExposure.Exposure.RequestedAddress = p.Spec.ServiceExposure.Exposure.RequestedAddress
+		}
+		if p.Spec.ServiceExposure.Protection.AllowedEmails != nil {
+			emails := make([]string, len(p.Spec.ServiceExposure.Protection.AllowedEmails))
+			copy(emails, p.Spec.ServiceExposure.Protection.AllowedEmails)
+			cp.Spec.ServiceExposure.Protection.AllowedEmails = emails
+		}
+		if p.Spec.ServiceExposure.Protection.AllowedDomains != nil {
+			domains := make([]string, len(p.Spec.ServiceExposure.Protection.AllowedDomains))
+			copy(domains, p.Spec.ServiceExposure.Protection.AllowedDomains)
+			cp.Spec.ServiceExposure.Protection.AllowedDomains = domains
 		}
 	}
-	if p.Exposure.RequestedAddress != "" {
-		cp.Exposure.RequestedAddress = p.Exposure.RequestedAddress
+	
+	if p.Spec.PortForward != nil {
+		pf := *p.Spec.PortForward
+		cp.Spec.PortForward = &pf
 	}
-	if p.Protection.AllowedEmails != nil {
-		emails := make([]string, len(p.Protection.AllowedEmails))
-		copy(emails, p.Protection.AllowedEmails)
-		cp.Protection.AllowedEmails = emails
+	
+	if p.Spec.PrivateNetwork != nil {
+		pn := *p.Spec.PrivateNetwork
+		cp.Spec.PrivateNetwork = &pn
 	}
-	if p.Protection.AllowedDomains != nil {
-		domains := make([]string, len(p.Protection.AllowedDomains))
-		copy(domains, p.Protection.AllowedDomains)
-		cp.Protection.AllowedDomains = domains
-	}
-	if p.Provider.Options != nil {
-		options := make(map[string]string, len(p.Provider.Options))
-		for k, v := range p.Provider.Options {
+	
+	// Deep copy driver options
+	if p.Driver.Options != nil {
+		options := make(map[string]string, len(p.Driver.Options))
+		for k, v := range p.Driver.Options {
 			options[k] = v
 		}
-		cp.Provider.Options = options
+		cp.Driver.Options = options
 	}
+	
 	return &cp
 }
 
@@ -110,99 +249,146 @@ func (p *ConnectionProfile) Validate() error {
 		return fmt.Errorf("profile name is required")
 	}
 
+	// Validate Kind is set
+	if p.Kind == "" {
+		return fmt.Errorf("connection kind is required")
+	}
+
+	// Validate exactly one spec is set and matches the Kind
+	specCount := 0
+	if p.Spec.ServiceExposure != nil {
+		specCount++
+		if p.Kind != ConnectionServiceExposure {
+			return fmt.Errorf("kind %q does not match service exposure spec", p.Kind)
+		}
+		if err := validateServiceExposureSpec(p, p.Spec.ServiceExposure); err != nil {
+			return err
+		}
+	}
+	if p.Spec.PortForward != nil {
+		specCount++
+		if p.Kind != ConnectionPortForward {
+			return fmt.Errorf("kind %q does not match port forward spec", p.Kind)
+		}
+		if err := validatePortForwardSpec(p.Spec.PortForward); err != nil {
+			return err
+		}
+	}
+	if p.Spec.PrivateNetwork != nil {
+		specCount++
+		if p.Kind != ConnectionPrivateNetwork {
+			return fmt.Errorf("kind %q does not match private network spec", p.Kind)
+		}
+		if err := validatePrivateNetworkSpec(p.Spec.PrivateNetwork); err != nil {
+			return err
+		}
+	}
+	if specCount != 1 {
+		return fmt.Errorf("exactly one connection spec must be set, got %d", specCount)
+	}
+
+	return nil
+}
+
+// validateServiceExposureSpec validates a service exposure specification.
+func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec) error {
+	if spec == nil {
+		return fmt.Errorf("service exposure spec is nil")
+	}
+
 	// Validate source: exactly one must be set, and Kind must match
 	sourceCount := 0
-	if p.Source.Existing != nil {
+	if spec.Source.Existing != nil {
 		sourceCount++
-		if p.Source.Kind != SourceExisting {
-			return fmt.Errorf("source kind %q does not match existing service spec", p.Source.Kind)
+		if spec.Source.Kind != SourceExisting {
+			return fmt.Errorf("source kind %q does not match existing service spec", spec.Source.Kind)
 		}
-		if p.Source.Existing.Address == "" {
+		if spec.Source.Existing.Address == "" {
 			return fmt.Errorf("existing service address is required")
 		}
-		if p.Source.Existing.Network != "" {
-			switch p.Source.Existing.Network {
+		if spec.Source.Existing.Network != "" {
+			switch spec.Source.Existing.Network {
 			case "tcp", "udp":
 			default:
-				return fmt.Errorf("invalid network %q, must be tcp or udp", p.Source.Existing.Network)
+				return fmt.Errorf("invalid network %q, must be tcp or udp", spec.Source.Existing.Network)
 			}
 		}
 	}
-	if p.Source.Directory != nil {
+	if spec.Source.Directory != nil {
 		sourceCount++
-		if p.Source.Kind != SourceDirectory {
-			return fmt.Errorf("source kind %q does not match directory spec", p.Source.Kind)
+		if spec.Source.Kind != SourceDirectory {
+			return fmt.Errorf("source kind %q does not match directory spec", spec.Source.Kind)
 		}
-		if p.Source.Directory.Path == "" {
+		if spec.Source.Directory.Path == "" {
 			return fmt.Errorf("directory path is required")
 		}
-		switch p.Source.Directory.Mode {
+		switch spec.Source.Directory.Mode {
 		case DirectoryModeRead, DirectoryModeWrites, "":
 			// valid
 		default:
-			return fmt.Errorf("invalid directory mode %q", p.Source.Directory.Mode)
+			return fmt.Errorf("invalid directory mode %q", spec.Source.Directory.Mode)
 		}
-		if p.Source.Directory.Mode != DirectoryModeWrites && (p.Source.Directory.AllowUpload || p.Source.Directory.AllowDelete) {
+		if spec.Source.Directory.Mode != DirectoryModeWrites && (spec.Source.Directory.AllowUpload || spec.Source.Directory.AllowDelete) {
 			return fmt.Errorf("directory upload/delete permissions require writes mode")
 		}
 	}
-	if p.Source.Command != nil {
+	if spec.Source.Command != nil {
 		sourceCount++
-		if p.Source.Kind != SourceCommand {
-			return fmt.Errorf("source kind %q does not match command spec", p.Source.Kind)
+		if spec.Source.Kind != SourceCommand {
+			return fmt.Errorf("source kind %q does not match command spec", spec.Source.Kind)
 		}
-		if p.Source.Command.Executable == "" {
+		if spec.Source.Command.Executable == "" {
 			return fmt.Errorf("command executable is required")
 		}
-		if p.Source.Command.Port < 1 || p.Source.Command.Port > 65535 {
+		if spec.Source.Command.Port < 1 || spec.Source.Command.Port > 65535 {
 			return fmt.Errorf("command port must be between 1 and 65535")
 		}
-		if err := validateCommandEnvironment(p.Source.Command.Env); err != nil {
+		if err := validateCommandEnvironment(spec.Source.Command.Env); err != nil {
 			return err
 		}
-		switch p.Source.Command.Protocol {
+		switch spec.Source.Command.Protocol {
 		case ProtocolHTTP, ProtocolHTTPS, "":
 			// valid
 		default:
-			return fmt.Errorf("invalid command protocol %q", p.Source.Command.Protocol)
+			return fmt.Errorf("invalid command protocol %q", spec.Source.Command.Protocol)
 		}
 	}
-	if p.Source.MCP != nil {
+	if spec.Source.MCP != nil {
 		sourceCount++
-		if p.Source.Kind != SourceMCP {
-			return fmt.Errorf("source kind %q does not match MCP spec", p.Source.Kind)
+		if spec.Source.Kind != SourceMCP {
+			return fmt.Errorf("source kind %q does not match MCP spec", spec.Source.Kind)
 		}
-		if p.Source.MCP.Endpoint == "" && p.Source.MCP.Command == nil {
+		if spec.Source.MCP.Endpoint == "" && spec.Source.MCP.Command == nil {
 			return fmt.Errorf("MCP endpoint or command is required")
 		}
-		if p.Source.MCP.Endpoint != "" && p.Source.MCP.Command != nil {
+		if spec.Source.MCP.Endpoint != "" && spec.Source.MCP.Command != nil {
 			return fmt.Errorf("MCP source must use either an endpoint or a command, not both")
 		}
-		if p.Source.MCP.Endpoint != "" {
-			u, err := url.ParseRequestURI(p.Source.MCP.Endpoint)
+		if spec.Source.MCP.Endpoint != "" {
+			u, err := url.ParseRequestURI(spec.Source.MCP.Endpoint)
 			if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
 				return fmt.Errorf("MCP endpoint must be an absolute HTTP URL without embedded credentials")
 			}
 		}
-		if p.Source.MCP.Command != nil {
-			if p.Source.MCP.Command.Executable == "" {
+		if spec.Source.MCP.Command != nil {
+			if spec.Source.MCP.Command.Executable == "" {
 				return fmt.Errorf("MCP command executable is required")
 			}
-			if p.Source.MCP.Command.Port < 1 || p.Source.MCP.Command.Port > 65535 {
+			if spec.Source.MCP.Command.Port < 1 || spec.Source.MCP.Command.Port > 65535 {
 				return fmt.Errorf("MCP command port must be between 1 and 65535")
 			}
-			if err := validateCommandEnvironment(p.Source.MCP.Command.Env); err != nil {
+			if err := validateCommandEnvironment(spec.Source.MCP.Command.Env); err != nil {
 				return err
 			}
-			if p.Source.MCP.Command.Protocol != "" && p.Source.MCP.Command.Protocol != ProtocolHTTP {
-				return fmt.Errorf("MCP command protocol %q is not supported", p.Source.MCP.Command.Protocol)
+			if spec.Source.MCP.Command.Protocol != "" && spec.Source.MCP.Command.Protocol != ProtocolHTTP {
+				return fmt.Errorf("MCP command protocol %q is not supported", spec.Source.MCP.Command.Protocol)
 			}
 		}
-		switch p.Source.MCP.Transport {
+		switch spec.Source.MCP.Transport {
 		case MCPTransportHTTP, MCPTransportStreamable, MCPTransportSSE, "":
 			// valid
 		default:
-			return fmt.Errorf("invalid MCP transport %q", p.Source.MCP.Transport)
+			return fmt.Errorf("invalid MCP transport %q", spec.Source.MCP.Transport)
 		}
 	}
 	if sourceCount != 1 {
@@ -210,13 +396,13 @@ func (p *ConnectionProfile) Validate() error {
 	}
 
 	// Validate exposure mode
-	switch p.Exposure.Mode {
+	switch spec.Exposure.Mode {
 	case ExposureTemporary:
-		if p.Exposure.RequestedAddress != "" {
+		if spec.Exposure.RequestedAddress != "" {
 			return fmt.Errorf("temporary exposure does not accept a requested hostname")
 		}
 	case ExposurePermanent:
-		if p.Exposure.RequestedAddress == "" {
+		if spec.Exposure.RequestedAddress == "" {
 			return fmt.Errorf("permanent exposure requires a requested hostname")
 		}
 	case ExposurePrivate:
@@ -225,15 +411,15 @@ func (p *ConnectionProfile) Validate() error {
 	case "":
 		// Will be set to default later
 	default:
-		return fmt.Errorf("invalid exposure mode %q", p.Exposure.Mode)
+		return fmt.Errorf("invalid exposure mode %q", spec.Exposure.Mode)
 	}
 
 	// Validate protocol
-	switch p.Exposure.Protocol {
+	switch spec.Exposure.Protocol {
 	case ProtocolHTTP, ProtocolHTTPS, ProtocolTCP, ProtocolUDP, "":
 		// valid
 	default:
-		return fmt.Errorf("invalid exposure protocol %q", p.Exposure.Protocol)
+		return fmt.Errorf("invalid exposure protocol %q", spec.Exposure.Protocol)
 	}
 
 	// Validate desired state
@@ -245,23 +431,23 @@ func (p *ConnectionProfile) Validate() error {
 	}
 
 	// Validate protection
-	switch p.Protection.Kind {
+	switch spec.Protection.Kind {
 	case ProtectionNone, ProtectionEmailOTP, ProtectionIdentity, ProtectionServiceToken, ProtectionPrivateNet, "":
 		// valid
 	default:
-		return fmt.Errorf("invalid protection kind %q", p.Protection.Kind)
+		return fmt.Errorf("invalid protection kind %q", spec.Protection.Kind)
 	}
 
-	if p.Protection.Kind == ProtectionServiceToken {
-		if len(p.Provider.Options) == 0 {
-			return fmt.Errorf("service token protection requires provider options")
+	if spec.Protection.Kind == ProtectionServiceToken {
+		if len(p.Driver.Options) == 0 {
+			return fmt.Errorf("service token protection requires driver options")
 		}
 	}
 
 	// Write-enabled directories must not be exposed without protection.
 	// A publicly reachable upload endpoint is a severe security risk.
-	if p.Source.Directory != nil && p.Source.Directory.Mode == DirectoryModeWrites &&
-		p.Source.Directory.AllowUpload && p.Protection.Kind == ProtectionNone {
+	if spec.Source.Directory != nil && spec.Source.Directory.Mode == DirectoryModeWrites &&
+		spec.Source.Directory.AllowUpload && spec.Protection.Kind == ProtectionNone {
 		return fmt.Errorf("write-enabled directory with upload requires protection; use email_otp, identity_provider, service_token, or private_network")
 	}
 
@@ -269,16 +455,71 @@ func (p *ConnectionProfile) Validate() error {
 		return fmt.Errorf("invalid disconnect policy %q", p.Lifecycle.OnDisconnect)
 	}
 
-	// Validate provider selection
-	if p.Provider.ProviderID == "" {
+	// Validate driver selection
+	if p.Driver.ProviderID == "" {
 		return fmt.Errorf("provider ID is required")
 	}
 
 	// Validate command working directory
-	if p.Source.Command != nil {
-		if p.Source.Command.WorkingDir != "" {
+	if spec.Source.Command != nil {
+		if spec.Source.Command.WorkingDir != "" {
 			// Working directory is validated at use time
 		}
+	}
+
+	return nil
+}
+
+// validatePortForwardSpec validates a port forward specification.
+func validatePortForwardSpec(spec *PortForwardSpec) error {
+	if spec == nil {
+		return fmt.Errorf("port forward spec is nil")
+	}
+
+	if spec.LocalPort < 1 || spec.LocalPort > 65535 {
+		return fmt.Errorf("local port must be between 1 and 65535")
+	}
+
+	if spec.RemotePort < 1 || spec.RemotePort > 65535 {
+		return fmt.Errorf("remote port must be between 1 and 65535")
+	}
+
+	if spec.RemoteHost == "" {
+		return fmt.Errorf("remote host is required")
+	}
+
+	switch spec.Protocol {
+	case ProtocolTCP, ProtocolUDP, "":
+		// valid
+	default:
+		return fmt.Errorf("invalid protocol %q, must be tcp or udp", spec.Protocol)
+	}
+
+	switch spec.Direction {
+	case PortForwardLocal, PortForwardRemote, "":
+		// valid
+	default:
+		return fmt.Errorf("invalid direction %q, must be local or remote", spec.Direction)
+	}
+
+	return nil
+}
+
+// validatePrivateNetworkSpec validates a private network specification.
+func validatePrivateNetworkSpec(spec *PrivateNetworkSpec) error {
+	if spec == nil {
+		return fmt.Errorf("private network spec is nil")
+	}
+
+	if spec.NetworkID == "" {
+		return fmt.Errorf("network ID is required")
+	}
+
+	switch spec.Mode {
+	case PrivateNetworkJoin, PrivateNetworkExpose, "":
+		// valid
+	default:
+		return fmt.Errorf("invalid mode %q, must be join or expose", spec.Mode)
 	}
 
 	return nil

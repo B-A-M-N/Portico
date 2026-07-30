@@ -43,6 +43,7 @@ type RequestHandler interface {
 	HandleSnapshot() (*SnapshotDTO, error)
 	HandleListConnections() ([]ConnectionDTO, error)
 	HandleGetConnection(id string) (*ConnectionDTO, error)
+	HandleGetConnectionDetail(id string) (*ConnectionDetailDTO, error)
 	HandleCreateConnection(req CreateConnectionRequest) (*ConnectionDTO, error)
 	HandleUpdateConnection(id string, req UpdateConnectionRequest) (*ConnectionDTO, error)
 	HandlePlanOpen(id string) (*PlanDTO, error)
@@ -51,10 +52,12 @@ type RequestHandler interface {
 	HandlePlanDelete(id string) (*PlanDTO, error)
 	HandleApplyPlan(planID string, idempotencyKey string) (*OperationDTO, error)
 	HandleListProviders() ([]ProviderDTO, error)
+	HandleProviderRecommendation(req ProviderRecommendationRequest) (*ProviderRecommendationResponse, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
+	HandleOperationHistory() (*OperationHistoryDTO, error)
 	HandleDiscovery() (*DiscoveryDTO, error)
 	HandleRefreshDiscovery() (*DiscoveryDTO, error)
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
@@ -103,6 +106,7 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/providers", s.handleProviders)
 	mux.HandleFunc("/v1/providers/", s.handleProviderByID)
 	mux.HandleFunc("/v1/plans/", s.handlePlans)
+	mux.HandleFunc("/v1/operations", s.handleOperationList)
 	mux.HandleFunc("/v1/operations/", s.handleOperations)
 	mux.HandleFunc("/v1/discovery", s.handleDiscovery)
 	mux.HandleFunc("/v1/diagnostics/", s.handleDiagnostics)
@@ -636,6 +640,19 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "PROV-006", "unknown provider endpoint")
 	}
+}
+
+func (s *Server) handleOperationList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "OP-005", "method not allowed")
+		return
+	}
+	history, err := s.handler.HandleOperationHistory()
+	if err != nil {
+		writeHandlerError(w, "OP-006", err)
+		return
+	}
+	json.NewEncoder(w).Encode(history)
 }
 
 func (s *Server) handleOperations(w http.ResponseWriter, r *http.Request) {

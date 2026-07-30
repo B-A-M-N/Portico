@@ -77,16 +77,21 @@ func (f *fakeRuntimeCommitter) failureCount() int {
 func newFailureTestProfile() *core.ConnectionProfile {
 	return &core.ConnectionProfile{
 		Name: "failure-test",
-		Source: core.SourceSpec{
-			Kind: core.SourceExisting,
-			Existing: &core.ExistingServiceSpec{
-				Address:  "localhost:8080",
-				Protocol: core.ProtocolHTTP,
+		Kind: core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{
+					Kind: core.SourceExisting,
+					Existing: &core.ExistingServiceSpec{
+						Address:  "localhost:8080",
+						Protocol: core.ProtocolHTTP,
+					},
+				},
+				Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
-		Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
-		Provider:   core.ProviderSelection{ProviderID: "mock"},
+		Driver: core.DriverSelection{ProviderID: "mock"},
 		Lifecycle: core.LifecycleSpec{
 			AutoStart:    true,
 			OnDisconnect: core.DisconnectKeepAlive,

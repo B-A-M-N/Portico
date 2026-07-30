@@ -1,0 +1,70 @@
+version: 2
+
+project_name: portico
+
+builds:
+  - id: portico
+    main: .
+    binary: portico
+    ldflags: -s -w -X github.com/B-A-M-N/portico/cmd.Version={{.Version}} -X github.com/B-A-M-N/portico/cmd.Commit={{.Commit}} -X github.com/B-A-M-N/portico/cmd.Date={{.Date}}
+    goos: [linux]
+    goarch: [amd64, arm64]
+
+archives:
+  - format: tar.gz
+    name_template: "{{.ProjectName}}_{{.Version}}_{{.Os}}_{{.Arch}}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "{{.ProjectName}}_{{.Version}}_checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: B-A-M-N
+    name: portico
+  draft: false
+  prerelease: auto
+  header: "# Changelog"
+  footer: "---"
+  name_template: "Portico {{.Version}}"
+
+nfpms:
+  - package_name: portico
+    license: MIT
+    maintainer: Portico Authors <portico@bamn.dev>
+    description: Terminal-native connection manager for local services
+    homepage: https://github.com/B-A-M-N/portico
+    formats: [deb, rpm, apk]
+    binds:
+      - /usr/bin/portico=/usr/bin/portico
+    section: utils
+    priority: optional
+    scripts:
+      postinstall: scripts/postinstall.sh
+      preuninstall: scripts/preuninstall.sh
+
+brews:
+  - name: portico
+    tap:
+      owner: B-A-M-N
+      name: homebrew-tap
+    commit_author:
+      name: goreleaserbot
+      email: goreleaser@users.noreply.github.com
+    description: Terminal-native connection manager for local services
+    homepage: https://github.com/B-A-M-N/portico
+    license: MIT
+
+dockers:
+  - image_templates: ["ghcr.io/b-a-m-n/portico:{{.Version}}", "ghcr.io/b-a-m-n/portico:latest"]
+    goos: linux
+    goarch: [amd64, arm64]
+    dockerfile: Dockerfile
+    build_flag_templates:
+      - "--platform={{.Goarch}}"
+    extra_files:
+      - glob: LICENSE
+        path: /licenses/LICENSE

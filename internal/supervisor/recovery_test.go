@@ -33,19 +33,26 @@ func recoveryTestProfile(connID core.ConnectionID) *core.ConnectionProfile {
 		ID:       connID,
 		Name:     "recovery-test",
 		Revision: 1,
-		Source: core.SourceSpec{
-			Kind: core.SourceExisting,
-			Existing: &core.ExistingServiceSpec{
-				Network:  "tcp",
-				Address:  "localhost",
-				Protocol: core.ProtocolHTTP,
+		Kind:     core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{
+					Kind: core.SourceExisting,
+					Existing: &core.ExistingServiceSpec{
+						Network:  "tcp",
+						Address:  "localhost",
+						Protocol: core.ProtocolHTTP,
+					},
+				},
+				Exposure: core.ExposureSpec{Mode: core.ExposureTemporary},
+				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
-		Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
-		Provider:   core.ProviderSelection{ProviderID: core.ProviderID("mock")},
-		Lifecycle:  core.LifecycleSpec{OnDisconnect: core.DisconnectKeepAlive},
-		Desired:    core.DesiredOpen,
+		Driver: core.DriverSelection{
+			ProviderID: core.ProviderID("mock"),
+		},
+		Lifecycle: core.LifecycleSpec{OnDisconnect: core.DisconnectKeepAlive},
+		Desired:   core.DesiredOpen,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
@@ -140,7 +147,7 @@ func openSteps() []core.PlanStep {
 func TestSnapshotIncludesNonSecretProviderAccountSummaries(t *testing.T) {
 	st := newRecoveryTestStore(t)
 	profile := recoveryTestProfile("conn-account-summary")
-	profile.Provider.AccountID = "account-a"
+	profile.Driver.AccountID = "account-a"
 	if err := st.SaveProfile(context.Background(), profile); err != nil {
 		t.Fatalf("save profile: %v", err)
 	}
@@ -195,7 +202,7 @@ func TestUnavailableProviderIsPersistedAsActionableRuntimeError(t *testing.T) {
 	st := newRecoveryTestStore(t)
 	connID := core.ConnectionID("conn-unavailable-provider")
 	profile := recoveryTestProfile(connID)
-	profile.Provider.ProviderID = "missing-provider"
+	profile.Driver.ProviderID = "missing-provider"
 	profile.Desired = core.DesiredOpen
 	runtime := recoveryTestRuntime(connID)
 	runtime.State = core.RuntimeOpen
@@ -248,13 +255,13 @@ func TestClassifyResourceStateOnlyMarksAuthoritativelyMissingResources(t *testin
 	st := newRecoveryTestStore(t)
 	connID := core.ConnectionID("conn-externally-removed")
 	profile := recoveryTestProfile(connID)
-	profile.Provider.ProviderID = "repair-observer"
+	profile.Driver.ProviderID = "repair-observer"
 	if err := st.SaveProfile(ctx, profile); err != nil {
 		t.Fatalf("SaveProfile: %v", err)
 	}
 	resource := &core.ProviderResource{
 		ConnectionID: connID,
-		ProviderID:   profile.Provider.ProviderID,
+		ProviderID:   profile.Driver.ProviderID,
 		Type:         core.ResourceDNSRecord,
 		ExternalID:   "dns-externally-removed",
 		Ownership:    core.OwnershipManaged,

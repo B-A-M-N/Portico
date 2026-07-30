@@ -29,6 +29,9 @@ func (nullHandler) HandleListConnections() ([]ConnectionDTO, error) { return nil
 func (nullHandler) HandleGetConnection(string) (*ConnectionDTO, error) {
 	return nil, nil
 }
+func (nullHandler) HandleGetConnectionDetail(string) (*ConnectionDetailDTO, error) {
+	return nil, nil
+}
 func (nullHandler) HandleCreateConnection(CreateConnectionRequest) (*ConnectionDTO, error) {
 	return nil, nil
 }
@@ -43,6 +46,9 @@ func (nullHandler) HandleApplyPlan(string, string) (*OperationDTO, error) {
 	return nil, nil
 }
 func (nullHandler) HandleListProviders() ([]ProviderDTO, error) { return nil, nil }
+func (nullHandler) HandleProviderRecommendation(ProviderRecommendationRequest) (*ProviderRecommendationResponse, error) {
+	return &ProviderRecommendationResponse{}, nil
+}
 func (nullHandler) HandleAuthenticateProvider(string) error     { return nil }
 func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return &ConfigureProviderAccountResponse{}, nil
@@ -52,6 +58,9 @@ func (nullHandler) HandleGetOperation(string) (*OperationDTO, error) {
 }
 func (nullHandler) HandleGetOperationEvents(string) ([]EventDTO, error) {
 	return nil, nil
+}
+func (nullHandler) HandleOperationHistory() (*OperationHistoryDTO, error) {
+	return &OperationHistoryDTO{}, nil
 }
 func (nullHandler) HandleDiscovery() (*DiscoveryDTO, error)        { return nil, nil }
 func (nullHandler) HandleRefreshDiscovery() (*DiscoveryDTO, error) { return nil, nil }

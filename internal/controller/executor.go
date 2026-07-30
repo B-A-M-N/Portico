@@ -821,7 +821,7 @@ func (c *Controller) executeStep(ctx context.Context, plan *core.OperationPlan, 
 			if originURL == "" {
 				return core.StepResult{}, fmt.Errorf("start-origin step is missing origin_url")
 			}
-			err = manager.Start(ctx, plan.ConnectionID, profile.Source, originURL)
+			err = manager.Start(ctx, plan.ConnectionID, profile.GetSource(), originURL)
 		} else {
 			err = manager.Stop(ctx, plan.ConnectionID)
 		}

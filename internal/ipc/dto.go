@@ -29,13 +29,103 @@ type ConnectionDTO struct {
 	Error             string `json:"error,omitempty"`
 }
 
+// ConnectionDetailDTO is the full detail view of a connection for inspect screens.
+type ConnectionDetailDTO struct {
+	Summary       ConnectionDTO       `json:"summary"`
+	Revision      uint64              `json:"revision"`
+	DesiredSpec   ConnectionSpecDTO   `json:"desired_spec"`
+	Lifecycle     LifecycleDTO        `json:"lifecycle"`
+	Driver        DriverSelectionDTO  `json:"driver"`
+	Endpoints     []EndpointDTO       `json:"endpoints,omitempty"`
+	Segments      []RouteSegmentDTO   `json:"segments,omitempty"`
+	Resources     []ManagedResourceDTO `json:"resources,omitempty"`
+	Processes     []ProcessDTO        `json:"processes,omitempty"`
+	Findings      []DiagnosticDTO     `json:"findings,omitempty"`
+	LastVerified  string              `json:"last_verified,omitempty"`
+	LastOperation *OperationSummaryDTO `json:"last_operation,omitempty"`
+	CreatedAt     string              `json:"created_at"`
+	UpdatedAt     string              `json:"updated_at"`
+}
+
+// ConnectionSpecDTO describes the connection specification.
+type ConnectionSpecDTO struct {
+	Source     SourceDTO     `json:"source"`
+	Exposure   ExposureDTO   `json:"exposure"`
+	Protection ProtectionDTO `json:"protection"`
+}
+
+// DriverSelectionDTO describes the driver/provider choice.
+type DriverSelectionDTO struct {
+	ProviderID string            `json:"provider_id"`
+	AccountID  string            `json:"account_id,omitempty"`
+	Options    map[string]string `json:"options,omitempty"`
+}
+
+// EndpointDTO describes an observed endpoint.
+type EndpointDTO struct {
+	Address  string `json:"address"`
+	Protocol string `json:"protocol,omitempty"`
+	Public   bool   `json:"public"`
+}
+
+// RouteSegmentDTO describes one route segment.
+type RouteSegmentDTO struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Label  string `json:"label,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// ManagedResourceDTO describes a managed provider resource.
+type ManagedResourceDTO struct {
+	ID         string            `json:"id"`
+	Type       string            `json:"type"`
+	ExternalID string            `json:"external_id"`
+	Ownership  string            `json:"ownership"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+}
+
+// ProcessDTO describes a managed process.
+type ProcessDTO struct {
+	PID            int    `json:"pid"`
+	ConnectionID   string `json:"connection_id"`
+	ExecutablePath string `json:"executable_path,omitempty"`
+	Status         string `json:"status"`
+}
+
+// OperationSummaryDTO is a brief operation view for connection detail.
+type OperationSummaryDTO struct {
+	ID        string `json:"id"`
+	Intent    string `json:"intent"`
+	State     string `json:"state"`
+	StartedAt string `json:"started_at"`
+}
+
 // ProviderDTO is the view of a provider sent over IPC.
 type ProviderDTO struct {
-	ID            string               `json:"id"`
-	Name          string               `json:"name"`
-	DisplayName   string               `json:"display_name"`
-	Authenticated bool                 `json:"authenticated"`
-	Accounts      []ProviderAccountDTO `json:"accounts,omitempty"`
+	ID              string               `json:"id"`
+	Name            string               `json:"name"`
+	DisplayName     string               `json:"display_name"`
+	Authenticated   bool                 `json:"authenticated"`
+	Accounts        []ProviderAccountDTO `json:"accounts,omitempty"`
+	Availability    string               `json:"availability"`     // "ready", "unconfigured", "binary_missing", "degraded"
+	Readiness       string               `json:"readiness"`        // "ready", "needs_auth", "needs_config", "error"
+	Capabilities    *CapabilitySetDTO    `json:"capabilities,omitempty"`
+	LastError       string               `json:"last_error,omitempty"`
+	RestartRequired bool                 `json:"restart_required,omitempty"`
+}
+
+// CapabilitySetDTO describes provider capabilities in a versioned, serializable form.
+type CapabilitySetDTO struct {
+	TemporaryAddresses bool     `json:"temporary_addresses"`
+	CustomHostnames    bool     `json:"custom_hostnames"`
+	PrivateExposure    bool     `json:"private_exposure"`
+	ManagedDNS         bool     `json:"managed_dns"`
+	ProtectionModes    []string `json:"protection_modes"`
+	Protocols          []string `json:"protocols"`
+	TelemetrySupported bool     `json:"telemetry_supported"`
+	MaxConnectors      int      `json:"max_connectors"`
+	ExpirationMaxSecs  int      `json:"expiration_max_secs,omitempty"`
 }
 
 // ProviderAccountDTO is a selectable, non-secret provider account summary.
@@ -66,13 +156,58 @@ type ConfigureProviderAccountResponse struct {
 
 // EventDTO is an event delivered via SSE.
 type EventDTO struct {
-	Sequence     int64       `json:"seq"`
-	OperationID  string      `json:"operation_id,omitempty"`
-	ConnectionID string      `json:"connection_id,omitempty"`
-	Type         string      `json:"type"`
-	Stage        string      `json:"stage,omitempty"`
-	Timestamp    string      `json:"timestamp"`
-	Data         interface{} `json:"data"`
+	Sequence     int64  `json:"seq"`
+	OperationID  string `json:"operation_id,omitempty"`
+	ConnectionID string `json:"connection_id,omitempty"`
+	Type         string `json:"type"`
+	Stage        string `json:"stage,omitempty"`
+	Timestamp    string `json:"timestamp"`
+
+	// Typed payloads — at most one will be non-nil per event.
+	Operation  *OperationEventDTO  `json:"operation,omitempty"`
+	Connection *ConnectionEventDTO `json:"connection,omitempty"`
+	Provider   *ProviderEventDTO   `json:"provider,omitempty"`
+	Diagnostic *DiagnosticEventDTO `json:"diagnostic,omitempty"`
+
+	// Legacy untyped data for backward compatibility.
+	// Deprecated: use typed fields above.
+	Data interface{} `json:"data,omitempty"`
+}
+
+// OperationEventDTO describes an operation lifecycle event.
+type OperationEventDTO struct {
+	OperationID string `json:"operation_id"`
+	Intent      string `json:"intent,omitempty"`
+	State       string `json:"state,omitempty"`
+	StepID      string `json:"step_id,omitempty"`
+	StepSummary string `json:"step_summary,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// ConnectionEventDTO describes a connection state change event.
+type ConnectionEventDTO struct {
+	ConnectionID string `json:"connection_id"`
+	DesiredState string `json:"desired_state,omitempty"`
+	RuntimeState string `json:"runtime_state,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// ProviderEventDTO describes a provider state change event.
+type ProviderEventDTO struct {
+	ProviderID  string `json:"provider_id"`
+	AccountID   string `json:"account_id,omitempty"`
+	Available   bool   `json:"available"`
+	LastError   string `json:"last_error,omitempty"`
+}
+
+// DiagnosticEventDTO describes a diagnostic finding or resolution.
+type DiagnosticEventDTO struct {
+	ConnectionID string `json:"connection_id"`
+	FindingID    string `json:"finding_id"`
+	Segment      string `json:"segment,omitempty"`
+	Severity     string `json:"severity,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	Resolved     bool   `json:"resolved"`
 }
 
 // --------------- plans ---------------
@@ -96,10 +231,10 @@ type StepDTO struct {
 	Destructive  bool   `json:"destructive"`
 	Irreversible bool   `json:"irreversible"`
 	// Execution state (populated during operation execution)
-	State        string `json:"state,omitempty"` // pending, running, succeeded, failed, compensated, skipped
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
-	Error        string `json:"error,omitempty"`
+	State       string `json:"state,omitempty"` // pending, running, succeeded, failed, compensated, skipped
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 // --------------- operations ---------------
@@ -228,7 +363,45 @@ type LifecycleDTO struct {
 // UpdateConnectionRequest is the request body for PATCH /v1/connections/{id}.
 // State transitions must exclusively use plan open/close endpoints.
 type UpdateConnectionRequest struct {
-	Name *string `json:"name,omitempty"`
+	ExpectedRevision uint64              `json:"expected_revision,omitempty"`
+	Name             *string             `json:"name,omitempty"`
+	Spec             *ConnectionSpecDTO  `json:"spec,omitempty"`
+	Driver           *DriverSelectionDTO `json:"driver,omitempty"`
+	Lifecycle        *LifecycleDTO       `json:"lifecycle,omitempty"`
+}
+
+// ProviderRecommendationRequest asks the supervisor to recommend a driver.
+type ProviderRecommendationRequest struct {
+	SourceKind       string `json:"source_kind,omitempty"`
+	ExposureMode     string `json:"exposure_mode,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
+	ProtectionKind   string `json:"protection_kind,omitempty"`
+	PreferredAccount string `json:"preferred_account,omitempty"`
+}
+
+// ProviderRecommendationResponse contains the recommendation result.
+type ProviderRecommendationResponse struct {
+	Recommended *ProviderChoiceDTO   `json:"recommended,omitempty"`
+	Alternatives []ProviderChoiceDTO `json:"alternatives,omitempty"`
+	Filtered     []FilteredChoiceDTO `json:"filtered,omitempty"`
+}
+
+// ProviderChoiceDTO describes one viable provider choice.
+type ProviderChoiceDTO struct {
+	ProviderID string `json:"provider_id"`
+	AccountID  string `json:"account_id,omitempty"`
+	Reasons    []string `json:"reasons,omitempty"`
+}
+
+// FilteredChoiceDTO describes a provider that was filtered out and why.
+type FilteredChoiceDTO struct {
+	ProviderID string `json:"provider_id"`
+	Reason     string `json:"reason"`
+}
+
+// OperationHistoryDTO contains a list of past operations.
+type OperationHistoryDTO struct {
+	Operations []OperationDTO `json:"operations"`
 }
 
 // --------------- discovery ---------------

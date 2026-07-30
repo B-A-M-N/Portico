@@ -20,12 +20,17 @@ func TestController_OwnedDirectoryOriginLifecycle(t *testing.T) {
 	controller.SetOriginManager(origin.NewManager())
 	profile := &core.ConnectionProfile{
 		Name: "owned-directory",
-		Source: core.SourceSpec{Kind: core.SourceDirectory, Directory: &core.DirectorySpec{
-			Path: root, Mode: core.DirectoryModeRead,
-		}},
-		Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
-		Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
-		Provider:   core.ProviderSelection{ProviderID: "mock"},
+		Kind: core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{Kind: core.SourceDirectory, Directory: &core.DirectorySpec{
+					Path: root, Mode: core.DirectoryModeRead,
+				}},
+				Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+			},
+		},
+		Driver: core.DriverSelection{ProviderID: "mock"},
 		Desired:    core.DesiredClosed,
 	}
 	if _, _, err := controller.CreateProfile(context.Background(), profile); err != nil {

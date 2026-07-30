@@ -19,6 +19,8 @@
 | `./portico supervisor run` | Start supervisor daemon |
 | `./portico list` | CLI list connections |
 
+**Systemd service:** `scripts/portico-supervisor.service` — install with `cp scripts/portico-supervisor.service ~/.config/systemd/user/` then `systemctl --user enable --now portico-supervisor`.
+
 **Note:** `make build` builds the `portico` binary with version ldflags; `go build -o portico .` also works.
 
 ## Structure
@@ -70,6 +72,7 @@ internal/
 ## Testing
 
 - **Mock provider** (`provider/mock/`) implements `core.Provider` in-memory — used in controller tests and CLI handler.
+- **Ngrok provider tests** (`provider/ngrok/adapter_test.go`) cover identity, capabilities, planning, step execution (start/stop/verify/protection/delete), observation, repair, and removal.
 - **Controller tests** use `newTestController()` + `testProfile()` + `awaitOp()` patterns; `executor_failure_test.go` injects step-commit and terminal-commit failures with fake committers.
 - **Store tests** cover atomic step commits (`commit_test.go`) and migration-8 duplicate-ownership fixtures (`migration_test.go`).
 - **Also covered:** process manager (adoption, backoff, rotation), IPC SSE journal (replay across restart, monotonic sequences), TUI state machine (fake client, no socket), discovery/diagnostics (fake enumerators/probers), core deep-copy isolation.

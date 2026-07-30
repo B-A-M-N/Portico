@@ -250,16 +250,22 @@ func (c *Controller) CreateProfile(
 	if profile.ID == "" {
 		profile.ID = core.NewConnectionID()
 	}
-	if profile.Provider.AccountID == "" && profile.Provider.ProviderID != "" {
-		if accounts := c.registry.GetAccounts(profile.Provider.ProviderID); len(accounts) == 1 {
+	// For backward compatibility, use the accessor methods
+	provider := profile.GetProvider()
+	if provider.AccountID == "" && provider.ProviderID != "" {
+		if accounts := c.registry.GetAccounts(provider.ProviderID); len(accounts) == 1 {
 			// Make the implicit single-account choice durable. A profile created
 			// before a second account is added must continue using the account it
 			// was originally planned against.
-			profile.Provider.AccountID = accounts[0]
+			profile.Driver.AccountID = accounts[0]
 		}
 	}
-	if profile.Protection.Kind != "" && profile.Protection.Kind != core.ProtectionNone && profile.Protection.SessionTTL <= 0 {
-		profile.Protection.SessionTTL = core.DefaultProtectedSessionTTL
+	protection := profile.GetProtection()
+	if protection.Kind != "" && protection.Kind != core.ProtectionNone && protection.SessionTTL <= 0 {
+		// Update the session TTL in the spec
+		if profile.Spec.ServiceExposure != nil {
+			profile.Spec.ServiceExposure.Protection.SessionTTL = core.DefaultProtectedSessionTTL
+		}
 	}
 
 	// Validate before storing
@@ -648,7 +654,7 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	// Prepare/resolve the local origin before calling the provider. Owned
 	// origins are represented by an explicit plan step and are started only
 	// after the preview is accepted.
-	resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, openProfile.Source)
+	resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, openProfile.GetSource())
 	if err != nil {
 		return nil, fmt.Errorf("origin preparation: %w", err)
 	}
@@ -798,7 +804,7 @@ func (c *Controller) PlanClose(ctx context.Context, connID core.ConnectionID) (*
 		return nil, err
 	}
 
-	if sourceOwnsOrigin(profile.Source) {
+	if sourceOwnsOrigin(profile.GetSource()) {
 		appendStopOriginStep(plan)
 	}
 
@@ -859,14 +865,14 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 			Kind:    core.StepStopConnector,
 			Summary: "Stop connector process",
 			Technical: core.TechnicalOperation{
-				Provider: profile.Provider.ProviderID,
+				Provider: profile.GetProvider().ProviderID,
 				Type:     "stop_connector",
 			},
 			Destructive:  true,
 			Irreversible: false,
 		})
 	}
-	if sourceOwnsOrigin(profile.Source) {
+	if sourceOwnsOrigin(profile.GetSource()) {
 		steps = append(steps, core.PlanStep{
 			ID:          "delete-stop-origin",
 			Kind:        core.StepStopOrigin,
@@ -912,7 +918,7 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 			Kind:    stepKind,
 			Summary: fmt.Sprintf("%s %s", stepSummary, res.ExternalID),
 			Technical: core.TechnicalOperation{
-				Provider:   profile.Provider.ProviderID,
+				Provider:   profile.GetProvider().ProviderID,
 				Type:       stepType,
 				ResourceID: res.ExternalID,
 			},
@@ -938,7 +944,7 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 		Kind:    "finalize_local_deletion",
 		Summary: "Finalize local connection deletion",
 		Technical: core.TechnicalOperation{
-			Provider: profile.Provider.ProviderID,
+			Provider: profile.GetProvider().ProviderID,
 			Type:     "finalize_local_deletion",
 		},
 		Destructive:  true,
@@ -949,7 +955,7 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 		ID:              core.NewPlanID(),
 		ConnectionID:    connID,
 		ProfileRevision: profile.Revision,
-		Provider:        profile.Provider.ProviderID,
+		Provider:        profile.GetProvider().ProviderID,
 		Intent:          core.IntentDelete,
 		Steps:           steps,
 		CreatedAt:       time.Now().UTC(),
@@ -1013,12 +1019,12 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 			rt.Connector.Status == core.ConnectorStatusUnstable
 
 		if originNeedsRestart || connectorDown {
-			resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, profile.Source)
+			resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, profile.GetSource())
 			if err != nil {
 				return nil, fmt.Errorf("origin preparation: %w", err)
 			}
 			mode := "permanent"
-			if profile.Exposure.Mode == core.ExposureTemporary {
+			if profile.GetExposure().Mode == core.ExposureTemporary {
 				mode = "quick"
 			}
 			// Owned origin must come first so the connector has a healthy
@@ -1036,7 +1042,7 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 					Kind:    core.StepStartConnector,
 					Summary: "Restart connector",
 					Technical: core.TechnicalOperation{
-						Provider:   profile.Provider.ProviderID,
+						Provider:   profile.GetProvider().ProviderID,
 						Type:       "start_connector",
 						Parameters: map[string]string{"mode": mode, "origin_url": resolvedOrigin.URL},
 					},
@@ -1054,7 +1060,7 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 		ID:              core.NewPlanID(),
 		ConnectionID:    connID,
 		ProfileRevision: profile.Revision,
-		Provider:        profile.Provider.ProviderID,
+		Provider:        profile.GetProvider().ProviderID,
 		Intent:          core.IntentRepair,
 		Steps:           steps,
 		CreatedAt:       time.Now().UTC(),
@@ -1266,7 +1272,7 @@ func (c *Controller) Observe(ctx context.Context, connID core.ConnectionID) (*co
 		rt.ObservedRevision++
 		rt.LastObservedAt = time.Now().UTC()
 		// Always derive origin ownership from the profile.
-		ownsOrigin := sourceOwnsOrigin(profile.Source)
+		ownsOrigin := sourceOwnsOrigin(profile.GetSource())
 		if ownsOrigin && c.originManager != nil {
 			if ort, hasOrigin := c.originManager.Observe(connID); hasOrigin {
 				rt.Origin = ort

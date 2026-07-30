@@ -326,6 +326,23 @@ func (c *Client) GetOperation(ctx context.Context, operationID string) (*Operati
 	return &op, nil
 }
 
+// GetOperationHistory returns the operation history.
+func (c *Client) GetOperationHistory(ctx context.Context) (*OperationHistoryDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/operations", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var history OperationHistoryDTO
+	if err := json.NewDecoder(resp.Body).Decode(&history); err != nil {
+		return nil, err
+	}
+	return &history, nil
+}
+
 // ListProviders lists providers.
 func (c *Client) ListProviders(ctx context.Context) ([]ProviderDTO, error) {
 	resp, err := c.doRequest(ctx, "GET", "/v1/providers", nil)

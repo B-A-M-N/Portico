@@ -291,18 +291,45 @@ but are not represented by the current profile source union or wizard.
 
 **Current state**
 
-`AGENTS.md` still says there are no integration/e2e or import-boundary tests,
-but `test/integration/supervisor_lifecycle_test.go` and
-`test/architecture/import_boundaries_test.go` now exist. The document also
-needs a short account-store and multi-account note once the user-facing flow is
+`AGENTS.md` now correctly references integration and import-boundary tests
+(`test/integration/supervisor_lifecycle_test.go` and
+`test/architecture/import_boundaries_test.go`). The document still needs a
+short account-store and multi-account note once the user-facing flow is
 complete.
 
 **Implementation and acceptance**
 
-- Correct those testing claims when the corresponding tests remain in place.
+- ~~Correct those testing claims when the corresponding tests remain in place.~~ (done)
 - Keep README capability language aligned with the actual Cloudflare matrix.
 - Add a concise operator guide for account setup, backup, key rotation,
   operation recovery, and event resynchronization.
+
+### Completed remediation items
+
+The following audit findings have been addressed in recent commits:
+
+- **CSRF protection** (`builtin_filebrowser.go`): HMAC-based CSRF tokens are
+  generated per-form-action, validated with constant-time comparison, and
+  embedded in upload and delete forms.
+- **Provider PID checks removed** (`cloudflare/adapter.go`): Direct
+  `syscall.Kill` liveness checks replaced with process manager observation.
+  Process identity belongs to `process.Manager`.
+- **Idempotency activated** (`store/sqlite.go`, `ipc/server.go`,
+  `supervisor/supervisor.go`): The `idempotency_keys` table is now wired
+  through the IPC `Idempotency-Key` header. Duplicate applies return the
+  cached operation.
+- **Event-driven reconciliation** (`supervisor/supervisor.go`): The reconcile
+  loop now responds to connector exit/crash/unstable events via a buffered
+  channel with coalescing, in addition to the 15s periodic ticker.
+- **File browser HTTP method enforcement** (`builtin_filebrowser.go`): All
+  handlers enforce their expected HTTP method (GET for browse/download/api,
+  POST for upload/delete).
+- **Read-only command validation** (`scripts/validate_readonly_command.py`):
+  Standalone script checks command specs for write operations.
+- **Descriptor-relative filesystem** (`builtin_filebrowser.go`): File browser
+  now uses `openat()` with a pinned root file descriptor (O_PATH) to prevent
+  symlink retarget attacks. All path operations are fd-relative, eliminating
+  TOCTOU races. Legacy path-based resolution retained for BuiltinStatic.
 
 ### Release and operational verification
 
