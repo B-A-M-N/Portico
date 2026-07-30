@@ -403,13 +403,18 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			}
 
 			plan.Steps = append(plan.Steps,
+				core.PlanStep{ID: "cf-verify-origin", Kind: core.StepVerifyOrigin, Summary: "Verify local service is reachable",
+					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_origin",
+						Parameters: map[string]string{"origin_url": originURL}}},
 				core.PlanStep{ID: "cf-connector", Kind: core.StepStartConnector, Summary: "Start cloudflared quick tunnel",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "start_connector",
 						Parameters: map[string]string{
 							"mode":       "quick",
 							"origin_url": originURL,
 						}}},
-				core.PlanStep{ID: "cf-verify", Kind: core.StepVerifyEndpoint, Summary: "Verify public URL reachable"},
+				core.PlanStep{ID: "cf-verify", Kind: core.StepVerifyEndpoint, Summary: "Verify public URL reachable",
+					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_endpoint",
+						Parameters: map[string]string{"origin_url": originURL}}},
 			)
 			plan.Expected.State = core.RuntimeOpen
 			plan.Expected.PublicAddress = "temporary (assigned by Cloudflare)"
@@ -444,6 +449,13 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			plan.Steps = append(plan.Steps,
 				core.PlanStep{ID: "cf-validate", Kind: core.StepValidateAccount, Summary: "Validate Cloudflare account and zone",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "validate_account"}},
+				// The origin is probed before the first provider mutation.
+				// Tunnels, DNS records and Access policies are externally
+				// visible and survive a failed operation, so none of them may
+				// be created for an origin that is not answering.
+				core.PlanStep{ID: "cf-verify-origin", Kind: core.StepVerifyOrigin, Summary: "Verify local service is reachable",
+					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_origin",
+						Parameters: map[string]string{"origin_url": originURL}}},
 				core.PlanStep{ID: "cf-tunnel", Kind: core.StepCreateTunnel, Summary: fmt.Sprintf("Create named tunnel %q", tunnelName),
 					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "create_tunnel", Parameters: map[string]string{"name": tunnelName}},
 					Destructive: false, Irreversible: false,
@@ -514,7 +526,8 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 				core.PlanStep{ID: "cf-verify-connector", Kind: core.StepVerifyConnector, Summary: "Verify connector process",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_connector"}},
 				core.PlanStep{ID: "cf-verify", Kind: core.StepVerifyEndpoint, Summary: "Verify endpoint reachable",
-					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_endpoint"}},
+					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_endpoint",
+						Parameters: map[string]string{"origin_url": originURL}}},
 			)
 			plan.Expected.State = core.RuntimeOpen
 			plan.Expected.PublicAddress = hostname
@@ -1943,6 +1956,21 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		_, _, err := p.apiClient.Accounts(ctx, cf.AccountsListParams{})
 		if err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("account validation failed: %w", err)}, nil
+		}
+		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
+
+	case core.StepVerifyOrigin:
+		// Runs before any provider mutation. Failing here means no tunnel, DNS
+		// record or Access policy is created, so nothing externally visible is
+		// left behind pointing at a service that is not answering.
+		originURL := step.Technical.Parameters["origin_url"]
+		if originURL == "" {
+			return core.StepResult{StepID: step.ID, Succeeded: false,
+				Error: fmt.Errorf("cannot verify origin: plan did not carry a resolved origin URL")}, nil
+		}
+		if err := p.verifyLocalOrigin(ctx, originURL); err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false,
+				Error: fmt.Errorf("local service at %s is not reachable: %w", originURL, err)}, nil
 		}
 		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 

@@ -753,18 +753,35 @@ func insertStartOriginStep(plan *core.OperationPlan, originURL string) {
 			Technical: core.TechnicalOperation{Type: "stop_origin"},
 		},
 	}
-	for i, existing := range plan.Steps {
-		if existing.Kind == core.StepStartConnector {
-			plan.Steps = append(plan.Steps, core.PlanStep{})
-			copy(plan.Steps[i+1:], plan.Steps[i:])
-			plan.Steps[i] = step
-			return
-		}
+	// The origin must be running before the first step that depends on it.
+	// That is the origin verification step when the provider emits one, and
+	// otherwise the connector start. Anchoring only on StepStartConnector
+	// would place the start after a provider's origin probe and fail every
+	// owned-origin connection.
+	if i, ok := firstIndexOfKind(plan.Steps, core.StepVerifyOrigin, core.StepStartConnector); ok {
+		plan.Steps = append(plan.Steps, core.PlanStep{})
+		copy(plan.Steps[i+1:], plan.Steps[i:])
+		plan.Steps[i] = step
+		return
 	}
 	// A provider opening a connection must start a connector. Retaining the
 	// step at the end makes malformed provider plans visible during execution
 	// instead of performing an invisible side effect during preview.
 	plan.Steps = append(plan.Steps, step)
+}
+
+// firstIndexOfKind returns the index of the earliest step matching any of the
+// given kinds, so callers can anchor an insertion to whichever dependency
+// appears first in a provider's plan.
+func firstIndexOfKind(steps []core.PlanStep, kinds ...core.StepKind) (int, bool) {
+	for i, step := range steps {
+		for _, kind := range kinds {
+			if step.Kind == kind {
+				return i, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func appendStopOriginStep(plan *core.OperationPlan) {

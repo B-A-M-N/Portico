@@ -2,7 +2,9 @@ package cloudflare
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -344,5 +346,158 @@ func TestClassifyObservationErrorNeverTurnsUncertainLookupIntoMissing(t *testing
 				t.Fatalf("classification=%q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestOpenPlanVerifiesOriginBeforeAnyProviderMutation pins the sequencing
+// invariant of audit item 12.
+//
+// Tunnels, DNS records and Access policies are externally visible and outlive a
+// failed operation. Creating them for an origin that is not answering leaves
+// real Cloudflare resources pointing at a dead service, so the origin probe
+// must precede every provider mutation.
+func TestOpenPlanVerifiesOriginBeforeAnyProviderMutation(t *testing.T) {
+	mutations := map[core.StepKind]bool{
+		core.StepCreateTunnel:       true,
+		core.StepConfigureRoute:     true,
+		core.StepCreateDNSRecord:    true,
+		core.StepCreateAccessApp:    true,
+		core.StepCreateAccessPolicy: true,
+		core.StepStartConnector:     true,
+	}
+
+	for name, profile := range map[string]*core.ConnectionProfile{
+		"temporary": cfTestProfile(core.ExposureTemporary, "", core.ProtectionSpec{Kind: core.ProtectionNone}),
+		"permanent": cfTestProfile(core.ExposurePermanent, "demo.example.com", core.ProtectionSpec{Kind: core.ProtectionNone}),
+		"protected": cfTestProfile(core.ExposurePermanent, "demo.example.com", core.ProtectionSpec{
+			Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+		}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := cfPlanTestProvider()
+			plan, err := p.Plan(context.Background(), core.DesiredConnection{
+				Profile: profile,
+				Origin:  &core.ResolvedOrigin{URL: "http://127.0.0.1:3000"},
+			})
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+
+			verifyIdx := -1
+			for i, step := range plan.Steps {
+				if step.Kind == core.StepVerifyOrigin {
+					verifyIdx = i
+					break
+				}
+			}
+			if verifyIdx < 0 {
+				t.Fatalf("open plan has no %s step:\n%s", core.StepVerifyOrigin, formatSteps(plan.Steps))
+			}
+			if got := plan.Steps[verifyIdx].Technical.Parameters["origin_url"]; got != "http://127.0.0.1:3000" {
+				t.Fatalf("verify-origin step carries origin_url %q", got)
+			}
+
+			for i, step := range plan.Steps {
+				if mutations[step.Kind] && i < verifyIdx {
+					t.Fatalf("provider mutation %s at index %d precedes origin verification at %d:\n%s",
+						step.Kind, i, verifyIdx, formatSteps(plan.Steps))
+				}
+			}
+
+			// The final endpoint verification must also carry the origin so the
+			// executor's origin probe is not silently skipped.
+			for _, step := range plan.Steps {
+				if step.Kind == core.StepVerifyEndpoint {
+					if step.Technical.Parameters["origin_url"] == "" {
+						t.Fatal("verify-endpoint step does not carry origin_url, so the origin probe is skipped")
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestVerifyOriginStepFailsWhenOriginUnreachable ensures the step actually
+// probes, rather than passing vacuously.
+func TestVerifyOriginStepFailsWhenOriginUnreachable(t *testing.T) {
+	p := cfPlanTestProvider()
+
+	// Port 1 on loopback refuses connections.
+	res, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
+		ID:   "cf-verify-origin",
+		Kind: core.StepVerifyOrigin,
+		Technical: core.TechnicalOperation{
+			Parameters: map[string]string{"origin_url": "http://127.0.0.1:1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned transport error: %v", err)
+	}
+	if res.Succeeded {
+		t.Fatal("verify-origin succeeded against an unreachable origin")
+	}
+	if res.Error == nil {
+		t.Fatal("failed verify-origin carries no error")
+	}
+}
+
+// TestVerifyOriginStepRefusesMissingOriginURL ensures a plan that forgot to
+// carry the resolved origin fails loudly instead of passing vacuously, which is
+// how the probe came to be skipped in the first place.
+func TestVerifyOriginStepRefusesMissingOriginURL(t *testing.T) {
+	p := cfPlanTestProvider()
+	res, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
+		ID: "cf-verify-origin", Kind: core.StepVerifyOrigin,
+		Technical: core.TechnicalOperation{Parameters: map[string]string{}},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned transport error: %v", err)
+	}
+	if res.Succeeded {
+		t.Fatal("verify-origin succeeded with no origin URL to probe")
+	}
+}
+
+func formatSteps(steps []core.PlanStep) string {
+	var b strings.Builder
+	for i, s := range steps {
+		fmt.Fprintf(&b, "  %d. %s (%s)\n", i, s.ID, s.Kind)
+	}
+	return b.String()
+}
+
+// cfPlanTestProvider builds a Provider wired with fakes and a configured zone,
+// so permanent plans are producible without a live Cloudflare account.
+func cfPlanTestProvider() *Provider {
+	return &Provider{
+		accountID:     "account-test",
+		zoneID:        "zone-test",
+		tunnels:       &fakeTunnelManager{},
+		dns:           &fakeDNSManager{},
+		access:        &fakeAccessManager{},
+		connectorProc: fakeConnectorProcessService{},
+		connections:   make(map[core.ConnectionID]*cfConnection),
+	}
+}
+
+// cfTestProfile builds a service-exposure profile for plan-shape tests.
+func cfTestProfile(mode core.ExposureMode, hostname string, protection core.ProtectionSpec) *core.ConnectionProfile {
+	return &core.ConnectionProfile{
+		ID:       "conn-1",
+		Name:     "test",
+		Revision: 1,
+		Kind:     core.ConnectionServiceExposure,
+		Spec: core.ConnectionSpec{
+			ServiceExposure: &core.ServiceExposureSpec{
+				Source: core.SourceSpec{
+					Kind:     core.SourceExisting,
+					Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP},
+				},
+				Exposure:   core.ExposureSpec{Mode: mode, Protocol: core.ProtocolHTTP, RequestedAddress: hostname},
+				Protection: protection,
+			},
+		},
+		Driver:  core.DriverSelection{ProviderID: "cloudflare"},
+		Desired: core.DesiredOpen,
 	}
 }

@@ -126,7 +126,12 @@ const (
 	// StepStartOrigin starts a local service owned by Portico before the
 	// provider connector is started. It is deliberately separate from the
 	// connector so plans show both lifecycles and can compensate safely.
-	StepStartOrigin           StepKind = "start_origin"
+	StepStartOrigin StepKind = "start_origin"
+	// StepVerifyOrigin probes the resolved local origin before any provider
+	// resource is created. Provider mutations are externally visible and
+	// outlive a failed operation, so a dead origin must stop the plan before
+	// a tunnel, DNS record or Access policy is published for it.
+	StepVerifyOrigin          StepKind = "verify_origin"
 	StepVerifyConnector       StepKind = "verify_connector"
 	StepVerifyEndpoint        StepKind = "verify_endpoint"
 	StepStopConnector         StepKind = "stop_connector"

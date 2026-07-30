@@ -89,3 +89,61 @@ func TestController_OwnedDirectoryOriginLifecycle(t *testing.T) {
 		t.Fatal("origin still accepted requests after close")
 	}
 }
+
+// TestStartOriginPrecedesOriginVerification pins the ordering dependency
+// between the controller's origin lifecycle and a provider's origin probe.
+//
+// insertStartOriginStep used to anchor only on StepStartConnector. Once
+// providers began emitting a StepVerifyOrigin before their first mutation, that
+// anchor placed the origin start *after* the probe, so every owned-origin
+// connection would have failed verification against a service Portico had not
+// started yet.
+func TestStartOriginPrecedesOriginVerification(t *testing.T) {
+	plan := &core.OperationPlan{Steps: []core.PlanStep{
+		{ID: "p-validate", Kind: core.StepValidateAccount},
+		{ID: "p-verify-origin", Kind: core.StepVerifyOrigin},
+		{ID: "p-tunnel", Kind: core.StepCreateTunnel},
+		{ID: "p-connector", Kind: core.StepStartConnector},
+	}}
+
+	insertStartOriginStep(plan, "http://127.0.0.1:3000")
+
+	idx := func(kind core.StepKind) int {
+		for i, s := range plan.Steps {
+			if s.Kind == kind {
+				return i
+			}
+		}
+		return -1
+	}
+
+	start := idx(core.StepStartOrigin)
+	verify := idx(core.StepVerifyOrigin)
+	if start < 0 {
+		t.Fatal("start_origin step was not inserted")
+	}
+	if start > verify {
+		t.Fatalf("start_origin at %d runs after verify_origin at %d; the probe would hit a service that has not been started", start, verify)
+	}
+	if start > idx(core.StepCreateTunnel) {
+		t.Fatal("start_origin runs after the first provider mutation")
+	}
+}
+
+// TestStartOriginStillAnchorsToConnectorWithoutVerifyStep keeps the fallback
+// behaviour for providers that emit no origin verification step.
+func TestStartOriginStillAnchorsToConnectorWithoutVerifyStep(t *testing.T) {
+	plan := &core.OperationPlan{Steps: []core.PlanStep{
+		{ID: "p-tunnel", Kind: core.StepCreateTunnel},
+		{ID: "p-connector", Kind: core.StepStartConnector},
+	}}
+
+	insertStartOriginStep(plan, "http://127.0.0.1:3000")
+
+	if plan.Steps[1].Kind != core.StepStartOrigin {
+		t.Fatalf("expected start_origin immediately before the connector, got %v", plan.Steps[1].Kind)
+	}
+	if plan.Steps[2].Kind != core.StepStartConnector {
+		t.Fatalf("connector step displaced: %v", plan.Steps[2].Kind)
+	}
+}
