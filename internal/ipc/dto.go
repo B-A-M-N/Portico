@@ -326,13 +326,26 @@ type RecoveryAction struct {
 // It uses a versioned tagged union so that new source, exposure, protection,
 // provider, and lifecycle fields can be added without breaking the contract.
 type CreateConnectionRequest struct {
-	Version    int                  `json:"version"`
-	Name       string               `json:"name"`
-	Source     SourceDTO            `json:"source"`
-	Exposure   ExposureDTO          `json:"exposure"`
-	Protection ProtectionDTO        `json:"protection"`
-	Provider   ProviderSelectionDTO `json:"provider"`
-	Lifecycle  LifecycleDTO         `json:"lifecycle"`
+	Version int    `json:"version"`
+	Name    string `json:"name"`
+	// Kind selects the connection kind. It defaults to service exposure, so
+	// existing callers are unaffected.
+	Kind        string               `json:"kind,omitempty"`
+	Source      SourceDTO            `json:"source"`
+	Exposure    ExposureDTO          `json:"exposure"`
+	Protection  ProtectionDTO        `json:"protection"`
+	Provider    ProviderSelectionDTO `json:"provider"`
+	Lifecycle   LifecycleDTO         `json:"lifecycle"`
+	PortForward *PortForwardDTO      `json:"port_forward,omitempty"`
+}
+
+// PortForwardDTO describes a port forward connection.
+type PortForwardDTO struct {
+	LocalPort  int    `json:"local_port"`
+	RemoteHost string `json:"remote_host"`
+	RemotePort int    `json:"remote_port"`
+	Protocol   string `json:"protocol,omitempty"`
+	Direction  string `json:"direction,omitempty"`
 }
 
 // SourceDTO describes the local service to expose.

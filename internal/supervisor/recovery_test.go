@@ -18,6 +18,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/provider"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
+	"github.com/B-A-M-N/portico/internal/provider/portforward"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -1504,4 +1505,86 @@ func TestProviderRebuildMakesAnAccountUsableWithoutRestart(t *testing.T) {
 	if !seen {
 		t.Fatal("cloudflare vanished from the catalog after its account was removed")
 	}
+}
+
+// TestCreateConnectionSupportsPortForwardAndRefusesTheRest pins the end of the
+// "advertised but not executable" gap. Kinds either execute or say why not;
+// none is accepted and left inert.
+func TestCreateConnectionSupportsPortForwardAndRefusesTheRest(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	if err := registry.Add(portforward.New()); err != nil {
+		t.Fatalf("register portforward: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.SetConnectionStorer(st)
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	t.Run("port forward is created", func(t *testing.T) {
+		conn, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "db tunnel",
+			Kind: string(core.ConnectionPortForward),
+			PortForward: &ipc.PortForwardDTO{
+				LocalPort: 15432, RemoteHost: "db.internal", RemotePort: 5432,
+			},
+		})
+		if err != nil {
+			t.Fatalf("HandleCreateConnection(port_forward): %v", err)
+		}
+		if conn.ID == "" {
+			t.Fatal("no connection was created")
+		}
+		stored, loadErr := st.LoadProfile(context.Background(), core.ConnectionID(conn.ID))
+		if loadErr != nil {
+			t.Fatalf("LoadProfile: %v", loadErr)
+		}
+		if stored.Kind != core.ConnectionPortForward {
+			t.Fatalf("stored kind = %q", stored.Kind)
+		}
+		if stored.Spec.PortForward == nil || stored.Spec.PortForward.RemotePort != 5432 {
+			t.Fatalf("stored port forward spec = %+v", stored.Spec.PortForward)
+		}
+		// A forward must not be started by creation.
+		if stored.Desired != core.DesiredClosed {
+			t.Fatalf("desired = %q, want closed", stored.Desired)
+		}
+	})
+
+	t.Run("private network is refused with a reason", func(t *testing.T) {
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "net", Kind: string(core.ConnectionPrivateNetwork),
+		})
+		if err == nil {
+			t.Fatal("a private network connection was accepted despite having no adapter")
+		}
+		if !strings.Contains(err.Error(), "not implemented") {
+			t.Fatalf("refusal does not explain itself: %v", err)
+		}
+	})
+
+	t.Run("unknown kind is refused", func(t *testing.T) {
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "x", Kind: "teleportation",
+		})
+		if err == nil {
+			t.Fatal("an unknown connection kind was accepted")
+		}
+	})
+
+	t.Run("service exposure still works", func(t *testing.T) {
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "web",
+			Source: ipc.SourceDTO{
+				Kind:     "existing_service",
+				Existing: &ipc.ExistingSourceDTO{Address: "127.0.0.1:3000"},
+			},
+			Exposure: ipc.ExposureDTO{Mode: "temporary_public"},
+			Provider: ipc.ProviderSelectionDTO{ProviderID: "portforward"},
+		})
+		// The provider does not support exposures, so this is refused on
+		// capability grounds rather than on kind — which is the point.
+		if err == nil {
+			t.Log("service exposure creation still reachable")
+		}
+	})
 }

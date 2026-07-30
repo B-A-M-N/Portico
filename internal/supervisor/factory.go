@@ -20,6 +20,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/provider/mock"
 	"github.com/B-A-M-N/portico/internal/provider/ngrok"
 	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
+	"github.com/B-A-M-N/portico/internal/provider/portforward"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -81,6 +82,11 @@ func RunSupervisor(ctx context.Context) error {
 	// validated against the concrete adapter during startup; doing it before
 	// adapter construction would advertise credentials it cannot actually use.
 	registerProviderCatalog(reg)
+	// A local forward needs no account, binary or remote service, so it is
+	// always available.
+	if err := reg.Add(portforward.New()); err != nil {
+		slog.Warn("port forward provider register failed", "err", err)
+	}
 	registerOpenAITunnel(reg, &processManagerAdapter{mgr: procMgr})
 	hasRealProvider := registerCloudflareWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st)
 	hasRealProvider = registerNgrokWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st) || hasRealProvider

@@ -793,6 +793,24 @@ func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, 
 }
 
 func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	// The kind is no longer hardcoded. Kinds that cannot be executed are
+	// refused with the reason rather than accepted and left inert.
+	switch core.ConnectionKind(req.Kind) {
+	case "", core.ConnectionServiceExposure:
+		// handled below
+	case core.ConnectionPortForward:
+		return h.createPortForward(req)
+	case core.ConnectionPrivateNetwork:
+		return nil, core.ErrValidation(
+			"private network connections are not implemented: Portico ships no adapter that can join or expose " +
+				"through a private network yet")
+	case core.ConnectionClientTunnel:
+		return nil, core.ErrValidation(
+			"client tunnel connections are created through their provider's setup flow, not this endpoint")
+	default:
+		return nil, core.ErrValidation(fmt.Sprintf("unknown connection kind %q", req.Kind))
+	}
+
 	// Convert IPC DTO to core profile.
 	profile := &core.ConnectionProfile{
 		Name: req.Name,
@@ -1105,6 +1123,63 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 	}
 
 	return h.HandleGetConnection(id)
+}
+
+// createPortForward creates a local port forward connection.
+func (h *supervisorHandler) createPortForward(req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	if req.PortForward == nil {
+		return nil, core.ErrValidation("a port forward connection requires a port_forward specification")
+	}
+	pf := req.PortForward
+
+	direction := core.PortForwardDirection(pf.Direction)
+	if direction == "" {
+		direction = core.PortForwardLocal
+	}
+	protocol := core.Protocol(pf.Protocol)
+	if protocol == "" {
+		protocol = core.ProtocolTCP
+	}
+
+	providerID := core.ProviderID(req.Provider.ProviderID)
+	if providerID == "" {
+		providerID = "portforward"
+	}
+
+	profile := &core.ConnectionProfile{
+		Name: req.Name,
+		Kind: core.ConnectionPortForward,
+		Spec: core.ConnectionSpec{
+			PortForward: &core.PortForwardSpec{
+				LocalPort:  pf.LocalPort,
+				RemoteHost: pf.RemoteHost,
+				RemotePort: pf.RemotePort,
+				Protocol:   protocol,
+				Direction:  direction,
+			},
+		},
+		Driver: core.DriverSelection{
+			ProviderID: providerID,
+			AccountID:  core.ProviderAccountID(req.Provider.AccountID),
+		},
+		Lifecycle: core.LifecycleSpec{
+			AutoStart:    req.Lifecycle.AutoStart,
+			OnDisconnect: core.DisconnectPolicy(req.Lifecycle.OnDisconnect),
+		},
+		Desired: core.DesiredClosed,
+	}
+	// The identity is assigned by CreateProfile, which validates the completed
+	// profile; validating here would fail on the not-yet-assigned ID.
+	created, _, err := h.sup.controller.CreateProfile(context.Background(), profile)
+	if err != nil {
+		return nil, err
+	}
+	if h.sup.ipcServer != nil {
+		if dispatchErr := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); dispatchErr != nil {
+			slog.Warn("dispatch create event", "connection", created.ID, "err", dispatchErr)
+		}
+	}
+	return h.HandleGetConnection(string(created.ID))
 }
 
 // HandleCloneConnection copies a connection's desired state into a new
