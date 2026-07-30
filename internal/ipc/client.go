@@ -59,6 +59,14 @@ type APIStatusError struct {
 	Status  int
 	Code    string
 	Message string
+	// The supervisor already returns a structured error carrying an
+	// explanation, concrete recovery actions and technical detail. Flattening
+	// it into a single string discarded everything a caller needs to present
+	// an intervention rather than a raw failure.
+	Explanation      string
+	RecoveryActions  []RecoveryAction
+	TechnicalDetails string
+	Retryable        bool
 }
 
 // Error implements the error interface.
@@ -85,9 +93,10 @@ func checkResponse(resp *http.Response) error {
 		if err := json.Unmarshal(body, &apiErr); err == nil && (apiErr.Code != "" || apiErr.Summary != "") {
 			statusErr.Code = apiErr.Code
 			statusErr.Message = apiErr.Summary
-			if apiErr.Explanation != "" {
-				statusErr.Message += ": " + apiErr.Explanation
-			}
+			statusErr.Explanation = apiErr.Explanation
+			statusErr.RecoveryActions = apiErr.RecoveryActions
+			statusErr.TechnicalDetails = apiErr.TechnicalDetails
+			statusErr.Retryable = apiErr.Retryable
 		} else {
 			statusErr.Message = strings.TrimSpace(string(body))
 		}

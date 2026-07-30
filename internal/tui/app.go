@@ -156,7 +156,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = msg.Err
 				m.screen = ScreenRecovery
 			} else {
-				m.status = fmt.Sprintf("snapshot refresh failed: %v", msg.Err)
+				m.status = statusLine("snapshot refresh failed", msg.Err)
 			}
 			return m, nil
 		}
@@ -201,7 +201,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case planLoadedMsg:
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("plan failed: %v", msg.Err)
+			m.status = statusLine("plan failed", msg.Err)
 			return m, nil
 		}
 		m.status = ""
@@ -218,7 +218,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case planAppliedMsg:
 		m.applying = false
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("apply failed: %v", msg.Err)
+			m.status = statusLine("apply failed", msg.Err)
 			return m, nil
 		}
 		m.status = ""
@@ -230,7 +230,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case operationLoadedMsg:
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("operation refresh failed: %v", msg.Err)
+			m.status = statusLine("operation refresh failed", msg.Err)
 			return m, nil
 		}
 		m.operation = msg.Operation
@@ -258,7 +258,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Err != nil {
 			// Keep whatever detail is already on screen; report the staleness
 			// rather than blanking the view.
-			m.status = fmt.Sprintf("connection detail unavailable: %v", msg.Err)
+			m.status = statusLine("connection detail unavailable", msg.Err)
 			return m, nil
 		}
 		m.connectionDetail = msg.Detail
@@ -269,7 +269,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case diagnosticsMsg:
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("diagnostics failed: %v", msg.Err)
+			m.status = statusLine("diagnostics failed", msg.Err)
 			return m, nil
 		}
 		m.status = ""
@@ -284,7 +284,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case discoveryMsg:
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("discovery failed: %v", msg.Err)
+			m.status = statusLine("discovery failed", msg.Err)
 			m.screen = ScreenHome
 			m.clearNav()
 			return m, nil
@@ -299,7 +299,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.operationsAvailable = false
 			m.operationsUnavailable = msg.Err.Error()
 			m.operations = nil
-			m.status = fmt.Sprintf("operations load failed: %v", msg.Err)
+			m.status = statusLine("operations load failed", msg.Err)
 			return m, nil
 		}
 		m.operations = msg.Operations
@@ -347,14 +347,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wizard != nil {
 			cmd := m.wizard.HandleCreated(msg)
 			if msg.Err != nil {
-				m.status = fmt.Sprintf("create failed: %v", msg.Err)
+				m.status = statusLine("create failed", msg.Err)
 				return m, nil
 			}
 			m.status = ""
 			return m, tea.Batch(cmd, m.requestSnapshot())
 		}
 		if msg.Err != nil {
-			m.status = fmt.Sprintf("create failed: %v", msg.Err)
+			m.status = statusLine("create failed", msg.Err)
 			return m, nil
 		}
 		m.status = ""
@@ -364,7 +364,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wizard != nil {
 			cmd := m.wizard.HandlePlanLoaded(msg)
 			if msg.Err != nil {
-				m.status = fmt.Sprintf("plan failed: %v", msg.Err)
+				m.status = statusLine("plan failed", msg.Err)
 			}
 			return m, cmd
 		}
@@ -374,7 +374,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.wizard != nil {
 			cmd := m.wizard.HandlePlanApplied(msg)
 			if msg.Err != nil {
-				m.status = fmt.Sprintf("apply failed: %v", msg.Err)
+				m.status = statusLine("apply failed", msg.Err)
 			}
 			return m, cmd
 		}
@@ -1317,10 +1317,35 @@ func (m *Model) renderLoading() string {
 		Render("Portico — connecting to supervisor...")
 }
 
+// renderError presents a failure as an intervention: what happened, why, and
+// what to do next, with the original error text kept under technical details
+// rather than shown as the primary message.
 func (m *Model) renderError() string {
-	return lipgloss.NewStyle().
-		Foreground(m.theme.Intervention).
-		Render(fmt.Sprintf("Error: %s", m.err))
+	ufe := describeError(m.err)
+
+	var b strings.Builder
+	b.WriteString(lipgloss.NewStyle().Foreground(m.theme.Intervention).Render(ufe.Summary))
+	if ufe.Explanation != "" {
+		b.WriteString("\n\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(m.theme.Text).Render(ufe.Explanation))
+	}
+	if len(ufe.NextActions) > 0 {
+		b.WriteString("\n\nWhat you can do:\n")
+		for _, action := range ufe.NextActions {
+			b.WriteString(lipgloss.NewStyle().Foreground(m.theme.Text).Render("  • " + action))
+			b.WriteString("\n")
+		}
+	}
+	if ufe.Technical != "" && ufe.Technical != ufe.Summary {
+		b.WriteString("\n")
+		b.WriteString(lipgloss.NewStyle().Foreground(m.theme.Muted).
+			Render("Technical details: " + ufe.Technical))
+		b.WriteString("\n")
+	}
+	if ufe.Code != "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(m.theme.Muted).Render("Code: " + ufe.Code))
+	}
+	return b.String()
 }
 
 func (m *Model) renderRecovery() string {
