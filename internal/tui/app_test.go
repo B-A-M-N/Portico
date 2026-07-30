@@ -34,6 +34,7 @@ type fakeClient struct {
 	detail    *ipc.ConnectionDetailDTO
 	detailErr error
 	history   *ipc.OperationHistoryDTO
+	logs      *ipc.ConnectionLogsDTO
 
 	snapshotCalls  int
 	planOpenCalls  int
@@ -42,6 +43,15 @@ type fakeClient struct {
 	createCalls    int
 	detailCalls    int
 	detailIDs      []string
+}
+
+func (f *fakeClient) ConnectionLogs(_ context.Context, _ string, _ int) (*ipc.ConnectionLogsDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.logs != nil {
+		return f.logs, nil
+	}
+	return &ipc.ConnectionLogsDTO{Available: true}, nil
 }
 
 func (f *fakeClient) GetConnectionDetail(_ context.Context, id string) (*ipc.ConnectionDetailDTO, error) {
@@ -1116,10 +1126,11 @@ func TestEnterOnConnectionLoadsAuthoritativeDetail(t *testing.T) {
 		t.Fatal("entering inspect issued no command to load connection detail")
 	}
 
-	msg := cmd()
-	detailMsg, ok := msg.(connectionDetailMsg)
+	// Entering inspect now loads detail and logs together, so the command is a
+	// batch; find the detail message within it.
+	detailMsg, ok := findDetailMsg(cmd())
 	if !ok {
-		t.Fatalf("command produced %T, want connectionDetailMsg", msg)
+		t.Fatal("entering inspect issued no command that loads connection detail")
 	}
 	if detailMsg.ConnectionID != "conn-1" {
 		t.Fatalf("detail requested for %q, want conn-1", detailMsg.ConnectionID)
@@ -1512,4 +1523,80 @@ func TestCredentialNeverAppearsInAnyRenderedView(t *testing.T) {
 	if strings.Contains(m.providerSetupError, setupProbeSecret) {
 		t.Fatalf("credential leaked into the setup error: %q", m.providerSetupError)
 	}
+}
+
+// TestLogsTabDistinguishesUnreadableFromEmpty pins the last of the
+// authoritative-empty-state fixes. An unreadable log subsystem must not render
+// as "the connector produced no output".
+func TestLogsTabDistinguishesUnreadableFromEmpty(t *testing.T) {
+	openLogsTab := func(t *testing.T, logs *ipc.ConnectionLogsDTO) string {
+		t.Helper()
+		m := readyModel(&fakeClient{logs: logs}, testSnapshot())
+		next, _ := m.Update(keyMsg("enter"))
+		m = next.(Model)
+		next, _ = m.Update(connectionLogsMsg{ConnectionID: "conn-1", Logs: logs})
+		m = next.(Model)
+		for range 4 {
+			next, _ = m.Update(keyMsg("right"))
+			m = next.(Model)
+		}
+		return m.View().Content
+	}
+
+	t.Run("read and empty", func(t *testing.T) {
+		view := openLogsTab(t, &ipc.ConnectionLogsDTO{Available: true})
+		if !strings.Contains(view, "has not written any output yet") {
+			t.Fatalf("empty logs not reported authoritatively:\n%s", view)
+		}
+		if strings.Contains(view, "unavailable") {
+			t.Fatalf("readable empty logs reported as unavailable:\n%s", view)
+		}
+	})
+
+	t.Run("unreadable", func(t *testing.T) {
+		view := openLogsTab(t, &ipc.ConnectionLogsDTO{
+			Available:   false,
+			Unavailable: "no connector process is being supervised",
+		})
+		if !strings.Contains(view, "unavailable") {
+			t.Fatalf("unreadable logs not reported as such:\n%s", view)
+		}
+		if !strings.Contains(view, "does not mean the connector produced no output") {
+			t.Fatalf("unreadable logs do not disclaim emptiness:\n%s", view)
+		}
+	})
+
+	t.Run("lines are rendered with their stream", func(t *testing.T) {
+		view := openLogsTab(t, &ipc.ConnectionLogsDTO{
+			Available: true,
+			Lines: []ipc.LogLineDTO{
+				{Stream: "stdout", Text: "INF Connection established"},
+				{Stream: "stderr", Text: "WRN retrying"},
+			},
+		})
+		for _, want := range []string{"stdout", "INF Connection established", "stderr", "WRN retrying"} {
+			if !strings.Contains(view, want) {
+				t.Fatalf("log view missing %q:\n%s", want, view)
+			}
+		}
+	})
+}
+
+// findDetailMsg locates a connectionDetailMsg in a message that may be a batch
+// of several commands.
+func findDetailMsg(msg tea.Msg) (connectionDetailMsg, bool) {
+	switch typed := msg.(type) {
+	case connectionDetailMsg:
+		return typed, true
+	case tea.BatchMsg:
+		for _, cmd := range typed {
+			if cmd == nil {
+				continue
+			}
+			if found, ok := findDetailMsg(cmd()); ok {
+				return found, true
+			}
+		}
+	}
+	return connectionDetailMsg{}, false
 }

@@ -222,6 +222,30 @@ func (c *Client) CloneConnection(ctx context.Context, id string, req CloneConnec
 	return &conn, nil
 }
 
+// ConnectionLogs fetches a bounded, redacted tail of a connection's connector
+// output.
+func (c *Client) ConnectionLogs(ctx context.Context, id string, lines int) (*ConnectionLogsDTO, error) {
+	path := "/v1/connections/" + id + "/logs"
+	if lines > 0 {
+		path += "?lines=" + strconv.Itoa(lines)
+	}
+	resp, err := c.doRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var logs ConnectionLogsDTO
+	if err := json.NewDecoder(resp.Body).Decode(&logs); err != nil {
+		return nil, err
+	}
+	return &logs, nil
+}
+
 // CreateConnection creates a new connection.
 func (c *Client) CreateConnection(ctx context.Context, req CreateConnectionRequest) (*ConnectionDTO, error) {
 	body, err := json.Marshal(req)

@@ -74,6 +74,9 @@ func (nullHandler) HandleRefreshDiscovery() (*DiscoveryDTO, error) { return nil,
 func (nullHandler) HandleDiagnostics(string) ([]DiagnosticDTO, error) {
 	return nil, nil
 }
+func (nullHandler) HandleConnectionLogs(string, int) (*ConnectionLogsDTO, error) {
+	return &ConnectionLogsDTO{}, nil
+}
 func (nullHandler) HandleSupportExport() (*SupportExportDTO, error) {
 	return &SupportExportDTO{}, nil
 }

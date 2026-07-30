@@ -64,6 +64,7 @@ type RequestHandler interface {
 	HandleDiscovery() (*DiscoveryDTO, error)
 	HandleRefreshDiscovery() (*DiscoveryDTO, error)
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
+	HandleConnectionLogs(id string, lines int) (*ConnectionLogsDTO, error)
 	HandleSupportExport() (*SupportExportDTO, error)
 	HandleSupervisorStop(ctx context.Context) error
 }
@@ -549,6 +550,22 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(conn)
+
+	case len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet:
+		lines := 0
+		if raw := r.URL.Query().Get("lines"); raw != "" {
+			if parsed, convErr := strconv.Atoi(raw); convErr == nil {
+				lines = parsed
+			}
+		}
+		logs, err := s.handler.HandleConnectionLogs(id, lines)
+		if err != nil {
+			writeHandlerError(w, "PTO-CONN-LOGS", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(logs)
 
 	case len(parts) == 2 && parts[1] == "detail" && r.Method == http.MethodGet:
 		detail, err := s.handler.HandleGetConnectionDetail(id)

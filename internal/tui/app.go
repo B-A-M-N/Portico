@@ -58,6 +58,7 @@ type Model struct {
 
 	// Connection detail for inspect screen
 	connectionDetail *ipc.ConnectionDetailDTO
+	connectionLogs   *ipc.ConnectionLogsDTO
 
 	// Operations screen state
 	operations     []ipc.OperationDTO
@@ -246,6 +247,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.diagnosticsCmd(m.repairConnectionID)
 				}
 			}
+		}
+		return m, nil
+
+	case connectionLogsMsg:
+		if msg.ConnectionID != m.selectedID {
+			return m, nil
+		}
+		if msg.Err != nil {
+			// Report the subsystem as unreadable rather than showing an empty
+			// log view that reads as "the connector said nothing".
+			m.connectionLogs = &ipc.ConnectionLogsDTO{
+				ConnectionID: msg.ConnectionID,
+				Unavailable:  msg.Err.Error(),
+			}
+		} else {
+			m.connectionLogs = msg.Logs
+		}
+		if m.inspect != nil {
+			m.inspect.LogTail = m.connectionLogs
 		}
 		return m, nil
 
@@ -554,6 +574,12 @@ type providerAccountConfiguredMsg struct {
 	Err      error
 }
 
+type connectionLogsMsg struct {
+	ConnectionID string
+	Logs         *ipc.ConnectionLogsDTO
+	Err          error
+}
+
 type connectionDetailMsg struct {
 	ConnectionID string
 	Detail       *ipc.ConnectionDetailDTO
@@ -582,6 +608,21 @@ func (m *Model) connectionDetailCmd(connID string) tea.Cmd {
 		defer cancel()
 		detail, err := client.GetConnectionDetail(detailCtx, connID)
 		return connectionDetailMsg{ConnectionID: connID, Detail: detail, Err: err}
+	}
+}
+
+// connectionLogsCmd loads a bounded, redacted tail of the connector's output.
+func (m *Model) connectionLogsCmd(connID string) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return connectionLogsMsg{ConnectionID: connID, Err: fmt.Errorf("no supervisor connection")}
+		}
+		logCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		logs, err := client.ConnectionLogs(logCtx, connID, 0)
+		return connectionLogsMsg{ConnectionID: connID, Logs: logs, Err: err}
 	}
 }
 
@@ -986,8 +1027,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// Detail from the previous connection must not be shown against
 			// this one while the fetch is in flight.
 			m.connectionDetail = nil
+			m.connectionLogs = nil
 			m.pushScreen(ScreenInspect)
-			return m, m.connectionDetailCmd(conn.ID)
+			return m, tea.Batch(m.connectionDetailCmd(conn.ID), m.connectionLogsCmd(conn.ID))
 		} else if m.screen == ScreenPlanPreview && m.plan != nil {
 			if m.applying {
 				return m, nil
@@ -1521,6 +1563,7 @@ func (m *Model) renderInspect() string {
 		m.inspect.Connection = conn
 		m.inspect.Diagnostics = m.diagnostics
 		m.inspect.Detail = m.connectionDetail
+		m.inspect.LogTail = m.connectionLogs
 
 		var b strings.Builder
 		b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" %s ", conn.Name)))

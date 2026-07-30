@@ -19,6 +19,9 @@ type InspectModel struct {
 	selectedTab int
 	Diagnostics []ipc.DiagnosticDTO
 	Logs        []string
+	// LogTail is the authoritative log response, distinguishing "read and
+	// empty" from "could not be read".
+	LogTail *ipc.ConnectionLogsDTO
 }
 
 // NewInspect creates a new inspect model.
@@ -299,6 +302,31 @@ func (m *InspectModel) renderTechnical() []string {
 }
 
 func (m *InspectModel) renderLogs() []string {
+	if m.LogTail != nil {
+		lines := []string{"LOGS", ""}
+		if !m.LogTail.Available {
+			reason := m.LogTail.Unavailable
+			if reason == "" {
+				reason = "logs could not be read"
+			}
+			return append(lines,
+				"Logs are unavailable.",
+				"",
+				"Reason: "+reason,
+				"",
+				"This does not mean the connector produced no output.")
+		}
+		if len(m.LogTail.Lines) == 0 {
+			return append(lines, "The connector has not written any output yet.")
+		}
+		if m.LogTail.Truncated {
+			lines = append(lines, "(showing the most recent lines)", "")
+		}
+		for _, entry := range m.LogTail.Lines {
+			lines = append(lines, fmt.Sprintf("  [%s] %s", entry.Stream, entry.Text))
+		}
+		return lines
+	}
 	if len(m.Logs) == 0 {
 		// Portico does not yet capture connector output into a per-connection
 		// buffer, so there is nothing to tail. "No logs available" reads as an

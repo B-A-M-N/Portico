@@ -12,6 +12,7 @@ import (
 type SupervisorClient interface {
 	GetSnapshot(ctx context.Context) (*ipc.SnapshotDTO, error)
 	GetConnectionDetail(ctx context.Context, id string) (*ipc.ConnectionDetailDTO, error)
+	ConnectionLogs(ctx context.Context, id string, lines int) (*ipc.ConnectionLogsDTO, error)
 	PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanClose(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanRepair(ctx context.Context, connID string) (*ipc.PlanDTO, error)

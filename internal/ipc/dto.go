@@ -612,3 +612,23 @@ type SupportOperationDTO struct {
 	CompletedAt  string `json:"completed_at,omitempty"`
 	Error        string `json:"error,omitempty"`
 }
+
+// ConnectionLogsDTO is a bounded, redacted tail of a connection's connector
+// output.
+//
+// Available distinguishes "logs were read and there are none" from "logs could
+// not be read", so an empty list is never presented as an authoritative
+// statement that the connector produced no output.
+type ConnectionLogsDTO struct {
+	ConnectionID string       `json:"connection_id"`
+	Lines        []LogLineDTO `json:"lines,omitempty"`
+	Available    bool         `json:"available"`
+	Unavailable  string       `json:"unavailable,omitempty"`
+	Truncated    bool         `json:"truncated,omitempty"`
+}
+
+// LogLineDTO is one line of connector output.
+type LogLineDTO struct {
+	Stream string `json:"stream"`
+	Text   string `json:"text"`
+}
