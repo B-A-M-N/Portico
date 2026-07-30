@@ -48,8 +48,8 @@ func TestController_OwnedCommandOriginLifecycle(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "mock"},
-		Desired:    core.DesiredClosed,
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredClosed,
 	}
 	if _, _, err := controller.CreateProfile(context.Background(), profile); err != nil {
 		t.Fatalf("CreateProfile: %v", err)

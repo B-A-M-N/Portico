@@ -49,7 +49,7 @@ func (nullHandler) HandleListProviders() ([]ProviderDTO, error) { return nil, ni
 func (nullHandler) HandleProviderRecommendation(ProviderRecommendationRequest) (*ProviderRecommendationResponse, error) {
 	return &ProviderRecommendationResponse{}, nil
 }
-func (nullHandler) HandleAuthenticateProvider(string) error     { return nil }
+func (nullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return &ConfigureProviderAccountResponse{}, nil
 }

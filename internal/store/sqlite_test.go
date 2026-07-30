@@ -3,9 +3,9 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -117,10 +117,97 @@ func TestSaveProfileRoundTripPreservesTaggedUnion(t *testing.T) {
 	}
 }
 
-// TestSaveProfileRejectsKindTheSchemaCannotRepresent ensures a connection kind
-// the v1 profile columns cannot store is refused with a typed error rather than
-// panicking or being silently written as a partial service-exposure row.
-func TestSaveProfileRejectsKindTheSchemaCannotRepresent(t *testing.T) {
+// TestProfileKindIsDurableNotInferred pins the core invariant of the versioned
+// spec schema: a profile's kind is read from its stored column. Before this
+// change both load paths inferred service exposure from the schema shape, so a
+// row of any other kind would have been silently mis-typed on load.
+func TestProfileKindIsDurableNotInferred(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	var storedKind string
+	if err := s.DB().QueryRowContext(ctx,
+		"SELECT kind FROM connection_profiles WHERE id = ?", profile.ID).Scan(&storedKind); err != nil {
+		t.Fatalf("read stored kind: %v", err)
+	}
+	if storedKind != string(core.ConnectionServiceExposure) {
+		t.Fatalf("stored kind = %q, want %q", storedKind, core.ConnectionServiceExposure)
+	}
+
+	// A row whose stored kind disagrees with its spec arm must be refused, not
+	// quietly reinterpreted as service exposure.
+	if _, err := s.DB().ExecContext(ctx,
+		"UPDATE connection_profiles SET kind = ? WHERE id = ?",
+		string(core.ConnectionPortForward), profile.ID); err != nil {
+		t.Fatalf("corrupt kind: %v", err)
+	}
+	if _, err := s.LoadProfile(ctx, profile.ID); err == nil {
+		t.Fatal("LoadProfile accepted a row whose kind disagrees with its spec arm")
+	}
+}
+
+// TestLoadProfileRejectsUnknownSpecVersion ensures a profile written by a newer
+// Portico is refused with a typed error rather than decoded under assumptions
+// that no longer hold.
+func TestLoadProfileRejectsUnknownSpecVersion(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx,
+		"UPDATE connection_profiles SET spec_version = ? WHERE id = ?",
+		currentProfileSpecVersion+1, profile.ID); err != nil {
+		t.Fatalf("bump spec_version: %v", err)
+	}
+
+	_, err := s.LoadProfile(ctx, profile.ID)
+	if err == nil {
+		t.Fatal("LoadProfile accepted a spec version newer than this binary supports")
+	}
+	if !errors.Is(err, ErrUnsupportedSpecVersion) {
+		t.Fatalf("error %v is not ErrUnsupportedSpecVersion", err)
+	}
+}
+
+// TestLoadProfileRejectsAmbiguousSpecArms ensures the tagged union stays a
+// union in storage: zero or multiple populated arms is corruption, not a
+// profile.
+func TestLoadProfileRejectsAmbiguousSpecArms(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	profile := testProfile()
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	for name, spec := range map[string]string{
+		"no arms":       `{}`,
+		"multiple arms": `{"service_exposure":{"source":{"Kind":"existing_service","Existing":{"Address":"127.0.0.1:1"}},"exposure":{},"protection":{}},"port_forward":{"local_port":1,"remote_host":"h","remote_port":2}}`,
+	} {
+		if _, err := s.DB().ExecContext(ctx,
+			"UPDATE connection_profiles SET spec_json = ? WHERE id = ?", spec, profile.ID); err != nil {
+			t.Fatalf("%s: write spec: %v", name, err)
+		}
+		if _, err := s.LoadProfile(ctx, profile.ID); err == nil {
+			t.Fatalf("%s: LoadProfile accepted an invalid spec union", name)
+		}
+	}
+}
+
+// TestSaveProfilePersistsNonServiceExposureKinds verifies that the versioned
+// schema can now durably represent the other connection kinds. They remain
+// unreachable through the supervisor, but storage must no longer be the thing
+// that blocks them, and must never panic on them.
+func TestSaveProfilePersistsNonServiceExposureKinds(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
@@ -145,12 +232,21 @@ func TestSaveProfileRejectsKindTheSchemaCannotRepresent(t *testing.T) {
 		UpdatedAt: now,
 	}
 
-	err := s.SaveProfile(ctx, portForward)
-	if err == nil {
-		t.Fatal("SaveProfile accepted a port_forward profile the schema cannot represent")
+	if err := s.SaveProfile(ctx, portForward); err != nil {
+		t.Fatalf("SaveProfile(port_forward): %v", err)
 	}
-	if !strings.Contains(err.Error(), string(core.ConnectionPortForward)) {
-		t.Fatalf("error %q does not name the unsupported kind", err)
+	loaded, err := s.LoadProfile(ctx, portForward.ID)
+	if err != nil {
+		t.Fatalf("LoadProfile(port_forward): %v", err)
+	}
+	if loaded.Kind != core.ConnectionPortForward {
+		t.Fatalf("loaded Kind = %q, want %q", loaded.Kind, core.ConnectionPortForward)
+	}
+	if loaded.Spec.ServiceExposure != nil {
+		t.Fatal("port_forward profile loaded with a service exposure arm")
+	}
+	if loaded.Spec.PortForward == nil || loaded.Spec.PortForward.RemoteHost != "example.com" {
+		t.Fatalf("loaded port forward spec = %+v", loaded.Spec.PortForward)
 	}
 }
 

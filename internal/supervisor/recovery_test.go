@@ -44,7 +44,7 @@ func recoveryTestProfile(connID core.ConnectionID) *core.ConnectionProfile {
 						Protocol: core.ProtocolHTTP,
 					},
 				},
-				Exposure: core.ExposureSpec{Mode: core.ExposureTemporary},
+				Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
@@ -53,8 +53,8 @@ func recoveryTestProfile(connID core.ConnectionID) *core.ConnectionProfile {
 		},
 		Lifecycle: core.LifecycleSpec{OnDisconnect: core.DisconnectKeepAlive},
 		Desired:   core.DesiredOpen,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 }
 

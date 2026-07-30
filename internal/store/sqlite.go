@@ -503,6 +503,108 @@ CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider ON provider_credent
 			return addColumnIfNotExists(tx, "connection_runtime", "runtime_revision", "INTEGER NOT NULL DEFAULT 0")
 		},
 	},
+	{
+		version: 18,
+		onApply: migrateProfilesToVersionedSpec,
+	},
+}
+
+// migrateProfilesToVersionedSpec converts connection_profiles from the
+// service-exposure-only column layout to a versioned tagged-spec layout.
+//
+// Before this migration the connection kind was not stored at all: it was
+// inferred on load from the fact that the schema could only describe a service
+// exposure. That made the kind a property of the code rather than of the data.
+//
+// The conversion is done in place with ADD COLUMN / backfill / DROP COLUMN
+// rather than by rebuilding the table. connection_profiles is a parent table
+// and operations, resources and findings hold immediate foreign keys to it;
+// with foreign_keys=on a DROP TABLE performs an implicit DELETE FROM that
+// violates those constraints, and PRAGMA foreign_keys cannot be suspended
+// inside the migration transaction. In-place column changes never orphan the
+// dependent rows.
+func migrateProfilesToVersionedSpec(tx *sql.Tx) error {
+	for _, col := range []struct{ name, decl string }{
+		{"kind", "TEXT NOT NULL DEFAULT ''"},
+		{"spec_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"spec_json", "BLOB NOT NULL DEFAULT ''"},
+		{"driver_json", "BLOB NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumnIfNotExists(tx, "connection_profiles", col.name, col.decl); err != nil {
+			return fmt.Errorf("add %s: %w", col.name, err)
+		}
+	}
+
+	rows, err := tx.Query(`SELECT id, source_json, exposure_json, protection_json, provider_json
+		FROM connection_profiles`)
+	if err != nil {
+		return fmt.Errorf("read legacy profiles: %w", err)
+	}
+
+	type converted struct {
+		id         string
+		specJSON   []byte
+		driverJSON []byte
+	}
+	var pending []converted
+
+	for rows.Next() {
+		var id string
+		var sourceJSON, exposureJSON, protectionJSON, providerJSON []byte
+		if err := rows.Scan(&id, &sourceJSON, &exposureJSON, &protectionJSON, &providerJSON); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan legacy profile: %w", err)
+		}
+
+		// A row that cannot be decoded aborts the whole migration. Converting
+		// the remainder would leave the database in a half-migrated state that
+		// no later run could distinguish from a complete one.
+		var spec core.ServiceExposureSpec
+		if err := json.Unmarshal(sourceJSON, &spec.Source); err != nil {
+			rows.Close()
+			return fmt.Errorf("profile %s: decode legacy source: %w", id, err)
+		}
+		if err := json.Unmarshal(exposureJSON, &spec.Exposure); err != nil {
+			rows.Close()
+			return fmt.Errorf("profile %s: decode legacy exposure: %w", id, err)
+		}
+		if err := json.Unmarshal(protectionJSON, &spec.Protection); err != nil {
+			rows.Close()
+			return fmt.Errorf("profile %s: decode legacy protection: %w", id, err)
+		}
+
+		specJSON, err := json.Marshal(core.ConnectionSpec{ServiceExposure: &spec})
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("profile %s: encode spec: %w", id, err)
+		}
+
+		// provider_json already holds a DriverSelection; it is carried across
+		// verbatim rather than re-encoded, so no field is reinterpreted here.
+		pending = append(pending, converted{id: id, specJSON: specJSON, driverJSON: providerJSON})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate legacy profiles: %w", err)
+	}
+	rows.Close()
+
+	for _, c := range pending {
+		if _, err := tx.Exec(`UPDATE connection_profiles
+			SET kind = ?, spec_version = ?, spec_json = ?, driver_json = ?
+			WHERE id = ?`,
+			string(core.ConnectionServiceExposure), currentProfileSpecVersion,
+			c.specJSON, c.driverJSON, c.id); err != nil {
+			return fmt.Errorf("profile %s: write converted spec: %w", c.id, err)
+		}
+	}
+
+	for _, col := range []string{"source_json", "exposure_json", "protection_json", "provider_json"} {
+		if _, err := tx.Exec("ALTER TABLE connection_profiles DROP COLUMN " + col); err != nil {
+			return fmt.Errorf("drop legacy column %s: %w", col, err)
+		}
+	}
+	return nil
 }
 
 // Open opens the SQLite database at path, runs migrations, and returns a Store.
@@ -1067,25 +1169,13 @@ func (s *Store) CreateConnection(
 	}
 
 	// Persist profile.
-	spec, err := serviceExposureForPersist(profile)
+	kind, specJSON, err := encodeProfileSpec(profile)
 	if err != nil {
 		return err
 	}
-	sourceJSON, err := json.Marshal(spec.Source)
+	driverJSON, err := json.Marshal(profile.Driver)
 	if err != nil {
-		return fmt.Errorf("marshal source: %w", err)
-	}
-	exposureJSON, err := json.Marshal(spec.Exposure)
-	if err != nil {
-		return fmt.Errorf("marshal exposure: %w", err)
-	}
-	protectionJSON, err := json.Marshal(spec.Protection)
-	if err != nil {
-		return fmt.Errorf("marshal protection: %w", err)
-	}
-	providerJSON, err := json.Marshal(profile.Driver)
-	if err != nil {
-		return fmt.Errorf("marshal provider: %w", err)
+		return fmt.Errorf("marshal driver: %w", err)
 	}
 	lifecycleJSON, err := json.Marshal(profile.Lifecycle)
 	if err != nil {
@@ -1094,12 +1184,12 @@ func (s *Store) CreateConnection(
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO connection_profiles
-			(id, name, revision, source_json, exposure_json, protection_json,
-			 provider_json, lifecycle_json, desired_state, created_at, updated_at)
+			(id, name, revision, kind, spec_version, spec_json,
+			 driver_json, lifecycle_json, desired_state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		profile.ID, profile.Name, profile.Revision,
-		sourceJSON, exposureJSON, protectionJSON,
-		providerJSON, lifecycleJSON,
+		kind, currentProfileSpecVersion, specJSON,
+		driverJSON, lifecycleJSON,
 		string(profile.Desired),
 		profile.CreatedAt.Format(time.RFC3339),
 		profile.UpdatedAt.Format(time.RFC3339),
@@ -1168,39 +1258,80 @@ func (s *Store) CreateConnection(
 
 // --------------- profile CRUD ---------------
 
-// serviceExposureForPersist returns the service-exposure arm of a profile's
-// tagged spec union, or an error when the profile cannot be represented by the
-// current connection_profiles columns.
-//
-// The v1 schema stores service exposure only: it has source_json, exposure_json
-// and protection_json columns and no connection kind or versioned spec column.
-// Port-forward and private-network profiles therefore must be refused here
-// rather than dereferenced into a nil arm (a panic) or written as a partial
-// service-exposure row (silent corruption).
-func serviceExposureForPersist(p *core.ConnectionProfile) (*core.ServiceExposureSpec, error) {
-	if p == nil {
-		return nil, fmt.Errorf("profile is nil")
+// currentProfileSpecVersion is the encoding version this binary writes into
+// connection_profiles.spec_version. It versions the shape of spec_json
+// independently of the table schema, so a spec encoding change does not require
+// a table migration and can be refused precisely.
+const currentProfileSpecVersion = 1
+
+// ErrUnsupportedSpecVersion reports a stored connection spec written by a newer
+// Portico. Decoding it under this binary's assumptions could silently
+// reinterpret durable state, so it is refused instead.
+var ErrUnsupportedSpecVersion = errors.New("unsupported connection spec version")
+
+// specArmKind returns the connection kind implied by the populated arm of a
+// spec union, requiring exactly one arm to be set. Zero or multiple arms is
+// corruption: the union's whole purpose is that kinds are mutually exclusive.
+func specArmKind(spec core.ConnectionSpec) (core.ConnectionKind, error) {
+	var kinds []core.ConnectionKind
+	if spec.ServiceExposure != nil {
+		kinds = append(kinds, core.ConnectionServiceExposure)
 	}
-	if p.Kind != "" && p.Kind != core.ConnectionServiceExposure {
-		return nil, fmt.Errorf(
-			"connection %s: cannot persist connection kind %q; the current schema stores %q only",
-			p.ID, p.Kind, core.ConnectionServiceExposure)
+	if spec.PortForward != nil {
+		kinds = append(kinds, core.ConnectionPortForward)
 	}
-	if p.Spec.ServiceExposure == nil {
-		return nil, fmt.Errorf("connection %s: service exposure spec is required", p.ID)
+	if spec.PrivateNetwork != nil {
+		kinds = append(kinds, core.ConnectionPrivateNetwork)
 	}
-	return p.Spec.ServiceExposure, nil
+	if len(kinds) != 1 {
+		return "", fmt.Errorf("exactly one connection spec arm must be set, got %d", len(kinds))
+	}
+	return kinds[0], nil
 }
 
-// hydrateServiceExposure prepares a profile decoded from the v1 profile columns.
-// Those columns can only describe a service exposure, so the kind is restored
-// explicitly and the union arm allocated before any field is decoded into it.
-func hydrateServiceExposure(p *core.ConnectionProfile) *core.ServiceExposureSpec {
-	p.Kind = core.ConnectionServiceExposure
-	if p.Spec.ServiceExposure == nil {
-		p.Spec.ServiceExposure = &core.ServiceExposureSpec{}
+// encodeProfileSpec marshals a profile's spec union for storage and derives the
+// kind to store alongside it.
+func encodeProfileSpec(p *core.ConnectionProfile) (kind string, specJSON []byte, err error) {
+	if p == nil {
+		return "", nil, fmt.Errorf("profile is nil")
 	}
-	return p.Spec.ServiceExposure
+	armKind, err := specArmKind(p.Spec)
+	if err != nil {
+		return "", nil, fmt.Errorf("connection %s: %w", p.ID, err)
+	}
+	// A declared kind that disagrees with the populated arm would make the
+	// stored kind column a lie, which is exactly what this schema exists to
+	// prevent.
+	if p.Kind != "" && p.Kind != armKind {
+		return "", nil, fmt.Errorf(
+			"connection %s: declared kind %q does not match populated spec arm %q", p.ID, p.Kind, armKind)
+	}
+	specJSON, err = json.Marshal(p.Spec)
+	if err != nil {
+		return "", nil, fmt.Errorf("connection %s: marshal spec: %w", p.ID, err)
+	}
+	return string(armKind), specJSON, nil
+}
+
+// decodeProfileSpec restores a profile's spec union from storage, refusing
+// unknown encodings and rows whose stored kind disagrees with the stored arm.
+func decodeProfileSpec(id core.ConnectionID, kind string, specVersion int, specJSON []byte) (core.ConnectionSpec, core.ConnectionKind, error) {
+	var spec core.ConnectionSpec
+	if specVersion > currentProfileSpecVersion {
+		return spec, "", fmt.Errorf("profile %s: %w: stored version %d, supported %d",
+			id, ErrUnsupportedSpecVersion, specVersion, currentProfileSpecVersion)
+	}
+	if err := json.Unmarshal(specJSON, &spec); err != nil {
+		return spec, "", fmt.Errorf("profile %s: unmarshal spec: %w", id, err)
+	}
+	armKind, err := specArmKind(spec)
+	if err != nil {
+		return spec, "", fmt.Errorf("profile %s: %w", id, err)
+	}
+	if core.ConnectionKind(kind) != armKind {
+		return spec, "", fmt.Errorf("profile %s: stored kind %q does not match stored spec arm %q", id, kind, armKind)
+	}
+	return spec, armKind, nil
 }
 
 // SaveProfile persists a connection profile.
@@ -1208,22 +1339,9 @@ func (s *Store) SaveProfile(ctx context.Context, p *core.ConnectionProfile) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	spec, err := serviceExposureForPersist(p)
+	kind, specJSON, err := encodeProfileSpec(p)
 	if err != nil {
 		return err
-	}
-
-	sourceJSON, err := json.Marshal(spec.Source)
-	if err != nil {
-		return fmt.Errorf("marshal source: %w", err)
-	}
-	exposureJSON, err := json.Marshal(spec.Exposure)
-	if err != nil {
-		return fmt.Errorf("marshal exposure: %w", err)
-	}
-	protectionJSON, err := json.Marshal(spec.Protection)
-	if err != nil {
-		return fmt.Errorf("marshal protection: %w", err)
 	}
 	driverJSON, err := json.Marshal(p.Driver)
 	if err != nil {
@@ -1234,22 +1352,19 @@ func (s *Store) SaveProfile(ctx context.Context, p *core.ConnectionProfile) erro
 		return fmt.Errorf("marshal lifecycle: %w", err)
 	}
 
-	// provider_json is the legacy column name for the driver selection. The
-	// column was never renamed, so writing driver_json here fails against the
-	// declared schema for every profile.
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO connection_profiles
-			(id, name, revision, source_json, exposure_json, protection_json,
-			 provider_json, lifecycle_json, desired_state, created_at, updated_at)
+			(id, name, revision, kind, spec_version, spec_json,
+			 driver_json, lifecycle_json, desired_state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, revision=excluded.revision,
-			source_json=excluded.source_json, exposure_json=excluded.exposure_json,
-			protection_json=excluded.protection_json, provider_json=excluded.provider_json,
+			kind=excluded.kind, spec_version=excluded.spec_version,
+			spec_json=excluded.spec_json, driver_json=excluded.driver_json,
 			lifecycle_json=excluded.lifecycle_json, desired_state=excluded.desired_state,
 			created_at=excluded.created_at, updated_at=excluded.updated_at`,
 		p.ID, p.Name, p.Revision,
-		sourceJSON, exposureJSON, protectionJSON,
+		kind, currentProfileSpecVersion, specJSON,
 		driverJSON, lifecycleJSON,
 		string(p.Desired),
 		p.CreatedAt.Format(time.RFC3339),
@@ -1273,25 +1388,13 @@ func (s *Store) UpdateProfile(ctx context.Context, profile *core.ConnectionProfi
 	defer s.mu.Unlock()
 
 	// Serialize profile fields
-	spec, err := serviceExposureForPersist(profile)
+	kind, specJSON, err := encodeProfileSpec(profile)
 	if err != nil {
 		return nil, err
 	}
-	sourceJSON, err := json.Marshal(spec.Source)
+	driverJSON, err := json.Marshal(profile.Driver)
 	if err != nil {
-		return nil, fmt.Errorf("marshal source: %w", err)
-	}
-	exposureJSON, err := json.Marshal(spec.Exposure)
-	if err != nil {
-		return nil, fmt.Errorf("marshal exposure: %w", err)
-	}
-	protectionJSON, err := json.Marshal(spec.Protection)
-	if err != nil {
-		return nil, fmt.Errorf("marshal protection: %w", err)
-	}
-	providerJSON, err := json.Marshal(profile.Driver)
-	if err != nil {
-		return nil, fmt.Errorf("marshal provider: %w", err)
+		return nil, fmt.Errorf("marshal driver: %w", err)
 	}
 	lifecycleJSON, err := json.Marshal(profile.Lifecycle)
 	if err != nil {
@@ -1310,11 +1413,11 @@ func (s *Store) UpdateProfile(ctx context.Context, profile *core.ConnectionProfi
 	// Optimistic update: only update if revision matches
 	result, err := tx.ExecContext(ctx, `
 		UPDATE connection_profiles
-		SET name = ?, revision = ?, source_json = ?, exposure_json = ?, protection_json = ?,
-		    provider_json = ?, lifecycle_json = ?, desired_state = ?, updated_at = ?
+		SET name = ?, revision = ?, kind = ?, spec_version = ?, spec_json = ?,
+		    driver_json = ?, lifecycle_json = ?, desired_state = ?, updated_at = ?
 		WHERE id = ? AND revision = ?`,
-		profile.Name, newRevision, sourceJSON, exposureJSON, protectionJSON,
-		providerJSON, lifecycleJSON, string(profile.Desired), updatedAt,
+		profile.Name, newRevision, kind, currentProfileSpecVersion, specJSON,
+		driverJSON, lifecycleJSON, string(profile.Desired), updatedAt,
 		profile.ID, expectedRevision,
 	)
 	if err != nil {
@@ -1354,18 +1457,19 @@ func (s *Store) UpdateProfile(ctx context.Context, profile *core.ConnectionProfi
 // loadProfileLocked loads a profile assuming the caller holds s.mu.
 func (s *Store) loadProfileLocked(ctx context.Context, id core.ConnectionID) (*core.ConnectionProfile, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, revision, source_json, exposure_json, protection_json,
-		       provider_json, lifecycle_json, desired_state, created_at, updated_at
+		SELECT id, name, revision, kind, spec_version, spec_json,
+		       driver_json, lifecycle_json, desired_state, created_at, updated_at
 		FROM connection_profiles WHERE id = ?`, id)
 
 	var p core.ConnectionProfile
-	var sourceJSON, exposureJSON, protectionJSON, providerJSON, lifecycleJSON []byte
-	var desiredState, createdAtStr, updatedAtStr string
+	var specJSON, driverJSON, lifecycleJSON []byte
+	var kind, desiredState, createdAtStr, updatedAtStr string
+	var specVersion int
 
 	err := row.Scan(
 		&p.ID, &p.Name, &p.Revision,
-		&sourceJSON, &exposureJSON, &protectionJSON,
-		&providerJSON, &lifecycleJSON,
+		&kind, &specVersion, &specJSON,
+		&driverJSON, &lifecycleJSON,
 		&desiredState, &createdAtStr, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
@@ -1375,17 +1479,13 @@ func (s *Store) loadProfileLocked(ctx context.Context, id core.ConnectionID) (*c
 		return nil, err
 	}
 
-	spec := hydrateServiceExposure(&p)
-	if err := json.Unmarshal(sourceJSON, &spec.Source); err != nil {
-		return nil, fmt.Errorf("profile %s: unmarshal source: %w", id, err)
+	spec, armKind, err := decodeProfileSpec(id, kind, specVersion, specJSON)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(exposureJSON, &spec.Exposure); err != nil {
-		return nil, fmt.Errorf("profile %s: unmarshal exposure: %w", id, err)
-	}
-	if err := json.Unmarshal(protectionJSON, &spec.Protection); err != nil {
-		return nil, fmt.Errorf("profile %s: unmarshal protection: %w", id, err)
-	}
-	if err := json.Unmarshal(providerJSON, &p.Driver); err != nil {
+	p.Spec = spec
+	p.Kind = armKind
+	if err := json.Unmarshal(driverJSON, &p.Driver); err != nil {
 		return nil, fmt.Errorf("profile %s: unmarshal driver: %w", id, err)
 	}
 	if err := json.Unmarshal(lifecycleJSON, &p.Lifecycle); err != nil {
@@ -1485,8 +1585,8 @@ func (s *Store) ReadSnapshot(ctx context.Context) (*Snapshot, error) {
 
 func readSnapshotProfiles(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionProfile, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, name, revision, source_json, exposure_json, protection_json,
-		       provider_json, lifecycle_json, desired_state, created_at, updated_at
+		SELECT id, name, revision, kind, spec_version, spec_json,
+		       driver_json, lifecycle_json, desired_state, created_at, updated_at
 		FROM connection_profiles ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot profiles: %w", err)
@@ -1495,23 +1595,20 @@ func readSnapshotProfiles(ctx context.Context, tx *sql.Tx) ([]*core.ConnectionPr
 	var profiles []*core.ConnectionProfile
 	for rows.Next() {
 		var p core.ConnectionProfile
-		var sourceJSON, exposureJSON, protectionJSON, providerJSON, lifecycleJSON []byte
-		var desiredState, createdAt, updatedAt string
-		if err := rows.Scan(&p.ID, &p.Name, &p.Revision, &sourceJSON, &exposureJSON, &protectionJSON,
-			&providerJSON, &lifecycleJSON, &desiredState, &createdAt, &updatedAt); err != nil {
+		var specJSON, driverJSON, lifecycleJSON []byte
+		var kind, desiredState, createdAt, updatedAt string
+		var specVersion int
+		if err := rows.Scan(&p.ID, &p.Name, &p.Revision, &kind, &specVersion, &specJSON,
+			&driverJSON, &lifecycleJSON, &desiredState, &createdAt, &updatedAt); err != nil {
 			return nil, fmt.Errorf("scan snapshot profile: %w", err)
 		}
-		spec := hydrateServiceExposure(&p)
-		if err := json.Unmarshal(sourceJSON, &spec.Source); err != nil {
-			return nil, fmt.Errorf("snapshot profile %s source: %w", p.ID, err)
+		spec, armKind, err := decodeProfileSpec(p.ID, kind, specVersion, specJSON)
+		if err != nil {
+			return nil, fmt.Errorf("snapshot %w", err)
 		}
-		if err := json.Unmarshal(exposureJSON, &spec.Exposure); err != nil {
-			return nil, fmt.Errorf("snapshot profile %s exposure: %w", p.ID, err)
-		}
-		if err := json.Unmarshal(protectionJSON, &spec.Protection); err != nil {
-			return nil, fmt.Errorf("snapshot profile %s protection: %w", p.ID, err)
-		}
-		if err := json.Unmarshal(providerJSON, &p.Driver); err != nil {
+		p.Spec = spec
+		p.Kind = armKind
+		if err := json.Unmarshal(driverJSON, &p.Driver); err != nil {
 			return nil, fmt.Errorf("snapshot profile %s driver: %w", p.ID, err)
 		}
 		if err := json.Unmarshal(lifecycleJSON, &p.Lifecycle); err != nil {

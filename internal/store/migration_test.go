@@ -395,3 +395,267 @@ CREATE TABLE provider_accounts (
 		t.Fatalf("idempotency key = %q", key)
 	}
 }
+
+// seedV17ProfileSchema creates a database at schema version 17: the
+// service-exposure-only connection_profiles shape, plus a dependent table
+// holding an immediate foreign key to it. Migration 18 is the only migration
+// left to run, which keeps the fixture focused on the conversion under test.
+//
+// The dependent row matters: connection_profiles is a parent table, so a
+// migration that rebuilt it by dropping it would orphan these rows and fail
+// under the DSN's foreign_keys=on.
+func seedV17ProfileSchema(t *testing.T, path string, profileRow []any) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`
+CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+CREATE TABLE connection_profiles (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
+    source_json BLOB NOT NULL, exposure_json BLOB NOT NULL, protection_json BLOB NOT NULL,
+    provider_json BLOB NOT NULL, lifecycle_json BLOB NOT NULL, desired_state TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE operations (
+    id TEXT PRIMARY KEY, connection_id TEXT NOT NULL,
+    FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
+);`); err != nil {
+		t.Fatalf("seed v17 schema: %v", err)
+	}
+	for v := 1; v <= 17; v++ {
+		if _, err := db.Exec("INSERT INTO schema_migrations VALUES (?, ?)", v, "2026-01-01T00:00:00Z"); err != nil {
+			t.Fatalf("stamp migration %d: %v", v, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO connection_profiles VALUES (?,?,?,?,?,?,?,?,?,?,?)`, profileRow...); err != nil {
+		t.Fatalf("seed legacy profile: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO operations VALUES ('op-1','conn-legacy')`); err != nil {
+		t.Fatalf("seed dependent operation: %v", err)
+	}
+}
+
+func legacyProfileRow(sourceJSON string) []any {
+	return []any{
+		"conn-legacy", "legacy connection", 3,
+		sourceJSON,
+		`{"Mode":"permanent_public","Protocol":"http","RequestedAddress":"legacy.example.com","Expiration":null}`,
+		`{"Kind":"email_otp","AllowedEmails":["person@example.com"],"AllowedDomains":null,"SessionTTL":1800000000000}`,
+		`{"driver_id":"","provider_id":"cloudflare","account_id":"acct-1"}`,
+		`{"AutoStart":true,"OnDisconnect":"keep_alive"}`,
+		"open", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z",
+	}
+}
+
+const legacySourceJSON = `{"Kind":"existing_service","Existing":{"Network":"tcp","Address":"127.0.0.1:3000","Protocol":"http","Health":{"Enabled":false,"Path":"","Timeout":0,"Interval":0}},"Directory":null,"Command":null,"MCP":null}`
+
+// TestMigration18ConvertsLegacyProfileAndPreservesDependents verifies the
+// in-place conversion to versioned tagged-spec storage: the connection kind
+// becomes durable rather than inferred, the spec union is stored whole, the
+// legacy columns are removed, and dependent foreign-key rows survive.
+func TestMigration18ConvertsLegacyProfileAndPreservesDependents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v17.db")
+	seedV17ProfileSchema(t, path, legacyProfileRow(legacySourceJSON))
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migration 18): %v", err)
+	}
+	defer s.Close()
+
+	var kind, specJSON, driverJSON string
+	var specVersion int
+	if err := s.DB().QueryRow(
+		"SELECT kind, spec_version, spec_json, driver_json FROM connection_profiles WHERE id='conn-legacy'",
+	).Scan(&kind, &specVersion, &specJSON, &driverJSON); err != nil {
+		t.Fatalf("read converted row: %v", err)
+	}
+	if kind != "service_exposure" {
+		t.Fatalf("kind = %q, want service_exposure", kind)
+	}
+	if specVersion != currentProfileSpecVersion {
+		t.Fatalf("spec_version = %d, want %d", specVersion, currentProfileSpecVersion)
+	}
+	for _, want := range []string{"service_exposure", "127.0.0.1:3000", "legacy.example.com", "person@example.com"} {
+		if !strings.Contains(specJSON, want) {
+			t.Fatalf("spec_json missing %q: %s", want, specJSON)
+		}
+	}
+	if !strings.Contains(driverJSON, "cloudflare") || !strings.Contains(driverJSON, "acct-1") {
+		t.Fatalf("driver_json did not carry the legacy provider selection: %s", driverJSON)
+	}
+
+	// The legacy columns must actually be gone: leaving them behind would keep
+	// a second, silently divergent source of truth for the same state.
+	for _, gone := range []string{"source_json", "exposure_json", "protection_json", "provider_json"} {
+		if columnExists(t, s.DB(), "connection_profiles", gone) {
+			t.Fatalf("legacy column %s still present after migration 18", gone)
+		}
+	}
+
+	// The dependent row must survive and the database must be referentially clean.
+	var opCount int
+	if err := s.DB().QueryRow("SELECT COUNT(*) FROM operations WHERE connection_id='conn-legacy'").Scan(&opCount); err != nil {
+		t.Fatalf("count dependents: %v", err)
+	}
+	if opCount != 1 {
+		t.Fatalf("dependent operations = %d, want 1", opCount)
+	}
+	rows, err := s.DB().Query("PRAGMA foreign_key_check")
+	if err != nil {
+		t.Fatalf("foreign_key_check: %v", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("migration 18 left foreign key violations")
+	}
+
+	// The converted row must load back as a complete, valid profile.
+	loaded, err := s.LoadProfile(t.Context(), "conn-legacy")
+	if err != nil {
+		t.Fatalf("LoadProfile after migration: %v", err)
+	}
+	if loaded.Kind != "service_exposure" {
+		t.Fatalf("loaded Kind = %q", loaded.Kind)
+	}
+	if loaded.Spec.ServiceExposure == nil {
+		t.Fatal("loaded ServiceExposure arm is nil")
+	}
+	if got := loaded.Spec.ServiceExposure.Source.Existing; got == nil || got.Address != "127.0.0.1:3000" {
+		t.Fatalf("loaded source = %+v", got)
+	}
+	if loaded.Spec.ServiceExposure.Exposure.RequestedAddress != "legacy.example.com" {
+		t.Fatalf("loaded exposure address = %q", loaded.Spec.ServiceExposure.Exposure.RequestedAddress)
+	}
+	if loaded.Driver.ProviderID != "cloudflare" {
+		t.Fatalf("loaded driver provider = %q", loaded.Driver.ProviderID)
+	}
+	if loaded.Revision != 3 {
+		t.Fatalf("loaded revision = %d, want 3", loaded.Revision)
+	}
+}
+
+// TestMigration18AbortsOnUndecodableLegacyRow ensures a corrupt legacy row
+// fails the whole migration rather than being partially converted.
+func TestMigration18AbortsOnUndecodableLegacyRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.db")
+	seedV17ProfileSchema(t, path, legacyProfileRow(`{"Kind":`))
+
+	s, err := Open(path)
+	if err == nil {
+		s.Close()
+		t.Fatal("Open succeeded despite an undecodable legacy profile row")
+	}
+	if !strings.Contains(err.Error(), "conn-legacy") {
+		t.Fatalf("migration error does not identify the offending row: %v", err)
+	}
+
+	// The transaction must have rolled back, leaving the legacy shape intact.
+	db, dbErr := sql.Open("sqlite3", path)
+	if dbErr != nil {
+		t.Fatalf("reopen: %v", dbErr)
+	}
+	defer db.Close()
+	if !columnExists(t, db, "connection_profiles", "source_json") {
+		t.Fatal("migration 18 partially applied: source_json was dropped despite failure")
+	}
+	var applied int
+	if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version = 18").Scan(&applied); err != nil {
+		t.Fatalf("check migration record: %v", err)
+	}
+	if applied != 0 {
+		t.Fatal("migration 18 was recorded as applied despite failing")
+	}
+}
+
+func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		t.Fatalf("table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	return false
+}
+
+// TestMigration18TakesRecoveryBackupAndIsIdempotent covers the two properties a
+// destructive migration must have: it leaves a recoverable copy of the
+// pre-migration database, and reopening an already-migrated database is a
+// no-op rather than a second attempt to add and drop the same columns.
+func TestMigration18TakesRecoveryBackupAndIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "v17.db")
+	seedV17ProfileSchema(t, path, legacyProfileRow(legacySourceJSON))
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (first): %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Migration 18 drops columns. The pre-migration backup is the only way back.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	var backups []string
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".backup-") {
+			backups = append(backups, e.Name())
+		}
+	}
+	if len(backups) == 0 {
+		t.Fatal("no pre-migration backup was taken before a destructive migration")
+	}
+
+	// The backup must still carry the legacy shape, otherwise it is not a
+	// recovery point for this migration.
+	backupDB, err := sql.Open("sqlite3", filepath.Join(dir, backups[0]))
+	if err != nil {
+		t.Fatalf("open backup: %v", err)
+	}
+	defer backupDB.Close()
+	if !columnExists(t, backupDB, "connection_profiles", "source_json") {
+		t.Fatal("backup does not contain the pre-migration schema")
+	}
+
+	// Reopening must not re-run migration 18.
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (second): %v", err)
+	}
+	defer s2.Close()
+
+	loaded, err := s2.LoadProfile(t.Context(), "conn-legacy")
+	if err != nil {
+		t.Fatalf("LoadProfile after reopen: %v", err)
+	}
+	if loaded.Kind != "service_exposure" || loaded.Spec.ServiceExposure == nil {
+		t.Fatalf("profile degraded across reopen: kind=%q arm=%v", loaded.Kind, loaded.Spec.ServiceExposure)
+	}
+	var applied int
+	if err := s2.DB().QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version = 18").Scan(&applied); err != nil {
+		t.Fatalf("count migration 18 records: %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("migration 18 recorded %d times, want 1", applied)
+	}
+}

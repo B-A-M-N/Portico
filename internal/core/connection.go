@@ -13,10 +13,10 @@ type ConnectionKind string
 const (
 	// ConnectionServiceExposure exposes a local service through a tunnel provider.
 	ConnectionServiceExposure ConnectionKind = "service_exposure"
-	
+
 	// ConnectionPortForward forwards a local port to a remote endpoint.
 	ConnectionPortForward ConnectionKind = "port_forward"
-	
+
 	// ConnectionPrivateNetwork joins or exposes through a private network.
 	ConnectionPrivateNetwork ConnectionKind = "private_network"
 )
@@ -26,16 +26,16 @@ const (
 // public address, provider resource IDs, last error, traffic samples,
 // current health, or progress state.
 type ConnectionProfile struct {
-	ID         ConnectionID     `json:"id"`
-	Name       string           `json:"name"`
-	Revision   uint64           `json:"revision"`
-	Kind       ConnectionKind   `json:"kind"`
-	Spec       ConnectionSpec   `json:"spec"`
-	Driver     DriverSelection  `json:"driver"`
-	Lifecycle  LifecycleSpec    `json:"lifecycle"`
-	Desired    DesiredConnectionState `json:"desired"`
-	CreatedAt  time.Time        `json:"created_at"`
-	UpdatedAt  time.Time        `json:"updated_at"`
+	ID        ConnectionID           `json:"id"`
+	Name      string                 `json:"name"`
+	Revision  uint64                 `json:"revision"`
+	Kind      ConnectionKind         `json:"kind"`
+	Spec      ConnectionSpec         `json:"spec"`
+	Driver    DriverSelection        `json:"driver"`
+	Lifecycle LifecycleSpec          `json:"lifecycle"`
+	Desired   DesiredConnectionState `json:"desired"`
+	CreatedAt time.Time              `json:"created_at"`
+	UpdatedAt time.Time              `json:"updated_at"`
 }
 
 // ConnectionSpec is a tagged union containing kind-specific specifications.
@@ -55,10 +55,10 @@ type ServiceExposureSpec struct {
 
 // PortForwardSpec describes a port forward connection.
 type PortForwardSpec struct {
-	LocalPort  int       `json:"local_port"`
-	RemoteHost string    `json:"remote_host"`
-	RemotePort int       `json:"remote_port"`
-	Protocol   Protocol  `json:"protocol"`
+	LocalPort  int                  `json:"local_port"`
+	RemoteHost string               `json:"remote_host"`
+	RemotePort int                  `json:"remote_port"`
+	Protocol   Protocol             `json:"protocol"`
 	Direction  PortForwardDirection `json:"direction"`
 }
 
@@ -68,7 +68,7 @@ type PortForwardDirection string
 const (
 	// PortForwardLocal forwards a local port to a remote endpoint.
 	PortForwardLocal PortForwardDirection = "local"
-	
+
 	// PortForwardRemote forwards a remote port to a local endpoint.
 	PortForwardRemote PortForwardDirection = "remote"
 )
@@ -86,17 +86,17 @@ type PrivateNetworkMode string
 const (
 	// PrivateNetworkJoin joins an existing private network.
 	PrivateNetworkJoin PrivateNetworkMode = "join"
-	
+
 	// PrivateNetworkExpose exposes local services to the private network.
 	PrivateNetworkExpose PrivateNetworkMode = "expose"
 )
 
 // DriverSelection describes the driver choice for a connection.
 type DriverSelection struct {
-	DriverID   DriverID           `json:"driver_id"`
-	ProviderID ProviderID         `json:"provider_id"`
-	AccountID  ProviderAccountID  `json:"account_id"`
-	Options    map[string]string  `json:"options,omitempty"`
+	DriverID   DriverID          `json:"driver_id"`
+	ProviderID ProviderID        `json:"provider_id"`
+	AccountID  ProviderAccountID `json:"account_id"`
+	Options    map[string]string `json:"options,omitempty"`
 }
 
 // DriverID identifies a connection driver.
@@ -150,12 +150,12 @@ func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 		return nil
 	}
 	cp := *p
-	
+
 	// Deep copy the spec
 	if p.Spec.ServiceExposure != nil {
 		se := *p.Spec.ServiceExposure
 		cp.Spec.ServiceExposure = &se
-		
+
 		if p.Spec.ServiceExposure.Source.Existing != nil {
 			existing := *p.Spec.ServiceExposure.Source.Existing
 			cp.Spec.ServiceExposure.Source.Existing = &existing
@@ -211,17 +211,17 @@ func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 			cp.Spec.ServiceExposure.Protection.AllowedDomains = domains
 		}
 	}
-	
+
 	if p.Spec.PortForward != nil {
 		pf := *p.Spec.PortForward
 		cp.Spec.PortForward = &pf
 	}
-	
+
 	if p.Spec.PrivateNetwork != nil {
 		pn := *p.Spec.PrivateNetwork
 		cp.Spec.PrivateNetwork = &pn
 	}
-	
+
 	// Deep copy driver options
 	if p.Driver.Options != nil {
 		options := make(map[string]string, len(p.Driver.Options))
@@ -230,7 +230,7 @@ func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 		}
 		cp.Driver.Options = options
 	}
-	
+
 	return &cp
 }
 

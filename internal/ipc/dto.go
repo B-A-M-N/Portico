@@ -31,20 +31,20 @@ type ConnectionDTO struct {
 
 // ConnectionDetailDTO is the full detail view of a connection for inspect screens.
 type ConnectionDetailDTO struct {
-	Summary       ConnectionDTO       `json:"summary"`
-	Revision      uint64              `json:"revision"`
-	DesiredSpec   ConnectionSpecDTO   `json:"desired_spec"`
-	Lifecycle     LifecycleDTO        `json:"lifecycle"`
-	Driver        DriverSelectionDTO  `json:"driver"`
-	Endpoints     []EndpointDTO       `json:"endpoints,omitempty"`
-	Segments      []RouteSegmentDTO   `json:"segments,omitempty"`
+	Summary       ConnectionDTO        `json:"summary"`
+	Revision      uint64               `json:"revision"`
+	DesiredSpec   ConnectionSpecDTO    `json:"desired_spec"`
+	Lifecycle     LifecycleDTO         `json:"lifecycle"`
+	Driver        DriverSelectionDTO   `json:"driver"`
+	Endpoints     []EndpointDTO        `json:"endpoints,omitempty"`
+	Segments      []RouteSegmentDTO    `json:"segments,omitempty"`
 	Resources     []ManagedResourceDTO `json:"resources,omitempty"`
-	Processes     []ProcessDTO        `json:"processes,omitempty"`
-	Findings      []DiagnosticDTO     `json:"findings,omitempty"`
-	LastVerified  string              `json:"last_verified,omitempty"`
+	Processes     []ProcessDTO         `json:"processes,omitempty"`
+	Findings      []DiagnosticDTO      `json:"findings,omitempty"`
+	LastVerified  string               `json:"last_verified,omitempty"`
 	LastOperation *OperationSummaryDTO `json:"last_operation,omitempty"`
-	CreatedAt     string              `json:"created_at"`
-	UpdatedAt     string              `json:"updated_at"`
+	CreatedAt     string               `json:"created_at"`
+	UpdatedAt     string               `json:"updated_at"`
 }
 
 // ConnectionSpecDTO describes the connection specification.
@@ -108,8 +108,8 @@ type ProviderDTO struct {
 	DisplayName     string               `json:"display_name"`
 	Authenticated   bool                 `json:"authenticated"`
 	Accounts        []ProviderAccountDTO `json:"accounts,omitempty"`
-	Availability    string               `json:"availability"`     // "ready", "unconfigured", "binary_missing", "degraded"
-	Readiness       string               `json:"readiness"`        // "ready", "needs_auth", "needs_config", "error"
+	Availability    string               `json:"availability"` // "ready", "unconfigured", "binary_missing", "degraded"
+	Readiness       string               `json:"readiness"`    // "ready", "needs_auth", "needs_config", "error"
 	Capabilities    *CapabilitySetDTO    `json:"capabilities,omitempty"`
 	LastError       string               `json:"last_error,omitempty"`
 	RestartRequired bool                 `json:"restart_required,omitempty"`
@@ -194,10 +194,10 @@ type ConnectionEventDTO struct {
 
 // ProviderEventDTO describes a provider state change event.
 type ProviderEventDTO struct {
-	ProviderID  string `json:"provider_id"`
-	AccountID   string `json:"account_id,omitempty"`
-	Available   bool   `json:"available"`
-	LastError   string `json:"last_error,omitempty"`
+	ProviderID string `json:"provider_id"`
+	AccountID  string `json:"account_id,omitempty"`
+	Available  bool   `json:"available"`
+	LastError  string `json:"last_error,omitempty"`
 }
 
 // DiagnosticEventDTO describes a diagnostic finding or resolution.
@@ -381,15 +381,15 @@ type ProviderRecommendationRequest struct {
 
 // ProviderRecommendationResponse contains the recommendation result.
 type ProviderRecommendationResponse struct {
-	Recommended *ProviderChoiceDTO   `json:"recommended,omitempty"`
+	Recommended  *ProviderChoiceDTO  `json:"recommended,omitempty"`
 	Alternatives []ProviderChoiceDTO `json:"alternatives,omitempty"`
 	Filtered     []FilteredChoiceDTO `json:"filtered,omitempty"`
 }
 
 // ProviderChoiceDTO describes one viable provider choice.
 type ProviderChoiceDTO struct {
-	ProviderID string `json:"provider_id"`
-	AccountID  string `json:"account_id,omitempty"`
+	ProviderID string   `json:"provider_id"`
+	AccountID  string   `json:"account_id,omitempty"`
 	Reasons    []string `json:"reasons,omitempty"`
 }
 

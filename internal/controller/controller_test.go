@@ -425,8 +425,8 @@ func TestController_RepairFullPath(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "mock"},
-		Desired:    core.DesiredOpen,
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredOpen,
 	}
 	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -533,13 +533,13 @@ func TestPlanRepairHandlesUnknownAndUnstableConnector(t *testing.T) {
 				Kind: core.ConnectionServiceExposure,
 				Spec: core.ConnectionSpec{
 					ServiceExposure: &core.ServiceExposureSpec{
-						Source: core.SourceSpec{Kind: core.SourceExisting, Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:8080", Protocol: core.ProtocolHTTP}},
+						Source:     core.SourceSpec{Kind: core.SourceExisting, Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:8080", Protocol: core.ProtocolHTTP}},
 						Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
 						Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 					},
 				},
-				Driver: core.DriverSelection{ProviderID: "mock"},
-				Desired:    core.DesiredOpen,
+				Driver:  core.DriverSelection{ProviderID: "mock"},
+				Desired: core.DesiredOpen,
 			}
 			if _, _, err := ctrl.CreateProfile(context.Background(), profile); err != nil {
 				t.Fatalf("create profile: %v", err)
@@ -584,8 +584,8 @@ func TestController_DeleteFullPath(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "mock"},
-		Desired:    core.DesiredOpen,
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredOpen,
 	}
 	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -692,8 +692,8 @@ func TestController_LocalOnlyDeleteDoesNotRequireUnavailableProvider(t *testing.
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "removed-provider"},
-		Desired:    core.DesiredClosed,
+		Driver:  core.DriverSelection{ProviderID: "removed-provider"},
+		Desired: core.DesiredClosed,
 	}
 	ctrl.RestoreProfile(profile)
 	ctrl.RestoreRuntime(&core.ConnectionRuntime{
@@ -777,8 +777,8 @@ func TestController_ApplyStalePlan(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "mock"},
-		Desired:    core.DesiredOpen,
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredOpen,
 	}
 	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -826,8 +826,8 @@ func TestController_PlanValidationError(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "nonexistent"},
-		Desired:    core.DesiredOpen,
+		Driver:  core.DriverSelection{ProviderID: "nonexistent"},
+		Desired: core.DesiredOpen,
 	}
 
 	// CreateProfile should fail because provider not found
@@ -861,8 +861,8 @@ func TestController_ConcurrentOperationLimit(t *testing.T) {
 					Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 				},
 			},
-			Driver: core.DriverSelection{ProviderID: "mock"},
-			Desired:    core.DesiredOpen,
+			Driver:  core.DriverSelection{ProviderID: "mock"},
+			Desired: core.DesiredOpen,
 		}
 		if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
 			t.Fatalf("CreateProfile %d: %v", i, err)
@@ -964,8 +964,8 @@ func TestController_ExpiredPlanRejection(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "mock"},
-		Desired:    core.DesiredOpen,
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredOpen,
 	}
 	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
@@ -1008,8 +1008,8 @@ func TestController_ObservedFingerprintStalePlan(t *testing.T) {
 				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
 			},
 		},
-		Driver: core.DriverSelection{ProviderID: "mock"},
-		Desired:    core.DesiredOpen,
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredOpen,
 	}
 	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
 		t.Fatalf("CreateProfile: %v", err)
