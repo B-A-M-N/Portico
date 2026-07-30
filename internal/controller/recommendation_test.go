@@ -195,3 +195,54 @@ func TestRecommendationStatesTradeoffs(t *testing.T) {
 		t.Fatalf("tradeoffs do not mention unrestricted access: %q", joined)
 	}
 }
+
+// TestPrivateAndPublicProvidersAreNotInterchangeable pins the cross-provider
+// half of audit item 5: a public provider must not be offered for a private
+// client tunnel, and a private-only provider must not be offered for a public
+// exposure.
+func TestPrivateAndPublicProvidersAreNotInterchangeable(t *testing.T) {
+	public := capableProvider("cloudflare", true)
+
+	privateOnly := provider.ProviderSnapshot{
+		ID:            "openai_tunnel",
+		DisplayName:   "OpenAI Secure MCP Tunnel",
+		Authenticated: true,
+		Availability:  provider.AvailabilityReady,
+		Accounts:      []provider.AccountInfo{{ID: "acct-openai"}},
+		Capabilities: core.Capabilities{
+			PrivateExposure: core.CapabilitySupport{Supported: true, Stability: core.StabilityExperimental},
+			Protocols: map[core.Protocol]core.ProtocolCapability{
+				core.ProtocolHTTP: {Supported: true, Private: true},
+			},
+		},
+	}
+
+	t.Run("public exposure never selects the private provider", func(t *testing.T) {
+		rec := recommendWith(t, []provider.ProviderSnapshot{privateOnly, public},
+			RecommendationInput{ExposureMode: core.ExposureTemporary})
+		if rec.Recommended == nil || rec.Recommended.ProviderID != "cloudflare" {
+			t.Fatalf("recommended %+v for a public exposure", rec.Recommended)
+		}
+	})
+
+	t.Run("private exposure never selects the public provider", func(t *testing.T) {
+		rec := recommendWith(t, []provider.ProviderSnapshot{privateOnly, public},
+			RecommendationInput{ExposureMode: core.ExposurePrivate})
+		if rec.Recommended == nil {
+			t.Fatalf("no provider offered for a private exposure; summary=%q", rec.Summary)
+		}
+		if rec.Recommended.ProviderID != "openai_tunnel" {
+			t.Fatalf("recommended %q for a private exposure", rec.Recommended.ProviderID)
+		}
+		// Cloudflare must be reported ineligible with a reason, not dropped.
+		var found bool
+		for _, bad := range rec.Ineligible {
+			if bad.ProviderID == "cloudflare" && len(bad.BlockingReasons) > 0 {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("the public provider was not reported ineligible for private exposure")
+		}
+	})
+}

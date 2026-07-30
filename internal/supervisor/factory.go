@@ -19,6 +19,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
 	"github.com/B-A-M-N/portico/internal/provider/ngrok"
+	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -80,6 +81,7 @@ func RunSupervisor(ctx context.Context) error {
 	// validated against the concrete adapter during startup; doing it before
 	// adapter construction would advertise credentials it cannot actually use.
 	registerProviderCatalog(reg)
+	registerOpenAITunnel(reg, &processManagerAdapter{mgr: procMgr})
 	hasRealProvider := registerCloudflareWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st)
 	hasRealProvider = registerNgrokWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st) || hasRealProvider
 
@@ -128,9 +130,38 @@ func registerProviderCatalog(reg provider.Registry) {
 			Availability: provider.AvailabilityNotImplemented,
 			Reason:       "Portico ships no zrok adapter yet",
 		},
+		{
+			ID: "openai_tunnel", Name: "openai_tunnel", DisplayName: "OpenAI Secure MCP Tunnel",
+			Availability: provider.AvailabilityExperimental,
+			Reason: "the adapter has not been exercised against a live tunnel; " +
+				"it can start and observe the client but does not create tunnels or verify ChatGPT app registration",
+			SetupActions: []string{
+				"Install tunnel-client from the OpenAI platform's tunnel settings",
+				"Create a tunnel there and note its ID; Portico does not create tunnels",
+				"Export CONTROL_PLANE_API_KEY before starting the supervisor",
+				"Set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1 to register the provider",
+			},
+		},
 	} {
 		reg.AddCatalogEntry(entry)
 	}
+}
+
+// registerOpenAITunnel registers the Secure MCP Tunnel provider behind an
+// explicit opt-in. The adapter is experimental and has not been run against a
+// live tunnel, so it stays out of standard flows for the same reason ngrok
+// does.
+func registerOpenAITunnel(reg provider.Registry, procMgr core.ConnectorProcessService) bool {
+	if os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") != "1" {
+		return false
+	}
+	if err := reg.Add(openaitunnel.New("", procMgr)); err != nil {
+		slog.Warn("OpenAI tunnel provider register failed", "err", err)
+		return false
+	}
+	slog.Warn("registering EXPERIMENTAL OpenAI Secure MCP Tunnel provider; " +
+		"it has not been exercised against a live tunnel")
+	return true
 }
 
 // registerCloudflareWithAccounts attempts to register the Cloudflare provider

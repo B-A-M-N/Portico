@@ -1283,6 +1283,9 @@ func specArmKind(spec core.ConnectionSpec) (core.ConnectionKind, error) {
 	if spec.PrivateNetwork != nil {
 		kinds = append(kinds, core.ConnectionPrivateNetwork)
 	}
+	if spec.ClientTunnel != nil {
+		kinds = append(kinds, core.ConnectionClientTunnel)
+	}
 	if len(kinds) != 1 {
 		return "", fmt.Errorf("exactly one connection spec arm must be set, got %d", len(kinds))
 	}

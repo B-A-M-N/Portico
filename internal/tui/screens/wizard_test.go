@@ -700,8 +700,12 @@ func TestUnavailableOutcomeIsRefusedRatherThanSubstituted(t *testing.T) {
 		t.Fatalf("an unavailable private outcome fell back to public exposure: %q", m.state.ExposureMode)
 	}
 	view := m.View()
-	if !strings.Contains(view, "cannot do this yet") {
+	if !strings.Contains(view, "experimental in Portico and off by default") {
 		t.Fatalf("refusal does not explain itself:\n%s", view)
+	}
+	// It must also say how to enable it, not merely that it is unavailable.
+	if !strings.Contains(view, "PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") {
+		t.Fatalf("refusal does not say how to enable the feature:\n%s", view)
 	}
 	if !strings.Contains(view, "expose it to anyone who finds the URL") {
 		t.Fatalf("refusal does not explain the risk of the alternative:\n%s", view)

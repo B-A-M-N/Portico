@@ -127,6 +127,7 @@ portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp 
 | Ngrok | ⚠️ Experimental — not usable | Temporary (ephemeral tunnels) | Not applied |
 | Tailscale | ❌ Not implemented | — | — |
 | zrok | ❌ Not implemented | — | — |
+| OpenAI Secure MCP Tunnel | ⚠️ Experimental — not usable | Private only (no public address) | Mediated by OpenAI; Portico applies none |
 
 > Cloudflare is the only provider suitable for use. Tailscale and zrok are
 > planned for future releases but have no implementation yet.
@@ -142,6 +143,17 @@ not a working provider, and reports every capability as experimental. It:
 It is registered only when `PORTICO_ENABLE_EXPERIMENTAL_NGROK=1` is set, and no
 protection policy is applied to ngrok connections regardless of configuration.
 Do not rely on it.
+
+**OpenAI Secure MCP Tunnel is experimental and disabled by default.** It connects
+a local MCP server to ChatGPT over an outbound-only tunnel, with no public
+address and no inbound port. Portico can start and observe the `tunnel-client`
+process, but it does **not** create tunnels, enumerate MCP tools, or verify that
+the app has been registered in ChatGPT — those happen on OpenAI's platform and
+are reported as outstanding user actions rather than inferred.
+
+Enable it with `PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1` after installing
+`tunnel-client`, creating a tunnel in the OpenAI platform, and exporting
+`CONTROL_PLANE_API_KEY`. It has not been exercised against a live tunnel.
 
 ## Development
 

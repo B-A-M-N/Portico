@@ -1119,3 +1119,54 @@ func TestListRecentOperationsRespectsLimit(t *testing.T) {
 		t.Fatalf("newest = %q, want op-4", ops[0].ID)
 	}
 }
+
+// TestClientTunnelProfileRoundTrips verifies the versioned spec schema stores
+// the client-tunnel arm without a further migration, which is the reason the
+// kind was added to the existing union rather than modelled separately.
+func TestClientTunnelProfileRoundTrips(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	profile := &core.ConnectionProfile{
+		ID:       "conn-tunnel",
+		Name:     "mcp to chatgpt",
+		Revision: 1,
+		Kind:     core.ConnectionClientTunnel,
+		Spec: core.ConnectionSpec{
+			ClientTunnel: &core.ClientTunnelSpec{
+				Client:   core.ClientOpenAISecureMCPTunnel,
+				MCP:      core.MCPServiceSpec{Endpoint: "http://127.0.0.1:8787/mcp"},
+				TunnelID: "tunnel_abc",
+				Profile:  "local-http",
+			},
+		},
+		Driver:    core.DriverSelection{ProviderID: "openai_tunnel"},
+		Desired:   core.DesiredClosed,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	loaded, err := s.LoadProfile(ctx, profile.ID)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if loaded.Kind != core.ConnectionClientTunnel {
+		t.Fatalf("kind = %q", loaded.Kind)
+	}
+	if loaded.Spec.ServiceExposure != nil {
+		t.Fatal("a client tunnel loaded with a service exposure arm")
+	}
+	if loaded.Spec.ClientTunnel == nil || loaded.Spec.ClientTunnel.TunnelID != "tunnel_abc" {
+		t.Fatalf("client tunnel spec = %+v", loaded.Spec.ClientTunnel)
+	}
+	if loaded.Spec.ClientTunnel.MCP.Endpoint != "http://127.0.0.1:8787/mcp" {
+		t.Fatalf("MCP endpoint = %q", loaded.Spec.ClientTunnel.MCP.Endpoint)
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Fatalf("loaded client tunnel failed validation: %v", err)
+	}
+}

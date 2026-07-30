@@ -191,7 +191,10 @@ var wizardRecipes = []wizardRecipe{
 		Label:       "Connect an MCP server to ChatGPT",
 		Explanation: "A local MCP server should reach ChatGPT over a private, client-mediated tunnel rather than a public address.",
 		SourceType:  "mcp_server",
-		Unavailable: "Portico cannot do this yet. It has no Secure MCP Tunnel support, and publishing an MCP server at a public address instead would expose it to anyone who finds the URL. Choose \"Advanced\" only if a public address is genuinely what you want.",
+		Unavailable: "This uses OpenAI's Secure MCP Tunnel, which is experimental in Portico and off by default. " +
+			"Install tunnel-client, create a tunnel in the OpenAI platform, export CONTROL_PLANE_API_KEY, " +
+			"and set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1. " +
+			"Portico will not publish your MCP server at a public address instead: that would expose it to anyone who finds the URL.",
 	},
 	{
 		Label:       "Something else (choose the source yourself)",

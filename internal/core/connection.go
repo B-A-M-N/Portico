@@ -19,6 +19,13 @@ const (
 
 	// ConnectionPrivateNetwork joins or exposes through a private network.
 	ConnectionPrivateNetwork ConnectionKind = "private_network"
+
+	// ConnectionClientTunnel reaches a local service through a client-mediated
+	// tunnel operated by the consuming platform, with no public address and no
+	// inbound port. It is a distinct kind rather than an exposure mode because
+	// it has no hostname, no DNS record and no public endpoint, and must never
+	// be satisfied by publishing the service instead.
+	ConnectionClientTunnel ConnectionKind = "client_tunnel"
 )
 
 // ConnectionProfile represents the desired state of a connection.
@@ -43,6 +50,30 @@ type ConnectionSpec struct {
 	ServiceExposure *ServiceExposureSpec `json:"service_exposure,omitempty"`
 	PortForward     *PortForwardSpec     `json:"port_forward,omitempty"`
 	PrivateNetwork  *PrivateNetworkSpec  `json:"private_network,omitempty"`
+	ClientTunnel    *ClientTunnelSpec    `json:"client_tunnel,omitempty"`
+}
+
+// ClientKind identifies the platform whose client mediates the tunnel.
+type ClientKind string
+
+const (
+	// ClientOpenAISecureMCPTunnel is OpenAI's Secure MCP Tunnel, run locally as
+	// the tunnel-client binary. It opens an outbound HTTPS connection to
+	// OpenAI and forwards MCP requests to a local server; no inbound port is
+	// opened and no public address is created.
+	ClientOpenAISecureMCPTunnel ClientKind = "openai_secure_mcp_tunnel"
+)
+
+// ClientTunnelSpec describes a client-mediated private connection.
+type ClientTunnelSpec struct {
+	Client ClientKind     `json:"client"`
+	MCP    MCPServiceSpec `json:"mcp"`
+	// TunnelID identifies the tunnel created in the platform's own settings.
+	// Portico does not create it: tunnel creation happens on the platform, and
+	// claiming otherwise would report an unverified step as done.
+	TunnelID string `json:"tunnel_id,omitempty"`
+	// Profile names the local client profile to run.
+	Profile string `json:"profile,omitempty"`
 }
 
 // ServiceExposureSpec describes a service exposure connection.
@@ -222,6 +253,25 @@ func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 		cp.Spec.PrivateNetwork = &pn
 	}
 
+	if p.Spec.ClientTunnel != nil {
+		ct := *p.Spec.ClientTunnel
+		cp.Spec.ClientTunnel = &ct
+		if p.Spec.ClientTunnel.MCP.Command != nil {
+			cmd := *p.Spec.ClientTunnel.MCP.Command
+			if cmd.Args != nil {
+				cmd.Args = append([]string(nil), cmd.Args...)
+			}
+			if cmd.Env != nil {
+				env := make(map[string]string, len(cmd.Env))
+				for k, v := range cmd.Env {
+					env[k] = v
+				}
+				cmd.Env = env
+			}
+			cp.Spec.ClientTunnel.MCP.Command = &cmd
+		}
+	}
+
 	// Deep copy driver options
 	if p.Driver.Options != nil {
 		options := make(map[string]string, len(p.Driver.Options))
@@ -280,6 +330,15 @@ func (p *ConnectionProfile) Validate() error {
 			return fmt.Errorf("kind %q does not match private network spec", p.Kind)
 		}
 		if err := validatePrivateNetworkSpec(p.Spec.PrivateNetwork); err != nil {
+			return err
+		}
+	}
+	if p.Spec.ClientTunnel != nil {
+		specCount++
+		if p.Kind != ConnectionClientTunnel {
+			return fmt.Errorf("kind %q does not match client tunnel spec", p.Kind)
+		}
+		if err := validateClientTunnelSpec(p, p.Spec.ClientTunnel); err != nil {
 			return err
 		}
 	}
@@ -502,6 +561,47 @@ func validatePortForwardSpec(spec *PortForwardSpec) error {
 		return fmt.Errorf("invalid direction %q, must be local or remote", spec.Direction)
 	}
 
+	return nil
+}
+
+// validateClientTunnelSpec validates a client-mediated tunnel specification.
+func validateClientTunnelSpec(p *ConnectionProfile, spec *ClientTunnelSpec) error {
+	if spec == nil {
+		return fmt.Errorf("client tunnel spec is nil")
+	}
+	if spec.Client != ClientOpenAISecureMCPTunnel {
+		return fmt.Errorf("unsupported tunnel client %q", spec.Client)
+	}
+	// The client forwards to exactly one local MCP server, supplied either as a
+	// URL for an HTTP server or a command for a stdio server.
+	if spec.MCP.Endpoint == "" && spec.MCP.Command == nil {
+		return fmt.Errorf("a client tunnel requires an MCP endpoint or command")
+	}
+	if spec.MCP.Endpoint != "" && spec.MCP.Command != nil {
+		return fmt.Errorf("a client tunnel must use either an MCP endpoint or a command, not both")
+	}
+	if spec.MCP.Endpoint != "" {
+		u, err := url.ParseRequestURI(spec.MCP.Endpoint)
+		if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
+			return fmt.Errorf("MCP endpoint must be an absolute HTTP URL without embedded credentials")
+		}
+	}
+	if spec.MCP.Command != nil {
+		if spec.MCP.Command.Executable == "" {
+			return fmt.Errorf("MCP command executable is required")
+		}
+		if err := validateCommandEnvironment(spec.MCP.Command.Env); err != nil {
+			return err
+		}
+	}
+	if p.Driver.ProviderID == "" {
+		return fmt.Errorf("provider ID is required")
+	}
+	switch p.Desired {
+	case DesiredOpen, DesiredClosed, "":
+	default:
+		return fmt.Errorf("invalid desired state %q", p.Desired)
+	}
 	return nil
 }
 
