@@ -243,11 +243,28 @@ type PlanDTO struct {
 	Warnings     []string  `json:"warnings,omitempty"`
 	Fingerprint  string    `json:"fingerprint"`
 	Noop         bool      `json:"noop,omitempty"`
+
+	// A preview must state consequences before implementation terminology.
+	// These describe, in plain language, what the plan will achieve and what it
+	// will change; the step list remains available as the exact technical plan.
+
+	// Outcome is what the user will be able to do once the plan succeeds.
+	Outcome string `json:"outcome,omitempty"`
+	// Access states who will be able to reach the service.
+	Access string `json:"access,omitempty"`
+	// LocalChanges are the changes Portico will make on this machine.
+	LocalChanges []string `json:"local_changes,omitempty"`
+	// ProviderChanges are the resources Portico will create or remove at the
+	// provider.
+	ProviderChanges []string `json:"provider_changes,omitempty"`
+	// Reversibility explains what closing or deleting will and will not undo.
+	Reversibility []string `json:"reversibility,omitempty"`
 }
 
 // StepDTO is a step in a plan preview.
 type StepDTO struct {
 	ID           string `json:"id"`
+	Kind         string `json:"kind,omitempty"`
 	Summary      string `json:"summary"`
 	Destructive  bool   `json:"destructive"`
 	Irreversible bool   `json:"irreversible"`

@@ -1577,6 +1577,38 @@ func (m *Model) renderPlanPreview() string {
 		b.WriteString(fmt.Sprintf("Account:    %s\n", conn.ProviderAccountID))
 	}
 
+	// Consequences before implementation terminology: what this achieves, who
+	// can reach it, what changes locally and at the provider, and what can be
+	// undone. The step list follows as the exact technical plan.
+	if m.plan.Outcome != "" {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("header").Render(" OUTCOME "))
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("stable").Render("  " + m.plan.Outcome))
+		b.WriteString("\n")
+	}
+	if m.plan.Access != "" {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("header").Render(" ACCESS "))
+		b.WriteString("\n  ")
+		b.WriteString(m.plan.Access)
+		b.WriteString("\n")
+	}
+	writeSection := func(title string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("header").Render(" " + title + " "))
+		b.WriteString("\n")
+		for _, item := range items {
+			b.WriteString("  " + item + "\n")
+		}
+	}
+	writeSection("LOCAL CHANGES", m.plan.LocalChanges)
+	writeSection("PROVIDER CHANGES", m.plan.ProviderChanges)
+	writeSection("REVERSIBILITY", m.plan.Reversibility)
+
 	// Warnings
 	if len(m.plan.Warnings) > 0 {
 		b.WriteString("\n")
@@ -1587,8 +1619,8 @@ func (m *Model) renderPlanPreview() string {
 		}
 	}
 
-	// Steps with safety annotations
-	b.WriteString("\nSteps:\n")
+	// Exact technical plan.
+	b.WriteString("\nTechnical plan:\n")
 	hasIrreversible := false
 	for i, step := range m.plan.Steps {
 		mark := " "

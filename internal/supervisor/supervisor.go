@@ -935,21 +935,8 @@ func (h *supervisorHandler) HandlePlanOpen(id string) (*ipc.PlanDTO, error) {
 		return nil, fmt.Errorf("save plan to controller: %w", err)
 	}
 
-	dto := &ipc.PlanDTO{
-		ID:           string(canonicalPlan.ID),
-		ConnectionID: string(canonicalPlan.ConnectionID),
-		Intent:       string(canonicalPlan.Intent),
-		Provider:     string(canonicalPlan.Provider),
-		Fingerprint:  canonicalPlan.Fingerprint,
-	}
-	for _, step := range canonicalPlan.Steps {
-		dto.Steps = append(dto.Steps, ipc.StepDTO{
-			ID:          step.ID,
-			Summary:     step.Summary,
-			Destructive: step.Destructive,
-		})
-	}
-	return dto, nil
+	profile, _ := h.sup.controller.GetProfile(canonicalPlan.ConnectionID)
+	return planToDTO(canonicalPlan, profile), nil
 }
 
 func (h *supervisorHandler) HandlePlanClose(id string) (*ipc.PlanDTO, error) {
@@ -969,20 +956,8 @@ func (h *supervisorHandler) HandlePlanClose(id string) (*ipc.PlanDTO, error) {
 		return nil, fmt.Errorf("save plan to controller: %w", err)
 	}
 
-	dto := &ipc.PlanDTO{
-		ID:           string(canonicalPlan.ID),
-		ConnectionID: string(canonicalPlan.ConnectionID),
-		Intent:       string(canonicalPlan.Intent),
-		Provider:     string(canonicalPlan.Provider),
-		Fingerprint:  canonicalPlan.Fingerprint,
-	}
-	for _, step := range canonicalPlan.Steps {
-		dto.Steps = append(dto.Steps, ipc.StepDTO{
-			ID:      step.ID,
-			Summary: step.Summary,
-		})
-	}
-	return dto, nil
+	profile, _ := h.sup.controller.GetProfile(canonicalPlan.ConnectionID)
+	return planToDTO(canonicalPlan, profile), nil
 }
 
 func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string) (*ipc.OperationDTO, error) {
@@ -1131,16 +1106,14 @@ func (h *supervisorHandler) HandlePlanRepair(id string) (*ipc.PlanDTO, error) {
 
 	steps := make([]ipc.StepDTO, len(repairPlan.Steps))
 	for i, s := range repairPlan.Steps {
-		steps[i] = ipc.StepDTO{ID: s.ID, Summary: s.Summary}
+		steps[i] = ipc.StepDTO{ID: s.ID, Kind: string(s.Kind), Summary: s.Summary}
 	}
 
-	return &ipc.PlanDTO{
-		ID:           string(repairPlan.ID),
-		ConnectionID: id,
-		Intent:       string(repairPlan.Intent),
-		Provider:     string(repairPlan.Provider),
-		Steps:        steps,
-	}, nil
+	repairProfile, _ := h.sup.controller.GetProfile(cid)
+	dto := planToDTO(repairPlan, repairProfile)
+	dto.ConnectionID = id
+	dto.Steps = steps
+	return dto, nil
 }
 
 func (h *supervisorHandler) HandlePlanDelete(id string) (*ipc.PlanDTO, error) {
@@ -1177,13 +1150,12 @@ func (h *supervisorHandler) HandlePlanDelete(id string) (*ipc.PlanDTO, error) {
 		})
 	}
 
-	return &ipc.PlanDTO{
-		ID:           string(removePlan.ID),
-		ConnectionID: id,
-		Intent:       "delete",
-		Provider:     string(removePlan.Provider),
-		Steps:        steps,
-	}, nil
+	profile, _ := h.sup.controller.GetProfile(cid)
+	dto := planToDTO(removePlan, profile)
+	dto.ConnectionID = id
+	dto.Intent = "delete"
+	dto.Steps = steps
+	return dto, nil
 }
 
 func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
