@@ -19,6 +19,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
@@ -27,24 +30,42 @@ import (
 // ClientBinary is the customer-run agent's executable name.
 const ClientBinary = "tunnel-client"
 
-// CredentialEnvVar is the environment variable the client reads its
-// control-plane key from. The key is passed through the environment only:
-// process arguments are world-readable via /proc.
+// CredentialEnvVar is the environment variable holding the control-plane key.
+//
+// The client does not take the key as a value. It takes a *reference* of the
+// form env:VARNAME or file:/path, which it resolves itself, so the secret never
+// appears in a command line even as an argument value.
 const CredentialEnvVar = "CONTROL_PLANE_API_KEY"
 
-// defaultAdminPort is where the client serves /healthz and /readyz.
-const defaultAdminPort = 8619
+// credentialReference is what is passed to --control-plane.api-key.
+const credentialReference = "env:" + CredentialEnvVar
+
+// tunnelIDPattern is the identifier format the client accepts. Validating at
+// plan time turns a malformed ID into a preview-time error rather than a
+// process that starts and immediately exits.
+var tunnelIDPattern = regexp.MustCompile(`^tunnel_[a-z0-9]{32}$`)
 
 // Provider adapts the Secure MCP Tunnel client to Portico's provider contract.
 type Provider struct {
-	binPath       string
+	binPath string
+	// adminBaseURL is discovered from the health URL file the client writes on
+	// startup rather than assumed, because the health port is configurable and
+	// defaults to a fixed port that may already be in use.
 	adminBaseURL  string
+	healthURLFile string
 	connectorProc core.ConnectorProcessService
 	// lookPath is injectable so tests do not depend on the binary being
 	// installed on the machine running them.
 	lookPath func(string) (string, error)
 	// probe is injectable so readiness can be tested without a live client.
 	probe func(ctx context.Context, url string) error
+}
+
+// SetAdminBaseURL overrides where the client's health endpoints are expected.
+// The client serves them on loopback; tests point this at a stub server so the
+// real HTTP probe is exercised rather than replaced.
+func (p *Provider) SetAdminBaseURL(base string) {
+	p.adminBaseURL = base
 }
 
 // New creates a Secure MCP Tunnel provider.
@@ -54,7 +75,6 @@ func New(binPath string, procMgr core.ConnectorProcessService) *Provider {
 	}
 	p := &Provider{
 		binPath:       binPath,
-		adminBaseURL:  fmt.Sprintf("http://127.0.0.1:%d", defaultAdminPort),
 		connectorProc: procMgr,
 		lookPath:      exec.LookPath,
 	}
@@ -186,6 +206,11 @@ func (p *Provider) Plan(_ context.Context, desired core.DesiredConnection) (*cor
 			return nil, fmt.Errorf(
 				"openai tunnel: a tunnel ID is required; create the tunnel in the OpenAI platform's organization settings first")
 		}
+		if !tunnelIDPattern.MatchString(spec.TunnelID) {
+			return nil, core.ErrValidation(fmt.Sprintf(
+				"tunnel ID %q is malformed; the client requires tunnel_ followed by 32 lowercase letters or digits",
+				spec.TunnelID))
+		}
 		params := map[string]string{"tunnel_id": spec.TunnelID}
 		if spec.Profile != "" {
 			params["profile"] = spec.Profile
@@ -297,16 +322,24 @@ func (p *Provider) validateClient(step core.PlanStep) core.StepResult {
 // defect this audit found in the ngrok adapter.
 func (p *Provider) clientProcessSpec(step core.PlanStep) core.ProcessSpec {
 	args := []string{"run"}
-	if profile := step.Technical.Parameters["profile"]; profile != "" {
-		args = append(args, "--profile", profile)
-	}
 	if tunnelID := step.Technical.Parameters["tunnel_id"]; tunnelID != "" {
-		args = append(args, "--tunnel-id", tunnelID)
+		args = append(args, "--control-plane.tunnel-id", tunnelID)
 	}
+	// A reference, not the secret. The client resolves it from the environment
+	// itself, so the value never appears in argv at all.
+	args = append(args, "--control-plane.api-key", credentialReference)
+
 	if url := step.Technical.Parameters["mcp_server_url"]; url != "" {
-		args = append(args, "--mcp-server-url", url)
+		args = append(args, "--mcp.server-url", "url="+url)
 	} else if command := step.Technical.Parameters["mcp_command"]; command != "" {
-		args = append(args, "--mcp-command", command)
+		args = append(args, "--mcp.command", "command="+command)
+	}
+
+	// Ask for an ephemeral health port and have the client report it, rather
+	// than assuming the default port is free.
+	args = append(args, "--health.listen-addr", "127.0.0.1:0")
+	if p.healthURLFile != "" {
+		args = append(args, "--health.url-file", p.healthURLFile)
 	}
 
 	return core.ProcessSpec{
@@ -317,7 +350,33 @@ func (p *Provider) clientProcessSpec(step core.PlanStep) core.ProcessSpec {
 	}
 }
 
+// adminBase resolves the client's health base URL, preferring the file the
+// client writes on startup over any configured override.
+func (p *Provider) adminBase() (string, error) {
+	if p.adminBaseURL != "" {
+		return p.adminBaseURL, nil
+	}
+	if p.healthURLFile == "" {
+		return "", fmt.Errorf("the client was not asked to report its health URL")
+	}
+	data, err := os.ReadFile(p.healthURLFile)
+	if err != nil {
+		return "", fmt.Errorf("the client has not reported a health URL yet: %w", err)
+	}
+	base := strings.TrimSpace(string(data))
+	if base == "" {
+		return "", fmt.Errorf("the client reported an empty health URL")
+	}
+	return base, nil
+}
+
 func (p *Provider) startClient(ctx context.Context, connectionID core.ConnectionID, step core.PlanStep) core.StepResult {
+	// The client reports its chosen health port through this file.
+	if p.healthURLFile == "" && p.adminBaseURL == "" {
+		p.healthURLFile = filepath.Join(os.TempDir(),
+			fmt.Sprintf("portico-tunnel-health-%s.url", connectionID))
+		_ = os.Remove(p.healthURLFile)
+	}
 	if p.connectorProc == nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
 			Error: fmt.Errorf("no process manager is available to supervise the tunnel client")}
@@ -346,13 +405,37 @@ func (p *Provider) startClient(ctx context.Context, connectionID core.Connection
 	}
 }
 
+// verifyClient waits for the client to report ready.
+//
+// /healthz and /readyz mean different things and both are needed: the client
+// answers /healthz as soon as its HTTP server is up, but returns 503 from
+// /readyz until it has actually reached the control plane. Treating liveness as
+// readiness would report a tunnel as open while it was still unauthenticated.
 func (p *Provider) verifyClient(ctx context.Context, step core.PlanStep) core.StepResult {
-	if err := p.probe(ctx, p.adminBaseURL+"/readyz"); err != nil {
-		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("the tunnel client did not report ready: %w", err)}
+	deadline := time.Now().Add(clientReadyTimeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		base, err := p.adminBase()
+		if err != nil {
+			lastErr = err
+		} else if err := p.probe(ctx, base+"/readyz"); err == nil {
+			return core.StepResult{StepID: step.ID, Succeeded: true}
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: ctx.Err()}
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	return core.StepResult{StepID: step.ID, Succeeded: true}
+	return core.StepResult{StepID: step.ID, Succeeded: false,
+		Error: fmt.Errorf("the tunnel client did not report ready: %w", lastErr)}
 }
+
+// clientReadyTimeout bounds how long to wait for the client to reach the
+// control plane before the step fails.
+const clientReadyTimeout = 30 * time.Second
 
 func (p *Provider) stopClient(connectionID core.ConnectionID, step core.PlanStep) core.StepResult {
 	if p.connectorProc == nil {
@@ -381,7 +464,14 @@ func (p *Provider) Observe(ctx context.Context, id core.ConnectionID) (*core.Obs
 		return observed, nil
 	}
 	connector := &core.ObservedConnector{PID: handle.PID, Status: string(core.ConnectorStatusRunning)}
-	if err := p.probe(ctx, p.adminBaseURL+"/healthz"); err != nil {
+	base, baseErr := p.adminBase()
+	if baseErr != nil {
+		connector.Status = string(core.ConnectorStatusUnstable)
+		connector.LastError = baseErr.Error()
+		observed.Connector = connector
+		return observed, nil
+	}
+	if err := p.probe(ctx, base+"/healthz"); err != nil {
 		// The process is alive but the client is not answering, which is a
 		// degraded tunnel rather than a stopped one.
 		connector.Status = string(core.ConnectorStatusUnstable)

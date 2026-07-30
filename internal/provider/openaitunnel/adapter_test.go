@@ -47,7 +47,7 @@ func tunnelProfile(desired core.DesiredConnectionState) *core.ConnectionProfile 
 			ClientTunnel: &core.ClientTunnelSpec{
 				Client:   core.ClientOpenAISecureMCPTunnel,
 				MCP:      core.MCPServiceSpec{Endpoint: "http://127.0.0.1:8787/mcp"},
-				TunnelID: "tunnel_0123456789abcdef",
+				TunnelID: "tunnel_0123456789abcdef0123456789abcdef",
 				Profile:  "local-http",
 			},
 		},
@@ -141,7 +141,10 @@ func TestCredentialNeverEntersArgv(t *testing.T) {
 	}
 	// The documented flags must be used.
 	joined := strings.Join(spec.Args, " ")
-	for _, want := range []string{"run", "--tunnel-id", "--mcp-server-url", "--profile"} {
+	for _, want := range []string{
+		"run", "--control-plane.tunnel-id", "--control-plane.api-key",
+		"env:" + CredentialEnvVar, "--mcp.server-url",
+	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("argv %q missing documented flag %q", joined, want)
 		}
