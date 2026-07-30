@@ -500,3 +500,14 @@ type DiagnosticDTO struct {
 	Summary     string `json:"summary"`
 	Explanation string `json:"explanation"`
 }
+
+// CloneConnectionRequest asks the supervisor to copy a connection's desired
+// state into a new connection. Cloning never mutates the source connection or
+// its provider resources.
+type CloneConnectionRequest struct {
+	// Name for the clone. Defaults to the original's name with a suffix.
+	Name string `json:"name,omitempty"`
+	// RequestedAddress is required when the source uses a permanent hostname,
+	// since a hostname cannot be shared by two connections.
+	RequestedAddress string `json:"requested_address,omitempty"`
+}

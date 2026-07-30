@@ -199,6 +199,29 @@ func (c *Client) GetConnectionDetail(ctx context.Context, id string) (*Connectio
 	return &detail, nil
 }
 
+// CloneConnection copies a connection's desired state into a new connection.
+func (c *Client) CloneConnection(ctx context.Context, id string, req CloneConnectionRequest) (*ConnectionDTO, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/connections/"+id+"/clone", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var conn ConnectionDTO
+	if err := json.NewDecoder(resp.Body).Decode(&conn); err != nil {
+		return nil, err
+	}
+	return &conn, nil
+}
+
 // CreateConnection creates a new connection.
 func (c *Client) CreateConnection(ctx context.Context, req CreateConnectionRequest) (*ConnectionDTO, error) {
 	body, err := json.Marshal(req)

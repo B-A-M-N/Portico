@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,6 +45,7 @@ type RequestHandler interface {
 	HandleListConnections() ([]ConnectionDTO, error)
 	HandleGetConnection(id string) (*ConnectionDTO, error)
 	HandleGetConnectionDetail(id string) (*ConnectionDetailDTO, error)
+	HandleCloneConnection(id string, req CloneConnectionRequest) (*ConnectionDTO, error)
 	HandleCreateConnection(req CreateConnectionRequest) (*ConnectionDTO, error)
 	HandleUpdateConnection(id string, req UpdateConnectionRequest) (*ConnectionDTO, error)
 	HandlePlanOpen(id string) (*PlanDTO, error)
@@ -526,6 +528,24 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		// Destruction is intentionally a plan-preview-confirm-apply workflow.
 		// Do not let a conventional DELETE bypass the destructive preview.
 		writeMethodNotAllowed(w, "GET, PATCH")
+
+	case len(parts) == 2 && parts[1] == "clone" && r.Method == http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var req CloneConnectionRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "PTO-CONN-CLONE", "invalid request body")
+			return
+		}
+		conn, err := s.handler.HandleCloneConnection(id, req)
+		if err != nil {
+			writeHandlerError(w, "PTO-CONN-CLONE", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(conn)
 
 	case len(parts) == 2 && parts[1] == "detail" && r.Method == http.MethodGet:
 		detail, err := s.handler.HandleGetConnectionDetail(id)

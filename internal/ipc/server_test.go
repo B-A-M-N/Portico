@@ -33,6 +33,9 @@ func (nullHandler) HandleGetConnection(string) (*ConnectionDTO, error) {
 func (nullHandler) HandleGetConnectionDetail(string) (*ConnectionDetailDTO, error) {
 	return nil, nil
 }
+func (nullHandler) HandleCloneConnection(string, CloneConnectionRequest) (*ConnectionDTO, error) {
+	return nil, nil
+}
 func (nullHandler) HandleCreateConnection(CreateConnectionRequest) (*ConnectionDTO, error) {
 	return nil, nil
 }

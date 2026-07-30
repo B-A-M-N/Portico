@@ -1034,12 +1034,48 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 		return nil, core.ErrProfileNotFound(cid)
 	}
 
-	if req.Name != nil {
-		profile.Name = *req.Name
+	// The request accepts spec, driver and lifecycle changes, and this handler
+	// applied none of them. A caller could change the origin, provider, account,
+	// hostname or protection, receive a success response, and have nothing
+	// happen. Silently discarding a requested change is worse than refusing it,
+	// so unsupported edits are now rejected explicitly.
+	//
+	// These fields alter what the connection does at runtime and require a
+	// change plan that observes current resources and previews the creations,
+	// replacements and deletions involved. Until that exists, they are refused
+	// with the reason rather than accepted and dropped.
+	var unsupported []string
+	if req.Spec != nil {
+		unsupported = append(unsupported, "source, exposure or protection")
+	}
+	if req.Driver != nil {
+		unsupported = append(unsupported, "provider or account")
+	}
+	if req.Lifecycle != nil {
+		unsupported = append(unsupported, "lifecycle")
+	}
+	if len(unsupported) > 0 {
+		return nil, core.ErrValidation(fmt.Sprintf(
+			"changing %s is not supported yet because it requires a change plan that migrates the existing provider resources; "+
+				"delete this connection and create a replacement, or clone it and edit the copy",
+			strings.Join(unsupported, " and ")))
 	}
 
-	// Capture current revision for validation
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			return nil, core.ErrValidation("connection name cannot be empty")
+		}
+		profile.Name = name
+	}
+
+	// Honour the caller's expected revision. Reading the current revision back
+	// out of the profile made the check vacuous, so two concurrent edits both
+	// succeeded and the later one silently overwrote the earlier.
 	expectedRevision := profile.Revision
+	if req.ExpectedRevision != 0 {
+		expectedRevision = req.ExpectedRevision
+	}
 	profile.UpdatedAt = time.Now().UTC()
 	if err := h.sup.controller.UpdateProfile(ctx, profile, expectedRevision); err != nil {
 		return nil, err
@@ -1051,6 +1087,69 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 	}
 
 	return h.HandleGetConnection(id)
+}
+
+// HandleCloneConnection copies a connection's desired state into a new
+// connection.
+//
+// Cloning is the safe alternative to editing a live connection: it never
+// touches the source connection or its provider resources. Every identifier
+// tying the profile to existing infrastructure is dropped, so the clone plans
+// its own resources rather than adopting the original's. The clone is created
+// closed regardless of the source's desired state, so copying an open
+// connection never starts a second one by surprise.
+func (h *supervisorHandler) HandleCloneConnection(id string, req ipc.CloneConnectionRequest) (*ipc.ConnectionDTO, error) {
+	if !h.sup.mutating {
+		return nil, fmt.Errorf("supervisor is shutting down and not accepting mutations")
+	}
+	source, ok := h.sup.controller.GetProfile(core.ConnectionID(id))
+	if !ok {
+		return nil, core.ErrProfileNotFound(core.ConnectionID(id))
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = source.Name + " (copy)"
+	}
+
+	clone := source.DeepCopy()
+	clone.ID = core.NewConnectionID()
+	clone.Name = name
+	clone.Revision = 0
+	clone.Desired = core.DesiredClosed
+	clone.CreatedAt = time.Now().UTC()
+	clone.UpdatedAt = clone.CreatedAt
+
+	// A permanent hostname is unique to one connection. Carrying it over would
+	// make the clone contend with the original for the same DNS record, so the
+	// caller must supply a new one.
+	if clone.Spec.ServiceExposure != nil && clone.Spec.ServiceExposure.Exposure.Mode == core.ExposurePermanent {
+		hostname := strings.TrimSpace(req.RequestedAddress)
+		if hostname == "" {
+			return nil, core.ErrValidation(
+				"this connection uses a permanent hostname; supply a different hostname for the clone")
+		}
+		if hostname == clone.Spec.ServiceExposure.Exposure.RequestedAddress {
+			return nil, core.ErrValidation("the clone must use a different hostname from the original")
+		}
+		clone.Spec.ServiceExposure.Exposure.RequestedAddress = hostname
+	}
+
+	if err := clone.Validate(); err != nil {
+		return nil, core.ErrValidation(fmt.Sprintf("cloned connection is not valid: %v", err))
+	}
+
+	ctx := context.Background()
+	created, _, err := h.sup.controller.CreateProfile(ctx, clone)
+	if err != nil {
+		return nil, err
+	}
+	if h.sup.ipcServer != nil {
+		if dispatchErr := h.sup.ipcServer.DispatchCommittedEvents(ctx); dispatchErr != nil {
+			slog.Warn("dispatch clone event", "connection", created.ID, "err", dispatchErr)
+		}
+	}
+	return h.HandleGetConnection(string(created.ID))
 }
 
 func (h *supervisorHandler) HandlePlanRepair(id string) (*ipc.PlanDTO, error) {

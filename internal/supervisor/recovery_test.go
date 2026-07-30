@@ -934,3 +934,156 @@ func TestCloudflareSetupRejectsZoneNotVisibleToToken(t *testing.T) {
 		t.Fatalf("error does not name the offending zone: %v", err)
 	}
 }
+
+// TestUpdateConnectionRefusesSilentlyIgnoredChanges pins audit item 17. The
+// update request accepted spec, driver and lifecycle changes and the handler
+// applied none of them, so a caller could change the origin, provider or
+// protection, receive a success response, and have nothing happen.
+func TestUpdateConnectionRefusesSilentlyIgnoredChanges(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-update")
+	profile := recoveryTestProfile(connID)
+
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	driver := ipc.DriverSelectionDTO{ProviderID: "someone-else"}
+	if _, err := handler.HandleUpdateConnection(string(connID), ipc.UpdateConnectionRequest{
+		Driver: &driver,
+	}); err == nil {
+		t.Fatal("a provider change was accepted and silently discarded")
+	}
+
+	spec := ipc.ConnectionSpecDTO{}
+	if _, err := handler.HandleUpdateConnection(string(connID), ipc.UpdateConnectionRequest{
+		Spec: &spec,
+	}); err == nil {
+		t.Fatal("a spec change was accepted and silently discarded")
+	}
+
+	// The profile must be untouched by the refusals.
+	stored, err := st.LoadProfile(ctx, connID)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if stored.Driver.ProviderID != profile.Driver.ProviderID {
+		t.Fatalf("a refused update still changed the driver: %q", stored.Driver.ProviderID)
+	}
+}
+
+// TestUpdateConnectionHonoursExpectedRevision pins the optimistic concurrency
+// check. The handler read the current revision back out of the profile it had
+// just loaded, which made the comparison vacuous: two concurrent edits both
+// succeeded and the later silently overwrote the earlier.
+func TestUpdateConnectionHonoursExpectedRevision(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-revision")
+	profile := recoveryTestProfile(connID)
+	profile.Revision = 5
+
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	ctrl.RestoreProfile(profile)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	name := "renamed"
+	stale := uint64(3)
+	if _, err := handler.HandleUpdateConnection(string(connID), ipc.UpdateConnectionRequest{
+		Name: &name, ExpectedRevision: stale,
+	}); err == nil {
+		t.Fatal("an update against a stale revision was accepted")
+	}
+}
+
+// TestCloneConnectionProducesAnIndependentCopy pins the clone workflow: it must
+// never adopt the original's identity or provider resources.
+func TestCloneConnectionProducesAnIndependentCopy(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-source")
+	profile := recoveryTestProfile(connID)
+	profile.Desired = core.DesiredOpen
+
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock provider: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.SetConnectionStorer(st)
+	ctrl.RestoreProfile(profile)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	clone, err := handler.HandleCloneConnection(string(connID), ipc.CloneConnectionRequest{Name: "copy"})
+	if err != nil {
+		t.Fatalf("HandleCloneConnection: %v", err)
+	}
+	if clone.ID == string(connID) {
+		t.Fatal("clone reused the source connection ID")
+	}
+	if clone.Name != "copy" {
+		t.Fatalf("clone name = %q", clone.Name)
+	}
+	// Copying an open connection must not start a second one by surprise.
+	if clone.DesiredState != string(core.DesiredClosed) {
+		t.Fatalf("clone desired state = %q, want closed", clone.DesiredState)
+	}
+
+	// The source must be untouched.
+	source, err := st.LoadProfile(ctx, connID)
+	if err != nil {
+		t.Fatalf("LoadProfile(source): %v", err)
+	}
+	if source.Desired != core.DesiredOpen || source.Name != profile.Name {
+		t.Fatalf("cloning mutated the source: %+v", source)
+	}
+}
+
+// TestCloneRequiresANewHostnameForPermanentConnections ensures a clone cannot
+// contend with its original for the same DNS record.
+func TestCloneRequiresANewHostnameForPermanentConnections(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-permanent")
+	profile := recoveryTestProfile(connID)
+	profile.Spec.ServiceExposure.Exposure.Mode = core.ExposurePermanent
+	profile.Spec.ServiceExposure.Exposure.RequestedAddress = "demo.example.com"
+
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock provider: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.SetConnectionStorer(st)
+	ctrl.RestoreProfile(profile)
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	if _, err := handler.HandleCloneConnection(string(connID), ipc.CloneConnectionRequest{}); err == nil {
+		t.Fatal("clone of a permanent connection was allowed to reuse the hostname")
+	}
+	if _, err := handler.HandleCloneConnection(string(connID), ipc.CloneConnectionRequest{
+		RequestedAddress: "demo.example.com",
+	}); err == nil {
+		t.Fatal("clone was allowed to specify the original's hostname")
+	}
+	if _, err := handler.HandleCloneConnection(string(connID), ipc.CloneConnectionRequest{
+		RequestedAddress: "copy.example.com",
+	}); err != nil {
+		t.Fatalf("clone with a new hostname was rejected: %v", err)
+	}
+}
