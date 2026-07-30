@@ -324,13 +324,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.providerSetupStep = 4
 			return m, nil
 		}
-		// Success - reset setup state and refresh snapshot
-		m.providerSetupStep = 0
-		m.providerSetupID = ""
-		m.providerSetupLabel = ""
-		m.providerSetupZoneID = ""
-		m.providerSetupCred = ""
-		m.providerSetupError = ""
+		// Success: drop every collected answer, secret included.
+		m.clearProviderSetup()
 		// Report what the account can actually do, since a zone is required
 		// only for DNS and custom hostnames.
 		switch {
@@ -881,6 +876,8 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	key := msg.String()
 
 	if key == "ctrl+c" {
+		// Shutdown must not leave a collected secret resident in the model.
+		m.clearProviderSetupSecret()
 		if m.rootCancel != nil {
 			m.rootCancel()
 		}
@@ -912,6 +909,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.rootCancel != nil {
 				m.rootCancel()
 			}
+			m.clearProviderSetupSecret()
 			return m, tea.Quit
 		}
 		m.screen = ScreenHome
@@ -1134,12 +1132,32 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 	return m, m.wizard.HandleKey(key)
 }
 
+// clearProviderSetupSecret drops the credential from model memory.
+//
+// Visual masking hides a secret from the screen, not from the process. The
+// credential must not survive leaving the step that collected it, so every exit
+// path — cancel, back past the credential step, validation failure, success and
+// shutdown — calls this rather than relying on the success path alone.
+func (m *Model) clearProviderSetupSecret() {
+	m.providerSetupCred = ""
+}
+
+// clearProviderSetup resets the whole setup flow, secret included.
+func (m *Model) clearProviderSetup() {
+	m.providerSetupStep = 0
+	m.providerSetupID = ""
+	m.providerSetupLabel = ""
+	m.providerSetupZoneID = ""
+	m.providerSetupError = ""
+	m.clearProviderSetupSecret()
+}
+
 func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 	switch m.providerSetupStep {
 	case 1: // Account ID
 		if key == "esc" {
-			m.providerSetupStep = 0
-			m.providerSetupError = ""
+			// Leaving setup entirely: nothing collected may persist.
+			m.clearProviderSetup()
 			return m, nil
 		}
 		if key == "enter" {
@@ -1184,8 +1202,11 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 
 	case 4: // Credential
 		if key == "esc" {
+			// Moving back past the credential step must not leave the secret
+			// resident while the user edits earlier answers.
 			m.providerSetupStep = 3
 			m.providerSetupError = ""
+			m.clearProviderSetupSecret()
 			return m, nil
 		}
 		if key == "enter" {

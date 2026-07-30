@@ -1387,3 +1387,128 @@ func TestEditStringIgnoresNamedAndControlKeys(t *testing.T) {
 		}
 	}
 }
+
+const setupProbeSecret = "cf-token-DO-NOT-LEAK-9f3a"
+
+// enterCredentialStep drives provider setup as far as the credential step with
+// the probe secret typed in.
+func enterCredentialStep(t *testing.T) Model {
+	t.Helper()
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.providerSetupStep = 1
+	for _, r := range "account-a" {
+		next, _ := m.Update(keyMsg(string(r)))
+		m = next.(Model)
+	}
+	next, _ := m.Update(keyMsg("enter")) // -> label
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("enter")) // -> zone
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("enter")) // -> credential
+	m = next.(Model)
+	if m.providerSetupStep != 4 {
+		t.Fatalf("setup step = %d, want 4 (credential)", m.providerSetupStep)
+	}
+	for _, r := range setupProbeSecret {
+		next, _ = m.Update(keyMsg(string(r)))
+		m = next.(Model)
+	}
+	if m.providerSetupCred != setupProbeSecret {
+		t.Fatalf("credential not captured: %q", m.providerSetupCred)
+	}
+	return m
+}
+
+// TestCredentialIsClearedOnEveryExitPath pins audit item 18. The credential was
+// cleared only on success, so cancelling, stepping back past the credential
+// field, or quitting left the secret resident in the model.
+func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
+	t.Run("back past the credential step", func(t *testing.T) {
+		m := enterCredentialStep(t)
+		next, _ := m.Update(keyMsg("esc"))
+		m = next.(Model)
+		if m.providerSetupCred != "" {
+			t.Fatalf("credential survived stepping back: %q", m.providerSetupCred)
+		}
+	})
+
+	t.Run("cancelling setup", func(t *testing.T) {
+		m := enterCredentialStep(t)
+		// Back to the zone step, then to label, account, then out.
+		for range 4 {
+			next, _ := m.Update(keyMsg("esc"))
+			m = next.(Model)
+		}
+		if m.providerSetupStep != 0 {
+			t.Fatalf("setup step = %d, want 0 (exited)", m.providerSetupStep)
+		}
+		if m.providerSetupCred != "" || m.providerSetupID != "" {
+			t.Fatalf("setup state survived cancellation: cred=%q id=%q", m.providerSetupCred, m.providerSetupID)
+		}
+	})
+
+	t.Run("validation failure", func(t *testing.T) {
+		m := enterCredentialStep(t)
+		next, _ := m.Update(providerAccountConfiguredMsg{Err: errors.New("token rejected")})
+		m = next.(Model)
+		if m.providerSetupCred != "" {
+			t.Fatalf("rejected credential stayed in memory: %q", m.providerSetupCred)
+		}
+		// The answers that were accepted must survive so they are not retyped.
+		if m.providerSetupID != "account-a" {
+			t.Fatalf("accepted answers were discarded: id=%q", m.providerSetupID)
+		}
+	})
+
+	t.Run("quit", func(t *testing.T) {
+		m := enterCredentialStep(t)
+		next, _ := m.Update(keyMsg("ctrl+c"))
+		m = next.(Model)
+		if m.providerSetupCred != "" {
+			t.Fatalf("credential survived shutdown: %q", m.providerSetupCred)
+		}
+	})
+
+	t.Run("success", func(t *testing.T) {
+		m := enterCredentialStep(t)
+		next, _ := m.Update(providerAccountConfiguredMsg{
+			Response: &ipc.ConfigureProviderAccountResponse{Validated: true},
+		})
+		m = next.(Model)
+		if m.providerSetupCred != "" {
+			t.Fatalf("credential survived success: %q", m.providerSetupCred)
+		}
+	})
+}
+
+// TestCredentialNeverAppearsInAnyRenderedView ensures the secret is not printed
+// on the setup screen, in a status line, or in an error message.
+func TestCredentialNeverAppearsInAnyRenderedView(t *testing.T) {
+	m := enterCredentialStep(t)
+
+	// While it is held, the credential must still be masked on screen.
+	if view := m.View().Content; strings.Contains(view, setupProbeSecret) {
+		t.Fatalf("credential rendered on the setup screen:\n%s", view)
+	}
+
+	// A backend error must not echo the credential back into the UI.
+	next, _ := m.Update(providerAccountConfiguredMsg{
+		Err: errors.New("token rejected for account account-a"),
+	})
+	m = next.(Model)
+
+	for _, screen := range []ScreenID{
+		ScreenHome, ScreenProviders, ScreenOperations, ScreenHelp, ScreenDiscovery,
+	} {
+		m.screen = screen
+		if view := m.View().Content; strings.Contains(view, setupProbeSecret) {
+			t.Fatalf("credential leaked into the %s view:\n%s", screen, view)
+		}
+	}
+	if strings.Contains(m.status, setupProbeSecret) {
+		t.Fatalf("credential leaked into the status line: %q", m.status)
+	}
+	if strings.Contains(m.providerSetupError, setupProbeSecret) {
+		t.Fatalf("credential leaked into the setup error: %q", m.providerSetupError)
+	}
+}
