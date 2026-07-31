@@ -940,3 +940,30 @@ func privateAddressLabel(kind string) string {
 		return "Private"
 	}
 }
+
+// handleProviderRemoveAccount forgets a stored provider account.
+func handleProviderRemoveAccount(cmd *cobra.Command, providerID, accountID string) error {
+	client, err := getClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	response, err := client.RemoveProviderAccount(cmd.Context(), providerID, accountID)
+	if err != nil {
+		return err
+	}
+	if !response.Removed {
+		return fmt.Errorf("the account was not removed")
+	}
+
+	jsonFlag, _ := cmd.Flags().GetBool("json")
+	if jsonFlag {
+		return json.NewEncoder(os.Stdout).Encode(response)
+	}
+
+	fmt.Printf("Removed account %s from %s.\n", accountID, providerID)
+	if response.RestartRequired {
+		fmt.Println("Restart the supervisor to finish applying it.")
+	}
+	return nil
+}

@@ -487,6 +487,29 @@ func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string
 	return &result, nil
 }
 
+// RemoveProviderAccount removes a stored provider account.
+//
+// The supervisor refuses while connections still select the account, and the
+// refusal names them: removing it silently would strand those connections with
+// an unexplained "provider account unavailable" and no way to see why.
+func (c *Client) RemoveProviderAccount(ctx context.Context, providerID, accountID string) (
+	*RemoveProviderAccountResponse, error) {
+	path := "/v1/providers/" + url.PathEscape(providerID) + "/accounts/" + url.PathEscape(accountID)
+	resp, err := c.doRequest(ctx, "DELETE", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result RemoveProviderAccountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // RecommendProvider asks which provider suits a set of stated requirements.
 //
 // The answer names a provider and an account, and carries the reasons and

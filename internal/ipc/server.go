@@ -58,6 +58,7 @@ type RequestHandler interface {
 	HandleProviderRecommendation(req ProviderRecommendationRequest) (*ProviderRecommendationResponse, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
+	HandleRemoveProviderAccount(providerID, accountID string) (*RemoveProviderAccountResponse, error)
 	HandleProviderSetupFlow(id string) (*SetupFlowDTO, error)
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
@@ -676,11 +677,57 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	// POST /v1/providers/{id}/authenticate
 	// POST /v1/providers/{id}/accounts
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/providers/"), "/"), "/")
-	if len(parts) != 2 || parts[0] == "" {
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
 		writeError(w, http.StatusNotFound, "PROV-001", "unknown provider endpoint")
 		return
 	}
 	id, action := parts[0], parts[1]
+
+	// DELETE /v1/providers/{id}/accounts/{accountID}
+	//
+	// Removal was implemented on the supervisor and never routed, so an account
+	// could be added and never taken away: a revoked token stayed listed as a
+	// working account with no way to say otherwise.
+	if len(parts) == 3 {
+		if action != "accounts" || parts[2] == "" {
+			writeError(w, http.StatusNotFound, "PROV-006", "unknown provider endpoint")
+			return
+		}
+		if r.Method != http.MethodDelete {
+			writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
+			return
+		}
+		response, err := s.handler.HandleRemoveProviderAccount(id, parts[2])
+		if err != nil {
+			// A refusal because connections still depend on the account is not
+			// a failure to report and forget: each dependent connection is
+			// something the user has to go and deal with, so they are sent as
+			// the recovery actions rather than dropped in favour of a count.
+			if response != nil && len(response.DependentConnections) > 0 {
+				apiErr := APIError{
+					Version: 1, Code: "PROV-008", Summary: err.Error(),
+					ProviderID: id,
+				}
+				for _, connID := range response.DependentConnections {
+					apiErr.RecoveryActions = append(apiErr.RecoveryActions, RecoveryAction{
+						Label:  "Reassign or delete connection " + connID,
+						Action: "connection:" + connID,
+					})
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(apiErr)
+				return
+			}
+			writeHandlerError(w, "PROV-008", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+
 	// The method is checked per action rather than once for the group: reading
 	// a provider's setup requirements is a GET, while the actions that change
 	// state are POSTs.

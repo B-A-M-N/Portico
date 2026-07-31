@@ -36,6 +36,7 @@ const (
 	ScreenSettings          ScreenID = "settings"
 	ScreenHelp              ScreenID = "help"
 	ScreenSetup             ScreenID = "setup"
+	ScreenAccountRemoval    ScreenID = "account_removal"
 	ScreenQuit              ScreenID = "quit"
 )
 
@@ -61,6 +62,13 @@ type Model struct {
 	// a selection. It is reset whenever the screen changes, so opening a screen
 	// starts at the top rather than wherever the previous one was left.
 	scroll scrollState
+
+	// Account lifecycle on the providers screen.
+	accountSelected          int
+	accountRequests          requestTracker
+	accountRemovalTarget     *accountRow
+	accountRemovalError      string
+	accountRemovalDependents []string
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -216,6 +224,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// retype it by hand.
 		cmd, _ := m.routeTextEntry(msg)
 		return m, cmd
+
+	case accountRemovedMsg:
+		// A reply for an account the user has moved on from must not report
+		// against whichever account is selected now.
+		if !m.accountRequests.accepts(msg.Generation) {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.accountRemovalError = msg.Err.Error()
+			if msg.Response != nil {
+				m.accountRemovalDependents = msg.Response.DependentConnections
+			}
+			// The refusal names what has to change first, so it is shown on the
+			// confirmation rather than as a status line that scrolls away.
+			return m, nil
+		}
+		m.accountRemovalTarget = nil
+		m.accountRemovalError = ""
+		m.accountRemovalDependents = nil
+		m.status = "Removed " + msg.Name + "."
+		if msg.Response != nil && msg.Response.RestartRequired {
+			m.status += " Restart the supervisor to finish applying it."
+		}
+		// The cursor may now point past the end of a shorter list.
+		m.moveAccountSelection(0)
+		if !m.popScreen() {
+			m.screen = ScreenProviders
+		}
+		// The provider list is what changed, so it is refetched rather than
+		// edited in place — the supervisor is the authority on what remains.
+		return m, m.requestSnapshot()
 
 	case snapshotMsg:
 		if msg.Err != nil {
@@ -675,6 +714,8 @@ func (m Model) View() tea.View {
 		content = m.renderDiscovery()
 	case ScreenOperations:
 		content = m.renderOperations()
+	case ScreenAccountRemoval:
+		content = m.renderAccountRemoval()
 	case ScreenSetup:
 		if m.setup != nil {
 			content = m.setup.View()
@@ -1336,6 +1377,10 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case "up", "k":
+		if m.screen == ScreenProviders {
+			m.moveAccountSelection(-1)
+			return m, nil
+		}
 		if m.screen == ScreenDiscovery && m.discoverySelected > 0 {
 			m.discoverySelected--
 		} else if m.screen == ScreenOperations && m.opsSelectedIdx > 0 {
@@ -1350,6 +1395,10 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 
 	case "down", "j":
+		if m.screen == ScreenProviders {
+			m.moveAccountSelection(1)
+			return m, nil
+		}
 		if m.screen == ScreenDiscovery {
 			if m.discoverySelected < len(m.discovery)-1 {
 				m.discoverySelected++
@@ -1370,6 +1419,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 
 	case "enter":
+		if m.screen == ScreenAccountRemoval {
+			// A refusal already shown is not re-sent by pressing enter again;
+			// the only way on is back.
+			if m.accountRemovalTarget == nil || m.accountRemovalError != "" {
+				return m, nil
+			}
+			return m, m.removeAccountCmd(*m.accountRemovalTarget)
+		}
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
 			conn := m.SelectedConnection()
 			m.inspect = screens.NewInspect(conn)
@@ -1437,6 +1494,17 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.pushScreen(ScreenRepair)
 			m.diagnostics = nil
 			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+		}
+
+	case "x":
+		// Removing an account is reachable only where accounts are listed.
+		if m.screen == ScreenProviders {
+			if row, ok := m.selectedAccount(); ok {
+				m.accountRemovalTarget = &row
+				m.accountRemovalError = ""
+				m.accountRemovalDependents = nil
+				m.pushScreen(ScreenAccountRemoval)
+			}
 		}
 
 	case "a":
@@ -2437,7 +2505,11 @@ func (m *Model) renderProviders() string {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("[a] add account    [esc] back    [q] quit\n")
+	if len(m.accountRows()) > 0 {
+		b.WriteString("[↑↓] select account    [a] add account    [x] remove account    [esc] back\n")
+	} else {
+		b.WriteString("[a] add account    [esc] back    [q] quit\n")
+	}
 	return b.String()
 }
 
@@ -3097,6 +3169,11 @@ func (m *Model) abandonScreenWork() {
 	case ScreenPlanPreview, ScreenRepair:
 		m.planRequests.cancel()
 		m.planConnectionID = ""
+	case ScreenAccountRemoval:
+		m.accountRequests.cancel()
+		m.accountRemovalTarget = nil
+		m.accountRemovalError = ""
+		m.accountRemovalDependents = nil
 	}
 }
 
@@ -3110,7 +3187,7 @@ func (m *Model) abandonScreenWork() {
 func acceptsGlobalNavigation(screen ScreenID) bool {
 	switch screen {
 	case ScreenPlanPreview, ScreenRepair, ScreenOperationProgress,
-		ScreenNewConnection, ScreenBoot, ScreenQuit:
+		ScreenNewConnection, ScreenAccountRemoval, ScreenBoot, ScreenQuit:
 		return false
 	default:
 		return true

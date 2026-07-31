@@ -298,6 +298,19 @@ func newProviderCmd() *cobra.Command {
 	loginCmd.Flags().String("zone-id", "", "Cloudflare zone ID")
 	loginCmd.Flags().String("label", "", "Friendly account label")
 	cmd.AddCommand(loginCmd)
+
+	// Removal existed on the supervisor with no way to ask for it. An account
+	// added by mistake, or whose token has been revoked, had to be lived with.
+	cmd.AddCommand(&cobra.Command{
+		Use:   "remove-account <provider> <account-id>",
+		Short: "Forget a stored provider account",
+		Long: "Removes the credential Portico stored for an account. Nothing is deleted at " +
+			"the provider. Refused while connections still use the account, naming them.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return handleProviderRemoveAccount(cmd, args[0], args[1])
+		},
+	})
 	return cmd
 }
 

@@ -31,6 +31,11 @@ type fakeClient struct {
 	created     *ipc.ConnectionDTO
 	createErr   error
 
+	removedProvider       string
+	removedAccount        string
+	removeAccountResponse *ipc.RemoveProviderAccountResponse
+	removeAccountErr      error
+
 	detail    *ipc.ConnectionDetailDTO
 	detailErr error
 	history   *ipc.OperationHistoryDTO
@@ -222,6 +227,18 @@ func (f *fakeClient) RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, e
 
 func (f *fakeClient) ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
 	return &ipc.ConfigureProviderAccountResponse{RestartRequired: false}, nil
+}
+
+// removeAccountErr, when set, is what the supervisor answers a removal with.
+func (f *fakeClient) RemoveProviderAccount(ctx context.Context, providerID, accountID string) (*ipc.RemoveProviderAccountResponse, error) {
+	f.removedProvider, f.removedAccount = providerID, accountID
+	if f.removeAccountErr != nil {
+		return f.removeAccountResponse, f.removeAccountErr
+	}
+	if f.removeAccountResponse != nil {
+		return f.removeAccountResponse, nil
+	}
+	return &ipc.RemoveProviderAccountResponse{Removed: true}, nil
 }
 
 // --------------- helpers ---------------
