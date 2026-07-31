@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -32,6 +33,23 @@ type reconcileDecision struct {
 // truth for restart, reconciliation, and repair planning.
 func (s *Supervisor) computeReconcileDecision(ctx context.Context, input ReconcileInput) (*reconcileDecision, error) {
 	desired := input.Profile.Desired
+
+	// Reconciliation moves a connection toward its desired state without
+	// anyone asking, so it must not drive a connection toward a state that is
+	// no longer permitted. A profile stored under an older rule would
+	// otherwise have its connector restarted or its provider resources
+	// recreated on a loop, re-establishing exactly what the rule forbids, with
+	// nothing reporting why.
+	//
+	// Only the open direction is gated: a connection that can no longer open
+	// must still be closable.
+	if desired == core.DesiredOpen {
+		if err := input.Profile.ValidateForOpen(); err != nil {
+			slog.Warn("not reconciling a connection that can no longer be opened",
+				"connection", input.Profile.ID, "reason", err)
+			return &reconcileDecision{Action: "none"}, nil
+		}
+	}
 
 	// A missing runtime projection does not imply missing infrastructure. An
 	// interrupted bootstrap can leave a durable tunnel inventory with no

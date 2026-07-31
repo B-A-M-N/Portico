@@ -1396,6 +1396,16 @@ func (h *supervisorHandler) HandlePlanRepair(id string) (*ipc.PlanDTO, error) {
 	if !ok {
 		return nil, core.ErrProfileNotFound(cid)
 	}
+	// A closed connection has nothing to repair toward. Falling through to the
+	// controller's connector-focused fallback would produce a step that starts
+	// the connector of a connection the user deliberately closed — desired
+	// state must dominate a manual repair exactly as it dominates
+	// reconciliation.
+	if profile.Desired != core.DesiredOpen {
+		return nil, core.ErrValidation(
+			"this connection is closed, so there is nothing to repair; open it instead")
+	}
+
 	// Prefer the authoritative desired-versus-observed delta planner. It can
 	// produce narrowly scoped repairs (for example one DNS record) that the
 	// controller's connector-focused fallback cannot infer from runtime alone.

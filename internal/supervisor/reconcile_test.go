@@ -42,13 +42,25 @@ func (*repairObservationProvider) Remove(context.Context, core.RemovePlan) (<-ch
 // union explicitly so that unsupported connection kinds fail at compile time
 // rather than silently falling through zero-value compatibility accessors.
 func newReconcileProfile(id core.ConnectionID, desired core.DesiredConnectionState, protection core.ProtectionSpec) *core.ConnectionProfile {
+	// A complete profile, because reconciliation now refuses to drive a
+	// connection toward a desired state it could not be created in. A partial
+	// fixture would be testing a shape the store cannot hold.
 	return &core.ConnectionProfile{
 		ID:       id,
+		Name:     "service",
 		Revision: 1,
 		Kind:     core.ConnectionServiceExposure,
 		Spec: core.ConnectionSpec{
 			ServiceExposure: &core.ServiceExposureSpec{
-				Exposure:   core.ExposureSpec{RequestedAddress: "service.example.com"},
+				Source: core.SourceSpec{
+					Kind: core.SourceExisting,
+					Existing: &core.ExistingServiceSpec{
+						Network: "tcp", Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP,
+					},
+				},
+				Exposure: core.ExposureSpec{
+					Mode: core.ExposurePermanent, RequestedAddress: "service.example.com",
+				},
 				Protection: protection,
 			},
 		},
@@ -448,5 +460,66 @@ func TestTriggerReconcile_HandlesMultipleConnections(t *testing.T) {
 
 	if !received[conn1] || !received[conn2] || !received[conn3] {
 		t.Fatalf("missing connections in channel: got %v", received)
+	}
+}
+
+// TestReconciliationDoesNotDriveTowardAForbiddenState pins the automatic path.
+//
+// Reconciliation acts without anyone asking, so a profile stored under an older
+// rule would have had its connector restarted or its provider resources
+// recreated on a loop — re-establishing exactly what the rule forbids, with
+// nothing reporting why.
+func TestReconciliationDoesNotDriveTowardAForbiddenState(t *testing.T) {
+	profile := newReconcileProfile("conn-1", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+	})
+	// A temporary address cannot carry that protection.
+	profile.Spec.ServiceExposure.Exposure = core.ExposureSpec{Mode: core.ExposureTemporary}
+
+	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
+		Profile: profile,
+		Runtime: &core.ConnectionRuntime{
+			ConnectionID: profile.ID,
+			State:        core.RuntimeOpen,
+			Connector:    core.ConnectorRuntime{Status: core.ConnectorStatusStopped},
+		},
+		Resources: []core.ProviderResource{
+			{ConnectionID: profile.ID, ProviderID: "cloudflare", Type: core.ResourceTunnel,
+				ExternalID: "tunnel-1", Ownership: core.OwnershipManaged},
+		},
+	})
+	if err != nil {
+		t.Fatalf("computeReconcileDecision: %v", err)
+	}
+	if decision.Action != "none" || decision.Plan != nil {
+		t.Fatalf("reconciliation acted on a connection that cannot be opened: %#v", decision)
+	}
+}
+
+// TestReconciliationStillActsOnAValidConnection ensures the gate is narrow.
+func TestReconciliationStillActsOnAValidConnection(t *testing.T) {
+	profile := newReconcileProfile("conn-1", core.DesiredOpen, core.ProtectionSpec{})
+	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
+		Profile: profile,
+		Runtime: &core.ConnectionRuntime{
+			ConnectionID: profile.ID,
+			State:        core.RuntimeOpen,
+			Connector:    core.ConnectorRuntime{Status: core.ConnectorStatusRunning},
+		},
+		Resources: []core.ProviderResource{
+			{ConnectionID: profile.ID, ProviderID: "cloudflare", Type: core.ResourceTunnel,
+				ExternalID: "tunnel-1", Ownership: core.OwnershipManaged},
+			{ConnectionID: profile.ID, ProviderID: "cloudflare", Type: core.ResourceDNSRecord,
+				ExternalID: "dns-1", Ownership: core.OwnershipManaged},
+		},
+		Observed: &core.ObservedConnection{ResourceStatuses: []core.ObservedResourceStatus{{
+			Type: core.ResourceDNSRecord, ExternalID: "dns-1", Status: core.ObservationMissing,
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("computeReconcileDecision: %v", err)
+	}
+	if decision.Action != "repair" {
+		t.Fatalf("a valid connection was not reconciled: %#v", decision)
 	}
 }

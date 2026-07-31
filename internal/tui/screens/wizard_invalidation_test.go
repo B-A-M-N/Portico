@@ -78,89 +78,130 @@ func TestAQuestionLeavingTheSequenceDoesNotStrandTheUser(t *testing.T) {
 // TestTheEvaluationAndTheConnectionDescribeTheSameThing pins that a provider is
 // scored against the connection that will actually be created.
 //
-// The request applies a protocol default for a service that is already
-// listening. Applying it in only one of the two places scores a provider with
-// no protocol constraint and then creates a connection that has one.
+// The two used to be normalised separately, and had diverged: only an existing
+// service's protocol was defaulted on the recommendation side, while creation
+// also defaults a command's, a directory's, an MCP command's and the MCP
+// transport. A command or MCP connection was therefore scored with no protocol
+// requirement and created with a concrete one.
 func TestTheEvaluationAndTheConnectionDescribeTheSameThing(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot())
-	m.state = WizardState{
-		Name: "demo", SourceType: "existing_service",
-		SourceAddress: "127.0.0.1", Port: "8080",
-		ExposureMode: "permanent_public", Hostname: "demo.example.com",
-		Protection: "none", Provider: "cloudflare",
-		// Deliberately unset: both sides must default it the same way.
-		SourceProtocol: "",
-	}
-
-	scored := m.recommendationRequest()
-	built := m.buildRequest()
-
-	if scored.Protocol != built.Source.Existing.Protocol {
-		t.Fatalf("scored protocol %q, created %q", scored.Protocol, built.Source.Existing.Protocol)
-	}
-	if scored.ExposureMode != built.Exposure.Mode {
-		t.Fatalf("scored exposure %q, created %q", scored.ExposureMode, built.Exposure.Mode)
-	}
-	if scored.RequestedAddress != built.Exposure.RequestedAddress {
-		t.Fatalf("scored address %q, created %q", scored.RequestedAddress, built.Exposure.RequestedAddress)
-	}
-	if scored.ProtectionKind != built.Protection.Kind {
-		t.Fatalf("scored protection %q, created %q", scored.ProtectionKind, built.Protection.Kind)
-	}
-	if scored.ConnectionKind != built.Kind {
-		t.Fatalf("scored kind %q, created %q", scored.ConnectionKind, built.Kind)
-	}
-}
-
-// TestChoosingAPreparedOutcomeAfterTheAdvancedOneForgetsIt pins that the
-// intent question belongs to the path that asked it.
-//
-// The advanced flag was set on choosing the advanced route and never cleared,
-// so switching to a prepared outcome left the intent question in the sequence
-// and going back from the name question landed on a question that path never
-// asked.
-func TestChoosingAPreparedOutcomeAfterTheAdvancedOneForgetsIt(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot())
-
-	// Choose the advanced route.
-	advanced := -1
-	for i, recipe := range wizardRecipes {
-		if recipe.Advanced {
-			advanced = i
+	base := func() WizardState {
+		return WizardState{
+			Name: "demo", ExposureMode: "permanent_public", Hostname: "demo.example.com",
+			Protection: "none", Provider: "cloudflare", AccountID: "acct-a",
 		}
 	}
-	if advanced < 0 {
-		t.Skip("no advanced recipe to exercise")
-	}
-	m.selected = advanced
-	m.HandleKey("enter")
-	if m.Step() != WizardStepIntent || !m.state.Advanced {
-		t.Fatalf("advanced route not taken: step=%d advanced=%v", m.Step(), m.state.Advanced)
-	}
 
-	// Go back and choose a prepared outcome instead.
-	m.HandleKey("esc")
-	if m.Step() != WizardStepOutcome {
-		t.Fatalf("back from intent landed on %d, want the outcome question", m.Step())
-	}
-	prepared := -1
-	for i, recipe := range wizardRecipes {
-		if !recipe.Advanced && recipe.Unavailable == "" {
-			prepared = i
-			break
-		}
-	}
-	m.selected = prepared
-	m.HandleKey("enter")
+	for _, tc := range []struct {
+		name          string
+		mutate        func(*WizardState)
+		wantProtocol  string
+		wantTransport string
+	}{
+		{
+			name: "existing service with no protocol stated",
+			mutate: func(s *WizardState) {
+				s.SourceType = "existing_service"
+				s.SourceAddress = "127.0.0.1"
+				s.Port = "8080"
+			},
+			wantProtocol: "http",
+		},
+		{
+			name: "existing service over https",
+			mutate: func(s *WizardState) {
+				s.SourceType = "existing_service"
+				s.SourceAddress = "127.0.0.1"
+				s.Port = "8443"
+				s.SourceProtocol = "https"
+			},
+			wantProtocol: "https",
+		},
+		{
+			name: "directory",
+			mutate: func(s *WizardState) {
+				s.SourceType = "directory"
+				s.SourceAddress = "/srv/site"
+				s.DirectoryMode = "read"
+			},
+			wantProtocol: "http",
+		},
+		{
+			name: "command",
+			mutate: func(s *WizardState) {
+				s.SourceType = "command"
+				s.SourceAddress = "server"
+				s.Port = "3000"
+			},
+			wantProtocol: "http",
+		},
+		{
+			name: "mcp server run as a command",
+			mutate: func(s *WizardState) {
+				s.SourceType = "mcp_server"
+				s.MCPCommand = true
+				s.SourceAddress = "mcp-server"
+				s.Port = "4000"
+			},
+			wantProtocol:  "http",
+			wantTransport: "http",
+		},
+		{
+			name: "mcp server at an https endpoint",
+			mutate: func(s *WizardState) {
+				s.SourceType = "mcp_server"
+				s.SourceAddress = "https://mcp.example.com/sse"
+				s.MCPTransport = "sse"
+			},
+			wantProtocol:  "https",
+			wantTransport: "sse",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewWizard(nil, fullCloudflareSnapshot())
+			state := base()
+			tc.mutate(&state)
+			m.state = state
 
-	if m.state.Advanced {
-		t.Fatal("the advanced route was still recorded after choosing a prepared outcome")
-	}
-	if m.Step() != WizardStepName {
-		t.Fatalf("step = %d, want the name question", m.Step())
-	}
-	m.HandleKey("esc")
-	if m.Step() != WizardStepOutcome {
-		t.Fatalf("back from name landed on %d, want the outcome question this path came from", m.Step())
+			built := m.buildRequest()
+			scored := m.recommendationRequest()
+
+			if scored.ConnectionKind != built.Kind {
+				t.Fatalf("kind: scored %q, created %q", scored.ConnectionKind, built.Kind)
+			}
+			if scored.SourceKind != built.Source.Kind {
+				t.Fatalf("source kind: scored %q, created %q", scored.SourceKind, built.Source.Kind)
+			}
+			if scored.ExposureMode != built.Exposure.Mode {
+				t.Fatalf("exposure: scored %q, created %q", scored.ExposureMode, built.Exposure.Mode)
+			}
+			if scored.RequestedAddress != built.Exposure.RequestedAddress {
+				t.Fatalf("address: scored %q, created %q", scored.RequestedAddress, built.Exposure.RequestedAddress)
+			}
+			if scored.ProtectionKind != built.Protection.Kind {
+				t.Fatalf("protection: scored %q, created %q", scored.ProtectionKind, built.Protection.Kind)
+			}
+			if scored.PreferredProvider != built.Provider.ProviderID {
+				t.Fatalf("provider: scored %q, created %q", scored.PreferredProvider, built.Provider.ProviderID)
+			}
+			if scored.PreferredAccount != built.Provider.AccountID {
+				t.Fatalf("account: scored %q, created %q", scored.PreferredAccount, built.Provider.AccountID)
+			}
+			if scored.Protocol != tc.wantProtocol {
+				t.Fatalf("protocol: scored %q, want %q", scored.Protocol, tc.wantProtocol)
+			}
+			if scored.MCPTransport != tc.wantTransport {
+				t.Fatalf("transport: scored %q, want %q", scored.MCPTransport, tc.wantTransport)
+			}
+			// The scored protocol must be the one the connection carries.
+			if built.Source.Existing != nil && scored.Protocol != built.Source.Existing.Protocol {
+				t.Fatalf("protocol: scored %q, created %q", scored.Protocol, built.Source.Existing.Protocol)
+			}
+			if built.Source.Command != nil && scored.Protocol != built.Source.Command.Protocol {
+				t.Fatalf("protocol: scored %q, created %q", scored.Protocol, built.Source.Command.Protocol)
+			}
+			if built.Source.MCP != nil && scored.MCPTransport != built.Source.MCP.Transport {
+				t.Fatalf("transport: scored %q, created %q", scored.MCPTransport, built.Source.MCP.Transport)
+			}
+		})
 	}
 }

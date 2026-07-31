@@ -649,12 +649,10 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	openProfile := profile.DeepCopy()
 	openProfile.Desired = core.DesiredOpen
 
-	// A stored profile is validated here rather than when it is loaded.
-	// Rejecting it at load would make a connection disappear because a rule
-	// tightened; rejecting it here refuses only the attempt to open it, and
-	// says why. Without this a profile saved under an older rule reached the
-	// provider and failed there, far from the reason.
-	if err := openProfile.Validate(); err != nil {
+	// Validated here rather than when the profile is loaded. Rejecting it at
+	// load would make a connection disappear because a rule tightened;
+	// rejecting it here refuses only the attempt to open it, and says why.
+	if err := profile.ValidateForOpen(); err != nil {
 		return nil, core.ErrValidation(
 			"this saved connection can no longer be opened: " + err.Error())
 	}
@@ -1026,6 +1024,16 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 	c.mu.RUnlock()
 	if !ok {
 		return nil, core.ErrProfileNotFound(connID)
+	}
+
+	// Repair restores runtime and provider state toward the desired
+	// configuration; it cannot change that configuration. So a profile whose
+	// desired state is no longer permitted must not be repaired toward it —
+	// that would re-establish exactly what the rule forbids.
+	if err := profile.ValidateForOpen(); err != nil {
+		return nil, core.ErrValidation(
+			"this saved connection can no longer be opened, so there is nothing to repair toward: " +
+				err.Error())
 	}
 
 	if _, err := c.providerForProfile(profile); err != nil {

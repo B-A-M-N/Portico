@@ -844,3 +844,20 @@ const (
 	DisconnectKeepAlive DisconnectPolicy = "keep_alive"
 	DisconnectClose     DisconnectPolicy = "close"
 )
+
+// ValidateForOpen reports whether this profile could be opened as it stands.
+//
+// It validates a copy with open intent rather than the profile itself, so a
+// stored connection is never mutated by being checked, and a rule that tightens
+// after a connection was saved refuses the attempt to open it rather than
+// making the connection disappear.
+//
+// Every path that tries to realise an open state must call this: opening,
+// repairing, and automatic reconciliation. Closing and deleting must not — a
+// connection that can no longer open must still be closable and removable, or
+// a tightened rule would strand it with no way out.
+func (p *ConnectionProfile) ValidateForOpen() error {
+	candidate := p.DeepCopy()
+	candidate.Desired = DesiredOpen
+	return candidate.Validate()
+}

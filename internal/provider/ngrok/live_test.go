@@ -1,3 +1,5 @@
+//go:build live
+
 package ngrok
 
 import (
@@ -19,6 +21,14 @@ import (
 // credential. These tests drive the real agent end to end, because the defects
 // this rebuild fixes — a synthesised tunnel identifier, a hardcoded forwarding
 // port, deletion that did nothing — were all invisible to a stand-in.
+// liveAgent locates the real agent.
+//
+// These tests are behind the "live" build tag because they create real tunnels
+// against a real service. Having a client installed is not consent to reach the
+// network on every run, and a provider outage was turning the ordinary test
+// gate red for reasons unrelated to the code under test.
+//
+// Run them deliberately: go test -tags live ./internal/provider/ngrok/
 func liveAgent(t *testing.T) string {
 	t.Helper()
 	bin, err := exec.LookPath("ngrok")

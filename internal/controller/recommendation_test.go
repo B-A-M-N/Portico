@@ -159,8 +159,14 @@ func TestRecommendationPrefersAuthenticatedAndSelectedAccount(t *testing.T) {
 	unauth := capableProvider("aaa", false)
 	auth := capableProvider("zzz", true)
 
+	// The preference names its provider: an account ID alone is ambiguous once
+	// two providers can hold accounts of the same name.
 	rec := recommendWith(t, []provider.ProviderSnapshot{unauth, auth},
-		RecommendationInput{ExposureMode: core.ExposureTemporary, PreferredAccount: "acct-zzz"})
+		RecommendationInput{
+			ExposureMode:      core.ExposureTemporary,
+			PreferredProvider: "zzz",
+			PreferredAccount:  "acct-zzz",
+		})
 
 	if rec.Recommended == nil || rec.Recommended.ProviderID != "zzz" {
 		t.Fatalf("expected the authenticated provider with the selected account, got %+v", rec.Recommended)
@@ -170,6 +176,17 @@ func TestRecommendationPrefersAuthenticatedAndSelectedAccount(t *testing.T) {
 	}
 	if len(rec.Recommended.Strengths) == 0 {
 		t.Fatal("recommendation gives no reasons")
+	}
+	// The preference must actually have been credited, not merely satisfied by
+	// the provider happening to have one account.
+	var credited bool
+	for _, reason := range rec.Recommended.Strengths {
+		if strings.Contains(reason, "account you selected") {
+			credited = true
+		}
+	}
+	if !credited {
+		t.Fatal("the preferred account was not credited, so the preference did nothing")
 	}
 	// The unauthenticated provider is still eligible, but must be listed as an
 	// alternative with a setup action rather than presented as ready.
@@ -278,5 +295,58 @@ func TestRecommendationAsksProvidersWhichKindsTheyRun(t *testing.T) {
 	// An unspecified kind constrains nothing.
 	if !serviceOnly.Executes("") {
 		t.Fatal("an unspecified kind must not block a provider")
+	}
+}
+
+// TestAnAccountPreferenceBelongsToItsProvider pins that a preference is scored
+// against the pair, not the account name.
+//
+// Account identity is (provider, account). With two providers each holding an
+// account called "default", a preference carrying only the account ID credited
+// both — so a user who chose one provider's account raised another provider's
+// score by the same amount.
+func TestAnAccountPreferenceBelongsToItsProvider(t *testing.T) {
+	shared := []provider.AccountInfo{{ID: "default", Label: "Default", Status: "authenticated"}}
+	caps := core.Capabilities{
+		TemporaryAddresses: core.CapabilitySupport{Supported: true},
+		Protocols: map[core.Protocol]core.ProtocolCapability{
+			core.ProtocolHTTP: {Supported: true, Public: true},
+		},
+		BuiltInProtection: []core.ProtectionCapability{{Kind: core.ProtectionNone, Supported: true}},
+	}
+	reg := &snapshotRegistry{snaps: []provider.ProviderSnapshot{
+		{ID: "provider-a", DisplayName: "A", Availability: provider.AvailabilityReady,
+			Authenticated: true, Accounts: shared, Capabilities: caps},
+		{ID: "provider-b", DisplayName: "B", Availability: provider.AvailabilityReady,
+			Authenticated: true, Accounts: shared, Capabilities: caps},
+	}}
+	ctrl := &Controller{registry: reg}
+
+	rec, err := ctrl.Recommend(context.Background(), RecommendationInput{
+		Kind: core.ConnectionServiceExposure, SourceKind: core.SourceExisting,
+		ExposureMode: core.ExposureTemporary, Protocol: core.ProtocolHTTP,
+		PreferredProvider: "provider-b", PreferredAccount: "default",
+	})
+	if err != nil {
+		t.Fatalf("Recommend: %v", err)
+	}
+	if rec.Recommended == nil || rec.Recommended.ProviderID != "provider-b" {
+		t.Fatalf("recommended %#v, want the provider whose account was preferred", rec.Recommended)
+	}
+
+	// The other provider holds an account of the same name and must not be
+	// credited for it.
+	for _, alt := range rec.Alternatives {
+		if alt.ProviderID != "provider-a" {
+			continue
+		}
+		for _, reason := range alt.Strengths {
+			if strings.Contains(reason, "account you selected") {
+				t.Fatal("a preference for one provider's account credited another's")
+			}
+		}
+		if alt.Score >= rec.Recommended.Score {
+			t.Fatalf("scores did not separate: a=%d b=%d", alt.Score, rec.Recommended.Score)
+		}
 	}
 }

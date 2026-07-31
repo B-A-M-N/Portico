@@ -3,6 +3,7 @@ package screens
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -30,27 +31,69 @@ type ProviderRecommendationMsg struct {
 	Err         error
 }
 
-// recommendationRequest builds the requirements from the answers so far.
+// recommendationRequest derives the requirements from the connection that would
+// actually be created.
+//
+// Deriving them separately from wizard state meant two normalisations of the
+// same answers, and they had already diverged: only an existing service's
+// protocol was defaulted on this side, while creation also defaults a command's
+// protocol, a directory's, an MCP command's and the MCP transport. So a command
+// or MCP connection was scored with no protocol requirement and then created
+// with a concrete one — the evaluation and the connection describing different
+// things.
 func (m *WizardModel) recommendationRequest() ipc.ProviderRecommendationRequest {
-	// The protocol default is applied here as well as when the connection is
-	// built. Applying it in only one of them scores a provider against no
-	// protocol constraint and then creates a connection that has one, so the
-	// evaluation and the connection describe different things.
-	protocol := m.state.SourceProtocol
-	if protocol == "" && m.state.SourceType == "existing_service" {
-		protocol = "http"
+	return recommendationFromCreateRequest(m.buildRequest())
+}
+
+// recommendationFromCreateRequest reads the requirements out of a create
+// request. It is the single place that decides what a source implies.
+func recommendationFromCreateRequest(req ipc.CreateConnectionRequest) ipc.ProviderRecommendationRequest {
+	out := ipc.ProviderRecommendationRequest{
+		ConnectionKind:    req.Kind,
+		SourceKind:        req.Source.Kind,
+		ExposureMode:      req.Exposure.Mode,
+		ProtectionKind:    req.Protection.Kind,
+		RequestedAddress:  req.Exposure.RequestedAddress,
+		PreferredProvider: req.Provider.ProviderID,
+		PreferredAccount:  req.Provider.AccountID,
 	}
-	return ipc.ProviderRecommendationRequest{
-		ConnectionKind:    "service_exposure",
-		SourceKind:        m.state.SourceType,
-		MCPTransport:      m.state.MCPTransport,
-		ExposureMode:      m.state.ExposureMode,
-		Protocol:          protocol,
-		ProtectionKind:    m.state.Protection,
-		RequestedAddress:  m.state.Hostname,
-		PreferredAccount:  m.state.AccountID,
-		PreferredProvider: m.state.Provider,
+
+	switch req.Source.Kind {
+	case "existing_service":
+		if req.Source.Existing != nil {
+			out.Protocol = req.Source.Existing.Protocol
+		}
+	case "command":
+		if req.Source.Command != nil {
+			out.Protocol = req.Source.Command.Protocol
+		}
+	case "directory":
+		// Portico serves a directory over HTTP.
+		out.Protocol = "http"
+	case "mcp_server":
+		if req.Source.MCP != nil {
+			out.MCPTransport = req.Source.MCP.Transport
+			switch {
+			case req.Source.MCP.Command != nil:
+				out.Protocol = req.Source.MCP.Command.Protocol
+			case req.Source.MCP.Endpoint != "":
+				out.Protocol = endpointScheme(req.Source.MCP.Endpoint)
+			}
+		}
 	}
+	if out.Protocol == "" {
+		out.Protocol = "http"
+	}
+	return out
+}
+
+// endpointScheme reads the protocol an endpoint URL states, defaulting to HTTP
+// when it states none.
+func endpointScheme(endpoint string) string {
+	if parsed, err := url.Parse(endpoint); err == nil && parsed.Scheme != "" {
+		return parsed.Scheme
+	}
+	return "http"
 }
 
 // requirementFingerprint is a stable description of what a recommendation was
