@@ -45,7 +45,7 @@ func TestExistingServiceAddressRejectsAmbiguousColonAddress(t *testing.T) {
 }
 
 func TestEmailOTPProtectionRulesAreValidatedAndIncludedInRequest(t *testing.T) {
-	emails, domains, err := parseProtectionRules("Person@example.com, @Example.com, person@example.com")
+	emails, domains, err := ParseProtectionRules("Person@example.com, @Example.com, person@example.com")
 	if err != nil {
 		t.Fatalf("parseProtectionRules: %v", err)
 	}
@@ -78,8 +78,8 @@ func TestEmailOTPProtectionRulesAreValidatedAndIncludedInRequest(t *testing.T) {
 
 func TestEmailOTPProtectionRulesRejectEmptyAndMalformedValues(t *testing.T) {
 	for _, input := range []string{"", "not an address", "@bad_domain"} {
-		if _, _, err := parseProtectionRules(input); err == nil {
-			t.Fatalf("parseProtectionRules(%q) unexpectedly succeeded", input)
+		if _, _, err := ParseProtectionRules(input); err == nil {
+			t.Fatalf("ParseProtectionRules(%q) unexpectedly succeeded", input)
 		}
 	}
 }

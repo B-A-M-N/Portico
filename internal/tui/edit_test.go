@@ -496,3 +496,159 @@ func TestAbandoningThePreviewReturnsToTheEdit(t *testing.T) {
 		t.Fatalf("the pending change is not shown:\n%s", view)
 	}
 }
+
+// TestTurningProtectionOnAsksWhoCanSignIn pins the false affordance a review
+// found.
+//
+// The screen cycled protection to email_otp and offered no way to name anyone.
+// That builds a policy with no identities, which core validation refuses — so
+// the interface offered an operation that could not succeed, and the refusal
+// arrived from the server after a round trip.
+func TestTurningProtectionOnAsksWhoCanSignIn(t *testing.T) {
+	client := &fakeClient{}
+	m := editingModel(t, client, exposedDetail())
+
+	// Cycle protection from none to email_otp.
+	rows := m.edit.rows()
+	var protectionRow editRow
+	for _, row := range rows {
+		if row.field == editProtection {
+			protectionRow = row
+		}
+	}
+	m = m.beginEditingField(protectionRow)
+
+	// A field for the identities now exists.
+	var hasRules bool
+	for _, row := range m.edit.rows() {
+		if row.field == editProtectionRules {
+			hasRules = true
+			if !row.editable {
+				t.Error("the identities cannot be edited")
+			}
+		}
+	}
+	if !hasRules {
+		t.Fatal("turning protection on does not ask who can sign in")
+	}
+
+	// Previewing without naming anyone is refused here, not by the server.
+	next, cmd := m.Update(keyMsg("p"))
+	m = next.(Model)
+	if cmd != nil {
+		t.Fatal("a policy naming nobody was sent to the supervisor")
+	}
+	if !strings.Contains(m.renderEdit(), "at least one person or domain") {
+		t.Fatalf("the screen does not say what is missing:\n%s", m.renderEdit())
+	}
+}
+
+// TestNamedIdentitiesReachTheRequest pins that the identities are parsed with
+// the same authority the wizard uses and sent as structure.
+func TestNamedIdentitiesReachTheRequest(t *testing.T) {
+	client := &fakeClient{}
+	m := editingModel(t, client, exposedDetail())
+
+	otp := "email_otp"
+	m.edit.protection = &otp
+	m.edit.editing = editProtectionRules
+	m.commitEditField("alice@example.com, @example.org")
+
+	if m.edit.err != "" {
+		t.Fatalf("valid identities were refused: %q", m.edit.err)
+	}
+
+	_, cmd := m.Update(keyMsg("p"))
+	if cmd == nil {
+		t.Fatal("a complete policy was not previewed")
+	}
+	cmd()
+
+	spec := client.editRequest.Spec
+	if spec == nil {
+		t.Fatal("the request carries no spec")
+	}
+	if len(spec.Protection.AllowedEmails) != 1 || spec.Protection.AllowedEmails[0] != "alice@example.com" {
+		t.Fatalf("emails = %#v", spec.Protection.AllowedEmails)
+	}
+	if len(spec.Protection.AllowedDomains) != 1 || spec.Protection.AllowedDomains[0] != "example.org" {
+		t.Fatalf("domains = %#v", spec.Protection.AllowedDomains)
+	}
+}
+
+// TestAMalformedIdentityIsRefusedWhereItIsTyped pins that parsing uses the
+// wizard's rules rather than a second set that would drift from them.
+func TestAMalformedIdentityIsRefusedWhereItIsTyped(t *testing.T) {
+	m := editingModel(t, &fakeClient{}, exposedDetail())
+	otp := "email_otp"
+	m.edit.protection = &otp
+	m.edit.editing = editProtectionRules
+
+	m.commitEditField("not an address")
+	if m.edit.err == "" {
+		t.Fatal("a malformed identity was accepted")
+	}
+	if m.edit.protectionRules != nil {
+		t.Fatal("a malformed identity was recorded")
+	}
+}
+
+// TestTurningProtectionOffClearsTheIdentities pins that a list of people is not
+// left stored against a connection that no longer asks anyone to sign in.
+func TestTurningProtectionOffClearsTheIdentities(t *testing.T) {
+	detail := exposedDetail()
+	detail.DesiredSpec.ServiceExposure.Protection = ipc.ProtectionDTO{
+		Kind: "email_otp", AllowedEmails: []string{"alice@example.com"},
+	}
+	client := &fakeClient{}
+	m := editingModel(t, client, detail)
+
+	none := "none"
+	m.edit.protection = &none
+	_, cmd := m.Update(keyMsg("p"))
+	if cmd == nil {
+		t.Fatal("turning protection off was not previewed")
+	}
+	cmd()
+
+	spec := client.editRequest.Spec
+	if len(spec.Protection.AllowedEmails) != 0 || len(spec.Protection.AllowedDomains) != 0 {
+		t.Fatalf("identities survived turning protection off: %#v", spec.Protection)
+	}
+}
+
+// TestTheAccountIsChosenNotTyped pins the other false affordance.
+//
+// The account was a free text field. Typing an ID that does not exist saved a
+// profile that failed the next time it was opened — and for a closed connection
+// the edit plan generates no reopen steps, so nothing consulted the provider
+// and nothing refused it at the time.
+func TestTheAccountIsChosenNotTyped(t *testing.T) {
+	m := editingModel(t, &fakeClient{}, exposedDetail())
+	m.snapshot = accountSnapshot()
+
+	var accountRow editRow
+	for _, row := range m.edit.rows() {
+		if row.field == editAccount {
+			accountRow = row
+		}
+	}
+	m = m.beginEditingField(accountRow)
+
+	if m.edit.typing {
+		t.Fatal("the account is still a free text field")
+	}
+	if m.edit.accountID == nil {
+		t.Fatal("selecting the account chose nothing")
+	}
+	// Whatever it chose must be an account the provider actually reports.
+	var known bool
+	for _, account := range m.usableAccounts() {
+		if account.ID == *m.edit.accountID {
+			known = true
+		}
+	}
+	if !known {
+		t.Fatalf("selected %q, which the provider does not report", *m.edit.accountID)
+	}
+}

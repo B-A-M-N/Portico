@@ -151,7 +151,7 @@ func (m *WizardModel) restoreStepInput() {
 	case WizardStepHostname:
 		m.setInput(m.state.Hostname)
 	case WizardStepProtectionRules:
-		m.setInput(protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
+		m.setInput(ProtectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
 
 	// Menus restore a cursor rather than text, positioned on the stored answer
 	// so going back does not silently move the user's choice.

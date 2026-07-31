@@ -32,6 +32,11 @@ const (
 	editName editableField = iota
 	editHostname
 	editProtection
+	// editProtectionRules is the identities an email-OTP policy allows. It is
+	// a field of its own because protection without identities is not a policy
+	// anyone can use — core refuses it, and offering the mode without a way to
+	// name anyone was an operation that could not succeed.
+	editProtectionRules
 	editAutoStart
 	editOnDisconnect
 	editAccount
@@ -56,12 +61,17 @@ type editState struct {
 
 	// Pending values. A nil pointer means "unchanged", which is what the
 	// update request itself means by an absent field.
-	name         *string
-	hostname     *string
-	protection   *string
-	autoStart    *bool
-	onDisconnect *string
-	accountID    *string
+	name            *string
+	hostname        *string
+	protection      *string
+	protectionRules *string
+	// allowedEmails and allowedDomains are the parsed form of protectionRules,
+	// kept so the request carries structure rather than the raw line.
+	allowedEmails  []string
+	allowedDomains []string
+	autoStart      *bool
+	onDisconnect   *string
+	accountID      *string
 }
 
 // editRow is one line on the edit screen.
@@ -115,6 +125,15 @@ func (s *editState) rows() []editRow {
 			field: editProtection, label: "Protection", current: exposed.Protection.Kind,
 			pending: derefString(s.protection), editable: true,
 		})
+		if s.effectiveProtection() == "email_otp" {
+			rows = append(rows, editRow{
+				field: editProtectionRules, label: "Who can sign in",
+				current: screens.ProtectionRulesInput(
+					exposed.Protection.AllowedEmails, exposed.Protection.AllowedDomains),
+				pending:  derefString(s.protectionRules),
+				editable: true,
+			})
+		}
 	} else {
 		rows = append(rows, editRow{
 			field: editHostname, label: "Hostname", editable: false,
@@ -183,7 +202,8 @@ func (s *editState) request() ipc.UpdateConnectionRequest {
 			Options:    s.detail.Driver.Options,
 		}
 	}
-	if (s.hostname != nil || s.protection != nil) && s.detail.DesiredSpec.ServiceExposure != nil {
+	if (s.hostname != nil || s.protection != nil || s.protectionRules != nil) &&
+		s.detail.DesiredSpec.ServiceExposure != nil {
 		// The spec arm is sent whole because the supervisor merges it into the
 		// existing profile field by field; the unchanged parts must therefore
 		// carry their current values rather than zeroes.
@@ -200,9 +220,16 @@ func (s *editState) request() ipc.UpdateConnectionRequest {
 		if s.protection != nil {
 			exposed.Protection.Kind = *s.protection
 			if *s.protection == "none" {
+				// Turning protection off clears the identities. Leaving them
+				// would store a list of people against a connection that no
+				// longer asks anyone to sign in.
 				exposed.Protection.AllowedEmails = nil
 				exposed.Protection.AllowedDomains = nil
 			}
+		}
+		if s.effectiveProtection() == "email_otp" && s.protectionRules != nil {
+			exposed.Protection.AllowedEmails = s.allowedEmails
+			exposed.Protection.AllowedDomains = s.allowedDomains
 		}
 		req.Spec = &exposed
 	}
@@ -387,6 +414,12 @@ func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 		if !m.edit.dirty() {
 			return m, nil
 		}
+		// Refused here, where the values are still on screen and editable,
+		// rather than by core validation after a round trip.
+		if ok, reason := m.edit.protectionIsUsable(); !ok {
+			m.edit.err = reason
+			return m, nil
+		}
 		m.edit.err = ""
 		return m, m.planEditCmd()
 
@@ -423,6 +456,12 @@ func (m Model) beginEditingField(row editRow) Model {
 		}
 		next := cycleNext(protectionCycle, current)
 		m.edit.protection = &next
+		if next == "none" {
+			// The identities go with the policy that needed them.
+			m.edit.protectionRules = nil
+			m.edit.allowedEmails = nil
+			m.edit.allowedDomains = nil
+		}
 		return m
 
 	case editOnDisconnect:
@@ -432,6 +471,28 @@ func (m Model) beginEditingField(row editRow) Model {
 		}
 		next := cycleNext(disconnectCycle, current)
 		m.edit.onDisconnect = &next
+		return m
+	}
+
+	if row.field == editAccount {
+		// A selector, not free text. Typing an account ID that does not exist
+		// saved a profile that failed the next time it was opened — and for a
+		// closed connection the edit plan may never consult the provider, so
+		// nothing refused it at the time.
+		accounts := m.usableAccounts()
+		if len(accounts) == 0 {
+			m.edit.err = "this provider has no usable account to move the connection to"
+			return m
+		}
+		current := m.edit.effectiveAccount()
+		next := accounts[0].ID
+		for i, account := range accounts {
+			if account.ID == current {
+				next = accounts[(i+1)%len(accounts)].ID
+				break
+			}
+		}
+		m.edit.accountID = &next
 		return m
 	}
 
@@ -458,6 +519,19 @@ func (m *Model) commitEditField(value string) {
 		m.edit.name = &value
 	case editHostname:
 		m.edit.hostname = &value
+	case editProtectionRules:
+		emails, domains, err := screens.ParseProtectionRules(value)
+		if err != nil {
+			m.edit.err = err.Error()
+			return
+		}
+		if len(emails) == 0 && len(domains) == 0 {
+			m.edit.err = "name at least one person or domain, or set protection to none"
+			return
+		}
+		m.edit.protectionRules = &value
+		m.edit.allowedEmails = emails
+		m.edit.allowedDomains = domains
 	case editAccount:
 		m.edit.accountID = &value
 	}
@@ -472,4 +546,70 @@ func (m Model) beginEdit(connID string) (Model, tea.Cmd) {
 	m.edit = &editState{connectionID: connID}
 	m.pushScreen(ScreenEdit)
 	return m, m.connectionDetailCmd(connID)
+}
+
+// effectiveProtection is the protection this edit would end with.
+func (s *editState) effectiveProtection() string {
+	if s.protection != nil {
+		return *s.protection
+	}
+	if s.detail != nil && s.detail.DesiredSpec.ServiceExposure != nil {
+		return s.detail.DesiredSpec.ServiceExposure.Protection.Kind
+	}
+	return ""
+}
+
+// protectionIsUsable reports whether the pending protection can actually be
+// applied. An email-OTP policy naming nobody is refused by core validation, so
+// offering it as a change that could be previewed was a false affordance.
+func (s *editState) protectionIsUsable() (bool, string) {
+	if s.effectiveProtection() != "email_otp" {
+		return true, ""
+	}
+	emails, domains := s.effectiveIdentities()
+	if len(emails) == 0 && len(domains) == 0 {
+		return false, "an email sign-in policy has to name at least one person or domain"
+	}
+	return true, ""
+}
+
+// effectiveIdentities is who would be allowed after this edit.
+func (s *editState) effectiveIdentities() ([]string, []string) {
+	if s.protectionRules != nil {
+		return s.allowedEmails, s.allowedDomains
+	}
+	if s.detail != nil && s.detail.DesiredSpec.ServiceExposure != nil {
+		p := s.detail.DesiredSpec.ServiceExposure.Protection
+		return p.AllowedEmails, p.AllowedDomains
+	}
+	return nil, nil
+}
+
+// usableAccounts lists the accounts this connection could be moved to.
+//
+// Only accounts the supervisor reports as usable are offered: an account it
+// lists as pending has an unconfirmed credential, and moving a connection onto
+// one would produce a connection that cannot open.
+func (m *Model) usableAccounts() []ipc.ProviderAccountDTO {
+	if m.edit == nil || m.edit.detail == nil {
+		return nil
+	}
+	providerID := m.edit.detail.Driver.ProviderID
+	for _, p := range m.snapshot.Providers {
+		if p.ID == providerID {
+			return p.Accounts
+		}
+	}
+	return nil
+}
+
+// effectiveAccount is the account this edit would end with.
+func (s *editState) effectiveAccount() string {
+	if s.accountID != nil {
+		return *s.accountID
+	}
+	if s.detail != nil {
+		return s.detail.Summary.ProviderAccountID
+	}
+	return ""
 }

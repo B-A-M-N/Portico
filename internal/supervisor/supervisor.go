@@ -1283,6 +1283,14 @@ func (h *supervisorHandler) HandlePlanEdit(id string, req ipc.UpdateConnectionRe
 		return nil, err
 	}
 
+	// The account is checked whatever the connection's state. A closed
+	// connection generates no reopen steps, so nothing else in the edit path
+	// consults the provider — and an account that does not exist or cannot be
+	// used was saved happily and failed the next time someone opened it.
+	if err := h.validateEditAccount(proposed); err != nil {
+		return nil, err
+	}
+
 	ctx := context.Background()
 	plan, delta, err := h.sup.controller.PlanEdit(ctx, cid, proposed)
 	if err != nil {
@@ -2205,4 +2213,40 @@ func (h *supervisorHandler) HandleSupervisorStop(ctx context.Context) error {
 	// but we trigger it immediately so this HTTP handler can return before
 	// the server is fully shut down.
 	return nil
+}
+
+// validateEditAccount refuses an edit that would point a connection at an
+// account it cannot use.
+//
+// It is deliberately checked at plan time and again at apply time: an account
+// can be removed between previewing a change and approving it, and the whole
+// point of the preview is that what it describes is what happens.
+func (h *supervisorHandler) validateEditAccount(profile *core.ConnectionProfile) error {
+	selection := profile.GetProvider()
+	if selection.ProviderID == "" || selection.AccountID == "" {
+		return nil
+	}
+
+	for _, snapshot := range h.sup.registry.Snapshot() {
+		if snapshot.ID != selection.ProviderID {
+			continue
+		}
+		for _, account := range snapshot.Accounts {
+			if account.ID == selection.AccountID {
+				return nil
+			}
+		}
+		// Named separately, because "not usable yet" is a different problem
+		// from "does not exist" and has a different remedy.
+		for _, account := range snapshot.PendingAccounts {
+			if account.ID == selection.AccountID {
+				return core.ErrValidation(fmt.Sprintf(
+					"account %q cannot be used yet: its credential has not been confirmed, "+
+						"so this connection could not open", selection.AccountID))
+			}
+		}
+		return core.ErrValidation(fmt.Sprintf(
+			"%s has no account %q; choose one that exists", selection.ProviderID, selection.AccountID))
+	}
+	return core.ErrValidation(fmt.Sprintf("unknown provider %q", selection.ProviderID))
 }

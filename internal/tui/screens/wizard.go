@@ -689,7 +689,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Protection = choice.Value
 			if m.state.Protection == "email_otp" {
 				m.state.Step = WizardStepProtectionRules
-				m.setInput(protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
+				m.setInput(ProtectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
 				m.err = nil
 				return nil
 			}
@@ -709,7 +709,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			emails, domains, err := parseProtectionRules(m.inputValue())
+			emails, domains, err := ParseProtectionRules(m.inputValue())
 			if err != nil {
 				m.err = err
 				return nil
@@ -1694,7 +1694,11 @@ func boolIndex(value bool) int {
 // parseProtectionRules accepts explicit email addresses and domains. Domains
 // may be entered as example.com or @example.com, making the common intent
 // clear without making the user remember provider-specific policy syntax.
-func parseProtectionRules(input string) ([]string, []string, error) {
+// ParseProtectionRules is exported so the edit screen parses identities the
+// same way the wizard does. Two parsers would eventually disagree about what a
+// valid identity is, and the disagreement would appear as an edit that core
+// rejects for reasons the screen accepted.
+func ParseProtectionRules(input string) ([]string, []string, error) {
 	seenEmails := make(map[string]struct{})
 	seenDomains := make(map[string]struct{})
 	var emails, domains []string
@@ -1747,7 +1751,8 @@ func validProtectionDomain(value string) bool {
 	return true
 }
 
-func protectionRulesInput(emails, domains []string) string {
+// ProtectionRulesInput formats stored identities for editing.
+func ProtectionRulesInput(emails, domains []string) string {
 	values := append([]string(nil), emails...)
 	values = append(values, domains...)
 	return strings.Join(values, ", ")
