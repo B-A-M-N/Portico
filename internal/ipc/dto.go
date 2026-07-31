@@ -33,12 +33,35 @@ type ConnectionDTO struct {
 	Error             string `json:"error,omitempty"`
 }
 
+// OriginOwnershipDTO says what happens to the local service when the connection
+// is closed or deleted.
+//
+// Nothing said whether Portico had started the local service or merely
+// connected to one that was already running. That is what a user needs before
+// assuming that closing a connection will not stop their server — or, the other
+// way, before assuming it will.
+type OriginOwnershipDTO struct {
+	// Kind is "external" when the service was already running, "portico_managed"
+	// when Portico started it, or "client_managed" when a platform's client
+	// runs it.
+	Kind string `json:"kind"`
+	// StartsWithOpen reports that opening the connection starts the service.
+	StartsWithOpen bool `json:"starts_with_open"`
+	// StopsWithClose and StopsWithDelete report what closing and deleting do
+	// to it. They are separate because they are not always the same answer.
+	StopsWithClose  bool `json:"stops_with_close"`
+	StopsWithDelete bool `json:"stops_with_delete"`
+	// Description states the consequence in a sentence.
+	Description string `json:"description,omitempty"`
+}
+
 // ConnectionDetailDTO is the full detail view of a connection for inspect screens.
 type ConnectionDetailDTO struct {
 	Summary       ConnectionDTO        `json:"summary"`
 	Revision      uint64               `json:"revision"`
 	DesiredSpec   ConnectionSpecDTO    `json:"desired_spec"`
 	Lifecycle     LifecycleDTO         `json:"lifecycle"`
+	Origin        OriginOwnershipDTO   `json:"origin"`
 	Driver        DriverSelectionDTO   `json:"driver"`
 	Endpoints     []EndpointDTO        `json:"endpoints,omitempty"`
 	Segments      []RouteSegmentDTO    `json:"segments,omitempty"`

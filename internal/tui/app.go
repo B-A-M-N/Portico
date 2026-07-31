@@ -447,9 +447,15 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.status = ""
 		if msg.Plan != nil && msg.Plan.Noop {
+			// This handler receives open, close, repair and delete plans. It
+			// said "No repair needed" for all of them and pushed the repair
+			// screen — so closing an already-closed connection reported on a
+			// repair nobody asked for.
 			m.plan = nil
-			m.status = "No repair needed"
-			m.pushScreen(ScreenRepair)
+			m.status = noopOutcome(msg.Plan.Intent)
+			if msg.Plan.Intent == "repair" {
+				m.pushScreen(ScreenRepair)
+			}
 			return m, nil
 		}
 		m.plan = msg.Plan
@@ -2510,7 +2516,13 @@ func (m *Model) renderHome() string {
 			endpoint = screens.ConnectionKindLabel(selected.Kind)
 		}
 		vm := route.RouteVM{
-			LocalLabel:    selected.Name,
+			LocalLabel: selected.Name,
+			// The middle of the route is labelled by what it actually is. The
+			// strip drew one provider-gateway shape for every kind, so a port
+			// forward's forwarding process and a client tunnel's outbound
+			// client were both presented as a provider gateway that does not
+			// exist for either.
+			ProviderLabel: routeMiddleLabel(selected.Kind, selected.ProviderID),
 			EndpointLabel: endpoint,
 			State:         state,
 		}
@@ -3771,4 +3783,40 @@ func accountMarker(m *Model, providerID, accountID string) string {
 		return "▸"
 	}
 	return "•"
+}
+
+// noopOutcome says why a plan would do nothing, in terms of the intent that
+// produced it.
+func noopOutcome(intent string) string {
+	switch intent {
+	case "open":
+		return "This connection is already open."
+	case "close":
+		return "This connection is already closed."
+	case "repair":
+		return "No repair needed: nothing is wrong with this connection."
+	case "delete":
+		return "There is nothing to remove: Portico holds no resources for this connection."
+	case "edit":
+		return "That change would have no effect."
+	default:
+		return "Nothing would change."
+	}
+}
+
+// routeMiddleLabel names what carries the traffic, by connection kind.
+func routeMiddleLabel(kind, providerID string) string {
+	switch kind {
+	case "port_forward":
+		return "forward"
+	case "client_tunnel":
+		return "tunnel client"
+	case "private_network":
+		return "private network"
+	default:
+		if providerID != "" {
+			return providerID
+		}
+		return "provider"
+	}
 }

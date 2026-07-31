@@ -209,3 +209,58 @@ func TestAnUnreadableJournalSaysSoRatherThanShowingNothing(t *testing.T) {
 		t.Fatalf("a failed journal read is indistinguishable from an empty one:\n%s", view)
 	}
 }
+
+// TestANoOpPlanSaysWhichIntentItAnswers pins that the outcome matches the
+// question asked.
+//
+// Every no-op plan reported "No repair needed" and pushed the repair screen —
+// including open, close and delete plans, so closing an already-closed
+// connection reported on a repair nobody had asked for.
+func TestANoOpPlanSaysWhichIntentItAnswers(t *testing.T) {
+	cases := []struct {
+		intent string
+		want   string
+		repair bool
+	}{
+		{"open", "already open", false},
+		{"close", "already closed", false},
+		{"repair", "No repair needed", true},
+		{"delete", "nothing to remove", false},
+	}
+
+	for _, tc := range cases {
+		m := readyModel(&fakeClient{}, twoConnectionSnapshot())
+		m.selectedID = "conn-a"
+		m.planOpenCmd("conn-a")
+
+		next, _ := m.Update(planLoadedMsg{
+			Generation: m.planRequests.current, ConnectionID: "conn-a",
+			Plan: &ipc.PlanDTO{ID: "plan-1", ConnectionID: "conn-a", Intent: tc.intent, Noop: true},
+		})
+		m = next.(Model)
+
+		if !strings.Contains(strings.ToLower(m.status), strings.ToLower(tc.want)) {
+			t.Errorf("%s: status = %q, want it to mention %q", tc.intent, m.status, tc.want)
+		}
+		onRepair := m.screen == ScreenRepair
+		if onRepair != tc.repair {
+			t.Errorf("%s: repair screen = %v, want %v", tc.intent, onRepair, tc.repair)
+		}
+	}
+}
+
+// TestTheRouteStripNamesWhatCarriesTheTraffic pins that the middle of the route
+// is not always a provider gateway.
+func TestTheRouteStripNamesWhatCarriesTheTraffic(t *testing.T) {
+	cases := map[string]string{
+		"port_forward":     "forward",
+		"client_tunnel":    "tunnel client",
+		"private_network":  "private network",
+		"service_exposure": "cloudflare",
+	}
+	for kind, want := range cases {
+		if got := routeMiddleLabel(kind, "cloudflare"); got != want {
+			t.Errorf("kind %s labelled %q, want %q", kind, got, want)
+		}
+	}
+}

@@ -590,6 +590,7 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 		Summary:     *summary,
 		Revision:    p.Revision,
 		DesiredSpec: describeSpec(p),
+		Origin:      describeOriginOwnership(p, rt),
 		Lifecycle: ipc.LifecycleDTO{
 			AutoStart:    p.Lifecycle.AutoStart,
 			OnDisconnect: string(p.Lifecycle.OnDisconnect),

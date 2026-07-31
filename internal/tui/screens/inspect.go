@@ -124,6 +124,12 @@ func (m *InspectModel) renderOverview() []string {
 	if conn.ProviderAccountID != "" {
 		lines = append(lines, fmt.Sprintf("Account:    %s", conn.ProviderAccountID))
 	}
+	// What closing this does to the local service. Nothing said whether Portico
+	// started it or merely connected to one already running, which is what a
+	// user needs before assuming that closing will not stop their server.
+	if m.Detail != nil && m.Detail.Origin.Description != "" {
+		lines = append(lines, "", "LOCAL SERVICE", "  "+m.Detail.Origin.Description)
+	}
 	if conn.ConnectorPID > 0 {
 		lines = append(lines, fmt.Sprintf("Connector:  PID %d (%s)", conn.ConnectorPID, conn.ConnectorState))
 	}

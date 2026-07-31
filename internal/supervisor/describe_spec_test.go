@@ -231,3 +231,59 @@ func TestHistoryReportsWhetherItIsComplete(t *testing.T) {
 		t.Fatal("the default page size is not a usable bound")
 	}
 }
+
+// TestOriginOwnershipSaysWhatClosingDoes pins audit finding 13.
+//
+// Nothing said whether Portico had started the local service or merely
+// connected to one already running — which is what a user needs before assuming
+// that closing a connection will not stop their server.
+func TestOriginOwnershipSaysWhatClosingDoes(t *testing.T) {
+	// A service that was already running.
+	existing := previewProfile(core.ExposureTemporary, core.ProtectionSpec{Kind: core.ProtectionNone})
+	existing.Spec.ServiceExposure.Source = core.SourceSpec{
+		Kind: core.SourceExisting, Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000"},
+	}
+	own := describeOriginOwnership(existing, nil)
+	if own.Kind != "external" {
+		t.Errorf("an existing service is reported as %q", own.Kind)
+	}
+	if own.StopsWithClose || own.StopsWithDelete {
+		t.Error("closing is reported as stopping a service Portico did not start")
+	}
+	if own.Description == "" {
+		t.Error("the consequence is not stated")
+	}
+
+	// A command Portico runs.
+	command := previewProfile(core.ExposureTemporary, core.ProtectionSpec{Kind: core.ProtectionNone})
+	command.Spec.ServiceExposure.Source = core.SourceSpec{
+		Kind: core.SourceCommand, Command: &core.CommandSpec{Executable: "node", Port: 3000},
+	}
+	own = describeOriginOwnership(command, nil)
+	if own.Kind != "portico_managed" {
+		t.Errorf("a command source is reported as %q", own.Kind)
+	}
+	if !own.StartsWithOpen || !own.StopsWithClose {
+		t.Error("a service Portico starts is not reported as one it stops")
+	}
+
+	// The runtime is authoritative when there is one.
+	rt := &core.ConnectionRuntime{ConnectionID: existing.ID}
+	rt.Origin.Ownership = core.OriginOwnershipOwned
+	own = describeOriginOwnership(existing, rt)
+	if own.Kind != "portico_managed" {
+		t.Errorf("a runtime reporting an owned origin was overridden by the spec: %q", own.Kind)
+	}
+}
+
+// TestAForwardSaysOnlyForwardingStops pins that a kind with no local service of
+// its own does not claim to stop one.
+func TestAForwardSaysOnlyForwardingStops(t *testing.T) {
+	own := describeOriginOwnership(portForwardProfile(), nil)
+	if own.StopsWithClose {
+		t.Error("closing a port forward is reported as stopping a service")
+	}
+	if !strings.Contains(own.Description, "forwarding") {
+		t.Errorf("the description does not say what stops: %q", own.Description)
+	}
+}

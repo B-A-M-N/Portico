@@ -178,3 +178,59 @@ func connectionSummaryDTO(p *core.ConnectionProfile, rt *core.ConnectionRuntime)
 	}
 	return dto
 }
+
+// describeOriginOwnership says what closing or deleting the connection does to
+// the local service.
+//
+// It is derived from the runtime where one exists, because that is what
+// actually knows: the profile says what was asked for, the runtime says what
+// Portico is running. Falling back to the spec covers a connection that has
+// never been opened, where the answer is still knowable — a command source is
+// something Portico will start, an existing service is not.
+func describeOriginOwnership(p *core.ConnectionProfile, rt *core.ConnectionRuntime) ipc.OriginOwnershipDTO {
+	if p == nil {
+		return ipc.OriginOwnershipDTO{Kind: "external"}
+	}
+
+	if rt != nil && rt.Origin.Ownership == core.OriginOwnershipOwned {
+		return ipc.OriginOwnershipDTO{
+			Kind: "portico_managed", StartsWithOpen: true,
+			StopsWithClose: true, StopsWithDelete: true,
+			Description: "Portico started this service and will stop it when the connection closes.",
+		}
+	}
+
+	switch p.EffectiveKind() {
+	case core.ConnectionClientTunnel:
+		return ipc.OriginOwnershipDTO{
+			Kind: "client_managed", StartsWithOpen: true,
+			StopsWithClose: true, StopsWithDelete: true,
+			Description: "Portico runs the platform's tunnel client and will stop it when the " +
+				"connection closes. Your MCP server is not affected.",
+		}
+	case core.ConnectionPortForward, core.ConnectionPrivateNetwork:
+		return ipc.OriginOwnershipDTO{
+			Kind:        "external",
+			Description: "Closing this connection stops the forwarding only. Nothing else is stopped.",
+		}
+	}
+
+	source := p.GetSource()
+	switch {
+	case source.Command != nil, source.Directory != nil,
+		source.MCP != nil && source.MCP.Command != nil:
+		// Portico will start it, even though it is not running yet.
+		return ipc.OriginOwnershipDTO{
+			Kind: "portico_managed", StartsWithOpen: true,
+			StopsWithClose: true, StopsWithDelete: true,
+			Description: "Portico starts this service when the connection opens, and stops it " +
+				"when the connection closes.",
+		}
+	default:
+		return ipc.OriginOwnershipDTO{
+			Kind: "external",
+			Description: "This service runs independently of Portico. Closing or deleting the " +
+				"connection leaves it running.",
+		}
+	}
+}

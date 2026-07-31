@@ -192,7 +192,9 @@ func describeLocalChanges(plan *core.OperationPlan) []string {
 		case core.StepStartOrigin:
 			changes = append(changes, "Portico will start and supervise the local service.")
 		case core.StepStopOrigin:
-			changes = append(changes, "Portico will stop the local service it started.")
+			changes = append(changes,
+				"Portico will stop the local service it started. A service you started "+
+					"yourself is not affected.")
 		case core.StepStartConnector, core.StepRestartConnector:
 			changes = append(changes, "Portico will start and supervise one connector process.")
 		case core.StepStopConnector:
