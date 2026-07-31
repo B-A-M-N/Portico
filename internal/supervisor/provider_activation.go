@@ -63,6 +63,48 @@ func (c *activationCoordinator) definitionFor(id core.ProviderID) provider.Defin
 	return nil
 }
 
+// setupDefinitionFor resolves a provider's setup capability from its
+// definition.
+//
+// Setup requirements are static, so they must not require a constructed
+// adapter. Requiring one meant a provider that was switched off, or whose
+// client was not installed, could not tell you what it needed — which is the
+// moment that information matters most.
+func (s *Supervisor) setupDefinitionFor(id string) (provider.SetupDefinition, error) {
+	var def provider.Definition
+	if s.activation != nil {
+		def = s.activation.definitionFor(core.ProviderID(id))
+	}
+	if def == nil {
+		// A provider Portico has an adapter for but no definition of is a
+		// provider that cannot be configured, not one that does not exist.
+		// Saying "not found" about something on screen is wrong.
+		if s.registry != nil && s.registry.Get(core.ProviderID(id)) != nil {
+			return nil, core.ErrValidation(
+				fmt.Sprintf("provider %q cannot be configured through Portico", id))
+		}
+		if err := s.catalogOnlySetupError(id); err != nil {
+			return nil, err
+		}
+		return nil, core.ErrProviderNotFound(core.ProviderID(id))
+	}
+	setup, ok := def.(provider.SetupDefinition)
+	if !ok {
+		return nil, core.ErrValidation(
+			fmt.Sprintf("provider %q cannot be configured through Portico", id))
+	}
+	return setup, nil
+}
+
+// setupFlowFor returns a provider's declared setup flow.
+func (s *Supervisor) setupFlowFor(id string) (core.SetupFlow, error) {
+	setup, err := s.setupDefinitionFor(id)
+	if err != nil {
+		return core.SetupFlow{}, err
+	}
+	return setup.SetupFlow(), nil
+}
+
 // activateAll installs every known provider.
 func (s *Supervisor) activateAll(ctx context.Context) {
 	if s.activation == nil {

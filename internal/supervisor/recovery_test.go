@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -182,16 +183,14 @@ func TestSnapshotIncludesNonSecretProviderAccountSummaries(t *testing.T) {
 	}
 }
 
-// cloudflareTestRegistry returns a registry containing the Cloudflare adapter,
-// which setup now requires because configurability is decided by the provider's
-// declared setup flow rather than by a hardcoded provider ID.
-func cloudflareTestRegistry(t *testing.T) provider.Registry {
+// cloudflareTestSupervisor builds a supervisor whose Cloudflare provider comes
+// from its definition, as production does, with binary lookup stubbed.
+func cloudflareTestSupervisor(t *testing.T, st *store.Store, validator AccountValidator) *Supervisor {
 	t.Helper()
-	reg := provider.NewRegistry()
-	if err := reg.Add(&cloudflare.Provider{}); err != nil {
-		t.Fatalf("register cloudflare: %v", err)
-	}
-	return reg
+	sup, _ := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+	sup.accountValidator = validator
+	return sup
 }
 
 // stubAccountValidator stands in for a live provider so account setup can be
@@ -213,17 +212,18 @@ func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing
 		AccountAccessible: true,
 		Zones:             []ZoneSummary{{ID: "zone-a", Name: "example.com"}},
 	}}
-	handler := &supervisorHandler{sup: &Supervisor{
-		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
-	}}
+	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st, validator)}
 	response, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Label: "Personal", ZoneID: "zone-a", Credential: "secret-token",
 	})
 	if err != nil {
 		t.Fatalf("HandleConfigureProviderAccount: %v", err)
 	}
-	if !response.RestartRequired {
-		t.Fatal("account configuration must require adapter reconstruction")
+	// A saved account takes effect in this process. Requiring a restart was the
+	// old behaviour, and it existed only because Cloudflare was the one
+	// provider with a rebuild path.
+	if response.RestartRequired {
+		t.Fatal("configuring an account still demands a restart")
 	}
 	if validator.calls != 1 {
 		t.Fatalf("credential validated %d times, want exactly 1 before persisting", validator.calls)
@@ -880,9 +880,7 @@ func TestOperationHistoryEmptyIsMarkedAvailable(t *testing.T) {
 func TestCloudflareSetupAcceptsAccountWithoutZone(t *testing.T) {
 	st := newRecoveryTestStore(t)
 	validator := &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}}
-	handler := &supervisorHandler{sup: &Supervisor{
-		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
-	}}
+	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st, validator)}
 
 	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Label: "Personal", Credential: "secret-token",
@@ -913,9 +911,7 @@ func TestCloudflareSetupDoesNotPersistUnvalidatedCredentials(t *testing.T) {
 		result: &AccountValidation{MissingPermissions: []string{"Zone: Read"}},
 		err:    errors.New("the token is valid but cannot see account account-a"),
 	}
-	handler := &supervisorHandler{sup: &Supervisor{
-		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
-	}}
+	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st, validator)}
 
 	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Credential: "bad-token", ZoneID: "zone-a",
@@ -946,9 +942,7 @@ func TestCloudflareSetupRejectsZoneNotVisibleToToken(t *testing.T) {
 		AccountAccessible: true,
 		Zones:             []ZoneSummary{{ID: "zone-real", Name: "example.com"}},
 	}}
-	handler := &supervisorHandler{sup: &Supervisor{
-		store: st, accountValidator: validator, registry: cloudflareTestRegistry(t),
-	}}
+	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st, validator)}
 
 	_, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		AccountID: "account-a", Credential: "token", ZoneID: "zone-typo",
@@ -1125,12 +1119,11 @@ func TestCloneRequiresANewHostnameForPermanentConnections(t *testing.T) {
 // editing the UI and the handler rejected every other provider by ID.
 func TestProviderSetupIsDeclarative(t *testing.T) {
 	st := newRecoveryTestStore(t)
-	registry := provider.NewRegistry()
-	cf := &cloudflare.Provider{}
-	if err := registry.Add(cf); err != nil {
-		t.Fatalf("register cloudflare: %v", err)
-	}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+	// Deliberately no adapter: setup requirements are static and must be
+	// answerable before anything is constructed.
+	sup, _ := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+	handler := &supervisorHandler{sup: sup}
 
 	flow, err := handler.HandleProviderSetupFlow("cloudflare")
 	if err != nil {
@@ -1179,16 +1172,20 @@ func TestUnknownProviderSetupIsRefusedByCapabilityNotByName(t *testing.T) {
 
 // declaredProvider declares a setup flow but cannot check its own credential.
 // It is the case the authenticated-only-after-validation invariant is about.
-type declaredProvider struct {
-	*mock.Provider
-	id string
+// declaredDefinition declares a setup flow but cannot check its own
+// credential. It is the case the authenticated-only-after-validation invariant
+// is about.
+type declaredDefinition struct{ id string }
+
+func (d declaredDefinition) Identity() core.ProviderIdentity {
+	return core.ProviderIdentity{ID: core.ProviderID(d.id), Name: d.id, DisplayName: d.id}
 }
 
-func (p declaredProvider) Identity() core.ProviderIdentity {
-	return core.ProviderIdentity{ID: core.ProviderID(p.id), Name: p.id, DisplayName: p.id}
+func (d declaredDefinition) CatalogEntry() provider.CatalogEntry {
+	return provider.CatalogEntry{ID: core.ProviderID(d.id), DisplayName: d.id}
 }
 
-func (p declaredProvider) SetupFlow() core.SetupFlow {
+func (d declaredDefinition) SetupFlow() core.SetupFlow {
 	return core.SetupFlow{
 		Kind:          core.SetupAccount,
 		IdentityField: "workspace",
@@ -1202,43 +1199,85 @@ func (p declaredProvider) SetupFlow() core.SetupFlow {
 	}
 }
 
-// validatingProvider can check its own credential.
-type validatingProvider struct {
-	declaredProvider
+// PrepareAccount builds the canonical account, which is the provider's job.
+func (d declaredDefinition) PrepareAccount(values map[string]string) (provider.PreparedAccount, error) {
+	workspace := strings.TrimSpace(values["workspace"])
+	if workspace == "" {
+		return provider.PreparedAccount{}, fmt.Errorf("Workspace is required")
+	}
+	metadata := map[string]string{}
+	if region := strings.TrimSpace(values["region"]); region != "" {
+		metadata["region"] = region
+	}
+	return provider.PreparedAccount{
+		Account: core.ProviderAccount{
+			ID:       core.ProviderAccountID(workspace),
+			Provider: core.ProviderID(d.id),
+			Label:    workspace,
+			Metadata: metadata,
+		},
+		Secret: []byte(values["token"]),
+	}, nil
+}
+
+func (d declaredDefinition) Activate(_ context.Context, req provider.ActivationRequest) (provider.Installation, error) {
+	entry := d.CatalogEntry()
+	if len(req.Accounts) == 0 {
+		entry.Availability = provider.AvailabilityUnconfigured
+		return provider.Installation{Catalog: entry}, nil
+	}
+	entry.Availability = provider.AvailabilityReady
+	infos := make([]provider.AccountInfo, 0, len(req.Accounts))
+	for _, m := range req.Accounts {
+		infos = append(infos, provider.AccountInfo{
+			ID: m.Account.ID, Label: m.Account.Label, Status: string(m.Account.Status),
+		})
+	}
+	return provider.Installation{Provider: mock.New(), Catalog: entry, Accounts: infos}, nil
+}
+
+// validatingDefinition can check its own credential, so its accounts may be
+// recorded as authenticated.
+type validatingDefinition struct {
+	declaredDefinition
 	err error
 }
 
-func (p validatingProvider) ValidateSetup(context.Context, map[string]string) (core.SetupValidation, error) {
-	if p.err != nil {
-		return core.SetupValidation{}, p.err
+func (d validatingDefinition) VerifyAccount(context.Context, provider.PreparedAccount) (core.SetupValidation, error) {
+	if d.err != nil {
+		return core.SetupValidation{}, d.err
 	}
 	return core.SetupValidation{}, nil
 }
 
-// guidanceProvider is configured outside Portico entirely.
-type guidanceProvider struct{ declaredProvider }
+// guidanceDefinition is configured outside Portico entirely.
+type guidanceDefinition struct{ declaredDefinition }
 
-func (p guidanceProvider) SetupFlow() core.SetupFlow {
-	flow := p.declaredProvider.SetupFlow()
+func (d guidanceDefinition) SetupFlow() core.SetupFlow {
+	flow := d.declaredDefinition.SetupFlow()
 	flow.Kind = core.SetupGuidance
+	flow.GuidanceReason = "this provider reads its credential from the environment"
 	return flow
 }
 
-func newSetupHandler(t *testing.T, prov core.Provider) (*supervisorHandler, *store.Store) {
+func newSetupHandler(t *testing.T, defs ...provider.Definition) (*supervisorHandler, *store.Store) {
 	t.Helper()
-	st := newRecoveryTestStore(t)
-	registry := provider.NewRegistry()
-	if err := registry.Add(prov); err != nil {
-		t.Fatalf("register provider: %v", err)
-	}
-	return &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}, st
+	return newSetupHandlerOn(t, newRecoveryTestStore(t), defs...)
+}
+
+// newSetupHandlerOn wires a handler over an existing store, for tests that seed
+// state before configuring.
+func newSetupHandlerOn(t *testing.T, st *store.Store, defs ...provider.Definition) (*supervisorHandler, *store.Store) {
+	t.Helper()
+	sup, _ := activationTestSupervisor(t, st, defs...)
+	return &supervisorHandler{sup: sup}, st
 }
 
 // TestAnyProviderDeclaringAFlowCanBeConfigured is the point of this package.
 // The handler previously refused everything but Cloudflare, so the declarative
 // setup flow existed and no provider could use it.
 func TestAnyProviderDeclaringAFlowCanBeConfigured(t *testing.T) {
-	handler, st := newSetupHandler(t, declaredProvider{mock.New(), "acme"})
+	handler, st := newSetupHandler(t, declaredDefinition{"acme"})
 
 	resp, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
 		Fields: map[string]string{
@@ -1270,6 +1309,12 @@ func TestAnyProviderDeclaringAFlowCanBeConfigured(t *testing.T) {
 	if resp.Status != string(core.AccountPending) {
 		t.Fatalf("status = %q, want pending", resp.Status)
 	}
+	// A provider Portico has no built-in knowledge of becomes usable in this
+	// process. This used to answer "restart required" into a restart that
+	// changed nothing, because no code built an adapter for it.
+	if resp.RestartRequired {
+		t.Fatal("configuring a declared provider still demands a restart")
+	}
 }
 
 // TestUnvalidatedAccountIsNeverRecordedAsAuthenticated pins the invariant that
@@ -1277,7 +1322,7 @@ func TestAnyProviderDeclaringAFlowCanBeConfigured(t *testing.T) {
 // strength of a non-empty string is how Portico came to advertise providers
 // that could not perform a single operation.
 func TestUnvalidatedAccountIsNeverRecordedAsAuthenticated(t *testing.T) {
-	handler, st := newSetupHandler(t, declaredProvider{mock.New(), "acme"})
+	handler, st := newSetupHandler(t, declaredDefinition{"acme"})
 
 	resp, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
 		Fields: map[string]string{"workspace": "ws-1", "token": "unchecked"},
@@ -1308,9 +1353,7 @@ func TestUnvalidatedAccountIsNeverRecordedAsAuthenticated(t *testing.T) {
 // the pending status is a consequence of being unable to check, not a blanket
 // downgrade.
 func TestAProviderThatCanValidateGetsAnAuthenticatedAccount(t *testing.T) {
-	handler, st := newSetupHandler(t, validatingProvider{
-		declaredProvider: declaredProvider{mock.New(), "acme"},
-	})
+	handler, st := newSetupHandler(t, validatingDefinition{declaredDefinition: declaredDefinition{"acme"}})
 
 	resp, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
 		Fields: map[string]string{"workspace": "ws-1", "token": "checked"},
@@ -1330,9 +1373,9 @@ func TestAProviderThatCanValidateGetsAnAuthenticatedAccount(t *testing.T) {
 // TestAFailedValidationStoresNothing ensures a rejected credential does not
 // leave an account behind.
 func TestAFailedValidationStoresNothing(t *testing.T) {
-	handler, st := newSetupHandler(t, validatingProvider{
-		declaredProvider: declaredProvider{mock.New(), "acme"},
-		err:              errors.New("token rejected"),
+	handler, st := newSetupHandler(t, validatingDefinition{
+		declaredDefinition: declaredDefinition{"acme"},
+		err:                errors.New("token rejected"),
 	})
 
 	if _, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
@@ -1351,7 +1394,7 @@ func TestAFailedValidationStoresNothing(t *testing.T) {
 // so storing one here would write a value nothing reads and report success for
 // a setup that had no effect.
 func TestAGuidanceFlowCannotBeSubmitted(t *testing.T) {
-	handler, st := newSetupHandler(t, guidanceProvider{declaredProvider{mock.New(), "acme"}})
+	handler, st := newSetupHandler(t, guidanceDefinition{declaredDefinition{"acme"}})
 
 	flow, err := handler.HandleProviderSetupFlow("acme")
 	if err != nil {
@@ -1398,11 +1441,7 @@ func TestTheOpenAITunnelDeclaresGuidance(t *testing.T) {
 func TestConfiguringOneProviderLeavesAnotherProvidersSameNamedAccountIntact(t *testing.T) {
 	ctx := context.Background()
 	st := newRecoveryTestStore(t)
-	registry := provider.NewRegistry()
-	if err := registry.Add(declaredProvider{mock.New(), "acme"}); err != nil {
-		t.Fatalf("register provider: %v", err)
-	}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+	handler, _ := newSetupHandlerOn(t, st, declaredDefinition{"acme"})
 
 	existing := core.ProviderAccount{
 		ID: "shared", Provider: "cloudflare", Label: "Personal",
@@ -1458,10 +1497,8 @@ func TestConfiguringOneProviderLeavesAnotherProvidersSameNamedAccountIntact(t *t
 func TestCloudflareSetupCannotOverwriteAnotherProvidersAccount(t *testing.T) {
 	ctx := context.Background()
 	st := newRecoveryTestStore(t)
-	handler := &supervisorHandler{sup: &Supervisor{
-		store: st, registry: cloudflareTestRegistry(t), mutating: true,
-		accountValidator: &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}},
-	}}
+	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st,
+		&stubAccountValidator{result: &AccountValidation{AccountAccessible: true}})}
 
 	other := core.ProviderAccount{
 		ID: "acct-x", Provider: "acme", Label: "Someone else's",
@@ -1505,10 +1542,8 @@ func TestCloudflareSetupCannotOverwriteAnotherProvidersAccount(t *testing.T) {
 // account ID.
 func TestCloudflareAcceptsTheGenericFieldMap(t *testing.T) {
 	st := newRecoveryTestStore(t)
-	handler := &supervisorHandler{sup: &Supervisor{
-		store: st, registry: cloudflareTestRegistry(t), mutating: true,
-		accountValidator: &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}},
-	}}
+	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st,
+		&stubAccountValidator{result: &AccountValidation{AccountAccessible: true}})}
 
 	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
 		Fields: map[string]string{
@@ -1561,11 +1596,8 @@ func TestAnUnstatedAccountStatusIsPending(t *testing.T) {
 // asserted centrally and happening to be right for the first such provider.
 func TestGuidanceReasonComesFromTheProvider(t *testing.T) {
 	st := newRecoveryTestStore(t)
-	registry := provider.NewRegistry()
-	if err := registry.Add(openaitunnel.New("", nil)); err != nil {
-		t.Fatalf("register openai tunnel: %v", err)
-	}
-	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+	sup, _ := activationTestSupervisor(t, st, openaitunnel.NewDefinition(openaitunnel.DefinitionConfig{}))
+	handler := &supervisorHandler{sup: sup}
 
 	flow, err := handler.HandleProviderSetupFlow("openai_tunnel")
 	if err != nil {
@@ -1586,11 +1618,7 @@ func TestGuidanceReasonComesFromTheProvider(t *testing.T) {
 func TestRestartDoesNotPromotePendingAccounts(t *testing.T) {
 	ctx := context.Background()
 	st := newRecoveryTestStore(t)
-	registry := provider.NewRegistry()
-	if err := registry.Add(declaredProvider{mock.New(), "acme"}); err != nil {
-		t.Fatalf("register provider: %v", err)
-	}
-	sup := &Supervisor{store: st, registry: registry, mutating: true}
+	sup, registry := activationTestSupervisor(t, st, declaredDefinition{"acme"})
 
 	pending := core.ProviderAccount{
 		ID: "acct-pending", Provider: "acme", Label: "Unverified",
@@ -1602,9 +1630,7 @@ func TestRestartDoesNotPromotePendingAccounts(t *testing.T) {
 	}
 
 	// This is what a restart does.
-	if err := sup.loadProviderAccounts(ctx); err != nil {
-		t.Fatalf("loadProviderAccounts: %v", err)
-	}
+	sup.activateAll(ctx)
 
 	for _, snap := range registry.Snapshot() {
 		if snap.ID != "acme" {
@@ -1631,7 +1657,7 @@ func TestRestartDoesNotPromotePendingAccounts(t *testing.T) {
 // TestRequiredFieldsAreEnforcedFromTheDeclaration ensures the requirement comes
 // from the provider rather than from a hardcoded check.
 func TestRequiredFieldsAreEnforcedFromTheDeclaration(t *testing.T) {
-	handler, _ := newSetupHandler(t, declaredProvider{mock.New(), "acme"})
+	handler, _ := newSetupHandler(t, declaredDefinition{"acme"})
 
 	_, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
 		Fields: map[string]string{"token": "a-token"}, // workspace missing

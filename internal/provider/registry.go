@@ -242,6 +242,10 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 	maps.Copy(catalog, r.catalog)
 	declared := make(map[core.ProviderID]Availability, len(r.declared))
 	maps.Copy(declared, r.declared)
+	accountsByProvider := make(map[core.ProviderID][]AccountInfo, len(r.accountInfo))
+	for id, infos := range r.accountInfo {
+		accountsByProvider[id] = append([]AccountInfo(nil), infos...)
+	}
 	r.mu.RUnlock()
 
 	ids := make([]core.ProviderID, 0, len(live)+len(catalog))
@@ -260,13 +264,28 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 		h, registered := live[id]
 		if !registered {
 			entry := catalog[id]
+			// A provider with no adapter can still have accounts, and they are
+			// most worth showing precisely then: an account saved but never
+			// verified is why the provider has no adapter, so hiding it leaves
+			// the user with "needs setup" and no way to see the setup they
+			// already did.
+			var usable, pending []AccountInfo
+			for _, account := range accountsByProvider[id] {
+				if account.Usable() {
+					usable = append(usable, account)
+				} else {
+					pending = append(pending, account)
+				}
+			}
 			result = append(result, ProviderSnapshot{
-				ID:           entry.ID,
-				Name:         entry.Name,
-				DisplayName:  entry.DisplayName,
-				Availability: entry.Availability,
-				Reason:       entry.Reason,
-				SetupActions: append([]string(nil), entry.SetupActions...),
+				ID:              entry.ID,
+				Name:            entry.Name,
+				DisplayName:     entry.DisplayName,
+				Availability:    entry.Availability,
+				Reason:          entry.Reason,
+				SetupActions:    append([]string(nil), entry.SetupActions...),
+				Accounts:        usable,
+				PendingAccounts: pending,
 			})
 			continue
 		}

@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +21,6 @@ import (
 	"github.com/B-A-M-N/portico/internal/discovery"
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/lock"
-	"github.com/B-A-M-N/portico/internal/provider"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -228,9 +226,11 @@ func (s *Supervisor) startup(ctx context.Context) error {
 
 	// Phase 4: Load provider accounts.
 	slog.Info("startup: loading provider accounts")
-	if err := s.loadProviderAccounts(ctx); err != nil {
-		slog.Warn("startup: provider accounts not available", "err", err)
-	}
+	// Providers are built from the account rows rather than the rows being
+	// projected onto whatever adapters happen to exist already. This is the
+	// same call a live account change makes, so a restart and an in-process
+	// change cannot produce different results from the same state.
+	s.activateAll(ctx)
 
 	// Phase 5: Create provider adapters.
 	slog.Info("startup: creating provider adapters")
@@ -388,71 +388,6 @@ func (s *Supervisor) serveWithListener(ctx context.Context, listener net.Listene
 }
 
 // --------------- Phase helpers ---------------
-
-func (s *Supervisor) loadProviderAccounts(ctx context.Context) error {
-	accounts, err := s.store.ListProviderAccounts(ctx)
-	if err != nil {
-		return fmt.Errorf("list provider accounts: %w", err)
-	}
-
-	// Start with account IDs directly bound to registered provider adapters
-	// (for example, the environment/configured Cloudflare account). A single
-	// adapter must not advertise arbitrary stored rows: it would execute against
-	// its own configured account while the profile claims another one.
-	groups := make(map[core.ProviderID]map[core.ProviderAccountID]provider.AccountInfo)
-	for _, snapshot := range s.registry.List() {
-		if len(snapshot.Accounts) == 0 {
-			continue
-		}
-		group := make(map[core.ProviderAccountID]provider.AccountInfo, len(snapshot.Accounts))
-		for _, account := range snapshot.Accounts {
-			group[account.ID] = account
-		}
-		groups[snapshot.ID] = group
-	}
-
-	for _, a := range accounts {
-		prov := s.registry.Get(a.Provider)
-		if prov == nil {
-			slog.Warn("stored provider account has no registered provider", "provider", a.Provider, "account", a.ID)
-			continue
-		}
-		if scoped, ok := prov.(core.AccountScopedProvider); ok {
-			if _, err := scoped.ProviderForAccount(a.ID); err != nil {
-				slog.Warn("stored provider account is unavailable to the configured adapter", "provider", a.Provider, "account", a.ID, "err", err)
-				continue
-			}
-		}
-		if binding, ok := prov.(core.ProviderAccountBinding); ok {
-			boundAccount := binding.ProviderAccountID()
-			if boundAccount == "" || a.ID != boundAccount {
-				slog.Warn("stored provider account is unavailable to the configured adapter", "provider", a.Provider, "account", a.ID)
-				continue
-			}
-		}
-		if groups[a.Provider] == nil {
-			groups[a.Provider] = make(map[core.ProviderAccountID]provider.AccountInfo)
-		}
-		groups[a.Provider][a.ID] = provider.AccountInfo{ID: a.ID, Label: a.Label, Status: string(a.Status)}
-	}
-
-	for providerID, group := range groups {
-		ids := make([]core.ProviderAccountID, 0, len(group))
-		for id := range group {
-			ids = append(ids, id)
-		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		infos := make([]provider.AccountInfo, 0, len(ids))
-		for _, id := range ids {
-			infos = append(infos, group[id])
-		}
-		s.registry.SetAccountInfo(providerID, infos)
-		slog.Info("provider accounts loaded", "provider", providerID, "count", len(ids))
-	}
-
-	slog.Info("loaded provider accounts", "count", len(accounts))
-	return nil
-}
 
 func (s *Supervisor) validateProviders(ctx context.Context) error {
 	providers := s.registry.List()
