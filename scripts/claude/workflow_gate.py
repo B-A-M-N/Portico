@@ -6,6 +6,7 @@ This is the actual enforcement point; CLAUDE.md prose is advisory only.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -227,10 +228,48 @@ def post_tool_edit(tool_name):
     return 0
 
 
+ALLOWED_SUBAGENTS = ["portico-recon", "portico-auditor", "portico-architect"]
+
+# Model identifiers the harness can actually resolve. "default" is not one of
+# them: an agent declaring it fails at dispatch with a model-access error, which
+# is indistinguishable from the agent being unavailable and silently disables
+# every policy gate that depends on a dispatch.
+RESOLVABLE_MODELS = {"opus", "sonnet", "haiku", "fable", "inherit"}
+
+
+def validate_agent_definitions():
+    """Check every agent declaration names a model the harness can resolve.
+
+    A broken declaration does not announce itself. The dispatch fails, the gate
+    that required it is skipped, and work proceeds as though the review had
+    happened. This turns that into a visible error.
+    """
+    agents_dir = REPO_ROOT / ".claude" / "agents"
+    if not agents_dir.exists():
+        return []
+
+    problems = []
+    for path in sorted(agents_dir.glob("*.md")):
+        text = path.read_text()
+        match = re.search(r"^model:\s*(\S+)\s*$", text, re.MULTILINE)
+        if not match:
+            # No override is valid: the agent inherits the parent model.
+            continue
+        model = match.group(1)
+        if model not in RESOLVABLE_MODELS:
+            problems.append(
+                f"{path.relative_to(REPO_ROOT)}: model '{model}' is not resolvable "
+                f"(expected one of {', '.join(sorted(RESOLVABLE_MODELS))}, or no model: line)"
+            )
+    return problems
+
+
 def validate_subagent_start():
     """Validate handoff packet before subagent dispatch."""
     state = load_state()
-    allowed_subagents = ["portico-recon", "portico-auditor", "portico-architect"]
+
+    for problem in validate_agent_definitions():
+        print(f"ERROR: {problem}", file=sys.stderr)
 
     # We can't easily read the subagent type from here in Claude Code hooks,
     # but we can verify the work item is active
@@ -240,6 +279,22 @@ def validate_subagent_start():
               "Set work_item_id before dispatching.", file=sys.stderr)
         # Don't block — warn only
 
+    return 0
+
+
+def check_agents():
+    """Standalone check, for CI."""
+    problems = validate_agent_definitions()
+    for problem in problems:
+        print(f"ERROR: {problem}", file=sys.stderr)
+    if problems:
+        print(
+            "\nA subagent whose model cannot be resolved fails at dispatch. Every "
+            "policy gate requiring that dispatch is then skipped without saying so.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"agent definitions OK ({len(ALLOWED_SUBAGENTS)} remediation agents)")
     return 0
 
 
@@ -283,6 +338,8 @@ def main():
     elif cmd == "post-subagent-stop":
         subagent = sys.argv[2] if len(sys.argv) > 2 else "unknown"
         return post_subagent_stop(subagent)
+    elif cmd == "check-agents":
+        return check_agents()
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         return 1

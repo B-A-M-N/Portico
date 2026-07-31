@@ -1,7 +1,7 @@
 ---
 name: portico-recon
 description: Cheap read-only reconnaissance agent for Portico remediation. Returns exact call paths, mutation-site inventories, package ownership boundaries. Used before architect/auditor dispatches to reduce costs.
-model: default
+model: haiku
 permissionMode: plan
 maxTurns: 6
 background: false
