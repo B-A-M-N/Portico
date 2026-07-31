@@ -24,6 +24,12 @@ jobs:
             exit 1
           fi
 
+      # A subagent declaring a model the harness cannot resolve fails at
+      # dispatch, which is indistinguishable from the agent being unavailable —
+      # so the policy gate that required it is skipped silently.
+      - name: agent definitions
+        run: python3 scripts/claude/workflow_gate.py check-agents
+
       - name: go vet
         run: go vet ./...
 
