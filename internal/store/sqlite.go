@@ -4751,22 +4751,27 @@ func (s *Store) ListProviderAccounts(ctx context.Context) ([]core.ProviderAccoun
 	return accounts, rows.Err()
 }
 
-// CreateProviderAccountIfAbsent records an account only when the provider does
-// not already have one under that ID, leaving an existing row untouched.
+// CreateProviderAccountCredentialIfAbsent stores an account and its secret
+// together, and only when the provider has no account under that ID.
 //
-// It exists for writers that discovered a credential rather than verified one —
-// the environment bootstrap paths. Those run on every supervisor start, and an
-// unconditional upsert let them overwrite state they had not earned the right
-// to set: an account saved as pending because its credential could not be
-// checked was silently promoted to authenticated, and an operator's label and
-// metadata (including the Cloudflare zone the adapter is built against) were
-// reverted to whatever the environment happened to say.
+// The account row and the credential must be guarded as one thing. Guarding the
+// account alone is not enough: provider_credentials is keyed on the credential
+// reference, every writer derives the same reference for a given account, and
+// SaveProviderCredential is an upsert — so a bootstrap that wrote the secret
+// first replaced a validated token while the account row kept its label, zone
+// and status, and the adapter was then built from the wrong secret.
 //
-// Reports whether a row was created, so a caller can tell "I added this" from
-// "one was already there".
-func (s *Store) CreateProviderAccountIfAbsent(ctx context.Context, account core.ProviderAccount) (bool, error) {
+// Writing the account first and inspecting how many rows it affected is what
+// makes this safe. A query beforehand would be a race; reversing the two calls
+// would leave an account pointing at a credential that failed to persist.
+//
+// Reports whether a row was created.
+func (s *Store) CreateProviderAccountCredentialIfAbsent(ctx context.Context, account core.ProviderAccount, secret []byte) (bool, error) {
 	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" {
 		return false, fmt.Errorf("provider account ID, provider, label, and credential reference are required")
+	}
+	if len(secret) == 0 {
+		return false, fmt.Errorf("a provider credential is required")
 	}
 	if account.Status == "" {
 		account.Status = core.AccountPending
@@ -4775,10 +4780,24 @@ func (s *Store) CreateProviderAccountIfAbsent(ctx context.Context, account core.
 	if err != nil {
 		return false, fmt.Errorf("marshal provider account metadata: %w", err)
 	}
+	// Encrypting before the transaction keeps key work off the write lock and
+	// means a cipher failure cannot leave a half-open transaction.
+	encrypted, err := encryptCredential(s.secretStore, secret,
+		providerCredentialContext(account.Provider, account.CredentialRef))
+	if err != nil {
+		return false, fmt.Errorf("encrypt provider credential: %w", err)
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin provider account transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
 		INSERT INTO provider_accounts
 			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -4786,13 +4805,34 @@ func (s *Store) CreateProviderAccountIfAbsent(ctx context.Context, account core.
 		string(account.ID), string(account.Provider), account.Label, account.CredentialRef,
 		metadata, string(account.Status), now, now)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("save provider account: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return false, err
 	}
-	return affected > 0, nil
+	if affected == 0 {
+		// The provider already has this account. Its credential is not ours to
+		// replace: this writer found a token, it did not verify one.
+		return false, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO provider_credentials (credential_ref, provider_id, secret_encrypted, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(credential_ref) DO UPDATE SET
+			provider_id=excluded.provider_id,
+			secret_encrypted=excluded.secret_encrypted,
+			updated_at=excluded.updated_at`,
+		account.CredentialRef, string(account.Provider), encrypted, now, now); err != nil {
+		// The deferred rollback undoes the account insert, so the account and
+		// its secret are created together or not at all.
+		return false, fmt.Errorf("save provider credential: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit provider account: %w", err)
+	}
+	return true, nil
 }
 
 // UpsertProviderAccount records account metadata and an opaque credential

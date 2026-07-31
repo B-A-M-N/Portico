@@ -150,6 +150,28 @@ regression.
 3 is fixed at its source: one `providerCredentialRef` helper that every writer
 derives from, so a second reference for one account cannot be constructed.
 
+### A correction the fix for 3 made necessary
+
+Unifying the credential reference removed the orphaned secret and, in the same
+move, created a sharper defect. With one reference per account, the bootstrap's
+`SaveProviderCredential` — an upsert on that reference, called *before* the
+guarded account insert — no longer wrote a separate row. It overwrote the
+validated one. The account kept its label, zone and status while the adapter was
+built from a stale environment token: an orphaned secret traded for a silently
+swapped one.
+
+The account row and its secret are therefore written as one unit by
+`CreateProviderAccountCredentialIfAbsent`: insert the account with
+`ON CONFLICT DO NOTHING`, and write the credential only if that insert created a
+row, inside the same transaction, so a failed credential write rolls the account
+back. Querying first would be a race; reversing the two calls would leave an
+account pointing at a credential that never persisted.
+
+`CreateProviderAccountIfAbsent` — the account-only variant — is deleted rather
+than kept, because using it means writing the credential separately, which is
+the defect. Both provider bootstraps now share one `seedBootstrapAccount`
+helper so they cannot drift apart again.
+
 ### Residual gap, stated rather than hidden
 
 An account *created* by the bootstrap is still recorded as authenticated on the
@@ -161,9 +183,6 @@ label or metadata of an account that already exists.
 
 ## Out of scope, recorded so they are not lost
 
-- The three `credential_ref` formats are not unified. An ngrok account created
-  through setup and the same account bootstrapped from the environment produce
-  two credential rows. Pre-existing.
 - `SaveProviderCredential` rewrites `provider_id` on conflict, but refs are
   provider-prefixed and `LoadProviderCredential` already refuses a ref whose
   stored provider does not match, so it fails closed on read.

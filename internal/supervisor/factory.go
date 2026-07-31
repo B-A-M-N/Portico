@@ -324,29 +324,8 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 	}
 
 	if apiToken != "" && accountID != "" && zoneID != "" {
-		credentialRef := providerCredentialRef("cloudflare", accountID)
-		if err := st.SaveProviderCredential(context.Background(), "cloudflare", credentialRef, []byte(apiToken)); err != nil {
-			slog.Warn("persist Cloudflare bootstrap credential", "err", err)
-		} else if _, err := st.CreateProviderAccountIfAbsent(context.Background(), core.ProviderAccount{
-			ID:            core.ProviderAccountID(accountID),
-			Provider:      "cloudflare",
-			Label:         accountID,
-			CredentialRef: credentialRef,
-			Metadata:      map[string]string{"zone_id": zoneID},
-			// Applies to a row this call creates, never to one that exists:
-			// the write above is insert-if-absent, so an account already saved
-			// as pending is not promoted by an environment variable.
-			//
-			// Known gap: an account created here is marked authenticated on the
-			// strength of a token nobody checked. That is this path's existing
-			// behaviour — adapters are only built from authenticated accounts,
-			// so writing pending would disable environment setup outright.
-			// Closing it means verifying at startup, which is a network call on
-			// boot and a separate piece of work.
-			Status: core.AccountAuthenticated,
-		}); err != nil {
-			slog.Warn("persist Cloudflare bootstrap account", "err", err)
-		}
+		seedBootstrapAccount(st, "cloudflare", accountID, apiToken,
+			map[string]string{"zone_id": zoneID})
 	}
 
 	accounts, err := st.ListProviderAccounts(context.Background())
@@ -492,22 +471,7 @@ func registerNgrokWithAccounts(reg provider.Registry, paths app.Paths, procMgr c
 	}
 
 	if apiToken != "" && accountID != "" {
-		credentialRef := providerCredentialRef("ngrok", accountID)
-		if err := st.SaveProviderCredential(context.Background(), "ngrok", credentialRef, []byte(apiToken)); err != nil {
-			slog.Warn("persist Ngrok bootstrap credential", "err", err)
-		} else if _, err := st.CreateProviderAccountIfAbsent(context.Background(), core.ProviderAccount{
-			ID:            core.ProviderAccountID(accountID),
-			Provider:      "ngrok",
-			Label:         accountID,
-			CredentialRef: credentialRef,
-			Metadata:      map[string]string{},
-			// Applies only to a row this call creates; see the Cloudflare
-			// bootstrap above for why an unverified token is still recorded as
-			// authenticated here, and what it would take to change that.
-			Status: core.AccountAuthenticated,
-		}); err != nil {
-			slog.Warn("persist Ngrok bootstrap account", "err", err)
-		}
+		seedBootstrapAccount(st, "ngrok", accountID, apiToken, map[string]string{})
 	}
 
 	accounts, err := st.ListProviderAccounts(context.Background())

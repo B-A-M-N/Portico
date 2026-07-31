@@ -2292,15 +2292,10 @@ func TestBootstrapDoesNotOverwriteConfiguredAccountState(t *testing.T) {
 		t.Fatalf("seed configured account: %v", err)
 	}
 
-	// A stale environment from an earlier install, applied on the next start.
-	if _, err := st.CreateProviderAccountIfAbsent(ctx, core.ProviderAccount{
-		ID: "acct-1", Provider: "cloudflare", Label: "acct-1",
-		CredentialRef: providerCredentialRef("cloudflare", "acct-1"),
-		Status:        core.AccountAuthenticated,
-		Metadata:      map[string]string{"zone_id": "zone-stale"},
-	}); err != nil {
-		t.Fatalf("bootstrap write: %v", err)
-	}
+	// A stale environment from an earlier install, applied on the next start,
+	// through the same helper both provider bootstraps use.
+	seedBootstrapAccount(st, "cloudflare", "acct-1", "token-stale",
+		map[string]string{"zone_id": "zone-stale"})
 
 	accounts, err := st.ListProviderAccounts(ctx)
 	if err != nil {
@@ -2316,5 +2311,69 @@ func TestBootstrapDoesNotOverwriteConfiguredAccountState(t *testing.T) {
 	}
 	if accounts[0].Label != "Production" {
 		t.Fatalf("the configured label was reverted to %q", accounts[0].Label)
+	}
+}
+
+// TestBootstrapImportKeepsTheValidatedCredential covers the production
+// sequence for both providers that import from the environment.
+//
+// The account guard alone did not protect the secret: the credential was
+// written first, and every writer now derives the same reference, so a stale
+// environment token replaced a validated one while the account row kept its
+// label, zone and status. The adapter was then built from the wrong token.
+func TestBootstrapImportKeepsTheValidatedCredential(t *testing.T) {
+	for _, providerID := range []core.ProviderID{"cloudflare", "ngrok"} {
+		t.Run(string(providerID), func(t *testing.T) {
+			ctx := context.Background()
+			st := newRecoveryTestStore(t)
+			ref := providerCredentialRef(string(providerID), "acct-1")
+
+			configured := core.ProviderAccount{
+				ID: "acct-1", Provider: providerID, Label: "Configured in Portico",
+				CredentialRef: ref, Status: core.AccountAuthenticated,
+				Metadata: map[string]string{"zone_id": "zone-production"},
+			}
+			if err := st.UpsertProviderAccountCredential(ctx, configured, []byte("token-validated")); err != nil {
+				t.Fatalf("seed configured account: %v", err)
+			}
+
+			seedBootstrapAccount(st, providerID, "acct-1", "token-stale",
+				map[string]string{"zone_id": "zone-stale"})
+
+			secret, err := st.LoadProviderCredential(ctx, providerID, ref)
+			if err != nil {
+				t.Fatalf("load credential: %v", err)
+			}
+			if secret != "token-validated" {
+				t.Fatalf("a stale environment token replaced the validated one: %q", secret)
+			}
+			accounts, _ := st.ListProviderAccounts(ctx)
+			if len(accounts) != 1 || accounts[0].Label != "Configured in Portico" {
+				t.Fatalf("account state was disturbed: %#v", accounts)
+			}
+		})
+	}
+}
+
+// TestBootstrapImportCreatesTheAccountWhenThereIsNone keeps environment-only
+// setup working.
+func TestBootstrapImportCreatesTheAccountWhenThereIsNone(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
+		map[string]string{"zone_id": "z1"})
+
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != "acct-env" {
+		t.Fatalf("environment account not imported: %#v", accounts)
+	}
+	secret, err := st.LoadProviderCredential(ctx, "cloudflare",
+		providerCredentialRef("cloudflare", "acct-env"))
+	if err != nil || secret != "token-env" {
+		t.Fatalf("credential not imported with the account: %q err=%v", secret, err)
 	}
 }

@@ -1353,13 +1353,13 @@ func TestBootstrapWriteCannotPromoteAPendingAccount(t *testing.T) {
 	}
 
 	// What the bootstrap does on the next start.
-	created, err := s.CreateProviderAccountIfAbsent(ctx, core.ProviderAccount{
+	created, err := s.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
 		ID: "acct-1", Provider: "ngrok", Label: "acct-1",
 		CredentialRef: "ngrok:acct-1:api-token",
 		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
-	})
+	}, []byte("token-from-environment"))
 	if err != nil {
-		t.Fatalf("CreateProviderAccountIfAbsent: %v", err)
+		t.Fatalf("CreateProviderAccountCredentialIfAbsent: %v", err)
 	}
 	if created {
 		t.Fatal("an existing account was reported as newly created")
@@ -1387,13 +1387,13 @@ func TestBootstrapWriteCreatesAnAccountWhenThereIsNone(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	created, err := s.CreateProviderAccountIfAbsent(ctx, core.ProviderAccount{
+	created, err := s.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
 		ID: "acct-1", Provider: "cloudflare", Label: "acct-1",
 		CredentialRef: "cloudflare:acct-1:api-token",
 		Status:        core.AccountAuthenticated, Metadata: map[string]string{"zone_id": "z1"},
-	})
+	}, []byte("token-from-environment"))
 	if err != nil {
-		t.Fatalf("CreateProviderAccountIfAbsent: %v", err)
+		t.Fatalf("CreateProviderAccountCredentialIfAbsent: %v", err)
 	}
 	if !created {
 		t.Fatal("a new account was not created")
@@ -1435,5 +1435,167 @@ func TestDeletingAnAccountLeavesNoOrphanedCredential(t *testing.T) {
 	}
 	if remaining != 0 {
 		t.Fatalf("%d encrypted credential(s) survived the account being deleted", remaining)
+	}
+}
+
+// TestBootstrapDoesNotReplaceAValidatedCredential reproduces the production
+// bootstrap sequence, which writes the credential and then guards the account
+// row.
+//
+// Guarding the account row is not enough. provider_credentials is keyed on the
+// reference, and every writer now derives the same reference for one account —
+// so a stale environment token overwrites the validated one before the account
+// guard is ever consulted. The account keeps its label, zone and status while
+// the adapter is built from the wrong secret.
+func TestBootstrapDoesNotReplaceAValidatedCredential(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	ref := "cloudflare:acct-1:api-token"
+	validated := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Production",
+		CredentialRef: ref, Status: core.AccountAuthenticated,
+		Metadata: map[string]string{"zone_id": "zone-production"},
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, validated, []byte("token-validated")); err != nil {
+		t.Fatalf("seed validated account: %v", err)
+	}
+
+	// A restart with a stale token still in the environment.
+	created, err := s.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "acct-1",
+		CredentialRef: ref, Status: core.AccountAuthenticated,
+		Metadata: map[string]string{"zone_id": "zone-stale"},
+	}, []byte("token-stale"))
+	if err != nil {
+		t.Fatalf("bootstrap write: %v", err)
+	}
+	if created {
+		t.Fatal("an existing account was reported as newly created")
+	}
+
+	secret, err := s.LoadProviderCredential(ctx, "cloudflare", ref)
+	if err != nil {
+		t.Fatalf("load credential: %v", err)
+	}
+	if secret != "token-validated" {
+		t.Fatalf("a stale environment token replaced the validated one: %q", secret)
+	}
+	got := findAccount(t, s, "cloudflare", "acct-1")
+	if got.Metadata["zone_id"] != "zone-production" || got.Label != "Production" {
+		t.Fatalf("account state was reverted: %#v", got)
+	}
+}
+
+// TestBootstrapPreservesAPendingAccountEntirely covers the other status.
+func TestBootstrapPreservesAPendingAccountEntirely(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	ref := "ngrok:acct-1:api-token"
+	pending := core.ProviderAccount{
+		ID: "acct-1", Provider: "ngrok", Label: "Typed in Portico",
+		CredentialRef: ref, Status: core.AccountPending,
+		Metadata: map[string]string{"region": "eu"},
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, pending, []byte("token-typed")); err != nil {
+		t.Fatalf("seed pending account: %v", err)
+	}
+
+	if _, err := s.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "ngrok", Label: "acct-1",
+		CredentialRef: ref, Status: core.AccountAuthenticated,
+		Metadata: map[string]string{},
+	}, []byte("token-env")); err != nil {
+		t.Fatalf("bootstrap write: %v", err)
+	}
+
+	got := findAccount(t, s, "ngrok", "acct-1")
+	if got.Status != core.AccountPending {
+		t.Fatalf("an unverified account was promoted to %q", got.Status)
+	}
+	if got.Label != "Typed in Portico" || got.Metadata["region"] != "eu" {
+		t.Fatalf("account state was reverted: %#v", got)
+	}
+	secret, err := s.LoadProviderCredential(ctx, "ngrok", ref)
+	if err != nil || secret != "token-typed" {
+		t.Fatalf("the typed credential was replaced: %q err=%v", secret, err)
+	}
+}
+
+// TestBootstrapCreatesAccountAndCredentialTogether keeps the path that must
+// still work: a machine configured only through the environment.
+func TestBootstrapCreatesAccountAndCredentialTogether(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	ref := "cloudflare:acct-new:api-token"
+	created, err := s.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-new", Provider: "cloudflare", Label: "acct-new",
+		CredentialRef: ref, Status: core.AccountAuthenticated,
+		Metadata: map[string]string{"zone_id": "z1"},
+	}, []byte("token-env"))
+	if err != nil {
+		t.Fatalf("bootstrap write: %v", err)
+	}
+	if !created {
+		t.Fatal("a new account was not created")
+	}
+	if got := findAccount(t, s, "cloudflare", "acct-new"); got == nil {
+		t.Fatal("account not stored")
+	}
+	secret, err := s.LoadProviderCredential(ctx, "cloudflare", ref)
+	if err != nil || secret != "token-env" {
+		t.Fatalf("credential not stored with the account: %q err=%v", secret, err)
+	}
+}
+
+// TestBootstrapRollsBackWhenTheCredentialCannotBePersisted proves the two
+// writes are one unit.
+//
+// The account is inserted first and the credential second, so a failure on the
+// second must undo the first. Otherwise an account would exist pointing at a
+// credential that was never stored — visible, apparently configured, and
+// unusable for a reason nothing reports.
+//
+// The failure is injected by removing the credentials table, which makes the
+// second statement fail deterministically without a production seam.
+func TestBootstrapRollsBackWhenTheCredentialCannotBePersisted(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	if _, err := s.DB().Exec(`ALTER TABLE provider_credentials RENAME TO provider_credentials_hidden`); err != nil {
+		t.Fatalf("hide credentials table: %v", err)
+	}
+
+	created, err := s.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "acct-1",
+		CredentialRef: "cloudflare:acct-1:api-token",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}, []byte("token"))
+	if err == nil {
+		t.Fatal("a failed credential write was reported as success")
+	}
+	if created {
+		t.Fatal("a rolled-back account was reported as created")
+	}
+
+	var accounts int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM provider_accounts`).Scan(&accounts); err != nil {
+		t.Fatalf("count accounts: %v", err)
+	}
+	if accounts != 0 {
+		t.Fatalf("%d account(s) survived a failed credential write", accounts)
+	}
+
+	if _, err := s.DB().Exec(`ALTER TABLE provider_credentials_hidden RENAME TO provider_credentials`); err != nil {
+		t.Fatalf("restore credentials table: %v", err)
+	}
+	var credentials int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM provider_credentials`).Scan(&credentials); err != nil {
+		t.Fatalf("count credentials: %v", err)
+	}
+	if credentials != 0 {
+		t.Fatalf("%d orphaned credential(s) were left behind", credentials)
 	}
 }

@@ -1,9 +1,14 @@
 package supervisor
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/store"
 )
 
 // providerCredentialRef derives the credential reference for one account.
@@ -16,6 +21,43 @@ import (
 // gone, reachable by nothing.
 func providerCredentialRef(providerID, accountID string) string {
 	return fmt.Sprintf("%s:%s:api-token", providerID, accountID)
+}
+
+// seedBootstrapAccount imports a credential found in the supervisor's
+// environment, and only when the provider has no account under that ID.
+//
+// This runs on every supervisor start, so it must never overwrite anything an
+// operator established. It records what it found; it verified nothing. The
+// account row and the secret are written as one unit, because guarding the row
+// alone let a stale environment token silently replace a validated one while
+// the row kept its label, zone and status.
+//
+// Both provider bootstraps share this so neither can drift into writing the
+// account and the credential separately again.
+func seedBootstrapAccount(st *store.Store, providerID core.ProviderID, accountID, token string, metadata map[string]string) {
+	credentialRef := providerCredentialRef(string(providerID), accountID)
+	created, err := st.CreateProviderAccountCredentialIfAbsent(context.Background(), core.ProviderAccount{
+		ID:            core.ProviderAccountID(accountID),
+		Provider:      providerID,
+		Label:         accountID,
+		CredentialRef: credentialRef,
+		Metadata:      metadata,
+		// Applies only to a row this call creates. Known gap, unchanged here:
+		// an account created from the environment is recorded as authenticated
+		// on the strength of a token nobody checked. Adapters are built only
+		// from authenticated accounts, so writing pending would disable
+		// environment setup outright; closing it properly means verifying the
+		// import once, which is separate work.
+		Status: core.AccountAuthenticated,
+	}, []byte(token))
+	if err != nil {
+		slog.Warn("import bootstrap provider account", "provider", providerID, "err", err)
+		return
+	}
+	if created {
+		slog.Info("imported provider account from the environment",
+			"provider", providerID, "account", accountID)
+	}
 }
 
 // Launch modes.
