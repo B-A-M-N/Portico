@@ -114,7 +114,7 @@ func precedes(a, b int) bool {
 // question was showing.
 //
 // Restoring the input here, once, is the other half of what the hand-written
-// handlers each did separately: several of them set m.input and several forgot
+// handlers each did separately: several of them set m.inputValue() and several forgot
 // to, so going back could present an empty field over a stored answer.
 func (m *WizardModel) goBack() {
 	previous, ok := m.previousStep()
@@ -136,22 +136,22 @@ func (m *WizardModel) goBack() {
 
 // restoreStepInput puts the stored answer back on screen for the current step.
 func (m *WizardModel) restoreStepInput() {
-	m.input = ""
+	m.setInput("")
 	switch m.state.Step {
 	case WizardStepName:
-		m.input = m.state.Name
+		m.setInput(m.state.Name)
 	case WizardStepSource:
-		m.input = m.state.SourceAddress
+		m.setInput(m.state.SourceAddress)
 	case WizardStepPort:
-		m.input = m.state.Port
+		m.setInput(m.state.Port)
 	case WizardStepCommandArgs:
-		m.input = commandArgsInput(m.state.CommandArgs)
+		m.setInput(commandArgsInput(m.state.CommandArgs))
 	case WizardStepCommandWorkingDir:
-		m.input = m.state.WorkingDir
+		m.setInput(m.state.WorkingDir)
 	case WizardStepHostname:
-		m.input = m.state.Hostname
+		m.setInput(m.state.Hostname)
 	case WizardStepProtectionRules:
-		m.input = protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains)
+		m.setInput(protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
 
 	// Menus restore a cursor rather than text, positioned on the stored answer
 	// so going back does not silently move the user's choice.

@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
@@ -56,6 +57,10 @@ type Model struct {
 	navStack   []ScreenID // navigation stack for back navigation
 	selectedID string     // stable connection ID, not a list index
 	listOffset int        // scroll offset for connection list viewport
+	// scroll is free vertical scrolling for every screen that does not follow
+	// a selection. It is reset whenever the screen changes, so opening a screen
+	// starts at the top rather than wherever the previous one was left.
+	scroll scrollState
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -115,7 +120,11 @@ type Model struct {
 	providerSetupFlow       *ipc.SetupFlowDTO
 	providerSetupIndex      int
 	providerSetupValues     map[string]string
-	providerSetupError      string
+	// providerSetupField is the live editing surface for the field at
+	// providerSetupIndex. Values are committed into providerSetupValues, which
+	// remains what is submitted and what secret-clearing operates on.
+	providerSetupField textinput.Model
+	providerSetupError string
 	// providerSetupRequest increments per flow load, so a late reply to a
 	// cancelled load cannot reset a form already being filled in.
 	providerSetupRequest int
@@ -187,7 +196,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
+		// Quitting outranks text entry. Routing first would have let the
+		// field consume ctrl+c — which it did, appending the literal "ctrl+c"
+		// to whatever was being typed instead of shutting down.
+		if msg.String() == "ctrl+c" {
+			return m.handleKeyPress(msg)
+		}
+		// Otherwise a question answered by typing takes the keystroke first,
+		// so a character that happens to match a navigation key is entered
+		// rather than acted on.
+		if cmd, consumed := m.routeTextEntry(msg); consumed {
+			return m, cmd
+		}
 		return m.handleKeyPress(msg)
+
+	case tea.PasteMsg:
+		// Paste never reached anything: it is not a key press, so the single
+		// case above discarded it. A user copying a token or a hostname had to
+		// retype it by hand.
+		cmd, _ := m.routeTextEntry(msg)
+		return m, cmd
 
 	case snapshotMsg:
 		if msg.Err != nil {
@@ -335,6 +363,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.providerSetupFlow = msg.Flow
 		m.providerSetupIndex = 0
+		m.focusProviderSetupField()
 		return m, nil
 
 	case launchModeMsg:
@@ -478,6 +507,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// correct input for no reason.
 			m.clearProviderSetupSecret()
 			m.providerSetupIndex = m.providerSetupSecretIndex()
+			m.focusProviderSetupField()
 			return m, nil
 		}
 		// Success: drop every collected answer, secret included.
@@ -659,6 +689,14 @@ func (m Model) View() tea.View {
 		} else {
 			content = m.renderHome()
 		}
+	}
+
+	// Clip to what the terminal can show, and say what was cut. Rendering the
+	// full content and letting the terminal drop the overflow made everything
+	// past the last row unreachable.
+	m.scroll.follow(m.screen)
+	if scrollsFreely(m.screen) && m.height > 0 {
+		content = clipToViewport(content, m.height, &m.scroll)
 	}
 
 	v := tea.NewView(content)
@@ -1237,6 +1275,22 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 	}
 
+	// Scrolling works on every freely-scrolled screen, and is checked before
+	// per-screen keys so no screen has to implement it. It is checked after
+	// the wizard and setup forms above, which own the keyboard while typing.
+	if scrollsFreely(m.screen) {
+		switch key {
+		case "pgdown", "pgup", "ctrl+d", "ctrl+u":
+			switch key {
+			case "pgdown", "ctrl+d":
+				m.scroll.scrollBy(m.scroll.page())
+			default:
+				m.scroll.scrollBy(-m.scroll.page())
+			}
+			return m, nil
+		}
+	}
+
 	// While the inspect screen is active, delegate tab navigation to the InspectModel.
 	if m.screen == ScreenInspect && m.inspect != nil {
 		switch key {
@@ -1510,10 +1564,17 @@ func oppositeLaunchMode(mode string) string {
 // path — cancel, back past the credential step, validation failure, success and
 // shutdown — calls this rather than relying on the success path alone.
 func (m *Model) clearProviderSetupSecret() {
+	var cleared bool
 	for _, field := range m.providerSetupFields() {
 		if field.Secret {
 			delete(m.providerSetupValues, field.ID)
+			cleared = true
 		}
+	}
+	// The editing surface holds its own copy of the value being typed, so
+	// clearing only the map would leave the secret resident and on screen.
+	if cleared {
+		m.providerSetupField.SetValue("")
 	}
 }
 
@@ -1524,6 +1585,7 @@ func (m *Model) clearProviderSetup() {
 	m.clearProviderSetupSecret()
 	m.providerSetupStep = 0
 	m.providerSetupIndex = 0
+	m.focusProviderSetupField()
 	m.providerSetupFlow = nil
 	m.providerSetupProviderID = ""
 	m.providerSetupValues = nil
@@ -1588,6 +1650,7 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		switch key {
 		case "esc":
 			m.providerSetupIndex = len(fields) - 1
+			m.focusProviderSetupField()
 			m.providerSetupError = ""
 			return m, m.forgetSecretAt(len(fields) - 1)
 		case "enter":
@@ -1621,6 +1684,7 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		// Moving back past a secret must not leave it resident while the user
 		// edits earlier answers.
 		m.providerSetupIndex--
+		m.focusProviderSetupField()
 		m.providerSetupError = ""
 		if field.Secret {
 			delete(m.providerSetupValues, field.ID)
@@ -1633,12 +1697,60 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.providerSetupIndex++
+		m.focusProviderSetupField()
 		m.providerSetupError = ""
 		return m, nil
 	}
 
-	m.setProviderSetupValue(field.ID, editString(m.providerSetupValue(field.ID), key))
+	// Typing is handled by the field itself, routed before key handling.
 	return m, nil
+}
+
+// focusProviderSetupField loads the stored answer for the current field into
+// the editing surface, masking it when the field holds a secret.
+//
+// A credential was previously echoed in full as it was typed, which discloses
+// it to anyone who can see the screen or a recording of it.
+func (m *Model) focusProviderSetupField() {
+	fields := m.providerSetupFields()
+	if m.providerSetupIndex < 0 || m.providerSetupIndex >= len(fields) {
+		m.providerSetupField = newSetupField(false)
+		return
+	}
+	field := fields[m.providerSetupIndex]
+	m.providerSetupField = newSetupField(field.Secret)
+	m.providerSetupField.SetValue(m.providerSetupValue(field.ID))
+	m.providerSetupField.CursorEnd()
+}
+
+// updateProviderSetupField routes text entry to the setup form.
+//
+// The committed value is mirrored on every keystroke so everything that reads
+// providerSetupValues — validation, submission, and secret clearing — keeps
+// seeing the current answer.
+func (m *Model) updateProviderSetupField(msg tea.Msg) (tea.Cmd, bool) {
+	fields := m.providerSetupFields()
+	if m.providerSetupIndex < 0 || m.providerSetupIndex >= len(fields) {
+		return nil, false
+	}
+	if m.providerSetupSubmitting || m.providerSetupFlow == nil || !m.providerSetupFlow.StoresAccount() {
+		return nil, false
+	}
+	if !screens.FieldAccepts(msg) {
+		return nil, false
+	}
+	var cmd tea.Cmd
+	m.providerSetupField, cmd = m.providerSetupField.Update(msg)
+	m.setProviderSetupValue(fields[m.providerSetupIndex].ID, m.providerSetupField.Value())
+	return cmd, true
+}
+
+// newSetupField builds the editing surface for one setup field.
+func newSetupField(secret bool) textinput.Model {
+	if secret {
+		return screens.NewSecretField()
+	}
+	return screens.NewField()
 }
 
 // forgetSecretAt drops a secret value when stepping back onto its field, so it
@@ -1677,6 +1789,7 @@ func (m Model) beginProviderSetup(providerID string) (Model, tea.Cmd) {
 	m.providerSetupProviderID = providerID
 	m.providerSetupFlow = nil
 	m.providerSetupIndex = 0
+	m.focusProviderSetupField()
 	m.providerSetupValues = map[string]string{}
 	m.providerSetupError = ""
 	m.providerSetupRequest++
@@ -2407,14 +2520,12 @@ func (m *Model) renderProviderSetup() string {
 		if !field.Required {
 			b.WriteString(m.theme.Style("muted").Render("Optional — press enter to skip.") + "\n")
 		}
-		value := m.providerSetupValue(field.ID)
-		if field.Secret && value != "" {
-			value = "••••••••"
-		}
-		if value == "" && field.Placeholder != "" {
+		if m.providerSetupValue(field.ID) == "" && field.Placeholder != "" {
 			b.WriteString(m.theme.Style("muted").Render("e.g. "+field.Placeholder) + "\n")
 		}
-		b.WriteString(fmt.Sprintf("> %s_\n", value))
+		// The live field, so the cursor is where the user put it and a secret
+		// is masked as it is typed rather than echoed in full.
+		b.WriteString(m.providerSetupField.View() + "\n")
 	}
 
 	if len(flow.CapabilityNotes) > 0 && m.providerSetupIndex >= len(fields) {
@@ -2948,4 +3059,19 @@ func compareFindings(before, after []ipc.DiagnosticDTO) (resolved, remaining, ap
 		}
 	}
 	return resolved, remaining, appeared
+}
+
+// routeTextEntry offers a message to whichever text field is currently focused.
+//
+// It reports whether the message was consumed so the caller does not also treat
+// a typed character as a command. Only screens that are actually asking for
+// text take it.
+func (m *Model) routeTextEntry(msg tea.Msg) (tea.Cmd, bool) {
+	if m.screen == ScreenNewConnection && m.wizard != nil {
+		return m.wizard.Update(msg)
+	}
+	if m.providerSetupStep > 0 {
+		return m.updateProviderSetupField(msg)
+	}
+	return nil, false
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
@@ -60,8 +61,10 @@ type WizardModel struct {
 	ctx      context.Context // application lifetime context for IPC calls
 	state    WizardState
 	selected int
-	input    string
-	err      error
+	// field is the text entry for whichever question is currently asked. It
+	// replaced a plain string that could only append and truncate.
+	field textinput.Model
+	err   error
 	// caps derives every menu from what providers declare, replacing a single
 	// "is Cloudflare configured" boolean that decided what the user was shown.
 	caps providerCapabilities
@@ -238,6 +241,7 @@ func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO) *WizardMod
 		ctx:    context.Background(), // default; root model should call WithContext
 		caps:   providerCapabilities{providers: providers},
 		state:  WizardState{Step: WizardStepOutcome},
+		field:  NewField(),
 	}
 }
 
@@ -351,7 +355,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Protection = recipe.Protection
 			m.state.Step = WizardStepName
 			m.selected = 0
-			m.input = m.state.Name
+			m.setInput(m.state.Name)
 		}
 
 	case WizardStepIntent:
@@ -370,7 +374,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.SourceType = wizardSourceKinds[m.selected]
 			m.state.Step = WizardStepName
 			m.selected = 0
-			m.input = m.state.Name
+			m.setInput(m.state.Name)
 		}
 
 	case WizardStepName:
@@ -378,21 +382,21 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			if strings.TrimSpace(m.input) == "" {
+			if strings.TrimSpace(m.inputValue()) == "" {
 				m.err = fmt.Errorf("name is required")
 				return nil
 			}
 			m.err = nil
-			m.state.Name = strings.TrimSpace(m.input)
+			m.state.Name = strings.TrimSpace(m.inputValue())
 			if m.state.SourceType == "mcp_server" {
 				m.state.Step = WizardStepMCPMode
 				m.selected = boolIndex(m.state.MCPCommand)
 			} else {
 				m.state.Step = WizardStepSource
-				m.input = m.state.SourceAddress
+				m.setInput(m.state.SourceAddress)
 			}
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepMCPMode:
@@ -408,7 +412,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "enter":
 			m.state.MCPCommand = m.selected == 1
 			m.state.Step = WizardStepSource
-			m.input = m.state.SourceAddress
+			m.setInput(m.state.SourceAddress)
 		case "esc":
 			m.goBack()
 		}
@@ -418,15 +422,15 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			if strings.TrimSpace(m.input) == "" && m.state.SourceType != "existing_service" {
+			if strings.TrimSpace(m.inputValue()) == "" && m.state.SourceType != "existing_service" {
 				m.err = fmt.Errorf("value is required")
 				return nil
 			}
 			m.err = nil
-			m.state.SourceAddress = strings.TrimSpace(m.input)
+			m.state.SourceAddress = strings.TrimSpace(m.inputValue())
 			if m.hasPortStep() {
 				m.state.Step = WizardStepPort
-				m.input = m.state.Port
+				m.setInput(m.state.Port)
 			} else if m.state.SourceType == "directory" {
 				m.state.Step = WizardStepDirectoryMode
 				m.selected = m.directoryModeIndex()
@@ -438,7 +442,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = firstAvailable(m.exposureChoices())
 			}
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepPort:
@@ -446,7 +450,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			port := strings.TrimSpace(m.input)
+			port := strings.TrimSpace(m.inputValue())
 			if port == "" && m.isCommandOrigin() {
 				m.err = fmt.Errorf("a command source requires a local port")
 				return nil
@@ -472,7 +476,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Port = port
 			if m.isCommandOrigin() {
 				m.state.Step = WizardStepCommandArgs
-				m.input = commandArgsInput(m.state.CommandArgs)
+				m.setInput(commandArgsInput(m.state.CommandArgs))
 			} else if m.state.SourceType == "existing_service" {
 				m.state.Step = WizardStepProtocol
 				m.selected = 0 // default to HTTP
@@ -481,7 +485,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = firstAvailable(m.exposureChoices())
 			}
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepProtocol:
@@ -508,7 +512,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			args, err := parseCommandArgs(m.input)
+			args, err := parseCommandArgs(m.inputValue())
 			if err != nil {
 				m.err = err
 				return nil
@@ -516,9 +520,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.err = nil
 			m.state.CommandArgs = args
 			m.state.Step = WizardStepCommandWorkingDir
-			m.input = m.state.WorkingDir
+			m.setInput(m.state.WorkingDir)
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepCommandWorkingDir:
@@ -527,7 +531,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.goBack()
 		case "enter":
 			m.err = nil
-			m.state.WorkingDir = strings.TrimSpace(m.input)
+			m.state.WorkingDir = strings.TrimSpace(m.inputValue())
 			if m.state.SourceType == "mcp_server" {
 				m.state.Step = WizardStepMCPTransport
 				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
@@ -536,7 +540,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = firstAvailable(m.exposureChoices())
 			}
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepDirectoryMode:
@@ -634,7 +638,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.discardProtectionIfUnavailable()
 			if m.state.ExposureMode == "permanent_public" {
 				m.state.Step = WizardStepHostname
-				m.input = m.state.Hostname
+				m.setInput(m.state.Hostname)
 			} else {
 				m.state.Hostname = ""
 				m.state.Step = WizardStepProtection
@@ -649,16 +653,16 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			if strings.TrimSpace(m.input) == "" {
+			if strings.TrimSpace(m.inputValue()) == "" {
 				m.err = fmt.Errorf("permanent exposure requires a hostname")
 				return nil
 			}
 			m.err = nil
-			m.state.Hostname = strings.TrimSpace(m.input)
+			m.state.Hostname = strings.TrimSpace(m.inputValue())
 			m.state.Step = WizardStepProtection
 			m.selected = firstAvailable(m.protectionChoices())
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepProtection:
@@ -684,7 +688,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Protection = choice.Value
 			if m.state.Protection == "email_otp" {
 				m.state.Step = WizardStepProtectionRules
-				m.input = protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains)
+				m.setInput(protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
 				m.err = nil
 				return nil
 			}
@@ -704,7 +708,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "esc":
 			m.goBack()
 		case "enter":
-			emails, domains, err := parseProtectionRules(m.input)
+			emails, domains, err := parseProtectionRules(m.inputValue())
 			if err != nil {
 				m.err = err
 				return nil
@@ -716,7 +720,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.selected = 0
 			return m.recommendCmd()
 		default:
-			m.input = editInput(m.input, key)
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepProvider:
@@ -1167,24 +1171,24 @@ func (m *WizardModel) View() string {
 	case WizardStepIntent:
 		return m.renderIntent()
 	case WizardStepName:
-		return m.withError(renderInput("Name this connection:", m.input))
+		return m.withError(m.renderField("Name this connection:"))
 	case WizardStepMCPMode:
 		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
 	case WizardStepSource:
-		return m.withError(renderInput(m.sourcePrompt(), m.input))
+		return m.withError(m.renderField(m.sourcePrompt()))
 	case WizardStepPort:
 		if m.isCommandOrigin() {
-			return m.withError(renderInput("Local port for the command (required):", m.input))
+			return m.withError(m.renderField("Local port for the command (required):"))
 		}
-		return m.withError(renderInput("Local port (empty to skip):", m.input))
+		return m.withError(m.renderField("Local port (empty to skip):"))
 	case WizardStepProtocol:
 		return m.renderProtocol()
 	case WizardStepCommandArgs:
-		return m.withError(renderInput(
-			"Command arguments (space separated; quote any argument containing spaces; empty to skip):\n"+
-				renderArgvPreviewForInput(m.state.SourceAddress, m.input), m.input))
+		return m.withError(m.renderField(
+			"Command arguments (space separated; quote any argument containing spaces; empty to skip):\n" +
+				renderArgvPreviewForInput(m.state.SourceAddress, m.inputValue())))
 	case WizardStepCommandWorkingDir:
-		return m.withError(renderInput("Working directory (empty to use Portico's):", m.input))
+		return m.withError(m.renderField("Working directory (empty to use Portico's):"))
 	case WizardStepDirectoryMode:
 		return m.renderDirectoryMode()
 	case WizardStepDirectorySPA:
@@ -1194,11 +1198,11 @@ func (m *WizardModel) View() string {
 	case WizardStepExposure:
 		return m.renderExposure()
 	case WizardStepHostname:
-		return m.withError(renderInput("Enter the hostname to use:", m.input))
+		return m.withError(m.renderField("Enter the hostname to use:"))
 	case WizardStepProtection:
 		return m.renderProtection()
 	case WizardStepProtectionRules:
-		return m.withError(renderInput("Allow emails or domains (comma-separated; @example.com permits a domain):", m.input))
+		return m.withError(m.renderField("Allow emails or domains (comma-separated; @example.com permits a domain):"))
 	case WizardStepProvider:
 		return m.renderProvider()
 	case WizardStepAccount:
@@ -1521,8 +1525,10 @@ func renderMenu(title string, options []string, selected int) string {
 	return strings.Join(lines, "\n")
 }
 
-func renderInput(prompt, value string) string {
-	lines := []string{prompt, "", "> " + value, "", "Enter to continue  Esc Back"}
+// renderField draws a question answered by typing, showing the live field with
+// its cursor rather than a snapshot of the value.
+func (m *WizardModel) renderField(prompt string) string {
+	lines := []string{prompt, "", m.field.View(), "", "Enter to continue  Esc Back"}
 	return strings.Join(lines, "\n")
 }
 

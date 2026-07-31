@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
@@ -189,5 +190,76 @@ func TestACredentialIsNotSubmittedTwice(t *testing.T) {
 	_, cmd := m.Update(keyMsg("enter"))
 	if cmd != nil {
 		t.Fatal("a second enter sent the credential again while the first was in flight")
+	}
+}
+
+// TestACredentialCanBePasted pins audit finding 16 on the field it matters most
+// for. An API token is the value a user is most likely to have on the clipboard
+// and least likely to retype correctly, and paste did not reach the form at all.
+func TestACredentialCanBePasted(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.providerSetupStep = 1
+	m.providerSetupProviderID = "cloudflare"
+	m.providerSetupFlow = &ipc.SetupFlowDTO{
+		ProviderID: "cloudflare", Kind: "account",
+		Fields: []ipc.SetupFieldDTO{{ID: "api_token", Label: "API token", Secret: true, Required: true}},
+	}
+	m.providerSetupIndex = 0
+	m.focusProviderSetupField()
+
+	next, _ := m.Update(tea.PasteMsg{Content: "cf-token-pasted"})
+	m = next.(Model)
+
+	if got := m.providerSetupValue("api_token"); got != "cf-token-pasted" {
+		t.Fatalf("pasted credential = %q, want it accepted", got)
+	}
+}
+
+// TestQuittingOutranksTyping pins the ordering defect that routing text entry
+// first introduced: the field consumed ctrl+c and appended the literal string
+// "ctrl+c" to the credential being typed, instead of shutting down.
+func TestQuittingOutranksTyping(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.providerSetupStep = 1
+	m.providerSetupProviderID = "cloudflare"
+	m.providerSetupFlow = &ipc.SetupFlowDTO{
+		ProviderID: "cloudflare", Kind: "account",
+		Fields: []ipc.SetupFieldDTO{{ID: "api_token", Label: "API token", Secret: true}},
+	}
+	m.providerSetupIndex = 0
+	m.focusProviderSetupField()
+	m.setProviderSetupValue("api_token", "cf-token-secret")
+
+	next, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	m = next.(Model)
+
+	if cmd == nil {
+		t.Fatal("ctrl+c did not quit")
+	}
+	if got := m.providerSetupValue("api_token"); strings.Contains(got, "ctrl") {
+		t.Fatalf("ctrl+c was typed into the credential: %q", got)
+	}
+	if m.providerSetupValue("api_token") != "" {
+		t.Fatalf("the credential survived shutdown: %q", m.providerSetupValue("api_token"))
+	}
+}
+
+// TestAGuidanceFlowStillCollectsNothingWhenPasted covers the read-only guard on
+// the paste path as well as the key path.
+func TestAGuidanceFlowStillCollectsNothingWhenPasted(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.providerSetupStep = 1
+	m.providerSetupProviderID = "openai_tunnel"
+	m.providerSetupFlow = &ipc.SetupFlowDTO{
+		ProviderID: "openai_tunnel", Kind: "guidance",
+		Fields: []ipc.SetupFieldDTO{{ID: "credential", Label: "Key", Secret: true}},
+	}
+	m.providerSetupIndex = 0
+
+	next, _ := m.Update(tea.PasteMsg{Content: "secret-key"})
+	m = next.(Model)
+
+	if len(m.providerSetupValues) != 0 {
+		t.Fatalf("a guidance screen accepted a paste: %#v", m.providerSetupValues)
 	}
 }
