@@ -1106,12 +1106,69 @@ func handleSupportExport(cmd *cobra.Command) error {
 		return err
 	}
 
-	// 0600: the report is redacted, but it still describes this machine's
-	// services and addresses, which is not something to leave world-readable.
-	if err := os.WriteFile(output, encoded, 0o600); err != nil {
-		return fmt.Errorf("write report: %w", err)
+	force, _ := cmd.Flags().GetBool("force")
+	if err := writePrivateFile(output, encoded, force); err != nil {
+		return err
 	}
 	fmt.Fprintf(os.Stderr, "Wrote %s\n", output)
+	fmt.Fprintln(os.Stderr, "Read it before sharing: it describes this machine's services and addresses.")
+	return nil
+}
+
+// writePrivateFile writes a file only this user can read, atomically.
+//
+// os.WriteFile's mode applies only when it creates the file. Writing over an
+// existing world-readable file left it world-readable, so the previous version
+// of this claimed 0600 in a comment while producing 0644 — a redacted report is
+// still a description of this machine's services and addresses.
+//
+// It is also written through a temporary file and renamed, so an interrupted
+// write cannot leave a half-report that looks complete.
+func writePrivateFile(path string, data []byte, force bool) error {
+	if !force {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf(
+				"%s already exists; pass --force to replace it", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check %s: %w", path, err)
+		}
+	}
+
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".portico-export-*")
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return fmt.Errorf("write report: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return fmt.Errorf("flush report: %w", err)
+	}
+	// Set explicitly rather than relying on the creation mode, which umask
+	// modifies.
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return fmt.Errorf("restrict report permissions: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close report: %w", err)
+	}
+
+	if err := os.Rename(tempName, path); err != nil {
+		return fmt.Errorf("move report into place: %w", err)
+	}
+	// The rename preserves the temporary file's mode, but an existing target
+	// replaced by rename does not carry its own mode over — assert it anyway,
+	// because the whole point is that this file is not readable by others.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("restrict report permissions: %w", err)
+	}
 	return nil
 }
 

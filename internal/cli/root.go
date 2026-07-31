@@ -295,6 +295,7 @@ func newSupportCmd() *cobra.Command {
 		},
 	}
 	exportCmd.Flags().String("output", "", "Write to a file instead of standard output")
+	exportCmd.Flags().Bool("force", false, "Replace the output file if it already exists")
 	cmd.AddCommand(exportCmd)
 	return cmd
 }

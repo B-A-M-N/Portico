@@ -201,3 +201,98 @@ func TestARequiredFieldIsRefusedByName(t *testing.T) {
 		t.Fatalf("the refusal does not say what to supply: %v", err)
 	}
 }
+
+// TestOverwritingAPermissiveFileStillEndsPrivate pins the defect a review
+// found, which was verified empirically before fixing.
+//
+// os.WriteFile's mode applies only when it creates the file. Writing a report
+// over an existing world-readable file left it world-readable, so the code
+// claimed 0600 in a comment and produced 0644. A redacted report is still a
+// description of this machine's services and addresses.
+func TestOverwritingAPermissiveFileStillEndsPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writePrivateFile(path, []byte("new\n"), true); err != nil {
+		t.Fatalf("writePrivateFile: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("the report is mode %v, want 0600: anyone on this machine can read it", perm)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "new\n" {
+		t.Fatalf("the file holds %q", content)
+	}
+}
+
+// TestAnExistingReportIsNotSilentlyReplaced pins that a report is not
+// overwritten without being asked.
+func TestAnExistingReportIsNotSilentlyReplaced(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := writePrivateFile(path, []byte("new\n"), false)
+	if err == nil {
+		t.Fatal("an existing report was replaced without being asked")
+	}
+	if !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("the refusal does not say how to proceed: %v", err)
+	}
+
+	content, _ := os.ReadFile(path)
+	if string(content) != "keep\n" {
+		t.Fatal("the existing report was modified anyway")
+	}
+}
+
+// TestANewReportIsCreatedPrivate pins the create path, where umask would
+// otherwise have a say.
+func TestANewReportIsCreatedPrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh.json")
+	if err := writePrivateFile(path, []byte("x\n"), false); err != nil {
+		t.Fatalf("writePrivateFile: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("a new report is mode %v, want 0600", perm)
+	}
+}
+
+// TestAFailedWriteLeavesNoPartialReport pins that an interrupted write cannot
+// leave a half-report that looks complete.
+func TestAFailedWriteLeavesNoPartialReport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nonexistent-subdir", "report.json")
+
+	if err := writePrivateFile(path, []byte("x\n"), false); err == nil {
+		t.Fatal("writing into a missing directory succeeded")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".portico-export-") {
+			t.Fatalf("a temporary file was left behind: %s", entry.Name())
+		}
+	}
+}

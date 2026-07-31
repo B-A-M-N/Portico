@@ -2,6 +2,12 @@
 
 **Baseline:** `da0667e` (`feat: harden Portico connection lifecycle`)
 
+**Last reviewed against:** `be5f524`. Two audit remediations have landed since the
+baseline. Items below may already be done — each section states its current
+state, and `ACCEPTANCE_MATRIX.md` maps completed requirements to the tests that
+hold them. Treat an unqualified item here as unverified rather than as an open
+gap.
+
 This is the operational backlog after the durability, recovery, reconciliation,
 credential, process, IPC, and TUI fixes in that commit. It separates verified
 gaps from deliberate v0.1 exclusions in `SPEC.md`; an exclusion is not silently

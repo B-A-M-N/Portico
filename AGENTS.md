@@ -1,6 +1,10 @@
 # AGENTS.md — Portico
 
-**Connection manager for local services.** Discovers local services, creates provider-backed connections (Cloudflare, ngrok, Tailscale, zrok), keeps them alive after TUI closes, diagnoses failures.
+**Connection manager for local services.** Discovers local services, creates provider-backed connections, keeps them alive after TUI closes, diagnoses failures.
+
+See the provider status table below for what is actually implemented. Naming
+providers Portico does not implement, alongside ones it does, is how the
+previous version of this document came to be wrong in both directions.
 
 ---
 
@@ -56,7 +60,22 @@ internal/
 1. **`make build` outputs `portico`** with version ldflags; `go build -o portico .` also works.
 2. **Git history starts at the Portico baseline commit.** Repo originated from `paoloanzn/flare-cli`; pre-rename history is gone.
 3. **`portico legacy ...` still active.** Old flare-cli commands preserved in `cmd/`, hidden from help.
-4. **Only Cloudflare + mock providers exist.** Ngrok, Tailscale, zrok directories are SPEC-only stubs.
+4. **Provider status.** Derived from `internal/provider/builtin/catalog.go` and the
+   adapters themselves. Check that file before trusting this table.
+
+   | Provider | Adapter | Enabled by default | Account setup | Notes |
+   |---|---|---|---|---|
+   | cloudflare | yes (1633 lines) | yes | declarative flow: account ID, optional zone, API token | Tunnels, DNS, Access. Contract tests in `internal/tunnel`, `internal/dns`, `internal/access`. |
+   | ngrok | yes (702 lines) | no — experimental opt-in | agent auth token | Built against the real agent, not a stub. |
+   | openai_tunnel | yes (519 lines) | no — experimental opt-in | guidance only; Portico cannot hold the credential | Client-mediated, no public address. |
+   | port_forward | yes (314 lines) | yes | none needed | Local forwards only; remote forwards are refused with a reason. |
+   | tailscale | no | n/a | n/a | Catalog entry only, so the UI can explain the gap rather than omit it. |
+   | zrok | no | n/a | n/a | Catalog entry only. |
+   | mock | test only | n/a | n/a | Used by controller tests. |
+
+   A catalog entry is not an implementation. Tailscale and zrok appear in the
+   provider list so a user is told Portico does not implement them, which is a
+   different thing from them being available.
 5. **Tunnel logs use Portico's XDG state log directory.** Legacy Flare paths are compatibility-read only.
 6. **Credentials never serialized** into plans, events, logs, runtimes, or UI. Resolved by reference at operation time; durable tunnel credentials are keyed by exact connection, provider, and tunnel identity. Provider account credentials are encrypted behind opaque references, and profiles bind an account explicitly when one is selected.
 7. **Plan fingerprints are SHA-256** of canonical JSON (`core/plan.go:ComputeFingerprint`).
@@ -72,7 +91,7 @@ internal/
 ## Testing
 
 - **Mock provider** (`provider/mock/`) implements `core.Provider` in-memory — used in controller tests and CLI handler.
-- **Ngrok provider tests** (`provider/ngrok/adapter_test.go`) cover identity, capabilities, planning, step execution (start/stop/verify/protection/delete), observation, repair, and removal.
+- **Ngrok provider tests** (`provider/ngrok/adapter_test.go`) cover identity, capabilities, planning, step execution (start/stop/verify/protection/delete), observation, repair, and removal. The adapter is real, built against the ngrok agent; it is not a stub.
 - **Controller tests** use `newTestController()` + `testProfile()` + `awaitOp()` patterns; `executor_failure_test.go` injects step-commit and terminal-commit failures with fake committers.
 - **Store tests** cover atomic step commits (`commit_test.go`) and migration-8 duplicate-ownership fixtures (`migration_test.go`).
 - **Also covered:** process manager (adoption, backoff, rotation), IPC SSE journal (replay across restart, monotonic sequences), TUI state machine (fake client, no socket), discovery/diagnostics (fake enumerators/probers), core deep-copy isolation.
