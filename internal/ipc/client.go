@@ -458,6 +458,28 @@ func (c *Client) GetOperationHistoryLimit(ctx context.Context, limit int) (*Oper
 	return &history, nil
 }
 
+// GetOperationEvents fetches the journal of one operation.
+//
+// The live progress screen accumulates events from the stream, so an operation
+// watched as it ran shows its detail. An operation opened afterwards had only
+// its steps: what actually happened was in the store and nothing asked for it.
+func (c *Client) GetOperationEvents(ctx context.Context, operationID string) ([]EventDTO, error) {
+	path := "/v1/operations/" + url.PathEscape(operationID) + "/events"
+	resp, err := c.doRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var events []EventDTO
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
 // ListProviders lists providers.
 func (c *Client) ListProviders(ctx context.Context) ([]ProviderDTO, error) {
 	resp, err := c.doRequest(ctx, "GET", "/v1/providers", nil)

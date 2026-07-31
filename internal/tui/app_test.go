@@ -36,14 +36,17 @@ type fakeClient struct {
 	removeAccountResponse *ipc.RemoveProviderAccountResponse
 	removeAccountErr      error
 
-	createRequest *ipc.CreateConnectionRequest
-	historyLimit  int
-	cloneSource   string
-	cloneRequest  *ipc.CloneConnectionRequest
-	cloneErr      error
-	editRequest   *ipc.UpdateConnectionRequest
-	editPlan      *ipc.PlanDTO
-	editErr       error
+	createRequest      *ipc.CreateConnectionRequest
+	historyLimit       int
+	eventsFor          string
+	operationEvents    []ipc.EventDTO
+	operationEventsErr error
+	cloneSource        string
+	cloneRequest       *ipc.CloneConnectionRequest
+	cloneErr           error
+	editRequest        *ipc.UpdateConnectionRequest
+	editPlan           *ipc.PlanDTO
+	editErr            error
 
 	detail    *ipc.ConnectionDetailDTO
 	detailErr error
@@ -247,6 +250,16 @@ func (f *fakeClient) GetOperationHistoryLimit(ctx context.Context, limit int) (*
 		return f.history, nil
 	}
 	return f.GetOperationHistory(ctx)
+}
+
+func (f *fakeClient) GetOperationEvents(ctx context.Context, operationID string) ([]ipc.EventDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.eventsFor = operationID
+	if f.operationEventsErr != nil {
+		return nil, f.operationEventsErr
+	}
+	return f.operationEvents, nil
 }
 
 func (f *fakeClient) CloneConnection(ctx context.Context, id string, req ipc.CloneConnectionRequest) (*ipc.ConnectionDTO, error) {

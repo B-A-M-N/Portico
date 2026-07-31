@@ -81,6 +81,11 @@ type Model struct {
 	// operationsTruncated reports that older ones exist beyond them.
 	operationsLimit     int
 	operationsTruncated bool
+	// operationEvents is the journal of the operation currently selected in
+	// history, keyed by its ID so a reply for a different one is not shown.
+	operationEvents       []ipc.EventDTO
+	operationEventsFor    string
+	operationEventsFailed string
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -599,6 +604,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushScreen(ScreenDiscovery)
 		return m, nil
 
+	case operationEventsMsg:
+		// A journal for an operation the user has moved off must not be shown
+		// under the one now selected.
+		if msg.OperationID != m.selectedOperationID() {
+			return m, nil
+		}
+		m.operationEventsFor = msg.OperationID
+		if msg.Err != nil {
+			m.operationEvents = nil
+			m.operationEventsFailed = msg.Err.Error()
+			return m, nil
+		}
+		m.operationEvents = msg.Events
+		m.operationEventsFailed = ""
+		return m, nil
+
 	case operationsLoadedMsg:
 		if msg.Err != nil {
 			m.operationsAvailable = false
@@ -615,7 +636,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.opsSelectedIdx >= len(m.operations) {
 			m.opsSelectedIdx = 0
 		}
-		return m, nil
+		return m, m.operationEventsForSelection()
 
 	case providerAccountConfiguredMsg:
 		// A result from a setup the user abandoned must not clear or alter the
@@ -1084,6 +1105,32 @@ func (m *Model) discoveryCmd() tea.Cmd {
 	}
 }
 
+// loadOperationEventsCmd fetches the journal of one operation.
+//
+// An operation watched as it ran showed its detail, because the progress screen
+// accumulates events from the stream. An operation opened afterwards had only
+// its steps — what actually happened was in the store, and nothing asked.
+func (m *Model) loadOperationEventsCmd(operationID string) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return operationEventsMsg{OperationID: operationID, Err: fmt.Errorf("no supervisor connection")}
+		}
+		evtCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		events, err := client.GetOperationEvents(evtCtx, operationID)
+		return operationEventsMsg{OperationID: operationID, Events: events, Err: err}
+	}
+}
+
+// operationEventsMsg carries an operation's journal.
+type operationEventsMsg struct {
+	OperationID string
+	Events      []ipc.EventDTO
+	Err         error
+}
+
 func (m *Model) loadOperationsCmd() tea.Cmd {
 	return m.loadOperationsLimitCmd(m.operationsLimit)
 }
@@ -1527,6 +1574,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.discoverySelected--
 		} else if m.screen == ScreenOperations && m.opsSelectedIdx > 0 {
 			m.opsSelectedIdx--
+			return m, m.operationEventsForSelection()
 		} else if m.screen == ScreenHome {
 			// Move selection up by finding the current index and decrementing.
 			conns := m.ConnectionList()
@@ -1548,6 +1596,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		} else if m.screen == ScreenOperations {
 			if m.opsSelectedIdx < len(m.operations)-1 {
 				m.opsSelectedIdx++
+				return m, m.operationEventsForSelection()
 			}
 		} else if m.screen == ScreenHome {
 			// Move selection down by finding the current index and incrementing.
@@ -1694,6 +1743,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	case "o":
 		if m.screen == ScreenHome {
 			m.pushScreen(ScreenOperations)
+			m.operationEvents = nil
+			m.operationEventsFor = ""
+			m.operationEventsFailed = ""
 			return m, m.loadOperationsCmd()
 		}
 
@@ -3030,6 +3082,34 @@ func (m *Model) renderOperations() string {
 				b.WriteString(m.theme.Style("intervention").Render(fmt.Sprintf("  Error:      %s\n", op.Error)))
 			}
 
+			// What actually happened, from the operation's own journal. The
+			// steps say what was planned and how each ended; the journal says
+			// what the connector and provider reported while it ran, which is
+			// the difference between "the tunnel step failed" and knowing why.
+			if m.operationEventsFailed != "" {
+				b.WriteString("\n  ")
+				b.WriteString(m.theme.Style("muted").Render(
+					"The record of what happened could not be read: " + m.operationEventsFailed))
+				b.WriteString("\n")
+			} else if m.operationEventsFor == op.ID && len(m.operationEvents) > 0 {
+				b.WriteString("\n  What happened:\n")
+				for _, evt := range m.operationEvents {
+					line := evt.Type
+					if evt.Stage != "" {
+						line = evt.Stage + " — " + line
+					}
+					if summary := eventSummary(evt); summary != "" {
+						line = line + ": " + summary
+					}
+					b.WriteString(m.theme.Style("muted").Render("    " + line))
+					b.WriteString("\n")
+				}
+			} else if m.operationEventsFor == op.ID {
+				b.WriteString("\n  ")
+				b.WriteString(m.theme.Style("muted").Render("No further detail was recorded."))
+				b.WriteString("\n")
+			}
+
 			// Show steps if any
 			if len(op.Steps) > 0 {
 				b.WriteString("\n  Steps:\n")
@@ -3387,4 +3467,44 @@ func acceptsGlobalNavigation(screen ScreenID) bool {
 	default:
 		return true
 	}
+}
+
+// selectedOperationID names the operation the history cursor is on.
+func (m *Model) selectedOperationID() string {
+	if m.opsSelectedIdx < 0 || m.opsSelectedIdx >= len(m.operations) {
+		return ""
+	}
+	return m.operations[m.opsSelectedIdx].ID
+}
+
+// operationEventsForSelection loads the journal of the selected operation,
+// unless it is already loaded.
+func (m *Model) operationEventsForSelection() tea.Cmd {
+	id := m.selectedOperationID()
+	if id == "" || id == m.operationEventsFor {
+		return nil
+	}
+	m.operationEvents = nil
+	m.operationEventsFailed = ""
+	return m.loadOperationEventsCmd(id)
+}
+
+// eventSummary pulls a human-readable line out of an event payload.
+func eventSummary(evt ipc.EventDTO) string {
+	if evt.Operation != nil {
+		// An error is what the reader is looking for, so it wins over the
+		// step's own description of what it was trying to do.
+		if evt.Operation.Error != "" {
+			return evt.Operation.Error
+		}
+		if evt.Operation.StepSummary != "" {
+			return evt.Operation.StepSummary
+		}
+	}
+	if data, ok := evt.Data.(map[string]interface{}); ok {
+		if summary, ok := data["summary"].(string); ok {
+			return summary
+		}
+	}
+	return ""
 }

@@ -1,11 +1,14 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
+
+var errNoJournal = errors.New("operation journal unavailable")
 
 // TestAnOpenDetailViewRefreshesWhenItsConnectionChanges pins audit finding 26.
 //
@@ -123,5 +126,86 @@ func TestAskingForMoreDoesNothingWhenThereIsNoMore(t *testing.T) {
 
 	if _, cmd := m.Update(keyMsg("m")); cmd != nil {
 		t.Fatal("a complete history was refetched for more")
+	}
+}
+
+// TestAPastOperationShowsWhatHappened pins that history is not just a list of
+// outcomes.
+//
+// An operation watched as it ran showed its detail, because the progress screen
+// accumulates events from the stream. An operation opened afterwards had only
+// its steps: what the connector and provider actually reported was in the store
+// and nothing asked for it — the difference between "the tunnel step failed"
+// and knowing why.
+func TestAPastOperationShowsWhatHappened(t *testing.T) {
+	client := &fakeClient{
+		operationEvents: []ipc.EventDTO{
+			{Type: "operation.step", Stage: "create_tunnel",
+				Operation: &ipc.OperationEventDTO{StepSummary: "Created tunnel tun-1"}},
+			{Type: "operation.step", Stage: "create_dns",
+				Operation: &ipc.OperationEventDTO{Error: "zone is not delegated to Cloudflare"}},
+		},
+	}
+	m := readyModel(client, testSnapshot())
+	m.screen = ScreenOperations
+	m.operations = []ipc.OperationDTO{{ID: "op-1", State: ipc.OperationFailed, Intent: "open"}}
+	m.operationsAvailable = true
+
+	cmd := m.operationEventsForSelection()
+	if cmd == nil {
+		t.Fatal("selecting an operation did not load what happened")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+
+	view := m.renderOperations()
+	if !strings.Contains(view, "Created tunnel tun-1") {
+		t.Errorf("the journal is not shown:\n%s", view)
+	}
+	if !strings.Contains(view, "zone is not delegated") {
+		t.Errorf("the reason for the failure is not shown:\n%s", view)
+	}
+}
+
+// TestAJournalIsNotShownAgainstAnotherOperation pins the correlation rule here
+// too: a reply for an operation the cursor has moved off must not be attributed
+// to the one now selected.
+func TestAJournalIsNotShownAgainstAnotherOperation(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.screen = ScreenOperations
+	m.operations = []ipc.OperationDTO{
+		{ID: "op-1", State: ipc.OperationCompleted, Intent: "open"},
+		{ID: "op-2", State: ipc.OperationFailed, Intent: "close"},
+	}
+	m.operationsAvailable = true
+	m.opsSelectedIdx = 1
+
+	next, _ := m.Update(operationEventsMsg{
+		OperationID: "op-1",
+		Events:      []ipc.EventDTO{{Type: "operation.step", Operation: &ipc.OperationEventDTO{StepSummary: "belongs to op-1"}}},
+	})
+	m = next.(Model)
+
+	if strings.Contains(m.renderOperations(), "belongs to op-1") {
+		t.Fatal("one operation's journal was shown against another")
+	}
+}
+
+// TestAnUnreadableJournalSaysSoRatherThanShowingNothing pins that a failed read
+// is distinguishable from an operation that recorded nothing.
+func TestAnUnreadableJournalSaysSoRatherThanShowingNothing(t *testing.T) {
+	client := &fakeClient{operationEventsErr: errNoJournal}
+	m := readyModel(client, testSnapshot())
+	m.screen = ScreenOperations
+	m.operations = []ipc.OperationDTO{{ID: "op-1", State: ipc.OperationCompleted, Intent: "open"}}
+	m.operationsAvailable = true
+
+	cmd := m.operationEventsForSelection()
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+
+	view := m.renderOperations()
+	if !strings.Contains(view, "could not be read") {
+		t.Fatalf("a failed journal read is indistinguishable from an empty one:\n%s", view)
 	}
 }
