@@ -2035,21 +2035,66 @@ func (h *supervisorHandler) HandleGetOperationEvents(id string) ([]ipc.EventDTO,
 	return events, nil
 }
 
+// operationSteps rebuilds each step's outcome from the durable journal.
+//
+// It is a fold over every event for a step, not a last-event-wins overwrite.
+// Overwriting kept only the final event's fields, so a step's state, error and
+// timings were dropped and every reconstructed step rendered as still pending —
+// however it had actually ended. After a restart that is the only account of
+// what happened.
 func operationSteps(events []store.OperationJournalEvent) []ipc.StepDTO {
-	byID := make(map[string]ipc.StepDTO)
+	byID := make(map[string]*ipc.StepDTO)
 	order := make([]string, 0, len(events))
+
 	for _, event := range events {
 		if event.StepID == "" {
 			continue
 		}
-		if _, seen := byID[event.StepID]; !seen {
+		step, seen := byID[event.StepID]
+		if !seen {
+			step = &ipc.StepDTO{ID: event.StepID, State: ipc.StepPending}
+			byID[event.StepID] = step
 			order = append(order, event.StepID)
 		}
-		byID[event.StepID] = ipc.StepDTO{ID: event.StepID, Summary: event.Summary}
+
+		// A later event with no summary must not erase the one that had it:
+		// a failure event often carries only the error.
+		if event.Summary != "" {
+			step.Summary = event.Summary
+		}
+		if event.Error != "" {
+			step.Error = event.Error
+		}
+
+		switch event.EventType {
+		case string(core.EventOperationStepStarted):
+			step.State = ipc.StepRunning
+			if step.StartedAt == "" {
+				step.StartedAt = event.Timestamp
+			}
+		case string(core.EventOperationStepSucceeded):
+			// Compensation reports success through the same event type, and
+			// the two mean different things: one is the step having worked,
+			// the other is it having been undone.
+			if event.Stage == string(core.StageCompensated) {
+				step.State = ipc.StepCompensated
+			} else {
+				step.State = ipc.StepSucceeded
+			}
+			step.CompletedAt = event.Timestamp
+		case string(core.EventOperationStepFailed):
+			if event.Stage == string(core.StageCompensated) {
+				step.State = ipc.StepCompensationFailed
+			} else {
+				step.State = ipc.StepFailed
+			}
+			step.CompletedAt = event.Timestamp
+		}
 	}
+
 	steps := make([]ipc.StepDTO, 0, len(order))
 	for _, id := range order {
-		steps = append(steps, byID[id])
+		steps = append(steps, *byID[id])
 	}
 	return steps
 }

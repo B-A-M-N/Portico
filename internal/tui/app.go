@@ -2026,6 +2026,10 @@ func (m *Model) renderOperationProgress() string {
 			icon = "✗"
 		case "compensated":
 			icon = "↩"
+		case "compensation_failed":
+			// Worse than a failure: the step ran and could not be undone, so
+			// something is left behind.
+			icon = "⚠"
 		case "skipped":
 			icon = "⊘"
 		}
@@ -2039,6 +2043,8 @@ func (m *Model) renderOperationProgress() string {
 			stepText = m.theme.Style("intervention").Render(stepText)
 		case "running":
 			stepText = m.theme.Style("attention").Render(stepText)
+		case "compensation_failed":
+			stepText = m.theme.Style("intervention").Render(stepText)
 		case "compensated", "skipped":
 			stepText = m.theme.Style("muted").Render(stepText)
 		}
@@ -2520,6 +2526,9 @@ func (m *Model) renderOperations() string {
 						stepStyle = "stable"
 					case "failed":
 						stepStatus = "✗"
+						stepStyle = "intervention"
+					case "compensation_failed":
+						stepStatus = "⚠"
 						stepStyle = "intervention"
 					case "skipped":
 						stepStatus = "⊘"

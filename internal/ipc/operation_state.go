@@ -38,3 +38,20 @@ func OperationTerminal(state string) bool {
 func OperationSucceeded(state string) bool {
 	return state == OperationCompleted
 }
+
+// Step states, as reconstructed from the durable journal.
+const (
+	// StepPending has not started.
+	StepPending = "pending"
+	// StepRunning has started and not finished.
+	StepRunning = "running"
+	// StepFailed did not succeed.
+	StepFailed = "failed"
+	// StepCompensated succeeded and was then undone.
+	StepCompensated = "compensated"
+	// StepCompensationFailed could not be undone, which is worse than a
+	// failure and must not be shown as one: something was left behind.
+	StepCompensationFailed = "compensation_failed"
+	// StepSkipped was not attempted.
+	StepSkipped = "skipped"
+)
