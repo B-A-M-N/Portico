@@ -487,6 +487,27 @@ func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string
 	return &result, nil
 }
 
+// ProviderSetupFlow fetches what a provider needs in order to be configured.
+//
+// A provider that declares no flow returns an error rather than an empty form,
+// which the caller must state: "cannot be configured through Portico" and "has
+// no required fields" are different answers.
+func (c *Client) ProviderSetupFlow(ctx context.Context, providerID string) (*SetupFlowDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/providers/"+url.PathEscape(providerID)+"/setup-flow", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var flow SetupFlowDTO
+	if err := json.NewDecoder(resp.Body).Decode(&flow); err != nil {
+		return nil, err
+	}
+	return &flow, nil
+}
+
 // SetLaunchMode changes whether the supervisor arms connections at startup.
 //
 // The returned mode is the one now in effect, which is not necessarily the one

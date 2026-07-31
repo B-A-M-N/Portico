@@ -1511,6 +1511,14 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDTO, error) {
 	prov := h.sup.registry.Get(core.ProviderID(id))
 	if prov == nil {
+		// A provider can be catalogued — shown on screen, with a reason and
+		// setup actions — without an adapter being registered for it, which is
+		// how experimental providers stay visible while switched off. Saying
+		// "not found" about a provider the user is looking at is wrong: it is
+		// known, and the reason it cannot be configured is already recorded.
+		if err := h.catalogOnlySetupError(id); err != nil {
+			return nil, err
+		}
 		return nil, core.ErrProviderNotFound(core.ProviderID(id))
 	}
 	setup, ok := prov.(core.ProviderSetup)
@@ -1520,8 +1528,19 @@ func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDT
 	flow := setup.SetupFlow()
 	dto := &ipc.SetupFlowDTO{
 		ProviderID:      id,
+		Kind:            string(flow.Kind),
 		Summary:         flow.Summary,
 		CapabilityNotes: flow.CapabilityNotes,
+	}
+	if dto.Kind == "" {
+		dto.Kind = string(core.SetupAccount)
+	}
+	if !flow.StoresAccount() {
+		dto.GuidanceReason = flow.GuidanceReason
+		if dto.GuidanceReason == "" {
+			dto.GuidanceReason = "Portico cannot hold this provider's credential, " +
+				"so setting it here would store a value nothing reads."
+		}
 	}
 	for _, field := range flow.Fields {
 		dto.Fields = append(dto.Fields, ipc.SetupFieldDTO{
@@ -1534,6 +1553,39 @@ func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDT
 		})
 	}
 	return dto, nil
+}
+
+// catalogOnlySetupError explains a provider that is visible but has no adapter.
+//
+// It returns nil when the provider is not catalogued either, leaving the caller
+// to report a genuine not-found.
+func (h *supervisorHandler) catalogOnlySetupError(id string) error {
+	for _, snap := range h.sup.registry.Snapshot() {
+		if string(snap.ID) != id {
+			continue
+		}
+		// "Switched off" and "does not exist yet" are different answers, and
+		// telling a user to enable something Portico has not written is worse
+		// than saying nothing.
+		var message string
+		if snap.Availability == provider.AvailabilityNotImplemented {
+			message = fmt.Sprintf("Portico has no %s adapter yet, so there is nothing to configure",
+				snap.DisplayName)
+		} else {
+			message = fmt.Sprintf("%s is not switched on in this supervisor, so it cannot be configured yet",
+				snap.DisplayName)
+		}
+		if snap.Reason != "" {
+			message += ": " + snap.Reason
+		}
+		// The catalog already records what to do about it. Repeating it here
+		// keeps the answer with the refusal rather than on another screen.
+		if len(snap.SetupActions) > 0 {
+			message += "\n\nTo enable it:\n  • " + strings.Join(snap.SetupActions, "\n  • ")
+		}
+		return core.ErrValidation(message)
+	}
+	return nil
 }
 
 // HandleRemoveProviderAccount removes an account after reporting what depends
@@ -1577,23 +1629,186 @@ func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID st
 	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired}, nil
 }
 
+// HandleConfigureProviderAccount configures any provider that declares a setup
+// flow.
+//
+// Previously this refused everything but Cloudflare, so the declarative flow
+// existed and no provider could use it. What replaces the provider-ID check is
+// not "trust every provider" but a rule about what may be claimed: an account
+// whose credential could not be checked is stored as pending and reported as
+// unverified, never as authenticated.
 func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
-	// Provider setup is no longer gated on a hardcoded provider ID. A provider
-	// that declares a setup flow can be configured; one that does not cannot.
 	prov := h.sup.registry.Get(core.ProviderID(id))
 	if prov == nil {
 		return nil, core.ErrProviderNotFound(core.ProviderID(id))
 	}
-	if _, ok := prov.(core.ProviderSetup); !ok {
+	setup, ok := prov.(core.ProviderSetup)
+	if !ok {
 		return nil, core.ErrValidation(fmt.Sprintf("provider %q cannot be configured through Portico", id))
 	}
-	if id != "cloudflare" {
+	flow := setup.SetupFlow()
+
+	// A guidance flow describes what to do elsewhere. Storing its values would
+	// write something nothing reads and report success for a setup that had no
+	// effect.
+	if !flow.StoresAccount() {
 		return nil, core.ErrValidation(fmt.Sprintf(
-			"provider %q declares a setup flow but Portico has no validator for it yet", id))
+			"provider %q is configured outside Portico; its client reads the credential from the "+
+				"supervisor's environment, so there is nothing here to save", id))
 	}
-	accountID := strings.TrimSpace(req.AccountID)
-	zoneID := strings.TrimSpace(req.ZoneID)
-	credential := strings.TrimSpace(req.Credential)
+
+	values := setupValues(flow, req)
+	for _, field := range flow.Fields {
+		if field.Required && strings.TrimSpace(values[field.ID]) == "" {
+			return nil, core.ErrValidation(fmt.Sprintf("%s is required", field.Label))
+		}
+	}
+
+	// Cloudflare keeps its own path: zone membership, capability level and the
+	// in-place adapter rebuild are real provider semantics, not boilerplate.
+	if id == "cloudflare" {
+		return h.configureCloudflareAccount(values)
+	}
+	return h.configureDeclaredAccount(id, prov, flow, values)
+}
+
+// setupValues merges a request's generic field map with the named fields that
+// predate it, so both the new setup screen and existing callers work.
+func setupValues(flow core.SetupFlow, req ipc.ConfigureProviderAccountRequest) map[string]string {
+	values := map[string]string{}
+	for k, v := range req.Fields {
+		values[k] = strings.TrimSpace(v)
+	}
+	// The named fields are the reserved IDs by another name. They fill in only
+	// where the generic map said nothing, so a caller using both is not
+	// silently overridden.
+	for id, value := range map[string]string{
+		"account_id": req.AccountID,
+		"label":      req.Label,
+		"zone_id":    req.ZoneID,
+		"credential": req.Credential,
+	} {
+		if values[id] == "" && strings.TrimSpace(value) != "" {
+			values[id] = strings.TrimSpace(value)
+		}
+	}
+	if flow.IdentityField != "" && values[flow.IdentityField] == "" && values["account_id"] != "" {
+		values[flow.IdentityField] = values["account_id"]
+	}
+	return values
+}
+
+// configureDeclaredAccount stores an account for a provider Portico has no
+// built-in knowledge of.
+//
+// The account status is the whole point of this function. A provider that can
+// check its own credential gets an authenticated account; one that cannot gets
+// a pending account and a response that says why. Recording the second case as
+// authenticated is the defect this audit already corrected once.
+func (h *supervisorHandler) configureDeclaredAccount(
+	id string, prov core.Provider, flow core.SetupFlow, values map[string]string,
+) (*ipc.ConfigureProviderAccountResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	secretField := flow.SecretField
+	if secretField == "" {
+		secretField = "credential"
+	}
+	credential := values[secretField]
+
+	resp := &ipc.ConfigureProviderAccountResponse{}
+	status := core.AccountPending
+
+	if validator, ok := prov.(core.SetupValidator); ok {
+		validation, err := validator.ValidateSetup(ctx, values)
+		if err != nil {
+			resp.MissingPermissions = validation.MissingPermissions
+			return resp, core.ErrValidation(err.Error())
+		}
+		status = core.AccountAuthenticated
+		resp.Validated = true
+		resp.MissingPermissions = validation.MissingPermissions
+	} else {
+		resp.VerificationUnavailable = fmt.Sprintf(
+			"Portico cannot check a %s credential, so this account is saved but unverified. "+
+				"You will find out whether it works when a connection using it is opened.", id)
+	}
+
+	// The account identity: a provider with no identity field has a single
+	// implicit account, named for the provider itself.
+	accountID := values[flow.IdentityField]
+	if accountID == "" {
+		accountID = id
+	}
+	// Account rows are keyed on ID alone, and the upsert rewrites the owning
+	// provider. Without this check a provider whose identity field is free text
+	// could take over another provider's account: the row would change owner,
+	// the original adapter would lose it at the next start, and every
+	// connection bound to it would fail with an unexplained "provider account
+	// unavailable".
+	existing, err := h.sup.store.ListProviderAccounts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check existing accounts: %w", err)
+	}
+	for _, account := range existing {
+		if string(account.ID) == accountID && string(account.Provider) != id {
+			return nil, core.ErrValidation(fmt.Sprintf(
+				"%q is already the ID of a %s account; choose a different value",
+				accountID, account.Provider))
+		}
+	}
+
+	label := values["label"]
+	if label == "" {
+		label = accountID
+	}
+
+	// Every non-reserved declared field is account metadata. Metadata is a
+	// free-form map, so a new provider needs no schema change.
+	metadata := map[string]string{}
+	for _, field := range flow.Fields {
+		if field.ID == secretField || field.ID == flow.IdentityField || field.ID == "label" {
+			continue
+		}
+		if value := values[field.ID]; value != "" {
+			metadata[field.ID] = value
+		}
+	}
+
+	account := core.ProviderAccount{
+		ID:            core.ProviderAccountID(accountID),
+		Provider:      core.ProviderID(id),
+		Label:         label,
+		CredentialRef: fmt.Sprintf("%s:%s:credential", id, accountID),
+		Metadata:      metadata,
+		Status:        status,
+	}
+
+	secret := []byte(credential)
+	defer zeroBytes(secret)
+	if err := h.sup.store.UpsertProviderAccountCredential(ctx, account, secret); err != nil {
+		return nil, fmt.Errorf("save %s account: %w", id, err)
+	}
+
+	// Adapters are built at supervisor startup, and only Cloudflare can be
+	// rebuilt in place, so a newly stored account for any other provider needs
+	// a restart before it is selectable.
+	resp.RestartRequired = true
+	resp.Status = string(status)
+	return resp, nil
+}
+
+// configureCloudflareAccount reads the merged setup values rather than the
+// request's named fields.
+//
+// The required-field gate validates the merged map, so reading the named fields
+// here would accept a caller that sent everything in Fields — the contract the
+// generic setup screen follows — and then reject it for a missing account ID.
+func (h *supervisorHandler) configureCloudflareAccount(values map[string]string) (*ipc.ConfigureProviderAccountResponse, error) {
+	accountID := strings.TrimSpace(values["account_id"])
+	zoneID := strings.TrimSpace(values["zone_id"])
+	credential := strings.TrimSpace(values["credential"])
 
 	// A zone is only required for DNS and custom-hostname work. Quick Tunnels
 	// need no account at all, and managed tunnels need only an account and a
@@ -1647,7 +1862,7 @@ func (h *supervisorHandler) HandleConfigureProviderAccount(id string, req ipc.Co
 		}
 	}
 
-	label := strings.TrimSpace(req.Label)
+	label := strings.TrimSpace(values["label"])
 	if label == "" {
 		label = accountID
 	}

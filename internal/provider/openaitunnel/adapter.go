@@ -143,9 +143,23 @@ func (p *Provider) Authenticate(context.Context, core.AuthRequest) error {
 }
 
 // SetupFlow declares what the provider needs, for the generic setup screen.
+//
+// This is guidance, not a form. The tunnel client reads the control-plane key
+// from the supervisor's own environment — see validateClient and
+// clientProcessSpec, both of which call os.Getenv(CredentialEnvVar) — and
+// nothing here reads Portico's account store. A credential stored through
+// Portico would therefore change nothing, and setup would report success while
+// the connection went on failing for exactly the reason it failed before.
+//
+// The tunnel ID is not account state either: it belongs to the connection
+// (ClientTunnelSpec.TunnelID) and reaches the client through step parameters.
 func (p *Provider) SetupFlow() core.SetupFlow {
 	return core.SetupFlow{
+		Kind:    core.SetupGuidance,
 		Summary: "Connect a local MCP server to ChatGPT over a private, outbound-only tunnel.",
+		GuidanceReason: "The tunnel client reads " + CredentialEnvVar + " from the supervisor's own " +
+			"environment, so Portico has nowhere to put a credential you enter here. Export it before " +
+			"starting the supervisor.",
 		Fields: []core.SetupField{
 			{
 				ID:          "tunnel_id",

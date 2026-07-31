@@ -1568,7 +1568,10 @@ func splitNonEmpty(value string) []string {
 // not require a UI change.
 func (p *Provider) SetupFlow() core.SetupFlow {
 	return core.SetupFlow{
-		Summary: "Configure a Cloudflare account so Portico can create managed tunnels for you.",
+		Kind:          core.SetupAccount,
+		IdentityField: "account_id",
+		SecretField:   "credential",
+		Summary:       "Configure a Cloudflare account so Portico can create managed tunnels for you.",
 		Fields: []core.SetupField{
 			{
 				ID:          "account_id",

@@ -148,6 +148,13 @@ type ConfigureProviderAccountRequest struct {
 	Label      string `json:"label,omitempty"`
 	ZoneID     string `json:"zone_id,omitempty"`
 	Credential string `json:"credential"`
+	// Fields carries values for a provider's declared setup fields, keyed by
+	// SetupFieldDTO.ID. It exists so a provider Portico has no built-in
+	// knowledge of can still be configured.
+	//
+	// When empty, the named fields above are mapped onto the reserved IDs
+	// instead, which keeps existing callers working.
+	Fields map[string]string `json:"fields,omitempty"`
 }
 
 // ConfigureProviderAccountResponse tells clients whether a supervisor restart
@@ -165,6 +172,15 @@ type ConfigureProviderAccountResponse struct {
 	Zones []ZoneDTO `json:"zones,omitempty"`
 	// MissingPermissions names the specific permissions the token lacks.
 	MissingPermissions []string `json:"missing_permissions,omitempty"`
+	// Status is the account status actually recorded.
+	Status string `json:"status,omitempty"`
+	// VerificationUnavailable explains why the credential could not be
+	// checked, when it could not. An account saved this way is recorded as
+	// pending rather than authenticated, and callers must say so rather than
+	// showing it as ready — an unchecked credential presented as a working one
+	// is how Portico came to advertise providers that could not perform a
+	// single operation.
+	VerificationUnavailable string `json:"verification_unavailable,omitempty"`
 }
 
 // ZoneDTO is a DNS zone visible to a provider credential.
@@ -528,10 +544,22 @@ type CloneConnectionRequest struct {
 // SetupFlowDTO is a provider's declarative setup description, rendered by the
 // UI without provider-specific knowledge.
 type SetupFlowDTO struct {
-	ProviderID      string          `json:"provider_id"`
+	ProviderID string `json:"provider_id"`
+	// Kind is "account" when submitting the flow stores something, or
+	// "guidance" when Portico cannot hold this provider's credential and the
+	// fields are instructions for the user to act on elsewhere.
+	Kind            string          `json:"kind,omitempty"`
 	Summary         string          `json:"summary,omitempty"`
 	Fields          []SetupFieldDTO `json:"fields,omitempty"`
 	CapabilityNotes []string        `json:"capability_notes,omitempty"`
+	// GuidanceReason states why Portico cannot store the credential, so a
+	// read-only flow does not look like a missing feature.
+	GuidanceReason string `json:"guidance_reason,omitempty"`
+}
+
+// StoresAccount reports whether submitting this flow persists anything.
+func (f SetupFlowDTO) StoresAccount() bool {
+	return f.Kind == "" || f.Kind == "account"
 }
 
 // SetupFieldDTO is one input in a provider setup flow.

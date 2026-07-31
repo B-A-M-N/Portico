@@ -18,6 +18,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/provider"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
+	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
 	"github.com/B-A-M-N/portico/internal/provider/portforward"
 	"github.com/B-A-M-N/portico/internal/store"
 )
@@ -1174,6 +1175,358 @@ func TestUnknownProviderSetupIsRefusedByCapabilityNotByName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cannot be configured") {
 		t.Fatalf("error does not explain why: %v", err)
+	}
+}
+
+// declaredProvider declares a setup flow but cannot check its own credential.
+// It is the case the authenticated-only-after-validation invariant is about.
+type declaredProvider struct {
+	*mock.Provider
+	id string
+}
+
+func (p declaredProvider) Identity() core.ProviderIdentity {
+	return core.ProviderIdentity{ID: core.ProviderID(p.id), Name: p.id, DisplayName: p.id}
+}
+
+func (p declaredProvider) SetupFlow() core.SetupFlow {
+	return core.SetupFlow{
+		Kind:          core.SetupAccount,
+		IdentityField: "workspace",
+		SecretField:   "token",
+		Summary:       "Configure a workspace.",
+		Fields: []core.SetupField{
+			{ID: "workspace", Label: "Workspace", Required: true},
+			{ID: "region", Label: "Region"},
+			{ID: "token", Label: "API token", Secret: true, Required: true},
+		},
+	}
+}
+
+// validatingProvider can check its own credential.
+type validatingProvider struct {
+	declaredProvider
+	err error
+}
+
+func (p validatingProvider) ValidateSetup(context.Context, map[string]string) (core.SetupValidation, error) {
+	if p.err != nil {
+		return core.SetupValidation{}, p.err
+	}
+	return core.SetupValidation{}, nil
+}
+
+// guidanceProvider is configured outside Portico entirely.
+type guidanceProvider struct{ declaredProvider }
+
+func (p guidanceProvider) SetupFlow() core.SetupFlow {
+	flow := p.declaredProvider.SetupFlow()
+	flow.Kind = core.SetupGuidance
+	return flow
+}
+
+func newSetupHandler(t *testing.T, prov core.Provider) (*supervisorHandler, *store.Store) {
+	t.Helper()
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	if err := registry.Add(prov); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	return &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}, st
+}
+
+// TestAnyProviderDeclaringAFlowCanBeConfigured is the point of this package.
+// The handler previously refused everything but Cloudflare, so the declarative
+// setup flow existed and no provider could use it.
+func TestAnyProviderDeclaringAFlowCanBeConfigured(t *testing.T) {
+	handler, st := newSetupHandler(t, declaredProvider{mock.New(), "acme"})
+
+	resp, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{
+			"workspace": "ws-1",
+			"region":    "eu-west",
+			"token":     "a-real-looking-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleConfigureProviderAccount: %v", err)
+	}
+
+	accounts, err := st.ListProviderAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("stored %d accounts, want 1", len(accounts))
+	}
+	account := accounts[0]
+	if account.ID != "ws-1" {
+		t.Fatalf("account ID = %q, want the declared identity field's value", account.ID)
+	}
+	// A field that is neither identity, label nor secret is account metadata,
+	// which is a free-form map — so a new provider needs no schema change.
+	if account.Metadata["region"] != "eu-west" {
+		t.Fatalf("declared field was not carried into metadata: %#v", account.Metadata)
+	}
+	if resp.Status != string(core.AccountPending) {
+		t.Fatalf("status = %q, want pending", resp.Status)
+	}
+}
+
+// TestUnvalidatedAccountIsNeverRecordedAsAuthenticated pins the invariant that
+// survives generalising setup. Recording an account as authenticated on the
+// strength of a non-empty string is how Portico came to advertise providers
+// that could not perform a single operation.
+func TestUnvalidatedAccountIsNeverRecordedAsAuthenticated(t *testing.T) {
+	handler, st := newSetupHandler(t, declaredProvider{mock.New(), "acme"})
+
+	resp, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"workspace": "ws-1", "token": "unchecked"},
+	})
+	if err != nil {
+		t.Fatalf("HandleConfigureProviderAccount: %v", err)
+	}
+	if resp.Validated {
+		t.Fatal("an unchecked credential was reported as validated")
+	}
+	if resp.VerificationUnavailable == "" {
+		t.Fatal("nothing says the credential was not checked")
+	}
+
+	accounts, _ := st.ListProviderAccounts(context.Background())
+	if len(accounts) != 1 {
+		t.Fatalf("stored %d accounts, want 1", len(accounts))
+	}
+	if accounts[0].Status == core.AccountAuthenticated {
+		t.Fatal("an unverified account was stored as authenticated")
+	}
+	if accounts[0].Status != core.AccountPending {
+		t.Fatalf("status = %q, want pending", accounts[0].Status)
+	}
+}
+
+// TestAProviderThatCanValidateGetsAnAuthenticatedAccount is the other half:
+// the pending status is a consequence of being unable to check, not a blanket
+// downgrade.
+func TestAProviderThatCanValidateGetsAnAuthenticatedAccount(t *testing.T) {
+	handler, st := newSetupHandler(t, validatingProvider{
+		declaredProvider: declaredProvider{mock.New(), "acme"},
+	})
+
+	resp, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"workspace": "ws-1", "token": "checked"},
+	})
+	if err != nil {
+		t.Fatalf("HandleConfigureProviderAccount: %v", err)
+	}
+	if !resp.Validated {
+		t.Fatal("a checked credential was not reported as validated")
+	}
+	accounts, _ := st.ListProviderAccounts(context.Background())
+	if accounts[0].Status != core.AccountAuthenticated {
+		t.Fatalf("status = %q, want authenticated", accounts[0].Status)
+	}
+}
+
+// TestAFailedValidationStoresNothing ensures a rejected credential does not
+// leave an account behind.
+func TestAFailedValidationStoresNothing(t *testing.T) {
+	handler, st := newSetupHandler(t, validatingProvider{
+		declaredProvider: declaredProvider{mock.New(), "acme"},
+		err:              errors.New("token rejected"),
+	})
+
+	if _, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"workspace": "ws-1", "token": "bad"},
+	}); err == nil {
+		t.Fatal("a rejected credential was accepted")
+	}
+	accounts, _ := st.ListProviderAccounts(context.Background())
+	if len(accounts) != 0 {
+		t.Fatalf("a rejected credential left %d accounts behind", len(accounts))
+	}
+}
+
+// TestAGuidanceFlowCannotBeSubmitted pins the third provider class. The OpenAI
+// tunnel's client reads its credential from the supervisor's own environment,
+// so storing one here would write a value nothing reads and report success for
+// a setup that had no effect.
+func TestAGuidanceFlowCannotBeSubmitted(t *testing.T) {
+	handler, st := newSetupHandler(t, guidanceProvider{declaredProvider{mock.New(), "acme"}})
+
+	flow, err := handler.HandleProviderSetupFlow("acme")
+	if err != nil {
+		t.Fatalf("HandleProviderSetupFlow: %v", err)
+	}
+	if flow.StoresAccount() {
+		t.Fatal("a guidance flow was reported as one that stores an account")
+	}
+	if flow.GuidanceReason == "" {
+		t.Fatal("a read-only flow does not say why, so it reads as a missing feature")
+	}
+
+	_, err = handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"workspace": "ws-1", "token": "ignored"},
+	})
+	if err == nil {
+		t.Fatal("a guidance flow accepted a submission")
+	}
+	accounts, _ := st.ListProviderAccounts(context.Background())
+	if len(accounts) != 0 {
+		t.Fatalf("a guidance flow stored %d accounts", len(accounts))
+	}
+}
+
+// TestTheOpenAITunnelDeclaresGuidance checks the real adapter, not a stand-in.
+// Its credential reaches the client through the supervisor's environment
+// (validateClient and clientProcessSpec both read it with os.Getenv), so a form
+// that appeared to save it would be a lie the setup screen told.
+func TestTheOpenAITunnelDeclaresGuidance(t *testing.T) {
+	flow := openaitunnel.New("", nil).SetupFlow()
+	if flow.StoresAccount() {
+		t.Fatal("the OpenAI tunnel offers to store a credential it cannot use")
+	}
+}
+
+// TestOneProviderCannotHijackAnotherProvidersAccount pins the collision the
+// generic setup path made reachable.
+//
+// Account rows are keyed on ID alone and the upsert rewrites provider_id, so a
+// provider whose identity field is free text could take over an existing
+// Cloudflare account: the row changes owner, the Cloudflare adapter loses it at
+// the next start, and every connection bound to it fails with an unexplained
+// "provider account unavailable".
+func TestOneProviderCannotHijackAnotherProvidersAccount(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	if err := registry.Add(declaredProvider{mock.New(), "acme"}); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+
+	existing := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Personal",
+		CredentialRef: "cloudflare:acct-1:api-token",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, existing, []byte("cloudflare-secret")); err != nil {
+		t.Fatalf("seed cloudflare account: %v", err)
+	}
+
+	// The same identity value, submitted for a different provider.
+	_, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"workspace": "acct-1", "token": "acme-token"},
+	})
+	if err == nil {
+		t.Fatal("one provider was allowed to claim another provider's account ID")
+	}
+
+	accounts, listErr := st.ListProviderAccounts(ctx)
+	if listErr != nil {
+		t.Fatalf("ListProviderAccounts: %v", listErr)
+	}
+	for _, account := range accounts {
+		if account.ID == "acct-1" && account.Provider != "cloudflare" {
+			t.Fatalf("the Cloudflare account was taken over by %q", account.Provider)
+		}
+		if account.ID == "acct-1" && account.Status != core.AccountAuthenticated {
+			t.Fatalf("the Cloudflare account was downgraded to %q", account.Status)
+		}
+	}
+}
+
+// TestCloudflareAcceptsTheGenericFieldMap pins that the provider Portico knows
+// best is reachable through the same contract as every other one. The
+// required-field gate validates the merged map, so a writer reading the named
+// request fields instead would accept a caller and then reject it for a missing
+// account ID.
+func TestCloudflareAcceptsTheGenericFieldMap(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	handler := &supervisorHandler{sup: &Supervisor{
+		store: st, registry: cloudflareTestRegistry(t), mutating: true,
+		accountValidator: &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}},
+	}}
+
+	resp, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{
+			"account_id": "acct-generic",
+			"label":      "From the generic form",
+			"credential": "a-real-looking-token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("a Fields-only Cloudflare request was refused: %v", err)
+	}
+	if !resp.Validated {
+		t.Fatal("the credential was not validated")
+	}
+
+	accounts, _ := st.ListProviderAccounts(context.Background())
+	if len(accounts) != 1 || accounts[0].ID != "acct-generic" {
+		t.Fatalf("account not stored from the generic map: %#v", accounts)
+	}
+	if accounts[0].Label != "From the generic form" {
+		t.Fatalf("label from the generic map was lost: %q", accounts[0].Label)
+	}
+}
+
+// TestAnUnstatedAccountStatusIsPending guards the store's default. Defaulting
+// to authenticated makes "I forgot to set this" indistinguishable from "this
+// credential was checked".
+func TestAnUnstatedAccountStatusIsPending(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	account := core.ProviderAccount{
+		ID: "acct-nostatus", Provider: "cloudflare", Label: "No status",
+		CredentialRef: "cloudflare:acct-nostatus:api-token", Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("secret")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+
+	accounts, _ := st.ListProviderAccounts(ctx)
+	for _, stored := range accounts {
+		if stored.ID == "acct-nostatus" && stored.Status == core.AccountAuthenticated {
+			t.Fatal("an account saved without a status was recorded as authenticated")
+		}
+	}
+}
+
+// TestGuidanceReasonComesFromTheProvider ensures the explanation is declared by
+// the provider that knows how its client obtains a credential, rather than
+// asserted centrally and happening to be right for the first such provider.
+func TestGuidanceReasonComesFromTheProvider(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	if err := registry.Add(openaitunnel.New("", nil)); err != nil {
+		t.Fatalf("register openai tunnel: %v", err)
+	}
+	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
+
+	flow, err := handler.HandleProviderSetupFlow("openai_tunnel")
+	if err != nil {
+		t.Fatalf("HandleProviderSetupFlow: %v", err)
+	}
+	if !strings.Contains(flow.GuidanceReason, openaitunnel.CredentialEnvVar) {
+		t.Fatalf("the reason does not name the variable to export: %q", flow.GuidanceReason)
+	}
+}
+
+// TestRequiredFieldsAreEnforcedFromTheDeclaration ensures the requirement comes
+// from the provider rather than from a hardcoded check.
+func TestRequiredFieldsAreEnforcedFromTheDeclaration(t *testing.T) {
+	handler, _ := newSetupHandler(t, declaredProvider{mock.New(), "acme"})
+
+	_, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"token": "a-token"}, // workspace missing
+	})
+	if err == nil {
+		t.Fatal("a missing required field was accepted")
+	}
+	if !strings.Contains(err.Error(), "Workspace") {
+		t.Fatalf("error does not name the missing field: %v", err)
 	}
 }
 

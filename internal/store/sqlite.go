@@ -4679,8 +4679,12 @@ func (s *Store) UpsertProviderAccount(ctx context.Context, account core.Provider
 	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" {
 		return fmt.Errorf("provider account ID, provider, label, and credential reference are required")
 	}
+	// An unstated status means pending, never authenticated. Defaulting the
+	// other way makes "I forgot to set this" indistinguishable from "this
+	// credential was checked", which is the mistake that let Portico advertise
+	// providers that could not perform a single operation.
 	if account.Status == "" {
-		account.Status = core.AccountAuthenticated
+		account.Status = core.AccountPending
 	}
 	metadata, err := json.Marshal(account.Metadata)
 	if err != nil {
@@ -4713,8 +4717,12 @@ func (s *Store) UpsertProviderAccountCredential(ctx context.Context, account cor
 	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" || len(secret) == 0 {
 		return fmt.Errorf("provider account ID, provider, label, credential reference, and secret are required")
 	}
+	// An unstated status means pending, never authenticated. Defaulting the
+	// other way makes "I forgot to set this" indistinguishable from "this
+	// credential was checked", which is the mistake that let Portico advertise
+	// providers that could not perform a single operation.
 	if account.Status == "" {
-		account.Status = core.AccountAuthenticated
+		account.Status = core.AccountPending
 	}
 	metadata, err := json.Marshal(account.Metadata)
 	if err != nil {

@@ -58,6 +58,7 @@ type RequestHandler interface {
 	HandleProviderRecommendation(req ProviderRecommendationRequest) (*ProviderRecommendationResponse, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
+	HandleProviderSetupFlow(id string) (*SetupFlowDTO, error)
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
 	HandleOperationHistory() (*OperationHistoryDTO, error)
@@ -679,12 +680,28 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, action := parts[0], parts[1]
-	if r.Method != http.MethodPost {
+	// The method is checked per action rather than once for the group: reading
+	// a provider's setup requirements is a GET, while the actions that change
+	// state are POSTs.
+	wantMethod := http.MethodPost
+	if action == "setup-flow" {
+		wantMethod = http.MethodGet
+	}
+	if r.Method != wantMethod {
 		writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
 		return
 	}
 
 	switch action {
+	case "setup-flow":
+		flow, err := s.handler.HandleProviderSetupFlow(id)
+		if err != nil {
+			writeHandlerError(w, "PROV-007", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(flow)
 	case "authenticate":
 		if err := s.handler.HandleAuthenticateProvider(id); err != nil {
 			writeHandlerError(w, "PROV-003", err)

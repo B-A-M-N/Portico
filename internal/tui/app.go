@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"time"
@@ -84,12 +85,21 @@ type Model struct {
 	awaitingRepairVerification bool
 
 	// Provider account setup state
-	providerSetupStep   int // 0: not in setup, 1: account ID, 2: label, 3: zone ID, 4: credential, 5: confirming
-	providerSetupID     string
-	providerSetupLabel  string
-	providerSetupZoneID string
-	providerSetupCred   string
-	providerSetupError  string
+	// Provider setup is driven by the provider's own declared fields rather
+	// than by Cloudflare's, which is what the screen used to hardcode.
+	//
+	// providerSetupStep is 0 when no setup is active and 1 while it is; the
+	// position within the form is providerSetupIndex, which runs over the
+	// declared fields and then one past the end to mean "confirming".
+	providerSetupStep       int
+	providerSetupProviderID string
+	providerSetupFlow       *ipc.SetupFlowDTO
+	providerSetupIndex      int
+	providerSetupValues     map[string]string
+	providerSetupError      string
+	// providerSetupRequest increments per flow load, so a late reply to a
+	// cancelled load cannot reset a form already being filled in.
+	providerSetupRequest int
 
 	lastEventSeq    int64
 	stream          *ipc.EventStream
@@ -270,6 +280,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setup.Readiness = msg.Readiness
 		return m, nil
 
+	case providerSetupFlowMsg:
+		if msg.ProviderID != m.providerSetupProviderID || msg.Request != m.providerSetupRequest {
+			// A flow the user has since moved off, or a reply to a load they
+			// already cancelled, must not replace the form in front of them.
+			return m, nil
+		}
+		if msg.Err != nil {
+			// "Cannot be configured through Portico" is an answer, not a
+			// failure to answer. Either way the form cannot open, and saying
+			// which is the difference between a missing feature and a broken
+			// screen.
+			m.providerSetupError = msg.Err.Error()
+			return m, nil
+		}
+		m.providerSetupFlow = msg.Flow
+		m.providerSetupIndex = 0
+		return m, nil
+
 	case launchModeMsg:
 		if msg.Err != nil {
 			m.status = "Could not change launch mode: " + msg.Err.Error()
@@ -387,9 +415,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					strings.Join(msg.Response.MissingPermissions, "\n  • ")
 			}
 			// The rejected secret must not stay in memory while the user
-			// retypes it.
-			m.providerSetupCred = ""
-			m.providerSetupStep = 4
+			// retypes it. Return to the secret field, which is what validation
+			// almost always rejects; restarting at the first field discarded
+			// correct input for no reason.
+			m.clearProviderSetupSecret()
+			m.providerSetupIndex = m.providerSetupSecretIndex()
 			return m, nil
 		}
 		// Success: drop every collected answer, secret included.
@@ -399,6 +429,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.Response == nil:
 			m.status = "Account configured."
+		case msg.Response.VerificationUnavailable != "":
+			// An account Portico could not check must not be reported as
+			// configured. Saving it is fine; implying it works is not, and the
+			// user would otherwise find out only when a connection failed.
+			m.status = "Saved, but not verified. " + msg.Response.VerificationUnavailable
 		case msg.Response.CapabilityLevel == "tunnels_without_dns":
 			m.status = "Account verified. Tunnels are available; add a zone to use permanent hostnames."
 		case msg.Response.CapabilityLevel == "tunnels_with_dns":
@@ -638,6 +673,16 @@ type launchModeMsg struct {
 	Err    error
 }
 
+type providerSetupFlowMsg struct {
+	ProviderID string
+	// Request identifies which load this reply answers. Two loads for the same
+	// provider are possible — open, cancel, reopen — and without this the
+	// slower reply would reset a form the user had already started filling in.
+	Request int
+	Flow    *ipc.SetupFlowDTO
+	Err     error
+}
+
 type connectionLogsMsg struct {
 	ConnectionID string
 	Logs         *ipc.ConnectionLogsDTO
@@ -688,6 +733,24 @@ func (m *Model) readinessCmd() tea.Cmd {
 		defer cancel()
 		readiness, err := client.Readiness(readyCtx)
 		return readinessMsg{Readiness: readiness, Err: err}
+	}
+}
+
+// providerSetupFlowCmd asks a provider what it needs in order to be configured.
+func (m *Model) providerSetupFlowCmd(providerID string, request int) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return providerSetupFlowMsg{
+				ProviderID: providerID, Request: request,
+				Err: fmt.Errorf("no supervisor connection"),
+			}
+		}
+		flowCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		flow, err := client.ProviderSetupFlow(flowCtx, providerID)
+		return providerSetupFlowMsg{ProviderID: providerID, Request: request, Flow: flow, Err: err}
 	}
 }
 
@@ -1058,11 +1121,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// afterwards, so this never claims a change it did not make.
 			return m, m.setLaunchModeCmd(oppositeLaunchMode(m.currentLaunchMode()))
 		case "enter":
-			// Setting up the highlighted provider goes through the existing
-			// account flow rather than a second, parallel one.
-			if selected := m.setup.Selected(); selected != nil && selected.ID == "cloudflare" {
-				m.providerSetupStep = 1
+			// Any provider that declares a setup flow can be configured. What
+			// it needs is the provider's own declaration, fetched here rather
+			// than assumed, so this no longer works for Cloudflare alone.
+			if selected := m.setup.Selected(); selected != nil {
+				next, cmd := m.beginProviderSetup(selected.ID)
+				m = next
 				m.pushScreen(ScreenProviders)
+				return m, cmd
 			}
 			return m, nil
 		}
@@ -1209,14 +1275,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.discoveryCmd()
 		}
 		if m.screen == ScreenProviders {
-			// Start provider account setup
-			m.providerSetupStep = 1
-			m.providerSetupID = ""
-			m.providerSetupLabel = ""
-			m.providerSetupZoneID = ""
-			m.providerSetupCred = ""
-			m.providerSetupError = ""
-			return m, nil
+			return m.beginProviderSetup(m.selectedProviderID())
 		}
 
 	case "d":
@@ -1341,108 +1400,178 @@ func oppositeLaunchMode(mode string) string {
 // path — cancel, back past the credential step, validation failure, success and
 // shutdown — calls this rather than relying on the success path alone.
 func (m *Model) clearProviderSetupSecret() {
-	m.providerSetupCred = ""
+	for _, field := range m.providerSetupFields() {
+		if field.Secret {
+			delete(m.providerSetupValues, field.ID)
+		}
+	}
 }
 
 // clearProviderSetup resets the whole setup flow, secret included.
 func (m *Model) clearProviderSetup() {
-	m.providerSetupStep = 0
-	m.providerSetupID = ""
-	m.providerSetupLabel = ""
-	m.providerSetupZoneID = ""
-	m.providerSetupError = ""
 	m.clearProviderSetupSecret()
+	m.providerSetupStep = 0
+	m.providerSetupIndex = 0
+	m.providerSetupFlow = nil
+	m.providerSetupProviderID = ""
+	m.providerSetupValues = nil
+	m.providerSetupError = ""
 }
 
+// providerSetupFields returns the fields being collected, which come from the
+// provider's own declaration rather than from anything the TUI knows.
+func (m Model) providerSetupFields() []ipc.SetupFieldDTO {
+	if m.providerSetupFlow == nil {
+		return nil
+	}
+	return m.providerSetupFlow.Fields
+}
+
+// providerSetupValue reads one collected value.
+func (m Model) providerSetupValue(id string) string {
+	if m.providerSetupValues == nil {
+		return ""
+	}
+	return m.providerSetupValues[id]
+}
+
+// setProviderSetupValue records one collected value.
+func (m *Model) setProviderSetupValue(id, value string) {
+	if m.providerSetupValues == nil {
+		m.providerSetupValues = map[string]string{}
+	}
+	m.providerSetupValues[id] = value
+}
+
+// handleProviderSetupKey drives the setup form.
+//
+// The form is a walk over the fields the provider declared, not a fixed
+// sequence of Cloudflare's four inputs. Steps are: one per field, then a final
+// confirmation.
 func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
-	switch m.providerSetupStep {
-	case 1: // Account ID
-		if key == "esc" {
-			// Leaving setup entirely: nothing collected may persist.
+	fields := m.providerSetupFields()
+	if len(fields) == 0 {
+		// Nothing to collect: the flow either failed to load or declares no
+		// fields. Either way there is no form to drive.
+		if key == "esc" || key == "enter" {
 			m.clearProviderSetup()
-			return m, nil
-		}
-		if key == "enter" {
-			if m.providerSetupID == "" {
-				m.providerSetupError = "Account ID cannot be empty"
-				return m, nil
-			}
-			m.providerSetupStep = 2
-			m.providerSetupError = ""
-			return m, nil
-		}
-		m.providerSetupID = editString(m.providerSetupID, key)
-		return m, nil
-
-	case 2: // Label
-		if key == "esc" {
-			m.providerSetupStep = 1
-			m.providerSetupError = ""
-			return m, nil
-		}
-		if key == "enter" {
-			m.providerSetupStep = 3
-			m.providerSetupError = ""
-			return m, nil
-		}
-		m.providerSetupLabel = editString(m.providerSetupLabel, key)
-		return m, nil
-
-	case 3: // Zone ID
-		if key == "esc" {
-			m.providerSetupStep = 2
-			m.providerSetupError = ""
-			return m, nil
-		}
-		if key == "enter" {
-			m.providerSetupStep = 4
-			m.providerSetupError = ""
-			return m, nil
-		}
-		m.providerSetupZoneID = editString(m.providerSetupZoneID, key)
-		return m, nil
-
-	case 4: // Credential
-		if key == "esc" {
-			// Moving back past the credential step must not leave the secret
-			// resident while the user edits earlier answers.
-			m.providerSetupStep = 3
-			m.providerSetupError = ""
-			m.clearProviderSetupSecret()
-			return m, nil
-		}
-		if key == "enter" {
-			if m.providerSetupCred == "" {
-				m.providerSetupError = "Credential cannot be empty"
-				return m, nil
-			}
-			m.providerSetupStep = 5
-			m.providerSetupError = ""
-			return m, nil
-		}
-		m.providerSetupCred = editString(m.providerSetupCred, key)
-		return m, nil
-
-	case 5: // Confirm
-		if key == "esc" {
-			m.providerSetupStep = 4
-			m.providerSetupError = ""
-			return m, nil
-		}
-		if key == "enter" {
-			// Submit the configuration
-			req := ipc.ConfigureProviderAccountRequest{
-				AccountID:  m.providerSetupID,
-				Label:      m.providerSetupLabel,
-				ZoneID:     m.providerSetupZoneID,
-				Credential: m.providerSetupCred,
-			}
-			return m, m.configureProviderAccountCmd("cloudflare", req)
 		}
 		return m, nil
 	}
 
+	confirming := m.providerSetupIndex >= len(fields)
+	if confirming {
+		switch key {
+		case "esc":
+			m.providerSetupIndex = len(fields) - 1
+			m.providerSetupError = ""
+			return m, m.forgetSecretAt(len(fields) - 1)
+		case "enter":
+			req := ipc.ConfigureProviderAccountRequest{
+				Fields: maps.Clone(m.providerSetupValues),
+			}
+			// The reserved IDs are also sent under their own names, so a
+			// supervisor path that predates the generic map still works.
+			req.AccountID = m.providerSetupValue("account_id")
+			req.Label = m.providerSetupValue("label")
+			req.ZoneID = m.providerSetupValue("zone_id")
+			req.Credential = m.providerSetupValue(m.providerSetupSecretField())
+			return m, m.configureProviderAccountCmd(m.providerSetupProviderID, req)
+		}
+		return m, nil
+	}
+
+	field := fields[m.providerSetupIndex]
+	switch key {
+	case "esc":
+		if m.providerSetupIndex == 0 {
+			// Leaving setup entirely: nothing collected may persist.
+			m.clearProviderSetup()
+			return m, nil
+		}
+		// Moving back past a secret must not leave it resident while the user
+		// edits earlier answers.
+		m.providerSetupIndex--
+		m.providerSetupError = ""
+		if field.Secret {
+			delete(m.providerSetupValues, field.ID)
+		}
+		return m, nil
+
+	case "enter":
+		if field.Required && strings.TrimSpace(m.providerSetupValue(field.ID)) == "" {
+			m.providerSetupError = field.Label + " cannot be empty"
+			return m, nil
+		}
+		m.providerSetupIndex++
+		m.providerSetupError = ""
+		return m, nil
+	}
+
+	m.setProviderSetupValue(field.ID, editString(m.providerSetupValue(field.ID), key))
 	return m, nil
+}
+
+// forgetSecretAt drops a secret value when stepping back onto its field, so it
+// is retyped rather than silently retained.
+func (m *Model) forgetSecretAt(index int) tea.Cmd {
+	fields := m.providerSetupFields()
+	if index >= 0 && index < len(fields) && fields[index].Secret {
+		delete(m.providerSetupValues, fields[index].ID)
+	}
+	return nil
+}
+
+// selectedProviderID names the provider a setup action applies to.
+//
+// The setup screen has a highlighted provider. The providers screen does not,
+// so "a" there keeps the meaning it always had — configure Cloudflare — rather
+// than silently applying to whichever provider happens to be listed first.
+func (m Model) selectedProviderID() string {
+	if m.screen == ScreenSetup && m.setup != nil {
+		if selected := m.setup.Selected(); selected != nil {
+			return selected.ID
+		}
+	}
+	return "cloudflare"
+}
+
+// beginProviderSetup starts configuring a provider by asking it what it needs.
+//
+// Nothing is rendered until the flow arrives: the fields are the provider's to
+// declare, and inventing a form here is what confined setup to Cloudflare.
+func (m Model) beginProviderSetup(providerID string) (Model, tea.Cmd) {
+	if providerID == "" {
+		return m, nil
+	}
+	m.providerSetupStep = 1
+	m.providerSetupProviderID = providerID
+	m.providerSetupFlow = nil
+	m.providerSetupIndex = 0
+	m.providerSetupValues = map[string]string{}
+	m.providerSetupError = ""
+	m.providerSetupRequest++
+	return m, m.providerSetupFlowCmd(providerID, m.providerSetupRequest)
+}
+
+// providerSetupSecretIndex is the position of the credential field.
+func (m Model) providerSetupSecretIndex() int {
+	for i, field := range m.providerSetupFields() {
+		if field.Secret {
+			return i
+		}
+	}
+	return 0
+}
+
+// providerSetupSecretField names the field carrying the credential.
+func (m Model) providerSetupSecretField() string {
+	for _, field := range m.providerSetupFields() {
+		if field.Secret {
+			return field.ID
+		}
+	}
+	return "credential"
 }
 
 // editString is a simple string editor for terminal input.
@@ -2023,45 +2152,106 @@ func (m *Model) renderProviders() string {
 	return b.String()
 }
 
+// renderProviderSetup draws the setup form from the provider's declaration.
+//
+// Nothing here knows what an account ID or a zone is. The fields, their order,
+// which are required and which are secret all come from the provider, which is
+// what allows a provider Portico has no built-in knowledge of to be configured
+// without a UI change.
 func (m *Model) renderProviderSetup() string {
 	var b strings.Builder
-	b.WriteString(m.theme.Style("header").Render(" ADD CLOUDFLARE ACCOUNT "))
+	title := strings.ToUpper(m.providerSetupProviderID)
+	if title == "" {
+		title = "PROVIDER"
+	}
+	b.WriteString(m.theme.Style("header").Render(" SET UP " + title + " "))
 	b.WriteString("\n\n")
 
-	switch m.providerSetupStep {
-	case 1:
-		b.WriteString("Step 1/5: Account ID\n\n")
-		b.WriteString("Enter your Cloudflare account ID:\n")
-		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupID))
-	case 2:
-		b.WriteString("Step 2/5: Label\n\n")
-		b.WriteString("Enter a friendly label for this account:\n")
-		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupLabel))
-	case 3:
-		b.WriteString("Step 3/5: Zone ID\n\n")
-		b.WriteString("Enter your Cloudflare zone ID, or press enter to skip.\n")
-		b.WriteString("A zone is only needed for permanent hostnames and DNS.\n")
-		b.WriteString("Without one you can still create tunnels with temporary addresses.\n")
-		b.WriteString(fmt.Sprintf("> %s_\n", m.providerSetupZoneID))
-	case 4:
-		b.WriteString("Step 4/5: API Token\n\n")
-		b.WriteString("Enter your Cloudflare API token:\n")
-		// Mask the credential for security
-		maskedCred := ""
-		if len(m.providerSetupCred) > 0 {
-			maskedCred = "••••••••"
+	if m.providerSetupFlow == nil {
+		if m.providerSetupError != "" {
+			b.WriteString(m.theme.Style("intervention").Render(m.providerSetupError))
+			b.WriteString("\n\n[esc] back\n")
+			return b.String()
 		}
-		b.WriteString(fmt.Sprintf("> %s_\n", maskedCred))
-	case 5:
-		b.WriteString("Step 5/5: Confirm\n\n")
-		b.WriteString("Review your configuration:\n\n")
-		b.WriteString(fmt.Sprintf("  Account ID: %s\n", m.providerSetupID))
-		b.WriteString(fmt.Sprintf("  Label:      %s\n", m.providerSetupLabel))
-		if m.providerSetupZoneID != "" {
-			b.WriteString(fmt.Sprintf("  Zone ID:    %s\n", m.providerSetupZoneID))
+		b.WriteString("Asking " + m.providerSetupProviderID + " what it needs...\n")
+		return b.String()
+	}
+
+	flow := m.providerSetupFlow
+	if flow.Summary != "" {
+		b.WriteString(flow.Summary + "\n\n")
+	}
+
+	// A guidance flow is read-only. Presenting a form here would collect
+	// values Portico cannot store and report a setup that had no effect.
+	if !flow.StoresAccount() {
+		if flow.GuidanceReason != "" {
+			b.WriteString(flow.GuidanceReason + "\n\n")
 		}
-		b.WriteString("  API Token:  ••••••••\n\n")
-		b.WriteString("Press enter to confirm, or esc to go back and edit.\n")
+		b.WriteString("What this provider needs:\n\n")
+		for _, field := range flow.Fields {
+			b.WriteString("  • " + field.Label + "\n")
+			if field.Description != "" {
+				b.WriteString(m.theme.Style("muted").Render("    "+field.Description) + "\n")
+			}
+		}
+		if len(flow.CapabilityNotes) > 0 {
+			b.WriteString("\n")
+			for _, note := range flow.CapabilityNotes {
+				b.WriteString(m.theme.Style("muted").Render("  "+note) + "\n")
+			}
+		}
+		b.WriteString("\n[esc] back\n")
+		return b.String()
+	}
+
+	fields := flow.Fields
+	switch {
+	case len(fields) == 0:
+		b.WriteString("This provider declares no fields to fill in.\n")
+
+	case m.providerSetupIndex >= len(fields):
+		b.WriteString(fmt.Sprintf("Step %d/%d: Confirm\n\n", len(fields)+1, len(fields)+1))
+		for _, field := range fields {
+			value := m.providerSetupValue(field.ID)
+			if field.Secret {
+				// A collected secret is shown as present, never rendered.
+				if value != "" {
+					value = "••••••••"
+				}
+			}
+			if value == "" {
+				value = m.theme.Style("muted").Render("(not set)")
+			}
+			b.WriteString(fmt.Sprintf("  %-14s %s\n", field.Label+":", value))
+		}
+		b.WriteString("\nPress enter to confirm, or esc to go back and edit.\n")
+
+	default:
+		field := fields[m.providerSetupIndex]
+		b.WriteString(fmt.Sprintf("Step %d/%d: %s\n\n",
+			m.providerSetupIndex+1, len(fields)+1, field.Label))
+		if field.Description != "" {
+			b.WriteString(field.Description + "\n")
+		}
+		if !field.Required {
+			b.WriteString(m.theme.Style("muted").Render("Optional — press enter to skip.") + "\n")
+		}
+		value := m.providerSetupValue(field.ID)
+		if field.Secret && value != "" {
+			value = "••••••••"
+		}
+		if value == "" && field.Placeholder != "" {
+			b.WriteString(m.theme.Style("muted").Render("e.g. "+field.Placeholder) + "\n")
+		}
+		b.WriteString(fmt.Sprintf("> %s_\n", value))
+	}
+
+	if len(flow.CapabilityNotes) > 0 && m.providerSetupIndex >= len(fields) {
+		b.WriteString("\n")
+		for _, note := range flow.CapabilityNotes {
+			b.WriteString(m.theme.Style("muted").Render("  "+note) + "\n")
+		}
 	}
 
 	if m.providerSetupError != "" {

@@ -37,6 +37,10 @@ type fakeClient struct {
 	logs      *ipc.ConnectionLogsDTO
 	readiness *ipc.ReadinessDTO
 
+	setupFlow      *ipc.SetupFlowDTO
+	setupFlowErr   error
+	setupFlowAsked []string
+
 	launchMode    *ipc.LaunchModeDTO
 	launchModeErr error
 	// launchModeAsked records every mode the TUI requested, so a test can pin
@@ -59,6 +63,19 @@ func (f *fakeClient) Readiness(_ context.Context) (*ipc.ReadinessDTO, error) {
 		return f.readiness, nil
 	}
 	return &ipc.ReadinessDTO{Summary: "nothing configured", LaunchMode: "auto"}, nil
+}
+
+func (f *fakeClient) ProviderSetupFlow(_ context.Context, providerID string) (*ipc.SetupFlowDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setupFlowAsked = append(f.setupFlowAsked, providerID)
+	if f.setupFlowErr != nil {
+		return nil, f.setupFlowErr
+	}
+	if f.setupFlow != nil {
+		return f.setupFlow, nil
+	}
+	return &ipc.SetupFlowDTO{ProviderID: providerID}, nil
 }
 
 func (f *fakeClient) SetLaunchMode(_ context.Context, mode string) (*ipc.LaunchModeDTO, error) {
@@ -1431,31 +1448,57 @@ func TestEditStringIgnoresNamedAndControlKeys(t *testing.T) {
 
 const setupProbeSecret = "cf-token-DO-NOT-LEAK-9f3a"
 
-// enterCredentialStep drives provider setup as far as the credential step with
+// cloudflareSetupFlow is the flow Cloudflare declares, as the TUI now receives
+// it: the fields come from the provider rather than from the screen.
+func cloudflareSetupFlow() *ipc.SetupFlowDTO {
+	return &ipc.SetupFlowDTO{
+		ProviderID: "cloudflare",
+		Kind:       "account",
+		Summary:    "Configure a Cloudflare account.",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "account_id", Label: "Account ID", Required: true},
+			{ID: "label", Label: "Label"},
+			{ID: "zone_id", Label: "Zone ID"},
+			{ID: "credential", Label: "API token", Secret: true, Required: true},
+		},
+	}
+}
+
+// startSetupWithFlow opens provider setup and delivers the declared flow.
+func startSetupWithFlow(t *testing.T, flow *ipc.SetupFlowDTO) Model {
+	t.Helper()
+	m := readyModel(&fakeClient{setupFlow: flow}, testSnapshot())
+	next, cmd := m.beginProviderSetup(flow.ProviderID)
+	m = next
+	if cmd == nil {
+		t.Fatal("beginning setup issued no command to load the flow")
+	}
+	delivered, _ := m.Update(cmd())
+	return delivered.(Model)
+}
+
+// enterCredentialStep drives provider setup as far as the credential field with
 // the probe secret typed in.
 func enterCredentialStep(t *testing.T) Model {
 	t.Helper()
-	m := readyModel(&fakeClient{}, testSnapshot())
-	m.providerSetupStep = 1
+	m := startSetupWithFlow(t, cloudflareSetupFlow())
 	for _, r := range "account-a" {
 		next, _ := m.Update(keyMsg(string(r)))
 		m = next.(Model)
 	}
-	next, _ := m.Update(keyMsg("enter")) // -> label
-	m = next.(Model)
-	next, _ = m.Update(keyMsg("enter")) // -> zone
-	m = next.(Model)
-	next, _ = m.Update(keyMsg("enter")) // -> credential
-	m = next.(Model)
-	if m.providerSetupStep != 4 {
-		t.Fatalf("setup step = %d, want 4 (credential)", m.providerSetupStep)
-	}
-	for _, r := range setupProbeSecret {
-		next, _ = m.Update(keyMsg(string(r)))
+	for range 3 { // past account ID, label and zone
+		next, _ := m.Update(keyMsg("enter"))
 		m = next.(Model)
 	}
-	if m.providerSetupCred != setupProbeSecret {
-		t.Fatalf("credential not captured: %q", m.providerSetupCred)
+	if got := m.providerSetupIndex; got != 3 {
+		t.Fatalf("setup index = %d, want 3 (the credential field)", got)
+	}
+	for _, r := range setupProbeSecret {
+		next, _ := m.Update(keyMsg(string(r)))
+		m = next.(Model)
+	}
+	if m.providerSetupValue("credential") != setupProbeSecret {
+		t.Fatalf("credential not captured: %q", m.providerSetupValue("credential"))
 	}
 	return m
 }
@@ -1468,8 +1511,8 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 		m := enterCredentialStep(t)
 		next, _ := m.Update(keyMsg("esc"))
 		m = next.(Model)
-		if m.providerSetupCred != "" {
-			t.Fatalf("credential survived stepping back: %q", m.providerSetupCred)
+		if m.providerSetupValue("credential") != "" {
+			t.Fatalf("credential survived stepping back: %q", m.providerSetupValue("credential"))
 		}
 	})
 
@@ -1483,8 +1526,8 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 		if m.providerSetupStep != 0 {
 			t.Fatalf("setup step = %d, want 0 (exited)", m.providerSetupStep)
 		}
-		if m.providerSetupCred != "" || m.providerSetupID != "" {
-			t.Fatalf("setup state survived cancellation: cred=%q id=%q", m.providerSetupCred, m.providerSetupID)
+		if m.providerSetupValue("credential") != "" || m.providerSetupValue("account_id") != "" {
+			t.Fatalf("setup state survived cancellation: cred=%q id=%q", m.providerSetupValue("credential"), m.providerSetupValue("account_id"))
 		}
 	})
 
@@ -1492,12 +1535,12 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 		m := enterCredentialStep(t)
 		next, _ := m.Update(providerAccountConfiguredMsg{Err: errors.New("token rejected")})
 		m = next.(Model)
-		if m.providerSetupCred != "" {
-			t.Fatalf("rejected credential stayed in memory: %q", m.providerSetupCred)
+		if m.providerSetupValue("credential") != "" {
+			t.Fatalf("rejected credential stayed in memory: %q", m.providerSetupValue("credential"))
 		}
 		// The answers that were accepted must survive so they are not retyped.
-		if m.providerSetupID != "account-a" {
-			t.Fatalf("accepted answers were discarded: id=%q", m.providerSetupID)
+		if m.providerSetupValue("account_id") != "account-a" {
+			t.Fatalf("accepted answers were discarded: id=%q", m.providerSetupValue("account_id"))
 		}
 	})
 
@@ -1505,8 +1548,8 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 		m := enterCredentialStep(t)
 		next, _ := m.Update(keyMsg("ctrl+c"))
 		m = next.(Model)
-		if m.providerSetupCred != "" {
-			t.Fatalf("credential survived shutdown: %q", m.providerSetupCred)
+		if m.providerSetupValue("credential") != "" {
+			t.Fatalf("credential survived shutdown: %q", m.providerSetupValue("credential"))
 		}
 	})
 
@@ -1516,8 +1559,8 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 			Response: &ipc.ConfigureProviderAccountResponse{Validated: true},
 		})
 		m = next.(Model)
-		if m.providerSetupCred != "" {
-			t.Fatalf("credential survived success: %q", m.providerSetupCred)
+		if m.providerSetupValue("credential") != "" {
+			t.Fatalf("credential survived success: %q", m.providerSetupValue("credential"))
 		}
 	})
 }
@@ -1811,6 +1854,170 @@ func TestLaunchModeFailureIsReported(t *testing.T) {
 	}
 	if !strings.Contains(m.status, "supervisor unreachable") {
 		t.Fatalf("failed toggle does not give the reason: %q", m.status)
+	}
+}
+
+// TestEnterSetsUpWhicheverProviderIsHighlighted pins the gap this package
+// closed. enter previously did nothing unless the highlighted provider was
+// Cloudflare, so every other provider showed its actions and left you to act
+// outside Portico.
+func TestEnterSetsUpWhicheverProviderIsHighlighted(t *testing.T) {
+	fake := &fakeClient{setupFlow: &ipc.SetupFlowDTO{
+		ProviderID: "acme", Kind: "account",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "workspace", Label: "Workspace", Required: true},
+			{ID: "token", Label: "API token", Secret: true, Required: true},
+		},
+	}}
+	m := openSetupWith(t, fake, &ipc.ReadinessDTO{
+		Summary: "1 provider needs attention",
+		Providers: []ipc.ProviderReadinessDTO{
+			{ID: "acme", DisplayName: "Acme", Blocked: true},
+		},
+	})
+
+	next, cmd := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("enter on a non-Cloudflare provider issued no command")
+	}
+	if m.providerSetupProviderID != "acme" {
+		t.Fatalf("setup started for %q, want acme", m.providerSetupProviderID)
+	}
+
+	// The form must come from the provider's own declaration.
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+
+	fake.mu.Lock()
+	asked := append([]string(nil), fake.setupFlowAsked...)
+	fake.mu.Unlock()
+	if len(asked) != 1 || asked[0] != "acme" {
+		t.Fatalf("setup flow requested for %v, want [acme]", asked)
+	}
+
+	view := m.View().Content
+	if !strings.Contains(view, "Workspace") {
+		t.Fatalf("the provider's declared field is not rendered:\n%s", view)
+	}
+	// Cloudflare's vocabulary must not appear for a provider that never
+	// declared it.
+	if strings.Contains(view, "Zone ID") || strings.Contains(view, "Cloudflare") {
+		t.Fatalf("Cloudflare's fields leaked into another provider's form:\n%s", view)
+	}
+}
+
+// TestGuidanceFlowIsShownAsInstructionsNotAForm pins that a provider whose
+// credential Portico cannot hold is not given a form that pretends to save it.
+func TestGuidanceFlowIsShownAsInstructionsNotAForm(t *testing.T) {
+	fake := &fakeClient{setupFlow: &ipc.SetupFlowDTO{
+		ProviderID: "openai_tunnel", Kind: "guidance",
+		Summary:        "Connect a local MCP server to ChatGPT.",
+		GuidanceReason: "Portico cannot hold this provider's credential.",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "credential", Label: "Control plane API key", Secret: true, Required: true},
+		},
+	}}
+	m := openSetupWith(t, fake, &ipc.ReadinessDTO{
+		Summary: "1 provider needs attention",
+		Providers: []ipc.ProviderReadinessDTO{
+			{ID: "openai_tunnel", DisplayName: "OpenAI tunnel", Blocked: true},
+		},
+	})
+
+	next, cmd := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+
+	view := m.View().Content
+	if !strings.Contains(view, "Portico cannot hold") {
+		t.Fatalf("guidance flow does not say why it is read-only:\n%s", view)
+	}
+	// A form would offer a prompt to type into. This must not.
+	if strings.Contains(view, "> _") || strings.Contains(view, "Step 1/") {
+		t.Fatalf("a guidance flow rendered an input form:\n%s", view)
+	}
+	if !strings.Contains(view, "Control plane API key") {
+		t.Fatalf("guidance does not say what is needed:\n%s", view)
+	}
+}
+
+// TestSetupFlowFailureIsStatedNotSilentlyEmpty ensures a provider that cannot
+// be configured says so, rather than presenting an empty form.
+func TestSetupFlowFailureIsStatedNotSilentlyEmpty(t *testing.T) {
+	fake := &fakeClient{setupFlowErr: errors.New("provider \"mock\" cannot be configured through Portico")}
+	m := openSetupWith(t, fake, &ipc.ReadinessDTO{
+		Summary:   "1 provider needs attention",
+		Providers: []ipc.ProviderReadinessDTO{{ID: "mock", DisplayName: "Mock", Blocked: true}},
+	})
+
+	next, cmd := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+
+	view := m.View().Content
+	if !strings.Contains(view, "cannot be configured") {
+		t.Fatalf("a provider that cannot be configured does not say so:\n%s", view)
+	}
+}
+
+// TestAnUnverifiedAccountIsNotReportedAsConfigured pins the user-facing half of
+// the authenticated-only-after-validation invariant. The supervisor stores an
+// uncheckable credential as pending and says so in the response; the screen
+// reporting "Account configured." would leave the user believing setup
+// succeeded, to find out otherwise only when a connection failed.
+func TestAnUnverifiedAccountIsNotReportedAsConfigured(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+
+	next, _ := m.Update(providerAccountConfiguredMsg{
+		Response: &ipc.ConfigureProviderAccountResponse{
+			Status:                  "pending",
+			VerificationUnavailable: "Portico cannot check an acme credential, so this account is saved but unverified.",
+		},
+	})
+	m = next.(Model)
+
+	if strings.Contains(m.status, "Account configured.") {
+		t.Fatalf("an unverified account was reported as configured: %q", m.status)
+	}
+	if !strings.Contains(m.status, "not verified") {
+		t.Fatalf("status does not say the credential was unchecked: %q", m.status)
+	}
+	if !strings.Contains(m.status, "saved but unverified") {
+		t.Fatalf("the supervisor's explanation was dropped: %q", m.status)
+	}
+}
+
+// TestAStaleSetupFlowReplyDoesNotResetTheForm pins that a reply to a cancelled
+// load cannot rewind a form the user has already started filling in.
+func TestAStaleSetupFlowReplyDoesNotResetTheForm(t *testing.T) {
+	flow := cloudflareSetupFlow()
+	m := startSetupWithFlow(t, flow)
+
+	// Advance past the first field.
+	for _, r := range "account-a" {
+		next, _ := m.Update(keyMsg(string(r)))
+		m = next.(Model)
+	}
+	next, _ := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	if m.providerSetupIndex != 1 {
+		t.Fatalf("setup index = %d, want 1", m.providerSetupIndex)
+	}
+
+	// A reply to an earlier load for the same provider arrives late.
+	next, _ = m.Update(providerSetupFlowMsg{
+		ProviderID: "cloudflare", Request: m.providerSetupRequest - 1, Flow: flow,
+	})
+	m = next.(Model)
+
+	if m.providerSetupIndex != 1 {
+		t.Fatalf("a stale reply rewound the form to field %d", m.providerSetupIndex)
+	}
+	if m.providerSetupValue("account_id") != "account-a" {
+		t.Fatal("a stale reply disturbed values already entered")
 	}
 }
 
