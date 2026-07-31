@@ -502,7 +502,10 @@ func TestWizardOpenAfterCreateRequestsPlan(t *testing.T) {
 	if !ok {
 		t.Fatalf("poll cmd returned %T, want WizardOperationLoadedMsg", opMsg)
 	}
-	m.operation.State = "succeeded"
+	// "completed" is the operation's terminal success state. A test asserting
+	// "succeeded" describes a state the controller never produces, so it
+	// verified the behaviour of an impossible input.
+	m.operation.State = ipc.OperationCompleted
 	m.HandleOperationLoaded(opLoaded)
 	if m.Step() != WizardStepComplete {
 		t.Fatalf("step after success = %d, want complete", m.Step())

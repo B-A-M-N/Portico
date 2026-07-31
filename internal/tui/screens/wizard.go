@@ -889,13 +889,12 @@ func (m *WizardModel) HandleOperationLoaded(msg WizardOperationLoadedMsg) tea.Cm
 	}
 	m.operation = msg.Operation
 
-	// Check if the operation reached a terminal state
-	if msg.Operation != nil {
-		switch msg.Operation.State {
-		case "succeeded", "failed", "cancelled":
-			m.state.Step = WizardStepComplete
-			return nil
-		}
+	// An operation reaches "completed", never "succeeded" — that is a step's
+	// word. Waiting for it meant a connection that had already opened kept
+	// polling, and the wizard went on saying it was still working.
+	if msg.Operation != nil && ipc.OperationTerminal(msg.Operation.State) {
+		m.state.Step = WizardStepComplete
+		return nil
 	}
 
 	// Still running — schedule another poll
@@ -1478,16 +1477,14 @@ func (m *WizardModel) renderComplete() string {
 	lines := []string{"CONNECTION CREATED", ""}
 
 	if m.openAfterCreate && m.operation != nil {
-		switch m.operation.State {
-		case "succeeded":
+		switch {
+		case ipc.OperationSucceeded(m.operation.State):
 			lines = append(lines, "Connection opened successfully!")
-		case "failed":
+		case m.operation.State == ipc.OperationFailed:
 			lines = append(lines, "Connection created but opening failed.")
 			if m.err != nil {
 				lines = append(lines, "", "Error: "+m.err.Error())
 			}
-		case "cancelled":
-			lines = append(lines, "Connection created but opening was cancelled.")
 		default:
 			lines = append(lines, "Connection created. Opening is still in progress.")
 		}

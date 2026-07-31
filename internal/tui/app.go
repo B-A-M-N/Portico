@@ -270,8 +270,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Check if operation completed and we need post-repair verification
 		if m.operation != nil && m.awaitingRepairVerification {
-			state := m.operation.State
-			if state == "succeeded" || state == "failed" || state == "cancelled" {
+			// An operation reaches "completed", never "succeeded" — that is a
+			// step's word. Waiting for it meant repair verification never ran,
+			// so a repair that worked was never confirmed.
+			if ipc.OperationTerminal(m.operation.State) {
 				// Operation completed, re-run diagnostics to verify repair
 				m.awaitingRepairVerification = false
 				if m.repairConnectionID != "" {

@@ -1156,7 +1156,7 @@ func TestOperationsScreen(t *testing.T) {
 
 	// Simulate operations loaded message
 	ops := []ipc.OperationDTO{
-		{ID: "op-1", ConnectionID: "conn-1", State: "succeeded", PlanID: "plan-1"},
+		{ID: "op-1", ConnectionID: "conn-1", State: "completed", PlanID: "plan-1"},
 		{ID: "op-2", ConnectionID: "conn-2", State: "failed", PlanID: "plan-2", Error: "test error"},
 	}
 	next, _ := m.Update(operationsLoadedMsg{Operations: ops})
