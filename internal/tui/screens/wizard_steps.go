@@ -81,9 +81,33 @@ func (m *WizardModel) previousStep() (int, bool) {
 		}
 		return steps[i-1], true
 	}
-	// The current step is not in the sequence — the post-creation states are
-	// not questions — so there is nothing to go back to.
+	// The current step is not in the sequence. That is normal for the
+	// post-creation states, which are not questions, but it can also happen to
+	// a question whose predicate stopped holding while the user was on it — an
+	// account question after the provider it belonged to went away. Returning
+	// "nowhere to go" would strand them there, so fall back to the last
+	// applicable question that precedes it.
+	for i := len(steps) - 1; i >= 0; i-- {
+		if precedes(steps[i], m.state.Step) {
+			return steps[i], true
+		}
+	}
 	return 0, false
+}
+
+// precedes reports whether one step is asked before another in the canonical
+// order.
+func precedes(a, b int) bool {
+	var seenA bool
+	for _, rule := range wizardStepOrder {
+		switch rule.id {
+		case a:
+			seenA = true
+		case b:
+			return seenA
+		}
+	}
+	return false
 }
 
 // goBack moves to the previous applicable question and restores whatever that
@@ -196,4 +220,28 @@ func directoryModeIndex(choices []directoryModeChoice, want string) int {
 		}
 	}
 	return 0
+}
+
+// discardProtectionIfUnavailable drops a protection choice that the current
+// answers can no longer carry.
+//
+// An answer must not survive the invalidation of an answer it depends on. The
+// alternative is a combination that looks chosen, is rejected by core
+// validation, and reports the problem at create — a long way from the question
+// that caused it.
+func (m *WizardModel) discardProtectionIfUnavailable() {
+	if m.state.Protection == "" {
+		return
+	}
+	for _, choice := range m.protectionChoices() {
+		if choice.Value == m.state.Protection {
+			if choice.Available {
+				return
+			}
+			break
+		}
+	}
+	m.state.Protection = ""
+	m.state.AllowedEmails = nil
+	m.state.AllowedDomains = nil
 }

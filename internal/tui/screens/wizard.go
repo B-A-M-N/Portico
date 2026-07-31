@@ -612,6 +612,12 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.ExposureMode = choice.Value
+			// Protection depends on the address being stable, so changing the
+			// address can invalidate a protection already chosen. Leaving it
+			// set would carry a combination core validation rejects all the way
+			// to create, where the failure is far from the decision that caused
+			// it.
+			m.discardProtectionIfUnavailable()
 			if m.state.ExposureMode == "permanent_public" {
 				m.state.Step = WizardStepHostname
 				m.input = m.state.Hostname

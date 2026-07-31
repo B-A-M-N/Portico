@@ -32,12 +32,20 @@ type ProviderRecommendationMsg struct {
 
 // recommendationRequest builds the requirements from the answers so far.
 func (m *WizardModel) recommendationRequest() ipc.ProviderRecommendationRequest {
+	// The protocol default is applied here as well as when the connection is
+	// built. Applying it in only one of them scores a provider against no
+	// protocol constraint and then creates a connection that has one, so the
+	// evaluation and the connection describe different things.
+	protocol := m.state.SourceProtocol
+	if protocol == "" && m.state.SourceType == "existing_service" {
+		protocol = "http"
+	}
 	return ipc.ProviderRecommendationRequest{
 		ConnectionKind:   "service_exposure",
 		SourceKind:       m.state.SourceType,
 		MCPTransport:     m.state.MCPTransport,
 		ExposureMode:     m.state.ExposureMode,
-		Protocol:         m.state.SourceProtocol,
+		Protocol:         protocol,
 		ProtectionKind:   m.state.Protection,
 		RequestedAddress: m.state.Hostname,
 		PreferredAccount: m.state.AccountID,
