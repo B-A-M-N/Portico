@@ -291,3 +291,43 @@ func accountInfos(materials []provider.AccountMaterial) []provider.AccountInfo {
 	}
 	return infos
 }
+
+// verifyBootstrapCredential checks an environment credential before it is
+// imported as an authenticated account.
+//
+// It prefers the provider's own verifier and falls back to the supervisor's
+// account validator, which is where Cloudflare's check currently lives. A
+// provider offering neither returns an error, so nothing unchecked is ever
+// recorded as authenticated.
+func (s *Supervisor) verifyBootstrapCredential(
+	ctx context.Context, providerID core.ProviderID, accountID, token string,
+) error {
+	if s.activation != nil {
+		if def := s.activation.definitionFor(providerID); def != nil {
+			if setup, ok := def.(provider.SetupDefinition); ok {
+				if verifier, ok := setup.(provider.SetupVerifier); ok {
+					_, err := verifier.VerifyAccount(ctx, provider.PreparedAccount{
+						Account: core.ProviderAccount{
+							ID: core.ProviderAccountID(accountID), Provider: providerID,
+						},
+						Secret: []byte(token),
+					})
+					return err
+				}
+			}
+		}
+	}
+
+	validator := s.accountValidator
+	if validator == nil {
+		validator = cloudflareAccountValidator{}
+	}
+	validation, err := validator.Validate(ctx, string(providerID), accountID, token)
+	if err != nil {
+		return err
+	}
+	if validation == nil || !validation.AccountAccessible {
+		return fmt.Errorf("the credential could not be confirmed against %s", providerID)
+	}
+	return nil
+}

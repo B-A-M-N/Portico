@@ -2365,7 +2365,7 @@ func TestBootstrapDoesNotOverwriteConfiguredAccountState(t *testing.T) {
 	// A stale environment from an earlier install, applied on the next start,
 	// through the same helper both provider bootstraps use.
 	seedBootstrapAccount(st, "cloudflare", "acct-1", "token-stale",
-		map[string]string{"zone_id": "zone-stale"})
+		map[string]string{"zone_id": "zone-stale"}, acceptingVerifier)
 
 	accounts, err := st.ListProviderAccounts(ctx)
 	if err != nil {
@@ -2408,7 +2408,7 @@ func TestBootstrapImportKeepsTheValidatedCredential(t *testing.T) {
 			}
 
 			seedBootstrapAccount(st, providerID, "acct-1", "token-stale",
-				map[string]string{"zone_id": "zone-stale"})
+				map[string]string{"zone_id": "zone-stale"}, acceptingVerifier)
 
 			secret, err := st.LoadProviderCredential(ctx, providerID, ref)
 			if err != nil {
@@ -2432,7 +2432,7 @@ func TestBootstrapImportCreatesTheAccountWhenThereIsNone(t *testing.T) {
 	st := newRecoveryTestStore(t)
 
 	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
-		map[string]string{"zone_id": "z1"})
+		map[string]string{"zone_id": "z1"}, acceptingVerifier)
 
 	accounts, err := st.ListProviderAccounts(ctx)
 	if err != nil {
@@ -2595,4 +2595,74 @@ func TestAnAccountWithAnUnreadableCredentialIsExplained(t *testing.T) {
 		return
 	}
 	t.Fatal("cloudflare missing from the snapshot")
+}
+
+// acceptingVerifier stands in for a provider that confirms the credential.
+func acceptingVerifier(context.Context, core.ProviderID, string, string) error { return nil }
+
+// TestAnUnconfirmedEnvironmentCredentialIsNotImported pins the last place an
+// unchecked credential could become an authenticated account.
+//
+// Adapters are built only from authenticated accounts, so the environment
+// import wrote "authenticated" on the strength of a token nobody had checked —
+// the same claim-without-evidence this audit corrected everywhere else. A new
+// import is now confirmed once; if it cannot be confirmed nothing is written
+// and the import is retried on a later start.
+func TestAnUnconfirmedEnvironmentCredentialIsNotImported(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	refuse := func(context.Context, core.ProviderID, string, string) error {
+		return errors.New("the provider could not be reached")
+	}
+	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
+		map[string]string{"zone_id": "z1"}, refuse)
+
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("an unconfirmed environment credential was imported: %#v", accounts)
+	}
+
+	// Confirming later must still import it, so an offline first boot is not
+	// permanent.
+	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
+		map[string]string{"zone_id": "z1"}, acceptingVerifier)
+	accounts, _ = st.ListProviderAccounts(ctx)
+	if len(accounts) != 1 || accounts[0].Status != core.AccountAuthenticated {
+		t.Fatalf("a confirmed credential was not imported: %#v", accounts)
+	}
+}
+
+// TestExistingAccountsAreNotReverifiedOnEveryStart ensures startup does not
+// depend on the network for accounts that were already confirmed.
+func TestExistingAccountsAreNotReverifiedOnEveryStart(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	existing := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Configured",
+		CredentialRef: providerCredentialRef("cloudflare", "acct-1"),
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, existing, []byte("token")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	called := false
+	verify := func(context.Context, core.ProviderID, string, string) error {
+		called = true
+		return errors.New("network is unreachable")
+	}
+	seedBootstrapAccount(st, "cloudflare", "acct-1", "token", map[string]string{}, verify)
+
+	if called {
+		t.Fatal("an already-configured account was re-verified, making startup depend on the network")
+	}
+	accounts, _ := st.ListProviderAccounts(ctx)
+	if len(accounts) != 1 || accounts[0].Status != core.AccountAuthenticated {
+		t.Fatalf("an existing account was disturbed: %#v", accounts)
+	}
 }

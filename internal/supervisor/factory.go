@@ -113,7 +113,7 @@ func RunSupervisor(ctx context.Context) error {
 
 	// Environment credentials are imported before activation, so an import and
 	// a restart produce the same durable state in either order.
-	seedBootstrapAccounts(st)
+	seedBootstrapAccounts(st, sup.verifyBootstrapCredential)
 	sup.activateAll(ctx)
 
 	slog.Info("Portico supervisor starting", "socket", paths.SocketPath, "db", paths.DatabasePath)
@@ -126,7 +126,7 @@ func RunSupervisor(ctx context.Context) error {
 // This is a durable write and is deliberately not part of activation, which is
 // a pure read. Keeping them separate is what lets activation carry no store
 // handle at all.
-func seedBootstrapAccounts(st *store.Store) {
+func seedBootstrapAccounts(st *store.Store, verify bootstrapVerifier) {
 	apiToken := config.APIToken()
 	accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 	if accountID == "" {
@@ -138,7 +138,7 @@ func seedBootstrapAccounts(st *store.Store) {
 	}
 	if apiToken != "" && accountID != "" && zoneID != "" {
 		seedBootstrapAccount(st, "cloudflare", accountID, apiToken,
-			map[string]string{"zone_id": zoneID})
+			map[string]string{"zone_id": zoneID}, verify)
 	}
 
 	ngrokToken := config.NgrokAPIToken()
@@ -147,7 +147,7 @@ func seedBootstrapAccounts(st *store.Store) {
 		ngrokAccount = config.NgrokAccountID()
 	}
 	if ngrokToken != "" && ngrokAccount != "" {
-		seedBootstrapAccount(st, "ngrok", ngrokAccount, ngrokToken, map[string]string{})
+		seedBootstrapAccount(st, "ngrok", ngrokAccount, ngrokToken, map[string]string{}, verify)
 	}
 }
 

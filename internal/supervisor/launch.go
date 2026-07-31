@@ -23,31 +23,63 @@ func providerCredentialRef(providerID, accountID string) string {
 	return fmt.Sprintf("%s:%s:api-token", providerID, accountID)
 }
 
+// bootstrapVerifier checks an environment credential before Portico records an
+// account as authenticated. A nil verifier means no check is available.
+type bootstrapVerifier func(ctx context.Context, providerID core.ProviderID, accountID, token string) error
+
 // seedBootstrapAccount imports a credential found in the supervisor's
 // environment, and only when the provider has no account under that ID.
 //
 // This runs on every supervisor start, so it must never overwrite anything an
-// operator established. It records what it found; it verified nothing. The
-// account row and the secret are written as one unit, because guarding the row
-// alone let a stale environment token silently replace a validated one while
-// the row kept its label, zone and status.
+// operator established. The account row and the secret are written as one unit,
+// because guarding the row alone let a stale environment token silently replace
+// a validated one while the row kept its label, zone and status.
 //
-// Both provider bootstraps share this so neither can drift into writing the
-// account and the credential separately again.
-func seedBootstrapAccount(st *store.Store, providerID core.ProviderID, accountID, token string, metadata map[string]string) {
+// An account created here is verified first. Recording an unchecked token as
+// authenticated is the same defect this audit corrected elsewhere, and it was
+// reachable here because adapters are built only from authenticated accounts —
+// so writing pending would have disabled environment setup outright. Verifying
+// the import once closes it without making every boot depend on the network:
+// existing accounts are trusted as previously verified and are never re-checked.
+//
+// If verification cannot complete, nothing is written and the import is retried
+// on a later start. That is deliberate: an account Portico could not confirm
+// must not become the thing every connection is planned against.
+func seedBootstrapAccount(
+	st *store.Store, providerID core.ProviderID, accountID, token string,
+	metadata map[string]string, verify bootstrapVerifier,
+) {
+	ctx := context.Background()
 	credentialRef := providerCredentialRef(string(providerID), accountID)
-	created, err := st.CreateProviderAccountCredentialIfAbsent(context.Background(), core.ProviderAccount{
+
+	// Only a new import is verified, so a machine that is offline keeps working
+	// with the accounts it already has.
+	if existing, err := st.ListProviderAccounts(ctx); err == nil {
+		for _, account := range existing {
+			if account.Provider == providerID && string(account.ID) == accountID {
+				return
+			}
+		}
+	}
+
+	if verify == nil {
+		slog.Warn("not importing an environment credential that cannot be checked",
+			"provider", providerID, "account", accountID)
+		return
+	}
+	if err := verify(ctx, providerID, accountID, token); err != nil {
+		slog.Warn("environment credential was not imported because it could not be confirmed",
+			"provider", providerID, "account", accountID, "err", err)
+		return
+	}
+
+	created, err := st.CreateProviderAccountCredentialIfAbsent(ctx, core.ProviderAccount{
 		ID:            core.ProviderAccountID(accountID),
 		Provider:      providerID,
 		Label:         accountID,
 		CredentialRef: credentialRef,
 		Metadata:      metadata,
-		// Applies only to a row this call creates. Known gap, unchanged here:
-		// an account created from the environment is recorded as authenticated
-		// on the strength of a token nobody checked. Adapters are built only
-		// from authenticated accounts, so writing pending would disable
-		// environment setup outright; closing it properly means verifying the
-		// import once, which is separate work.
+		// Confirmed just above, so this claim is now earned.
 		Status: core.AccountAuthenticated,
 	}, []byte(token))
 	if err != nil {
@@ -55,7 +87,7 @@ func seedBootstrapAccount(st *store.Store, providerID core.ProviderID, accountID
 		return
 	}
 	if created {
-		slog.Info("imported provider account from the environment",
+		slog.Info("imported and confirmed a provider account from the environment",
 			"provider", providerID, "account", accountID)
 	}
 }

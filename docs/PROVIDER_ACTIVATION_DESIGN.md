@@ -264,6 +264,11 @@ Each stage is independently green and committable.
   `RebuildCloudflareProvider` deleted; `RestartRequired` false.
 - **D.** Verified environment import.
 
+All four stages are implemented. Cloudflare's verification still lives on the
+supervisor's account validator rather than its definition, which is the last
+provider-ID branch in the configure path; migrating it carries the
+zone-membership check and capability reporting with it and is separate work.
+
 ## Non-goals
 
 - No plugin or out-of-process boundary; no dynamic discovery; no `init()`
