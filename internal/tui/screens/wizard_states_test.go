@@ -192,7 +192,7 @@ func TestBackFromReviewReturnsToTheStepActuallyVisited(t *testing.T) {
 // never offered for another.
 func TestAccountsAreScopedToTheirProvider(t *testing.T) {
 	snapshot := append(fullCloudflareSnapshot(), ipc.ProviderDTO{
-		ID: "acme", DisplayName: "Acme", Availability: "ready", Readiness: "ready",
+		ID: "acme", DisplayName: "Acme", Availability: "ready", Readiness: "ready", Selectable: true,
 		Accounts: []ipc.ProviderAccountDTO{{ID: "acme-1", Label: "Acme account", Status: "authenticated"}},
 		Capabilities: &ipc.CapabilitySetDTO{
 			CustomHostnames: true, ProtectionModes: []string{"none"},
@@ -247,10 +247,14 @@ func TestAProviderDisappearingMidWizardIsReported(t *testing.T) {
 	gone := fullCloudflareSnapshot()
 	gone[0].Availability = "client_missing"
 	gone[0].Readiness = "needs_client"
-	m.ProvidersChanged(gone)
+	if cmd := m.ProvidersChanged(gone); cmd == nil {
+		t.Fatal("the landscape changed and nothing was re-evaluated")
+	}
 
-	if m.state.Provider != "" {
-		t.Fatal("a selection for a provider that is gone was carried forward")
+	// The previous choice becomes a preference for the fresh evaluation rather
+	// than a decision carried forward, and the account it named is dropped.
+	if m.state.AccountID != "" {
+		t.Fatalf("an account selection survived the landscape changing: %q", m.state.AccountID)
 	}
 	if m.Step() != WizardStepProvider {
 		t.Fatalf("step = %d, want a return to provider selection", m.Step())
@@ -314,7 +318,7 @@ func TestAProviderBecomingAvailableRefreshesTheOptions(t *testing.T) {
 func TestOneProvidersAccountsAreNeverOfferedForAnother(t *testing.T) {
 	snapshot := quickTunnelOnlySnapshot() // Cloudflare, no accounts
 	snapshot = append(snapshot, ipc.ProviderDTO{
-		ID: "ngrok", DisplayName: "ngrok", Availability: "ready", Readiness: "ready",
+		ID: "ngrok", DisplayName: "ngrok", Availability: "ready", Readiness: "ready", Selectable: true,
 		Accounts: []ipc.ProviderAccountDTO{{ID: "ngrok-1", Status: "authenticated"}},
 		Capabilities: &ipc.CapabilitySetDTO{
 			TemporaryAddresses: true, ProtectionModes: []string{"none"},
@@ -354,7 +358,9 @@ func TestAReplacedAccountIsNoticed(t *testing.T) {
 
 	after := fullCloudflareSnapshot()
 	after[0].Accounts = []ipc.ProviderAccountDTO{{ID: "acct-b", Status: "authenticated"}}
-	m.ProvidersChanged(after)
+	if cmd := m.ProvidersChanged(after); cmd == nil {
+		t.Fatal("an account being replaced did not trigger a fresh evaluation")
+	}
 
 	if m.state.AccountID == "acct-a" {
 		t.Fatal("a selection survived the account it named being replaced")

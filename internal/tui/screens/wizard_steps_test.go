@@ -4,13 +4,13 @@ import (
 	"testing"
 )
 
-// TestBackNavigationIsTheInverseOfForward is the property the hand-written
-// transitions could not guarantee.
+// TestBackNavigationIsTheInverseOfForward checks the table is self-consistent.
 //
-// Each step used to carry its own "esc" handler restating the source-kind
-// branch, so forward and back were two independent implementations of one
-// sequence and were free to disagree. Walking every source kind forward and
-// then back must return exactly the way it came.
+// This walks applicableSteps in both directions, so it proves the table agrees
+// with itself — not that it agrees with the wizard. The predicates were derived
+// by reading the forward handlers, so a misreading would be encoded here too.
+// TestTheStepsVisitedGoingBackAreTheStepsVisitedGoingForward drives the real
+// handlers and is the test that can catch that.
 func TestBackNavigationIsTheInverseOfForward(t *testing.T) {
 	for _, sourceKind := range []string{"existing_service", "directory", "command", "mcp_server"} {
 		t.Run(sourceKind, func(t *testing.T) {

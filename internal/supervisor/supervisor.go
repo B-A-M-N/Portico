@@ -541,6 +541,11 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 			}
 		}
 
+		// One decision, made here, about whether a connection can be planned
+		// against this provider. Clients were each deriving it from the
+		// availability string and reaching different answers.
+		dto.Selectable = p.Availability == provider.AvailabilityReady
+
 		for _, account := range p.Accounts {
 			dto.Accounts = append(dto.Accounts, ipc.ProviderAccountDTO{
 				ID: string(account.ID), Label: account.Label, Status: account.Status,

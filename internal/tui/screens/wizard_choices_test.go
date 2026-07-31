@@ -89,7 +89,7 @@ func TestUnavailableOptionsAreShownWithWhatTheyNeed(t *testing.T) {
 // without any wizard change.
 func TestASecondProviderChangesWhatIsOffered(t *testing.T) {
 	caps := providerCapabilities{providers: append(quickTunnelOnlySnapshot(), ipc.ProviderDTO{
-		ID: "acme", DisplayName: "Acme", Availability: "ready", Readiness: "ready",
+		ID: "acme", DisplayName: "Acme", Availability: "ready", Readiness: "ready", Selectable: true,
 		Capabilities: &ipc.CapabilitySetDTO{
 			CustomHostnames: true,
 			ProtectionModes: []string{"none", "email_otp"},
@@ -128,4 +128,33 @@ func containsString(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestTheWizardDoesNotReinterpretAvailability pins that selectability is read,
+// not derived.
+//
+// A provider marked ready but not selectable must not be offered, and one
+// marked selectable must be — whatever the availability string says. That is
+// what keeps the wizard and the recommendation engine from drifting into two
+// answers again.
+func TestTheWizardDoesNotReinterpretAvailability(t *testing.T) {
+	notSelectable := []ipc.ProviderDTO{{
+		ID: "acme", DisplayName: "Acme", Availability: "ready", Readiness: "ready",
+		Selectable: false,
+		Capabilities: &ipc.CapabilitySetDTO{
+			TemporaryAddresses: true, CustomHostnames: true,
+			ProtectionModes: []string{"none", "email_otp"},
+		},
+	}}
+	caps := providerCapabilities{providers: notSelectable}
+	if values := availableValues(caps.exposureChoices("existing_service", "")); len(values) != 0 {
+		t.Fatalf("a provider the supervisor called unselectable supplied options: %v", values)
+	}
+
+	selectable := notSelectable
+	selectable[0].Selectable = true
+	caps = providerCapabilities{providers: selectable}
+	if values := availableValues(caps.exposureChoices("existing_service", "")); len(values) != 2 {
+		t.Fatalf("a selectable provider supplied no options: %v", values)
+	}
 }

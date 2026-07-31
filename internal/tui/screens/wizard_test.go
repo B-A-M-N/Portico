@@ -726,7 +726,7 @@ func TestUnavailableOutcomeIsRefusedRatherThanSubstituted(t *testing.T) {
 func fullCloudflareSnapshot() []ipc.ProviderDTO {
 	return []ipc.ProviderDTO{{
 		ID: "cloudflare", DisplayName: "Cloudflare",
-		Availability: "ready", Readiness: "ready",
+		Availability: "ready", Readiness: "ready", Selectable: true,
 		Accounts: []ipc.ProviderAccountDTO{{ID: "acct-1", Label: "Personal", Status: "authenticated"}},
 		Capabilities: &ipc.CapabilitySetDTO{
 			TemporaryAddresses: true,
@@ -743,7 +743,7 @@ func fullCloudflareSnapshot() []ipc.ProviderDTO {
 func quickTunnelOnlySnapshot() []ipc.ProviderDTO {
 	return []ipc.ProviderDTO{{
 		ID: "cloudflare", DisplayName: "Cloudflare",
-		Availability: "ready", Readiness: "ready",
+		Availability: "ready", Readiness: "ready", Selectable: true,
 		Capabilities: &ipc.CapabilitySetDTO{
 			TemporaryAddresses: true,
 			ProtectionModes:    []string{"none"},

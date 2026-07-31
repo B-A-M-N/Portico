@@ -270,7 +270,7 @@ func testSnapshot() ipc.SnapshotDTO {
 		// means a fixture has to describe a real provider to exercise a flow.
 		Providers: []ipc.ProviderDTO{{
 			ID: "cloudflare", DisplayName: "Cloudflare",
-			Availability: "ready", Readiness: "ready",
+			Availability: "ready", Readiness: "ready", Selectable: true,
 			Accounts: []ipc.ProviderAccountDTO{{ID: "acct-1", Label: "Personal", Status: "authenticated"}},
 			Capabilities: &ipc.CapabilitySetDTO{
 				TemporaryAddresses: true,

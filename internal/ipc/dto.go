@@ -113,11 +113,22 @@ type ProviderDTO struct {
 	// revoked. They are carried separately so a UI can offer to repair them
 	// without any selection path treating them as working accounts.
 	PendingAccounts []ProviderAccountDTO `json:"pending_accounts,omitempty"`
-	Availability    string               `json:"availability"` // "ready", "unconfigured", "binary_missing", "degraded"
-	Readiness       string               `json:"readiness"`    // "ready", "needs_auth", "needs_config", "error"
-	Capabilities    *CapabilitySetDTO    `json:"capabilities,omitempty"`
-	LastError       string               `json:"last_error,omitempty"`
-	RestartRequired bool                 `json:"restart_required,omitempty"`
+	// Selectable reports whether a connection can be planned against this
+	// provider right now.
+	//
+	// It is decided once, by the supervisor, because clients were each
+	// reinterpreting the availability string and disagreeing: the
+	// recommendation engine refused experimental and degraded providers while
+	// the wizard's fallback list refused only missing clients, so a failed
+	// recommendation offered providers the engine considers unusable. A
+	// provider can also be worth showing while not being selectable — one that
+	// needs setup, for instance — and one string could not carry both facts.
+	Selectable      bool              `json:"selectable"`
+	Availability    string            `json:"availability"` // "ready", "unconfigured", "binary_missing", "degraded"
+	Readiness       string            `json:"readiness"`    // "ready", "needs_auth", "needs_config", "error"
+	Capabilities    *CapabilitySetDTO `json:"capabilities,omitempty"`
+	LastError       string            `json:"last_error,omitempty"`
+	RestartRequired bool              `json:"restart_required,omitempty"`
 	// SetupActions are concrete steps that would make this provider usable.
 	// They accompany an unavailable provider so the UI can offer a next step
 	// instead of only reporting a gap.

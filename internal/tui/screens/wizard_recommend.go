@@ -424,17 +424,21 @@ func (m *WizardModel) recommendedAccountFor(providerID string) string {
 }
 
 // ProvidersChanged updates the wizard when the provider landscape moves under
-// it.
+// it, and asks again which provider now suits the connection.
 //
 // A wizard open across a provider being configured, uninstalled or switched off
-// is holding options and a recommendation computed against a world that no
-// longer exists. The user's answers are kept — their intent did not change —
-// but anything derived from the providers is discarded and, if a choice has
-// already been made that is no longer viable, they are returned to make it
-// again rather than carrying a selection that cannot work.
-func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) {
+// holds options and a recommendation computed against a world that no longer
+// exists. Deciding locally whether the chosen provider still fits would be a
+// second, partial copy of the recommendation engine — and it would be wrong in
+// the case that matters: a provider can stay available while losing the
+// capability the connection depends on, as Cloudflare does when its last
+// account is removed and only Quick Tunnels remain.
+//
+// So the answers are kept, because the user's intent did not change, and the
+// question of which provider carries them is asked again.
+func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) tea.Cmd {
 	if sameProviderLandscape(m.caps.providers, providers) {
-		return
+		return nil
 	}
 	m.caps = providerCapabilities{providers: providers}
 	m.recommendation = nil
@@ -442,37 +446,20 @@ func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) {
 	m.recommendPending = false
 	m.recommendErr = nil
 
-	if m.state.Provider == "" {
-		return
+	// Before the provider question there is nothing to revisit: the answers
+	// that remain are about the source and how it should be reached, and the
+	// options for those are derived fresh on every render.
+	if m.state.Step < WizardStepProvider {
+		return nil
 	}
-	providerStillUsable := false
-	for _, choice := range m.snapshotChoices() {
-		if choice.Value == m.state.Provider && choice.Available {
-			providerStillUsable = true
-			break
-		}
-	}
-	if providerStillUsable {
-		// The provider survives, but the account it was going to use may not.
-		if m.state.AccountID != "" && !containsAccount(m.accountsFor(m.state.Provider), m.state.AccountID) {
-			m.err = fmt.Errorf("the account this connection was going to use is no longer available")
-			m.state.AccountID = ""
-			if m.state.Step > WizardStepAccount {
-				m.state.Step = WizardStepProvider
-				m.selected = 0
-			}
-		}
-		return
-	}
-	// The chosen provider cannot carry this any more. Saying so beats
-	// discovering it when the connection refuses to open.
-	m.err = fmt.Errorf("%s is no longer available; choose another provider", m.state.Provider)
-	m.state.Provider = ""
+
+	// The previous choice becomes a preference rather than a decision, so a
+	// provider that still fits is still favoured.
 	m.state.AccountID = ""
-	if m.state.Step > WizardStepProvider {
-		m.state.Step = WizardStepProvider
-		m.selected = 0
-	}
+	m.err = fmt.Errorf("the available providers changed, so this is being reconsidered")
+	m.state.Step = WizardStepProvider
+	m.selected = 0
+	return m.recommendCmd()
 }
 
 // sameProviderLandscape reports whether anything the wizard derives from has
@@ -536,14 +523,4 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-// containsAccount reports whether an account is still present.
-func containsAccount(accounts []ipc.ProviderAccountDTO, id string) bool {
-	for _, account := range accounts {
-		if account.ID == id {
-			return true
-		}
-	}
-	return false
 }
