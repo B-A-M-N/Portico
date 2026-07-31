@@ -23,45 +23,87 @@ import (
 // one is free scrolling, driven by the user rather than by a cursor.
 
 // scrollState is the vertical offset for the screen currently shown.
+//
+// Every field is written during Update and only read during View. The first
+// version of this mutated the state from inside View, which has a value
+// receiver — so the height, the screen and the clamped offset were written to a
+// copy that was discarded, and the live model never learned the viewport height
+// at all. Page Down incremented an offset that the next render reset to zero,
+// and the feature did not work. The unit tests passed because they set the
+// height by hand, which is setup production never performs.
 type scrollState struct {
 	// offset is the first content line rendered, in lines from the top.
 	offset int
-	// height is the viewport height last rendered, used to size a page.
+	// height is the viewport height, set from the window size message.
 	height int
-	// overflow reports whether the last render had more content than fit.
-	overflow bool
-	// screen is the screen this offset belongs to. Navigation happens through
-	// pushScreen, popScreen and direct assignment in a dozen places, so the
-	// change is detected at render rather than hooked at each site — otherwise
-	// opening a screen would inherit wherever the previous one was scrolled to.
+	// contentLines is how many lines the current screen last produced, which is
+	// what the offset is clamped against.
+	contentLines int
+	// screen is the screen this offset belongs to.
 	screen ScreenID
 }
 
-// follow resets the offset when the screen has changed since the last render.
-func (s *scrollState) follow(screen ScreenID) {
-	if s.screen != screen {
-		s.screen = screen
-		s.reset()
-	}
+// setHeight records the terminal height and re-clamps.
+func (s *scrollState) setHeight(height int) {
+	s.height = height
+	s.clamp()
 }
 
-// reset returns to the top, which is where a newly opened screen starts.
-func (s *scrollState) reset() {
+// setContentLines records how long the current screen's content is and
+// re-clamps, so an offset cannot survive the content shrinking beneath it.
+func (s *scrollState) setContentLines(lines int) {
+	s.contentLines = lines
+	s.clamp()
+}
+
+// resetFor moves to the top for a newly shown screen.
+func (s *scrollState) resetFor(screen ScreenID) {
+	s.screen = screen
 	s.offset = 0
-	s.overflow = false
 }
 
-// scrollBy moves the viewport, clamping at the top. The bottom is clamped at
-// render time, where the content length is known.
+// scrollBy moves the viewport and clamps at both ends.
 func (s *scrollState) scrollBy(lines int) {
 	s.offset += lines
+	s.clamp()
+}
+
+// toTop and toBottom are the Home and End motions.
+func (s *scrollState) toTop()    { s.offset = 0 }
+func (s *scrollState) toBottom() { s.offset = s.maxOffset() }
+
+// clamp keeps the offset inside the content.
+func (s *scrollState) clamp() {
+	if s.offset > s.maxOffset() {
+		s.offset = s.maxOffset()
+	}
 	if s.offset < 0 {
 		s.offset = 0
 	}
 }
 
-// page returns the number of lines a page-up or page-down moves, leaving two
-// lines of context so the user can see where they were.
+// maxOffset is the furthest the viewport can move down.
+func (s *scrollState) maxOffset() int {
+	visible := s.visibleLines()
+	if visible <= 0 || s.contentLines <= visible {
+		return 0
+	}
+	return s.contentLines - visible
+}
+
+// visibleLines is how many content lines fit, reserving one for the indicator
+// when there is more than fits.
+func (s *scrollState) visibleLines() int {
+	if s.height <= 0 {
+		return 0
+	}
+	if s.contentLines > s.height {
+		return s.height - 1
+	}
+	return s.height
+}
+
+// page is how far a page key moves, leaving two lines of context.
 func (s *scrollState) page() int {
 	if s.height > 3 {
 		return s.height - 2
@@ -77,37 +119,31 @@ func scrollsFreely(screen ScreenID) bool {
 	return screen != ScreenHome && screen != ScreenBoot && screen != ScreenQuit
 }
 
-// clipToViewport trims rendered content to the visible height and reports what
-// was cut, so a screen never silently hides the rest of its own output.
+// clipToViewport trims rendered content to the visible height and appends an
+// indicator saying what was cut.
 //
-// The returned content always fills at most height lines including the
-// indicator, so adding the indicator cannot itself push a line off the bottom.
-func clipToViewport(content string, height int, state *scrollState) string {
+// It is pure: it reads the offset and returns a string. Clamping is the
+// caller's job, done during Update where the result can be kept.
+func clipToViewport(content string, height, offset int) string {
 	if height <= 0 {
 		return content
 	}
 	lines := strings.Split(content, "\n")
-
-	state.height = height
 	if len(lines) <= height {
-		state.offset = 0
-		state.overflow = false
 		return content
 	}
-	state.overflow = true
 
-	// One line is spent on the indicator that says there is more.
 	visible := height - 1
 	maxOffset := len(lines) - visible
-	if state.offset > maxOffset {
-		state.offset = maxOffset
+	if offset > maxOffset {
+		offset = maxOffset
 	}
-	if state.offset < 0 {
-		state.offset = 0
+	if offset < 0 {
+		offset = 0
 	}
 
-	window := lines[state.offset : state.offset+visible]
-	return strings.Join(window, "\n") + "\n" + scrollIndicator(state.offset, visible, len(lines))
+	window := lines[offset : offset+visible]
+	return strings.Join(window, "\n") + "\n" + scrollIndicator(offset, visible, len(lines))
 }
 
 // scrollIndicator says where the viewport is and how to move it. A user cannot
@@ -117,12 +153,20 @@ func scrollIndicator(offset, visible, total int) string {
 	below := total - offset - visible
 	switch {
 	case above > 0 && below > 0:
-		return fmt.Sprintf("  ↑ %d more above · %d more below — pgup/pgdn to scroll", above, below)
+		return fmt.Sprintf("  ↑ %d above · %d below — pgup/pgdn, home/end", above, below)
 	case below > 0:
-		return fmt.Sprintf("  ↓ %d more below — pgdn to scroll", below)
+		return fmt.Sprintf("  ↓ %d more below — pgdn to scroll, end for the last", below)
 	case above > 0:
-		return fmt.Sprintf("  ↑ %d more above — pgup to scroll", above)
+		return fmt.Sprintf("  ↑ %d more above — pgup to scroll, home for the first", above)
 	default:
 		return ""
 	}
+}
+
+// countLines is how many lines a rendered screen occupies.
+func countLines(content string) int {
+	if content == "" {
+		return 0
+	}
+	return strings.Count(content, "\n") + 1
 }

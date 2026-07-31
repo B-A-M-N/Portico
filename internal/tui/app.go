@@ -213,11 +213,29 @@ func (m Model) Init() tea.Cmd {
 }
 
 // Update handles messages (SPEC §17.7).
+// Update advances the model, then measures what the next render will produce.
+//
+// The measurement is here rather than in View because View has a value receiver
+// and cannot keep anything. Wrapping the real handler means every one of its
+// many return points is covered without each having to remember.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	updated, ok := next.(Model)
+	if !ok {
+		return next, cmd
+	}
+	updated.measureViewport()
+	return updated, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// The viewport height is model state, set from the message that
+		// carries it. Reading it during render wrote it to a discarded copy.
+		m.scroll.setHeight(msg.Height)
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -258,7 +276,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clone = nil
 		m.status = "Created " + name + ", closed."
 		if !m.popScreen() {
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 		}
 		return m, m.requestSnapshot()
 
@@ -318,7 +336,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The cursor may now point past the end of a shorter list.
 		m.moveAccountSelection(0)
 		if !m.popScreen() {
-			m.screen = ScreenProviders
+			m.transitionTo(ScreenProviders)
 		}
 		// The provider list is what changed, so it is refetched rather than
 		// edited in place — the supervisor is the authority on what remains.
@@ -329,13 +347,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.ready {
 				// Initial snapshot failed — transition to recovery screen
 				m.err = msg.Err
-				m.screen = ScreenRecovery
+				m.transitionTo(ScreenRecovery)
 			} else {
 				m.status = statusLine("snapshot refresh failed", msg.Err)
 			}
 			return m, nil
 		}
 		m.snapshot = msg.Snapshot
+		m.syncInspectModel()
 		m.ready = true
 		// A wizard in progress was built against the previous provider
 		// landscape. If that changed underneath it, its options and any
@@ -351,7 +370,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Transition to home screen on successful initial load
 		if m.screen == ScreenBoot {
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 			m.clearNav()
 		}
 		// Preserve selection by stable connection ID. If the previously
@@ -516,7 +535,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.connectionLogs = msg.Logs
 		}
 		if m.inspect != nil {
-			m.inspect.LogTail = m.connectionLogs
+			m.syncInspectModel()
 		}
 		return m, nil
 
@@ -560,7 +579,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.connectionDetail = msg.Detail
 		if m.inspect != nil {
-			m.inspect.Detail = msg.Detail
+			m.syncInspectModel()
 		}
 		return m, nil
 
@@ -583,6 +602,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		m.diagnosticsFailed = nil
 		m.diagnostics = msg.Findings
+		m.syncInspectModel()
 		m.diagnosticsConnectionID = msg.ConnectionID
 
 		// If we just completed repair verification, show the results
@@ -595,7 +615,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case discoveryMsg:
 		if msg.Err != nil {
 			m.status = statusLine("discovery failed", msg.Err)
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 			m.clearNav()
 			return m, nil
 		}
@@ -802,65 +822,97 @@ func (m Model) View() tea.View {
 		return v
 	}
 
-	// Dispatch by screen — each screen owns its own error presentation.
-	// This ensures ScreenRecovery is reachable even when m.err is set.
-	var content string
-	switch m.screen {
-	case ScreenRecovery:
-		content = m.renderRecovery()
-	case ScreenHome:
-		content = m.renderHome()
-	case ScreenNewConnection:
-		content = m.renderNewConnection()
-	case ScreenInspect:
-		content = m.renderInspect()
-	case ScreenHelp:
-		content = m.renderHelp()
-	case ScreenPlanPreview:
-		content = m.renderPlanPreview()
-	case ScreenOperationProgress:
-		content = m.renderOperationProgress()
-	case ScreenProviders:
-		content = m.renderProviders()
-	case ScreenRepair:
-		content = m.renderRepair()
-	case ScreenDiscovery:
-		content = m.renderDiscovery()
-	case ScreenOperations:
-		content = m.renderOperations()
-	case ScreenAccountRemoval:
-		content = m.renderAccountRemoval()
-	case ScreenEdit:
-		content = m.renderEdit()
-	case ScreenClone:
-		content = m.renderClone()
-	case ScreenSetup:
-		if m.setup != nil {
-			content = m.setup.View()
-		} else {
-			content = "Checking what Portico needs..."
-		}
-	case ScreenQuit:
-		content = ""
-	default:
-		if m.err != nil {
-			content = m.renderError()
-		} else {
-			content = m.renderHome()
-		}
-	}
+	// One rendering path, shared with the measurement at the end of Update.
+	// Two switches would drift, and the one that drifted would be the one
+	// deciding how tall the content is.
+	content := m.renderScreen()
 
-	// Clip to what the terminal can show, and say what was cut. Rendering the
-	// full content and letting the terminal drop the overflow made everything
-	// past the last row unreachable.
-	m.scroll.follow(m.screen)
+	// Clip to what the terminal can show, and say what was cut. This reads the
+	// offset; it does not move it. View has a value receiver, so anything
+	// written here is written to a copy that is thrown away — which is how the
+	// first version of this managed to render a scroll indicator while the
+	// live model never learned the viewport height and Page Down did nothing.
 	if scrollsFreely(m.screen) && m.height > 0 {
-		content = clipToViewport(content, m.height, &m.scroll)
+		content = clipToViewport(content, m.height, m.scroll.offset)
 	}
 
 	v := tea.NewView(content)
 	v.AltScreen = true
 	return v
+}
+
+// renderScreen produces the content for the current screen.
+//
+// It is the single rendering path, used both by View and by the end of Update,
+// which measures it to clamp the scroll offset against something real.
+func (m Model) renderScreen() string {
+	switch m.screen {
+	case ScreenRecovery:
+		return m.renderRecovery()
+	case ScreenHome:
+		return m.renderHome()
+	case ScreenNewConnection:
+		return m.renderNewConnection()
+	case ScreenInspect:
+		return m.renderInspect()
+	case ScreenHelp:
+		return m.renderHelp()
+	case ScreenPlanPreview:
+		return m.renderPlanPreview()
+	case ScreenOperationProgress:
+		return m.renderOperationProgress()
+	case ScreenProviders:
+		return m.renderProviders()
+	case ScreenRepair:
+		return m.renderRepair()
+	case ScreenDiscovery:
+		return m.renderDiscovery()
+	case ScreenOperations:
+		return m.renderOperations()
+	case ScreenAccountRemoval:
+		return m.renderAccountRemoval()
+	case ScreenEdit:
+		return m.renderEdit()
+	case ScreenClone:
+		return m.renderClone()
+	case ScreenSetup:
+		if m.setup != nil {
+			return m.setup.View()
+		}
+		return "Checking what Portico needs..."
+	case ScreenQuit:
+		return ""
+	default:
+		if m.err != nil {
+			return m.renderError()
+		}
+		return m.renderHome()
+	}
+}
+
+// transitionTo is the one place a screen changes.
+//
+// Screen changes happened by direct assignment in a dozen places, so anything
+// that had to accompany one — resetting the scroll offset, so a newly opened
+// screen does not start part way down — had to be remembered at each site.
+func (m *Model) transitionTo(screen ScreenID) {
+	if m.screen != screen {
+		m.scroll.resetFor(screen)
+	}
+	m.screen = screen
+}
+
+// measureViewport records how tall the current screen's content is, so the
+// offset is clamped against the real content rather than against nothing.
+//
+// This runs at the end of every Update, which is the only place model state can
+// be kept.
+func (m *Model) measureViewport() {
+	if !scrollsFreely(m.screen) || m.height <= 0 {
+		m.scroll.setContentLines(0)
+		return
+	}
+	m.scroll.setContentLines(countLines(m.renderScreen()))
 }
 
 // --------------- message types ---------------
@@ -1426,7 +1478,7 @@ func (m *Model) pushScreen(target ScreenID) {
 	if m.screen != "" && m.screen != ScreenBoot && m.screen != target {
 		m.navStack = append(m.navStack, m.screen)
 	}
-	m.screen = target
+	m.transitionTo(target)
 }
 
 // popScreen returns to the previous screen from the navigation stack.
@@ -1437,7 +1489,7 @@ func (m *Model) popScreen() bool {
 	}
 	prev := m.navStack[len(m.navStack)-1]
 	m.navStack = m.navStack[:len(m.navStack)-1]
-	m.screen = prev
+	m.transitionTo(prev)
 	return true
 }
 
@@ -1509,14 +1561,20 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	// per-screen keys so no screen has to implement it. It is checked after
 	// the wizard and setup forms above, which own the keyboard while typing.
 	if scrollsFreely(m.screen) {
+		// ctrl+d is not bound. In a terminal it means end-of-input, and a user
+		// who presses it expecting that should not get a half-page scroll.
 		switch key {
-		case "pgdown", "pgup", "ctrl+d", "ctrl+u":
-			switch key {
-			case "pgdown", "ctrl+d":
-				m.scroll.scrollBy(m.scroll.page())
-			default:
-				m.scroll.scrollBy(-m.scroll.page())
-			}
+		case "pgdown":
+			m.scroll.scrollBy(m.scroll.page())
+			return m, nil
+		case "pgup":
+			m.scroll.scrollBy(-m.scroll.page())
+			return m, nil
+		case "home":
+			m.scroll.toTop()
+			return m, nil
+		case "end":
+			m.scroll.toBottom()
 			return m, nil
 		}
 	}
@@ -1543,7 +1601,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		// screen's in-flight work, so quitting the plan preview left the plan
 		// request live and a late reply reopened the preview behind the user.
 		m.abandonScreenWork()
-		m.screen = ScreenHome
+		m.transitionTo(ScreenHome)
 		return m, nil
 
 	case "esc":
@@ -1561,7 +1619,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		// Try to pop the navigation stack
 		if !m.popScreen() {
 			// Stack empty, go to home
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 		}
 		return m, nil
 
@@ -1621,6 +1679,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
 			conn := m.SelectedConnection()
 			m.inspect = screens.NewInspect(conn)
+			m.syncInspectModel()
 			// Detail from the previous connection must not be shown against
 			// this one while the fetch is in flight.
 			m.connectionDetail = nil
@@ -1671,7 +1730,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		if m.screen == ScreenRecovery {
 			// Retry connection to supervisor
 			m.err = nil
-			m.screen = ScreenBoot
+			m.transitionTo(ScreenBoot)
 			return m, m.requestSnapshot()
 		}
 		if m.screen == ScreenRepair && m.SelectedConnection() != nil {
@@ -1773,7 +1832,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.prevScreen = m.screen
-		m.screen = ScreenHelp
+		m.transitionTo(ScreenHelp)
 
 	case "space", " ":
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
@@ -1799,7 +1858,7 @@ func (m *Model) providerSnapshot() []ipc.ProviderDTO {
 // handleWizardKey routes keys to the new-connection wizard.
 func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 	if m.wizard == nil {
-		m.screen = ScreenHome
+		m.transitionTo(ScreenHome)
 		m.clearNav()
 		return m, nil
 	}
@@ -1813,7 +1872,7 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 		// the wizard entirely instead of returning to the outcome it came from.
 		if key == "esc" || key == "q" {
 			m.wizard = nil
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 			m.clearNav()
 			return m, nil
 		}
@@ -1821,7 +1880,7 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 		// Done — return home and refresh.
 		if key == "enter" || key == "esc" || key == "q" {
 			m.wizard = nil
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 			m.clearNav()
 			return m, m.requestSnapshot()
 		}
@@ -2384,16 +2443,17 @@ func (m *Model) renderInspect() string {
 
 	// Use the composed InspectModel if available (provides tabbed view).
 	if m.inspect != nil {
-		// Keep the InspectModel's connection data in sync with the snapshot.
-		m.inspect.Connection = conn
-		m.inspect.Diagnostics = m.diagnostics
-		m.inspect.Detail = m.connectionDetail
-		m.inspect.LogTail = m.connectionLogs
+		// Rendered from a copy. The root model passed to View is copied, but
+		// m.inspect is a pointer into the live model, so assigning through it
+		// here mutated production state from inside a render — and View is
+		// required to be pure. The live model is kept current by
+		// syncInspectModel during Update instead.
+		inspect := *m.inspect
 
 		var b strings.Builder
 		b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" %s ", conn.Name)))
 		b.WriteString("\n\n")
-		b.WriteString(m.inspect.View())
+		b.WriteString(inspect.View())
 		return b.String()
 	}
 
@@ -3507,4 +3567,22 @@ func eventSummary(evt ipc.EventDTO) string {
 		}
 	}
 	return ""
+}
+
+// syncInspectModel copies the data the inspect screen renders from into it.
+//
+// This used to happen inside the render, through a pointer that reached the
+// live model — so drawing the screen changed the program's state. It runs on
+// the messages that change its inputs, which keeps the model the complete
+// input to rendering.
+func (m *Model) syncInspectModel() {
+	if m.inspect == nil {
+		return
+	}
+	if conn := m.SelectedConnection(); conn != nil {
+		m.inspect.Connection = conn
+	}
+	m.inspect.Diagnostics = m.diagnostics
+	m.inspect.Detail = m.connectionDetail
+	m.inspect.LogTail = m.connectionLogs
 }

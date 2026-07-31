@@ -6,121 +6,173 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
-func numberedLines(n int) string {
-	lines := make([]string, n)
-	for i := range lines {
-		lines[i] = fmt.Sprintf("line-%d", i)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// TestContentTallerThanTheTerminalCanBeReached pins audit finding 14.
+// Scrolling is tested through the real model lifecycle.
 //
-// Only the connection list scrolled. Every other screen rendered its full
-// content and let the terminal clip it, so a connector's log tail, a plan with
-// many steps, or the findings for a broken connection were fetched, formatted,
-// and then discarded by the terminal with nothing on screen to say so.
+// The first version of these tests set the viewport height by hand and called
+// the screen-follow helper directly, then asserted on the clipping function.
+// Both passed while the feature did not work at all: the state they set up was
+// written during View, which has a value receiver, so production never kept it
+// and Page Down moved an offset the next render reset. A test that performs
+// setup production cannot perform proves nothing about production.
+
+// operationsModel returns a ready model showing more operations than fit.
+func operationsModel(t *testing.T, height int) Model {
+	t.Helper()
+	ops := make([]ipc.OperationDTO, 40)
+	for i := range ops {
+		ops[i] = ipc.OperationDTO{
+			ID:           fmt.Sprintf("op-%02d", i),
+			ConnectionID: fmt.Sprintf("marker-%02d", i),
+			State:        ipc.OperationCompleted,
+			Intent:       "open",
+		}
+	}
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.operations = ops
+	m.operationsAvailable = true
+
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: height})
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("o"))
+	return next.(Model)
+}
+
+// TestContentTallerThanTheTerminalCanBeReached pins audit finding 14 through
+// the path a user takes: size the window, open a screen, press Page Down.
 func TestContentTallerThanTheTerminalCanBeReached(t *testing.T) {
-	var state scrollState
-	content := numberedLines(100)
+	m := operationsModel(t, 20)
 
-	top := clipToViewport(content, 10, &state)
-	if !strings.Contains(top, "line-0") {
-		t.Fatalf("the top of the content is not shown:\n%s", top)
-	}
-	if strings.Contains(top, "line-50") {
-		t.Fatalf("content past the viewport was rendered:\n%s", top)
-	}
-	if !state.overflow {
-		t.Fatal("overflow was not reported")
+	first := m.View().Content
+	if !strings.Contains(first, "more below") {
+		t.Fatalf("a screen taller than the terminal does not say so:\n%s", first)
 	}
 
-	state.scrollBy(50)
-	middle := clipToViewport(content, 10, &state)
-	if !strings.Contains(middle, "line-50") {
-		t.Fatalf("scrolling did not reach line 50:\n%s", middle)
+	next, _ := m.Update(keyMsg("pgdown"))
+	m = next.(Model)
+	second := m.View().Content
+
+	if first == second {
+		t.Fatal("page down did not move the viewport")
 	}
-	if strings.Contains(middle, "line-0\n") {
-		t.Fatalf("the viewport did not move:\n%s", middle)
+	if m.scroll.offset == 0 {
+		t.Fatal("the offset was not kept: the model never learned it moved")
 	}
 }
 
-// TestTheUserIsToldThereIsMore pins that hidden content is announced. A user
-// cannot act on content they were never told exists.
-func TestTheUserIsToldThereIsMore(t *testing.T) {
-	var state scrollState
-	view := clipToViewport(numberedLines(100), 10, &state)
-	if !strings.Contains(view, "more below") {
-		t.Fatalf("nothing said there was more content:\n%s", view)
+// TestEndReachesTheBottomAndHomeReturns pins that the whole content is
+// reachable, not merely some of it.
+func TestEndReachesTheBottomAndHomeReturns(t *testing.T) {
+	m := operationsModel(t, 20)
+
+	next, _ := m.Update(keyMsg("end"))
+	m = next.(Model)
+	bottom := m.View().Content
+	if !strings.Contains(bottom, "marker-39") {
+		t.Fatalf("the end of the content is unreachable:\n%s", bottom)
+	}
+	if strings.Contains(bottom, "more below") {
+		t.Fatalf("the bottom still reports content below it:\n%s", bottom)
 	}
 
-	state.scrollBy(50)
-	view = clipToViewport(numberedLines(100), 10, &state)
-	if !strings.Contains(view, "more above") || !strings.Contains(view, "more below") {
-		t.Fatalf("the indicator does not report both directions:\n%s", view)
+	next, _ = m.Update(keyMsg("home"))
+	m = next.(Model)
+	if m.scroll.offset != 0 {
+		t.Fatalf("home left the offset at %d", m.scroll.offset)
 	}
 }
 
-// TestTheViewportNeverExceedsTheTerminalHeight pins that the indicator cannot
-// itself push a line off the bottom.
-func TestTheViewportNeverExceedsTheTerminalHeight(t *testing.T) {
-	for _, height := range []int{3, 5, 10, 24, 50} {
-		var state scrollState
-		view := clipToViewport(numberedLines(200), height, &state)
-		if got := len(strings.Split(view, "\n")); got > height {
-			t.Errorf("height %d: rendered %d lines", height, got)
+// TestPagingDownRepeatedlyStopsAtTheEnd pins that the offset is clamped against
+// real content rather than running off into blank space.
+func TestPagingDownRepeatedlyStopsAtTheEnd(t *testing.T) {
+	m := operationsModel(t, 20)
+	for i := 0; i < 50; i++ {
+		next, _ := m.Update(keyMsg("pgdown"))
+		m = next.(Model)
+	}
+	view := m.View().Content
+	if !strings.Contains(view, "marker-39") {
+		t.Fatalf("over-paging lost the end of the content:\n%s", view)
+	}
+	if lines := strings.Count(view, "\n") + 1; lines > 20 {
+		t.Fatalf("the view is %d lines in a 20 line terminal", lines)
+	}
+}
+
+// TestViewIsPure pins the rule the whole design rests on: rendering must not
+// change the program. It was violated twice — the scroll state was written to a
+// discarded copy, and the inspect model was written through a live pointer.
+func TestViewIsPure(t *testing.T) {
+	for _, screen := range []ScreenID{
+		ScreenHome, ScreenOperations, ScreenInspect, ScreenProviders, ScreenHelp,
+	} {
+		m := operationsModel(t, 20)
+		m.selectedID = "conn-1"
+		m.transitionTo(screen)
+		m.measureViewport()
+
+		before := m.scroll
+		// A deep comparison, because the inspect model holds slices and the
+		// defect was assignment through a pointer into the live model.
+		var inspectBefore string
+		if m.inspect != nil {
+			inspectBefore = fmt.Sprintf("%#v", *m.inspect)
+		}
+
+		first := m.View().Content
+		second := m.View().Content
+
+		if m.scroll != before {
+			t.Errorf("%s: View changed the scroll state: %+v -> %+v", screen, before, m.scroll)
+		}
+		if m.inspect != nil && fmt.Sprintf("%#v", *m.inspect) != inspectBefore {
+			t.Errorf("%s: View mutated the live inspect model", screen)
+		}
+		if first != second {
+			t.Errorf("%s: two identical renders differ", screen)
 		}
 	}
 }
 
-// TestScrollingStopsAtTheEnd pins that the viewport cannot run off the bottom
-// into blank space.
-func TestScrollingStopsAtTheEnd(t *testing.T) {
-	var state scrollState
-	content := numberedLines(30)
-
-	state.scrollBy(1000)
-	view := clipToViewport(content, 10, &state)
-	if !strings.Contains(view, "line-29") {
-		t.Fatalf("over-scrolling lost the end of the content:\n%s", view)
+// TestAScreenOpensAtTheTop pins that a newly shown screen does not inherit the
+// offset of the one before it.
+func TestAScreenOpensAtTheTop(t *testing.T) {
+	m := operationsModel(t, 20)
+	next, _ := m.Update(keyMsg("end"))
+	m = next.(Model)
+	if m.scroll.offset == 0 {
+		t.Fatal("the fixture no longer scrolls")
 	}
-	if strings.Count(view, "\n") > 9 {
-		t.Fatalf("over-scrolling produced blank space:\n%q", view)
+
+	next, _ = m.Update(keyMsg("esc"))
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("o"))
+	m = next.(Model)
+
+	if m.scroll.offset != 0 {
+		t.Fatalf("reopening a screen started at offset %d", m.scroll.offset)
 	}
 }
 
-// TestShortContentIsNotClipped pins that content which fits is untouched, with
-// no indicator and no reserved line.
+// TestShortContentIsNotClipped pins that content which fits is untouched.
 func TestShortContentIsNotClipped(t *testing.T) {
-	var state scrollState
-	content := numberedLines(5)
-	if got := clipToViewport(content, 20, &state); got != content {
-		t.Fatalf("content that fits was modified:\n%s", got)
-	}
-	if state.overflow {
-		t.Fatal("content that fits reported overflow")
-	}
-}
+	m := readyModel(&fakeClient{}, testSnapshot())
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 200})
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("o"))
+	m = next.(Model)
 
-// TestOpeningAScreenStartsAtTheTop pins that a screen does not inherit the
-// scroll position of the one before it — which would open a fresh screen part
-// way down for no reason the user could see.
-func TestOpeningAScreenStartsAtTheTop(t *testing.T) {
-	var state scrollState
-	state.follow(ScreenOperations)
-	state.scrollBy(40)
-
-	state.follow(ScreenInspect)
-	if state.offset != 0 {
-		t.Fatalf("a newly opened screen started at offset %d", state.offset)
+	view := m.View().Content
+	if strings.Contains(view, "more below") || strings.Contains(view, "more above") {
+		t.Fatalf("content that fits reported an overflow:\n%s", view)
 	}
 }
 
 // TestTheConnectionListIsNotScrolledTwice pins that the home screen, which
-// already tracks an offset to keep the selected connection visible, is not also
+// tracks its own offset to keep the selected connection visible, is not also
 // moved by this mechanism.
 func TestTheConnectionListIsNotScrolledTwice(t *testing.T) {
 	if scrollsFreely(ScreenHome) {
@@ -128,42 +180,33 @@ func TestTheConnectionListIsNotScrolledTwice(t *testing.T) {
 	}
 }
 
-// TestScrollKeysReachHiddenContent pins the keys end to end through the model.
-func TestScrollKeysReachHiddenContent(t *testing.T) {
-	m := readyModel(&fakeClient{}, testSnapshot())
-	m.screen = ScreenOperations
-	m.height = 10
-	m.scroll.follow(ScreenOperations)
-	m.scroll.height = 10
-
-	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
-	m = next.(Model)
-
-	if m.scroll.offset == 0 {
-		t.Fatal("page down did not move the viewport")
-	}
-
-	next, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
-	m = next.(Model)
-	if m.scroll.offset != 0 {
-		t.Fatalf("page up did not return to the top: offset %d", m.scroll.offset)
-	}
-}
-
 // TestScrollKeysDoNotFireWhileTyping pins that page keys reach the field rather
-// than the viewport when a question is being answered, and that the wizard's
-// own keyboard ownership is not broken by adding a global key.
+// than the viewport when a question is being answered.
 func TestScrollKeysDoNotFireWhileTyping(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
-	m.screen = ScreenNewConnection
-	m.height = 10
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 10})
+	m = next.(Model)
+	m.transitionTo(ScreenNewConnection)
 
 	before := m.scroll.offset
-	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	next, _ = m.Update(keyMsg("pgdown"))
 	m = next.(Model)
 
 	if m.scroll.offset != before {
 		t.Fatal("a page key scrolled the screen while the wizard owned the keyboard")
+	}
+}
+
+// TestCtrlDIsNotAScrollKey pins that end-of-input is not bound to scrolling.
+func TestCtrlDIsNotAScrollKey(t *testing.T) {
+	m := operationsModel(t, 20)
+	before := m.scroll.offset
+
+	next, _ := m.Update(tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl})
+	m = next.(Model)
+
+	if m.scroll.offset != before {
+		t.Fatal("ctrl+d scrolled: in a terminal it means end of input")
 	}
 }
 
