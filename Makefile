@@ -8,7 +8,7 @@ LDFLAGS  = -s -w \
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e vet staticcheck clean
+.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -38,6 +38,24 @@ staticcheck:
 	staticcheck ./...
 
 lint: vet staticcheck
+
+fmt-check:
+	@out="$$(gofmt -l . | grep -v '^vendor/' || true)"; \
+	if [ -n "$$out" ]; then \
+		echo "These files are not gofmt'd:"; echo "$$out"; exit 1; \
+	fi
+
+# validate is the gate a release must pass. It exists so the check is one
+# command rather than five that have to be remembered in the right order — the
+# way a step gets skipped is by it being a step someone has to remember.
+validate: fmt-check
+	go build ./...
+	go vet ./...
+	staticcheck ./...
+	go test ./... -count=1
+	go test -race ./... -count=1
+	@echo
+	@echo "All release gates passed."
 
 clean:
 	rm -f portico

@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	cf "github.com/cloudflare/cloudflare-go"
@@ -76,8 +77,12 @@ func (m *APIManager) Get(ctx context.Context, accountID, tunnelID string) (*Tunn
 	rc := cf.AccountIdentifier(accountID)
 	tunnel, err := m.client.GetTunnel(ctx, rc, tunnelID)
 	if err != nil {
-		// Check for not-found error.
-		if cfErr, ok := err.(*cf.Error); ok && cfErr.StatusCode == 404 {
+		// errors.As, not a type assertion: the client wraps its errors, so a
+		// direct assertion silently fails and a deleted tunnel is reported
+		// as a failed lookup instead of an absent one. One of the four places
+		// that made this check had already been corrected; the others had not.
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) && cfErr.StatusCode == 404 {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("getting tunnel: %w", err)

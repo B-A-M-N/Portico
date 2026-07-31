@@ -75,10 +75,21 @@ func safeShortID(id string, length int) string {
 
 // New creates a new Cloudflare provider.
 func New(apiToken, accountID, zoneID, cloudflaredBin, logDir string, connectorProc core.ConnectorProcessService) (*Provider, error) {
+	return newWithOptions(apiToken, accountID, zoneID, cloudflaredBin, logDir, connectorProc)
+}
+
+// newWithOptions builds the provider with extra client options.
+//
+// The options exist so a contract test can point the client at a local server
+// and assert what Portico actually sends. Without a seam the adapter could only
+// be tested through its own helpers, which asserts that the code agrees with
+// itself rather than that the requests are the ones Cloudflare documents.
+func newWithOptions(apiToken, accountID, zoneID, cloudflaredBin, logDir string,
+	connectorProc core.ConnectorProcessService, opts ...cf.Option) (*Provider, error) {
 	if connectorProc == nil {
 		return nil, fmt.Errorf("cloudflare: connector process service is required")
 	}
-	api, err := cf.NewWithAPIToken(apiToken)
+	api, err := cf.NewWithAPIToken(apiToken, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("cloudflare client: %w", err)
 	}

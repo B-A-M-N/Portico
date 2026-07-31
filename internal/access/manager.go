@@ -140,7 +140,12 @@ func (m *APIManager) GetApp(ctx context.Context, accountID, appID string) (*AppS
 	rc := cf.AccountIdentifier(accountID)
 	app, err := m.client.GetAccessApplication(ctx, rc, appID)
 	if err != nil {
-		if cfErr, ok := err.(*cf.Error); ok && cfErr.StatusCode == 404 {
+		// errors.As, not a type assertion: the client wraps its errors, so a
+		// direct assertion silently fails and a deleted application is reported
+		// as a failed lookup instead of an absent one. One of the four places
+		// that made this check had already been corrected; the others had not.
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) && cfErr.StatusCode == 404 {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("getting Access app: %w", err)

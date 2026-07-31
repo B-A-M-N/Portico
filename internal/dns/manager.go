@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	cf "github.com/cloudflare/cloudflare-go"
@@ -80,7 +81,12 @@ func (m *APIManager) GetRecord(ctx context.Context, zoneID, recordID string) (*R
 	rc := cf.ZoneIdentifier(zoneID)
 	record, err := m.client.GetDNSRecord(ctx, rc, recordID)
 	if err != nil {
-		if cfErr, ok := err.(*cf.Error); ok && cfErr.StatusCode == 404 {
+		// errors.As, not a type assertion: the client wraps its errors, so a
+		// direct assertion silently fails and a deleted record is reported
+		// as a failed lookup instead of an absent one. One of the four places
+		// that made this check had already been corrected; the others had not.
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) && cfErr.StatusCode == 404 {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("getting DNS record: %w", err)
