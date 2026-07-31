@@ -1572,7 +1572,10 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 
 	t.Run("validation failure", func(t *testing.T) {
 		m := enterCredentialStep(t)
-		next, _ := m.Update(providerAccountConfiguredMsg{Err: errors.New("token rejected")})
+		next, _ := m.Update(providerAccountConfiguredMsg{
+			Generation: m.providerSetupRequests.next(),
+			Err:        errors.New("token rejected"),
+		})
 		m = next.(Model)
 		if m.providerSetupValue("credential") != "" {
 			t.Fatalf("rejected credential stayed in memory: %q", m.providerSetupValue("credential"))
@@ -1595,7 +1598,8 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		m := enterCredentialStep(t)
 		next, _ := m.Update(providerAccountConfiguredMsg{
-			Response: &ipc.ConfigureProviderAccountResponse{Validated: true},
+			Generation: m.providerSetupRequests.next(),
+			Response:   &ipc.ConfigureProviderAccountResponse{Validated: true},
 		})
 		m = next.(Model)
 		if m.providerSetupValue("credential") != "" {
@@ -1616,7 +1620,8 @@ func TestCredentialNeverAppearsInAnyRenderedView(t *testing.T) {
 
 	// A backend error must not echo the credential back into the UI.
 	next, _ := m.Update(providerAccountConfiguredMsg{
-		Err: errors.New("token rejected for account account-a"),
+		Generation: m.providerSetupRequests.next(),
+		Err:        errors.New("token rejected for account account-a"),
 	})
 	m = next.(Model)
 
@@ -2011,6 +2016,7 @@ func TestAnUnverifiedAccountIsNotReportedAsConfigured(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
 
 	next, _ := m.Update(providerAccountConfiguredMsg{
+		Generation: m.providerSetupRequests.next(),
 		Response: &ipc.ConfigureProviderAccountResponse{
 			Status:                  "pending",
 			VerificationUnavailable: "Portico cannot check an acme credential, so this account is saved but unverified.",

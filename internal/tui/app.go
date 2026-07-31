@@ -84,6 +84,25 @@ type Model struct {
 	repairConnectionID         string
 	awaitingRepairVerification bool
 
+	// planRequests correlates plan replies, and planConnectionID records which
+	// connection the outstanding plan is for. The preview's identity is read
+	// from the plan, never from wherever the cursor happens to be.
+	planRequests     requestTracker
+	planConnectionID string
+
+	// diagnosticsRequests correlates diagnostic replies to the connection they
+	// were gathered for, and diagnosticsFailed records a check that could not
+	// run — which must never render as a connection with no problems.
+	diagnosticsRequests     requestTracker
+	diagnosticsConnectionID string
+	diagnosticsFailed       error
+
+	// providerSetupRequests correlates account submissions, and
+	// providerSetupSubmitting stops a second Enter sending the credential
+	// again while the first is still in flight.
+	providerSetupRequests   requestTracker
+	providerSetupSubmitting bool
+
 	// Provider account setup state
 	// Provider setup is driven by the provider's own declared fields rather
 	// than by Cloudflare's, which is what the screen used to hardcode.
@@ -233,6 +252,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, wizardCmd
 
 	case planLoadedMsg:
+		// A plan the user has moved on from must not open a preview. Showing it
+		// would describe a change to one connection while naming another, and
+		// the next keypress applies it.
+		if !m.planRequests.accepts(msg.Generation) {
+			return m, nil
+		}
 		if msg.Err != nil {
 			m.status = statusLine("plan failed", msg.Err)
 			return m, nil
@@ -378,12 +403,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case diagnosticsMsg:
+		// Findings belong to the connection they were gathered for. Applying a
+		// late reply to whatever is selected now would show one connection's
+		// problems against another.
+		if !m.diagnosticsRequests.accepts(msg.Generation) {
+			return m, nil
+		}
 		if msg.Err != nil {
+			// A failed check is reported as a failed check. Leaving the
+			// previous findings on screen, or showing none, would both read as
+			// a healthy connection.
+			m.diagnostics = nil
+			m.diagnosticsFailed = msg.Err
 			m.status = statusLine("diagnostics failed", msg.Err)
 			return m, nil
 		}
 		m.status = ""
+		m.diagnosticsFailed = nil
 		m.diagnostics = msg.Findings
+		m.diagnosticsConnectionID = msg.ConnectionID
 
 		// If we just completed repair verification, show the results
 		if len(m.preRepairDiagnostics) > 0 && m.repairConnectionID != "" {
@@ -419,6 +457,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case providerAccountConfiguredMsg:
+		// A result from a setup the user abandoned must not clear or alter the
+		// one they are working on now.
+		if !m.providerSetupRequests.accepts(msg.Generation) {
+			return m, nil
+		}
+		m.providerSetupSubmitting = false
 		if msg.Err != nil {
 			// Keep the answers that were accepted and return to the credential
 			// step, which is what validation almost always rejects. Restarting
@@ -630,8 +674,13 @@ type snapshotMsg struct {
 }
 
 type planLoadedMsg struct {
-	Plan *ipc.PlanDTO
-	Err  error
+	// Generation and ConnectionID identify the request this answers. The user
+	// can move the cursor while a plan is being prepared, and a plan applied
+	// under the wrong name is the worst thing this interface can do.
+	Generation   requestGeneration
+	ConnectionID string
+	Plan         *ipc.PlanDTO
+	Err          error
 }
 
 type planAppliedMsg struct {
@@ -669,8 +718,14 @@ type resyncMsg struct {
 }
 
 type diagnosticsMsg struct {
-	Findings []ipc.DiagnosticDTO
-	Err      error
+	// Generation and ConnectionID identify the request this answers.
+	// Diagnostics were applied to whatever was selected when they arrived, so
+	// findings for one connection could be displayed against another and the
+	// repair flow could reason from the wrong evidence.
+	Generation   requestGeneration
+	ConnectionID string
+	Findings     []ipc.DiagnosticDTO
+	Err          error
 }
 
 type discoveryMsg struct {
@@ -679,8 +734,12 @@ type discoveryMsg struct {
 }
 
 type providerAccountConfiguredMsg struct {
-	Response *ipc.ConfigureProviderAccountResponse
-	Err      error
+	// Generation and ProviderID identify the submission this answers, so a
+	// result from a setup the user abandoned cannot alter a newer one.
+	Generation requestGeneration
+	ProviderID string
+	Response   *ipc.ConfigureProviderAccountResponse
+	Err        error
 }
 
 type readinessMsg struct {
@@ -810,15 +869,19 @@ func (m *Model) connectionLogsCmd(connID string) tea.Cmd {
 func (m *Model) diagnosticsCmd(connID string) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
+	generation := m.diagnosticsRequests.next()
+	m.diagnosticsConnectionID = connID
 	return func() tea.Msg {
+		reply := diagnosticsMsg{Generation: generation, ConnectionID: connID}
 		if client == nil {
-			return diagnosticsMsg{Err: fmt.Errorf("no supervisor connection")}
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
 		}
 		// Diagnostics can take a while — use a bounded timeout.
 		diagCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		findings, err := client.Diagnostics(diagCtx, connID)
-		return diagnosticsMsg{Findings: findings, Err: err}
+		reply.Findings, reply.Err = client.Diagnostics(diagCtx, connID)
+		return reply
 	}
 }
 
@@ -865,14 +928,18 @@ func (m *Model) loadOperationsCmd() tea.Cmd {
 func (m *Model) configureProviderAccountCmd(providerID string, req ipc.ConfigureProviderAccountRequest) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
+	generation := m.providerSetupRequests.next()
+	m.providerSetupSubmitting = true
 	return func() tea.Msg {
+		reply := providerAccountConfiguredMsg{Generation: generation, ProviderID: providerID}
 		if client == nil {
-			return providerAccountConfiguredMsg{Err: fmt.Errorf("no supervisor connection")}
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
 		}
 		configCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		resp, err := client.ConfigureProviderAccount(configCtx, providerID, req)
-		return providerAccountConfiguredMsg{Response: resp, Err: err}
+		reply.Response, reply.Err = client.ConfigureProviderAccount(configCtx, providerID, req)
+		return reply
 	}
 }
 
@@ -896,56 +963,72 @@ func (m *Model) requestSnapshot() tea.Cmd {
 func (m *Model) planOpenCmd(connID string) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
+	generation := m.planRequests.next()
+	m.planConnectionID = connID
 	return func() tea.Msg {
+		reply := planLoadedMsg{Generation: generation, ConnectionID: connID}
 		if client == nil {
-			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
 		}
 		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		plan, err := client.PlanOpen(planCtx, connID)
-		return planLoadedMsg{Plan: plan, Err: err}
+		reply.Plan, reply.Err = client.PlanOpen(planCtx, connID)
+		return reply
 	}
 }
 
 func (m *Model) planCloseCmd(connID string) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
+	generation := m.planRequests.next()
+	m.planConnectionID = connID
 	return func() tea.Msg {
+		reply := planLoadedMsg{Generation: generation, ConnectionID: connID}
 		if client == nil {
-			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
 		}
 		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		plan, err := client.PlanClose(planCtx, connID)
-		return planLoadedMsg{Plan: plan, Err: err}
+		reply.Plan, reply.Err = client.PlanClose(planCtx, connID)
+		return reply
 	}
 }
 
 func (m *Model) planRepairCmd(connID string) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
+	generation := m.planRequests.next()
+	m.planConnectionID = connID
 	return func() tea.Msg {
+		reply := planLoadedMsg{Generation: generation, ConnectionID: connID}
 		if client == nil {
-			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
 		}
 		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		plan, err := client.PlanRepair(planCtx, connID)
-		return planLoadedMsg{Plan: plan, Err: err}
+		reply.Plan, reply.Err = client.PlanRepair(planCtx, connID)
+		return reply
 	}
 }
 
 func (m *Model) planDeleteCmd(connID string) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
+	generation := m.planRequests.next()
+	m.planConnectionID = connID
 	return func() tea.Msg {
+		reply := planLoadedMsg{Generation: generation, ConnectionID: connID}
 		if client == nil {
-			return planLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
 		}
 		planCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		plan, err := client.PlanDelete(planCtx, connID)
-		return planLoadedMsg{Plan: plan, Err: err}
+		reply.Plan, reply.Err = client.PlanDelete(planCtx, connID)
+		return reply
 	}
 }
 
@@ -1186,6 +1269,12 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// Can't go back from home
 			return m, nil
 		}
+		// Leaving a screen abandons whatever it was waiting for, so a reply
+		// still in flight cannot reopen it behind the user.
+		if m.screen == ScreenPlanPreview || m.screen == ScreenRepair {
+			m.planRequests.cancel()
+			m.planConnectionID = ""
+		}
 		// Try to pop the navigation stack
 		if !m.popScreen() {
 			// Stack empty, go to home
@@ -1239,6 +1328,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, tea.Batch(m.connectionDetailCmd(conn.ID), m.connectionLogsCmd(conn.ID))
 		} else if m.screen == ScreenPlanPreview && m.plan != nil {
 			if m.applying {
+				return m, nil
+			}
+			// What is applied must be what was previewed. The plan carries the
+			// connection it was prepared for, and it is checked against the
+			// connection the preview was opened for rather than assumed.
+			if m.planConnectionID != "" && m.plan.ConnectionID != "" &&
+				m.plan.ConnectionID != m.planConnectionID {
+				m.status = "This plan is for a different connection; press esc and try again"
 				return m, nil
 			}
 			// Apply the previewed plan asynchronously.
@@ -1422,6 +1519,8 @@ func (m *Model) clearProviderSetupSecret() {
 
 // clearProviderSetup resets the whole setup flow, secret included.
 func (m *Model) clearProviderSetup() {
+	m.providerSetupRequests.cancel()
+	m.providerSetupSubmitting = false
 	m.clearProviderSetupSecret()
 	m.providerSetupStep = 0
 	m.providerSetupIndex = 0
@@ -1462,6 +1561,18 @@ func (m *Model) setProviderSetupValue(id, value string) {
 // sequence of Cloudflare's four inputs. Steps are: one per field, then a final
 // confirmation.
 func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
+	// A guidance flow describes what to do elsewhere. The screen already
+	// renders it as instructions, but the keyboard went on walking fields,
+	// accepting typed values and submitting them — so a credential could be
+	// typed into a form whose own text says Portico cannot store it, and the
+	// refusal arrived from the server.
+	if m.providerSetupFlow != nil && !m.providerSetupFlow.StoresAccount() {
+		if key == "esc" || key == "enter" {
+			m.clearProviderSetup()
+		}
+		return m, nil
+	}
+
 	fields := m.providerSetupFields()
 	if len(fields) == 0 {
 		// Nothing to collect: the flow either failed to load or declares no
@@ -1480,6 +1591,11 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 			m.providerSetupError = ""
 			return m, m.forgetSecretAt(len(fields) - 1)
 		case "enter":
+			if m.providerSetupSubmitting {
+				// The credential is already on its way. Sending it again would
+				// write the account twice and race two replies.
+				return m, nil
+			}
 			req := ipc.ConfigureProviderAccountRequest{
 				Fields: maps.Clone(m.providerSetupValues),
 			}
@@ -1900,10 +2016,16 @@ func (m *Model) renderPlanPreview() string {
 	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" [%s] ", strings.ToUpper(intent))))
 	b.WriteString("\n\n")
 
-	// Connection and provider/account
-	conn := m.SelectedConnection()
+	// The identity comes from the plan, never from the cursor. Reading the
+	// selection meant a plan prepared for one connection could be previewed
+	// under another's name if the user moved while it was being prepared —
+	// and the next keypress applies what the plan says, not what the screen
+	// said.
+	conn := m.connectionByID(m.plan.ConnectionID)
 	if conn != nil {
 		b.WriteString(fmt.Sprintf("Connection: %s\n", conn.Name))
+	} else if m.plan.ConnectionID != "" {
+		b.WriteString(fmt.Sprintf("Connection: %s\n", m.plan.ConnectionID))
 	}
 	b.WriteString(fmt.Sprintf("Provider:   %s\n", m.plan.Provider))
 	if conn != nil && conn.ProviderAccountID != "" {
@@ -2244,6 +2366,11 @@ func (m *Model) renderProviderSetup() string {
 		b.WriteString("This provider declares no fields to fill in.\n")
 
 	case m.providerSetupIndex >= len(fields):
+		if m.providerSetupSubmitting {
+			b.WriteString("Checking the credential and saving the account...\n\n")
+			b.WriteString("  Please wait; pressing enter again will not send it twice.\n")
+			return b.String()
+		}
 		b.WriteString(fmt.Sprintf("Step %d/%d: Confirm\n\n", len(fields)+1, len(fields)+1))
 		for _, field := range fields {
 			value := m.providerSetupValue(field.ID)
@@ -2311,36 +2438,59 @@ func (m *Model) renderRepair() string {
 		b.WriteString(m.theme.Style("header").Render(" REPAIR VERIFICATION "))
 		b.WriteString("\n\n")
 
-		preCount := len(m.preRepairDiagnostics)
-		postCount := len(m.diagnostics)
+		// Findings are compared by identity, not by counting them. A repair
+		// that fixed DNS and broke the connector leaves the count unchanged,
+		// and a lower count does not show that the intended repair worked.
+		resolved, remaining, appeared := compareFindings(m.preRepairDiagnostics, m.diagnostics)
 
-		if postCount == 0 {
-			b.WriteString(m.theme.Style("stable").Render("✓ All issues resolved!"))
+		switch {
+		case m.diagnosticsFailed != nil:
+			// A check that could not run is not a clean bill of health.
+			b.WriteString(m.theme.Style("intervention").Render("✗ Could not verify the repair"))
 			b.WriteString("\n\n")
-			b.WriteString(fmt.Sprintf("Fixed %d issue(s):\n", preCount))
-			for _, d := range m.preRepairDiagnostics {
+			b.WriteString("  " + m.diagnosticsFailed.Error() + "\n")
+			b.WriteString("  The repair may or may not have worked; nothing was checked.\n")
+
+		case len(remaining) == 0 && len(appeared) == 0:
+			b.WriteString(m.theme.Style("stable").Render("✓ All issues resolved"))
+			b.WriteString("\n\n")
+			b.WriteString(fmt.Sprintf("Fixed %d issue(s):\n", len(resolved)))
+			for _, d := range resolved {
 				b.WriteString(fmt.Sprintf("  ✓ %s: %s\n", d.Segment, d.Summary))
 			}
-		} else if postCount < preCount {
-			b.WriteString(m.theme.Style("attention").Render("⚠ Partial repair"))
-			b.WriteString("\n\n")
-			b.WriteString(fmt.Sprintf("Fixed %d of %d issue(s)\n\n", preCount-postCount, preCount))
 
-			b.WriteString("Remaining issues:\n")
-			for _, d := range m.diagnostics {
-				b.WriteString(fmt.Sprintf("  ✗ %s: %s\n", d.Segment, d.Summary))
-				if d.Explanation != "" {
-					b.WriteString("      " + d.Explanation + "\n")
+		default:
+			if len(resolved) > 0 {
+				b.WriteString(m.theme.Style("attention").Render("⚠ Partial repair"))
+			} else {
+				b.WriteString(m.theme.Style("intervention").Render("✗ Repair did not resolve the problem"))
+			}
+			b.WriteString("\n\n")
+			if len(resolved) > 0 {
+				b.WriteString(fmt.Sprintf("Fixed %d issue(s):\n", len(resolved)))
+				for _, d := range resolved {
+					b.WriteString(fmt.Sprintf("  ✓ %s: %s\n", d.Segment, d.Summary))
+				}
+				b.WriteString("\n")
+			}
+			if len(remaining) > 0 {
+				b.WriteString("Still present:\n")
+				for _, d := range remaining {
+					b.WriteString(fmt.Sprintf("  ✗ %s: %s\n", d.Segment, d.Summary))
+					if d.Explanation != "" {
+						b.WriteString("      " + d.Explanation + "\n")
+					}
 				}
 			}
-		} else {
-			b.WriteString(m.theme.Style("intervention").Render("✗ Repair did not resolve issues"))
-			b.WriteString("\n\n")
-			b.WriteString("Current issues:\n")
-			for _, d := range m.diagnostics {
-				b.WriteString(fmt.Sprintf("  ✗ %s: %s\n", d.Segment, d.Summary))
-				if d.Explanation != "" {
-					b.WriteString("      " + d.Explanation + "\n")
+			if len(appeared) > 0 {
+				// New problems matter most: the repair changed something and
+				// this is what it changed.
+				b.WriteString("\nNew since the repair:\n")
+				for _, d := range appeared {
+					b.WriteString(fmt.Sprintf("  ✗ %s: %s\n", d.Segment, d.Summary))
+					if d.Explanation != "" {
+						b.WriteString("      " + d.Explanation + "\n")
+					}
 				}
 			}
 		}
@@ -2740,4 +2890,52 @@ var _ tea.Model = (*Model)(nil)
 // SetAltScreen enables or disables the alternate screen.
 func (m *Model) SetAltScreen(on bool) {
 	// alt screen is set in View()
+}
+
+// connectionByID finds a connection in the current snapshot.
+//
+// The plan preview and anything else describing a specific connection resolves
+// it by ID rather than by cursor position, so what is displayed cannot drift
+// from what will be changed.
+func (m *Model) connectionByID(id string) *ipc.ConnectionDTO {
+	if id == "" {
+		return nil
+	}
+	for i := range m.snapshot.Connections {
+		if m.snapshot.Connections[i].ID == id {
+			return &m.snapshot.Connections[i]
+		}
+	}
+	return nil
+}
+
+// compareFindings reports what a repair actually changed.
+//
+// Counting findings before and after cannot answer that: a repair that fixed
+// one problem and caused another leaves the count unchanged, and a lower count
+// does not show that the intended repair worked. Findings carry stable IDs, so
+// they can be compared by identity.
+func compareFindings(before, after []ipc.DiagnosticDTO) (resolved, remaining, appeared []ipc.DiagnosticDTO) {
+	beforeByID := make(map[string]ipc.DiagnosticDTO, len(before))
+	for _, d := range before {
+		beforeByID[d.ID] = d
+	}
+	afterByID := make(map[string]bool, len(after))
+	for _, d := range after {
+		afterByID[d.ID] = true
+	}
+
+	for _, d := range before {
+		if !afterByID[d.ID] {
+			resolved = append(resolved, d)
+		}
+	}
+	for _, d := range after {
+		if _, existed := beforeByID[d.ID]; existed {
+			remaining = append(remaining, d)
+		} else {
+			appeared = append(appeared, d)
+		}
+	}
+	return resolved, remaining, appeared
 }
