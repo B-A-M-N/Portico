@@ -27,6 +27,13 @@ type Requirement struct {
 
 // Capabilities represents provider capabilities.
 type Capabilities struct {
+	// Kinds are the connection kinds this provider can plan and execute.
+	//
+	// Empty means service exposure only, so a provider written before this
+	// existed keeps its previous meaning. Without it, "which kinds work" was a
+	// hardcoded list in the recommendation engine that drifted out of date and
+	// refused a kind Portico could already execute.
+	Kinds              []ConnectionKind
 	TemporaryAddresses CapabilitySupport
 	CustomHostnames    CapabilitySupport
 	PrivateExposure    CapabilitySupport
@@ -214,4 +221,22 @@ type ProviderIdentity struct {
 	Name        string
 	DisplayName string
 	LogoURL     string
+}
+
+// Executes reports whether a provider can run a connection kind.
+func (c Capabilities) Executes(kind ConnectionKind) bool {
+	if kind == "" {
+		return true
+	}
+	if len(c.Kinds) == 0 {
+		// A provider that declares nothing is a service-exposure provider,
+		// which is what every provider was when this field did not exist.
+		return kind == ConnectionServiceExposure
+	}
+	for _, k := range c.Kinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }

@@ -62,6 +62,7 @@ func (p *Provider) Identity() core.ProviderIdentity {
 // and stops a public provider being offered for a forward.
 func (p *Provider) Capabilities(context.Context) (core.Capabilities, error) {
 	return core.Capabilities{
+		Kinds: []core.ConnectionKind{core.ConnectionPortForward},
 		TemporaryAddresses: core.CapabilitySupport{
 			Supported: false,
 			Notes:     []string{"a forward is local; it creates no public address"},

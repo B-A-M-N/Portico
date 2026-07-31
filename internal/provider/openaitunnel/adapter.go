@@ -103,6 +103,7 @@ func (p *Provider) Identity() core.ProviderIdentity {
 // was written to correct.
 func (p *Provider) Capabilities(context.Context) (core.Capabilities, error) {
 	return core.Capabilities{
+		Kinds: []core.ConnectionKind{core.ConnectionClientTunnel},
 		TemporaryAddresses: core.CapabilitySupport{
 			Supported: false,
 			Notes:     []string{"the tunnel is private; it never creates a public address"},

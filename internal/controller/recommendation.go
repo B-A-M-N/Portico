@@ -128,11 +128,14 @@ func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput)
 
 	caps := prov.Capabilities
 
-	// Constraint: connection kind. Only service exposure is executable today;
-	// recommending a provider for a kind nothing can run would be misleading.
-	if input.Kind != "" && input.Kind != core.ConnectionServiceExposure {
+	// Constraint: connection kind. A provider is asked what it can execute
+	// rather than being measured against a hardcoded list — that list said only
+	// service exposure was executable, while Portico had been creating and
+	// running local port forwards for some time, so the engine refused a kind
+	// the rest of the system supported.
+	if !caps.Executes(input.Kind) {
 		eval.BlockingReasons = append(eval.BlockingReasons,
-			fmt.Sprintf("connection kind %q is not executable yet", input.Kind))
+			fmt.Sprintf("does not support %s connections", input.Kind))
 	}
 
 	// Constraint: exposure mode.

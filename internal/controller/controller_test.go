@@ -119,6 +119,11 @@ func TestCreateProfileDefaultsProtectedSessionTTL(t *testing.T) {
 	ctrl := New(newTestRegistry(mock.New()), newTestJournal())
 	profile := newFailureTestProfile()
 	if profile.Spec.ServiceExposure != nil {
+		// Protection needs an address that does not move, so this fixture is
+		// permanent: the subject of the test is the session TTL default.
+		profile.Spec.ServiceExposure.Exposure = core.ExposureSpec{
+			Mode: core.ExposurePermanent, RequestedAddress: "app.example.com",
+		}
 		profile.Spec.ServiceExposure.Protection = core.ProtectionSpec{
 			Kind:          core.ProtectionEmailOTP,
 			AllowedEmails: []string{"person@example.com"},

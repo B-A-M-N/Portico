@@ -503,6 +503,26 @@ func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec
 		}
 	}
 
+	// Access protection needs an address that does not move. A temporary
+	// address changes every time the connector restarts, so a policy bound to
+	// it stops applying without anything reporting that it stopped.
+	//
+	// This lived only as a condition in the setup wizard, which meant it was
+	// enforced for people using that screen and by nothing else: the
+	// recommendation engine checks whether a provider lists the protection
+	// kind, never whether the exposure can carry it, so the combination was
+	// accepted and failed when the plan was applied — after the connection had
+	// been saved. It belongs here, where every path reaches it.
+	// Private-network protection is exempt: it is not a policy bound to a
+	// public hostname, so a changing address does not detach it.
+	if spec.Protection.Kind != "" && spec.Protection.Kind != ProtectionNone &&
+		spec.Protection.Kind != ProtectionPrivateNet &&
+		spec.Exposure.Mode == ExposureTemporary {
+		return fmt.Errorf(
+			"%s protection needs a permanent address: a temporary address changes when the "+
+				"connector restarts, so the protection would stop applying", spec.Protection.Kind)
+	}
+
 	// Write-enabled directories must not be exposed without protection.
 	// A publicly reachable upload endpoint is a severe security risk.
 	if spec.Source.Directory != nil && spec.Source.Directory.Mode == DirectoryModeWrites &&

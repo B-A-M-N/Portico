@@ -249,3 +249,34 @@ func TestPrivateAndPublicProvidersAreNotInterchangeable(t *testing.T) {
 		}
 	})
 }
+
+// TestRecommendationAsksProvidersWhichKindsTheyRun pins the removal of a
+// hardcoded list that had gone stale.
+//
+// The engine blocked every kind except service exposure, on the stated grounds
+// that nothing else was executable. Portico had been creating and running local
+// port forwards for some time, so the engine refused a kind the rest of the
+// system supported — and wiring the wizard to it would have started refusing
+// connections that work today.
+func TestRecommendationAsksProvidersWhichKindsTheyRun(t *testing.T) {
+	serviceOnly := core.Capabilities{}
+	if !serviceOnly.Executes(core.ConnectionServiceExposure) {
+		t.Fatal("a provider declaring no kinds must still run service exposure")
+	}
+	if serviceOnly.Executes(core.ConnectionPortForward) {
+		t.Fatal("a provider declaring no kinds must not claim port forwarding")
+	}
+
+	forwarder := core.Capabilities{Kinds: []core.ConnectionKind{core.ConnectionPortForward}}
+	if !forwarder.Executes(core.ConnectionPortForward) {
+		t.Fatal("a declared kind was not honoured")
+	}
+	if forwarder.Executes(core.ConnectionServiceExposure) {
+		t.Fatal("declaring one kind must not imply another")
+	}
+
+	// An unspecified kind constrains nothing.
+	if !serviceOnly.Executes("") {
+		t.Fatal("an unspecified kind must not block a provider")
+	}
+}

@@ -84,7 +84,7 @@ func TestConnectionProfileAllowsWriteDirectoryWithProtection(t *testing.T) {
 					Mode:        DirectoryModeWrites,
 					AllowUpload: true,
 				}},
-				Exposure:   ExposureSpec{Mode: ExposureTemporary},
+				Exposure:   ExposureSpec{Mode: ExposurePermanent, RequestedAddress: "files.example.com"},
 				Protection: ProtectionSpec{Kind: ProtectionEmailOTP},
 			},
 		},
@@ -135,5 +135,51 @@ func TestObservedConnectionFingerprintIsCanonicalAndComplete(t *testing.T) {
 	}
 	if policyOrder.AccessPolicies[0].AllowedEmails[0] != "z@example.com" {
 		t.Fatalf("ComputeFingerprint mutated observed policy: %#v", policyOrder.AccessPolicies)
+	}
+}
+
+// TestProtectionRequiresAnAddressThatDoesNotMove pins a rule that previously
+// lived only as a condition in the setup wizard.
+//
+// A temporary address changes when the connector restarts, so a policy bound to
+// it stops applying with nothing reporting that it stopped. Because the rule was
+// enforced only in one screen, the recommendation engine — which checks whether
+// a provider supports a protection kind, never whether the exposure can carry
+// it — accepted the combination, and it failed when the plan was applied, after
+// the connection had been saved.
+func TestProtectionRequiresAnAddressThatDoesNotMove(t *testing.T) {
+	newProfile := func(mode ExposureMode, protection ProtectionKind) *ConnectionProfile {
+		// A requested hostname belongs only to a permanent address; setting one
+		// on a temporary address is separately invalid.
+		exposure := ExposureSpec{Mode: mode}
+		if mode == ExposurePermanent {
+			exposure.RequestedAddress = "app.example.com"
+		}
+		return &ConnectionProfile{
+			ID: "c1", Name: "test", Kind: ConnectionServiceExposure,
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{
+				Source: SourceSpec{Kind: SourceExisting, Existing: &ExistingServiceSpec{
+					Network: "tcp", Address: "127.0.0.1:3000", Protocol: ProtocolHTTP,
+				}},
+				Exposure:   exposure,
+				Protection: ProtectionSpec{Kind: protection, AllowedEmails: []string{"p@example.com"}},
+			}},
+			Driver: DriverSelection{ProviderID: "mock"},
+		}
+	}
+
+	if err := newProfile(ExposureTemporary, ProtectionEmailOTP).Validate(); err == nil {
+		t.Fatal("protection was accepted on an address that changes")
+	}
+	if err := newProfile(ExposurePermanent, ProtectionEmailOTP).Validate(); err != nil {
+		t.Fatalf("protection on a permanent address was refused: %v", err)
+	}
+	if err := newProfile(ExposureTemporary, ProtectionNone).Validate(); err != nil {
+		t.Fatalf("an unprotected temporary address was refused: %v", err)
+	}
+	// Private-network protection is not bound to a public hostname, so a
+	// changing address does not detach it.
+	if err := newProfile(ExposureTemporary, ProtectionPrivateNet).Validate(); err != nil {
+		t.Fatalf("private-network protection was refused on a temporary address: %v", err)
 	}
 }
