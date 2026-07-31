@@ -407,8 +407,15 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			if profile.GetExposure().RequestedAddress != "" {
 				return nil, fmt.Errorf("quick tunnels do not support custom hostnames")
 			}
-			// Reject unsupported protection for temporary mode
-			if profile.GetProtection().Kind != core.ProtectionNone {
+			// Reject unsupported protection for temporary mode.
+			//
+			// The test is positive. Written as "kind is not none" it reads the
+			// zero value — which GetProtection returns for a profile with no
+			// protection spec at all — as protection being configured, and
+			// refuses to open a connection that asked for nothing. The same
+			// mistake elsewhere granted work rather than refusing it; here it
+			// would have made a valid connection unopenable.
+			if profile.IsProtected() {
 				return nil, fmt.Errorf("quick tunnels do not support access protection")
 			}
 

@@ -183,3 +183,81 @@ func TestProtectionRequiresAnAddressThatDoesNotMove(t *testing.T) {
 		t.Fatalf("private-network protection was refused on a temporary address: %v", err)
 	}
 }
+
+// TestIsProtectedIsPositive pins the predicate that replaced four hand-written
+// "kind is not none" checks.
+//
+// Each of those read the zero value returned for a profile with no protection
+// spec as protection being configured. Three granted work that was not asked
+// for; the fourth refused to open a connection that had asked for nothing.
+func TestIsProtectedIsPositive(t *testing.T) {
+	cases := []struct {
+		name    string
+		profile *ConnectionProfile
+		want    bool
+	}{
+		{"no spec at all", &ConnectionProfile{}, false},
+		{"a port forward", &ConnectionProfile{
+			Kind: ConnectionPortForward,
+			Spec: ConnectionSpec{PortForward: &PortForwardSpec{LocalPort: 5432}},
+		}, false},
+		{"an exposure with an unset kind", &ConnectionProfile{
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{}},
+		}, false},
+		{"an exposure asking for none", &ConnectionProfile{
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{
+				Protection: ProtectionSpec{Kind: ProtectionNone},
+			}},
+		}, false},
+		{"an exposure asking for email OTP", &ConnectionProfile{
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{
+				Protection: ProtectionSpec{Kind: ProtectionEmailOTP},
+			}},
+		}, true},
+		{"a nil profile", nil, false},
+	}
+
+	for _, tc := range cases {
+		if got := tc.profile.IsProtected(); got != tc.want {
+			t.Errorf("%s: IsProtected() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestExpectsPublicAddressIsNegative pins the companion predicate, whose test
+// runs the other way for a reason.
+//
+// An empty exposure mode means the creation default, which is public. A
+// diagnostic that reads it as private would suppress a genuine provider-edge
+// fault, so the test is "not private" rather than "is one of the public modes".
+func TestExpectsPublicAddressIsNegative(t *testing.T) {
+	cases := []struct {
+		name    string
+		profile *ConnectionProfile
+		want    bool
+	}{
+		{"a port forward", &ConnectionProfile{
+			Spec: ConnectionSpec{PortForward: &PortForwardSpec{LocalPort: 5432}},
+		}, false},
+		{"a private-only exposure", &ConnectionProfile{
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{
+				Exposure: ExposureSpec{Mode: ExposurePrivate},
+			}},
+		}, false},
+		{"an exposure with no mode set", &ConnectionProfile{
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{}},
+		}, true},
+		{"a temporary exposure", &ConnectionProfile{
+			Spec: ConnectionSpec{ServiceExposure: &ServiceExposureSpec{
+				Exposure: ExposureSpec{Mode: ExposureTemporary},
+			}},
+		}, true},
+		{"a nil profile", nil, false},
+	}
+
+	for _, tc := range cases {
+		if got := tc.profile.ExpectsPublicAddress(); got != tc.want {
+			t.Errorf("%s: ExpectsPublicAddress() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
