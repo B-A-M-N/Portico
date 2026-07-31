@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // The migration chain itself.
@@ -152,5 +154,125 @@ func TestAFreshDatabaseIsImmediatelyUsable(t *testing.T) {
 	}
 	if _, err := st.ListRecentOperations(ctx, 10); err != nil {
 		t.Fatalf("a fresh database cannot report operations: %v", err)
+	}
+}
+
+// TestRemovingAnAccountDecidesAndDeletesTogether pins that the dependency check
+// and the delete cannot be separated.
+//
+// As two operations under separate locks, a connection created or edited
+// between them binds an account that is about to be removed — and because the
+// account reference lives inside the profile's driver JSON rather than behind a
+// foreign key, nothing at the database level refuses it. The connection is left
+// pointing at a credential that no longer exists.
+func TestRemovingAnAccountDecidesAndDeletesTogether(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "accounts.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if err := st.UpsertProviderAccount(ctx, core.ProviderAccount{
+		Provider: "cloudflare", ID: "acct-work", Label: "Work",
+		CredentialRef: "cf/acct-work", Status: "authenticated",
+	}); err != nil {
+		t.Fatalf("UpsertProviderAccount: %v", err)
+	}
+
+	// An unused account is removed.
+	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-work")
+	if err != nil {
+		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
+	}
+	if len(deps) != 0 {
+		t.Fatalf("an unused account reported dependencies: %#v", deps)
+	}
+
+	// An account a connection depends on is kept, and the connection is named.
+	if err := st.UpsertProviderAccount(ctx, core.ProviderAccount{
+		Provider: "cloudflare", ID: "acct-used", Label: "Used",
+		CredentialRef: "cf/acct-used", Status: "authenticated",
+	}); err != nil {
+		t.Fatalf("UpsertProviderAccount: %v", err)
+	}
+	profile := &core.ConnectionProfile{
+		ID: "conn-1", Name: "api-staging", Kind: core.ConnectionServiceExposure,
+		Driver: core.DriverSelection{ProviderID: "cloudflare", AccountID: "acct-used"},
+		Spec: core.ConnectionSpec{ServiceExposure: &core.ServiceExposureSpec{
+			Source: core.SourceSpec{Kind: core.SourceExisting,
+				Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP}},
+			Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+			Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+		}},
+	}
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	deps, err = st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-used")
+	if err != nil {
+		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("expected one dependency, got %#v", deps)
+	}
+	if deps[0].Kind != "connection" || deps[0].Name != "api-staging" {
+		t.Fatalf("the dependency is not the connection by name: %#v", deps[0])
+	}
+
+	// And it really was not deleted.
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	var found bool
+	for _, a := range accounts {
+		if a.ID == "acct-used" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a refused removal deleted the account anyway")
+	}
+}
+
+// TestACleanupObligationBlocksRemovingTheAccountThatCanDischargeIt pins the
+// dependency that reporting only connections hid entirely.
+//
+// A resource Portico created and has not finished removing needs the credential
+// that created it. Removing the account takes away the only means of removing
+// the resource, and it stays at the provider with nothing able to delete it.
+func TestACleanupObligationBlocksRemovingTheAccountThatCanDischargeIt(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "cleanup.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if err := st.UpsertProviderAccount(ctx, core.ProviderAccount{
+		Provider: "cloudflare", ID: "acct-1", Label: "One",
+		CredentialRef: "cf/acct-1", Status: "authenticated",
+	}); err != nil {
+		t.Fatalf("UpsertProviderAccount: %v", err)
+	}
+	if err := st.RecordCleanupItem(ctx, CleanupItem{
+		OperationID: "op-1", ConnectionID: "conn-gone",
+		ProviderID: "cloudflare", AccountID: "acct-1",
+		ResourceType: core.ResourceTunnel, ExternalID: "tun-7", State: "pending",
+	}); err != nil {
+		t.Fatalf("RecordCleanupItem: %v", err)
+	}
+
+	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1")
+	if err != nil {
+		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
+	}
+	if len(deps) != 1 || deps[0].Kind != "cleanup_item" {
+		t.Fatalf("an outstanding cleanup did not block removal: %#v", deps)
+	}
+	if deps[0].Explanation == "" {
+		t.Fatal("the cleanup dependency does not explain the consequence")
 	}
 }

@@ -511,6 +511,50 @@ CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider ON provider_credent
 		version: 19,
 		onApply: migrateProviderAccountsToProviderScopedKey,
 	},
+	{
+		version: 20,
+		onApply: migrateCleanupItemsRecordTheirAccount,
+	},
+}
+
+// migrateCleanupItemsRecordTheirAccount adds the account that can discharge a
+// cleanup obligation.
+//
+// A cleanup item records which provider it belongs to but not which account.
+// The account holds the credential, so removing an account could take away the
+// only means of removing a resource Portico had created and not yet cleaned up,
+// leaving it at the provider with nothing able to delete it.
+//
+// It tolerates the table being absent. A database upgraded from a schema old
+// enough to predate it has nothing to alter, and refusing to start over a
+// column on a table with no rows would be a worse outcome than adding it later.
+func migrateCleanupItemsRecordTheirAccount(tx *sql.Tx) error {
+	var present int
+	if err := tx.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='resource_cleanup_items'",
+	).Scan(&present); err != nil {
+		return fmt.Errorf("check for resource_cleanup_items: %w", err)
+	}
+	if present == 0 {
+		return nil
+	}
+
+	var hasColumn int
+	if err := tx.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('resource_cleanup_items') WHERE name='provider_account_id'",
+	).Scan(&hasColumn); err != nil {
+		return fmt.Errorf("check for provider_account_id: %w", err)
+	}
+	if hasColumn > 0 {
+		return nil
+	}
+
+	if _, err := tx.Exec(
+		"ALTER TABLE resource_cleanup_items ADD COLUMN provider_account_id TEXT NOT NULL DEFAULT ''",
+	); err != nil {
+		return fmt.Errorf("add provider_account_id: %w", err)
+	}
+	return nil
 }
 
 // migrateProviderAccountsToProviderScopedKey rebuilds provider_accounts with a
@@ -4416,6 +4460,10 @@ type CleanupItem struct {
 	OperationID  core.OperationID
 	ConnectionID core.ConnectionID
 	ProviderID   core.ProviderID
+	// AccountID is the account whose credential created the resource, and is
+	// therefore the one that can remove it. Without it, removing an account can
+	// take away the only means of discharging this obligation.
+	AccountID    core.ProviderAccountID
 	ResourceType core.ResourceType
 	ExternalID   string
 	State        string
@@ -4435,13 +4483,15 @@ func (s *Store) RecordCleanupItem(ctx context.Context, item CleanupItem) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO resource_cleanup_items
-			(operation_id, connection_id, provider_id, resource_type, external_id, cleanup_state, last_error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(operation_id, connection_id, provider_id, provider_account_id, resource_type, external_id, cleanup_state, last_error, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(provider_id, resource_type, external_id) DO UPDATE SET
 			operation_id=excluded.operation_id, connection_id=excluded.connection_id,
+			provider_account_id=excluded.provider_account_id,
 			cleanup_state=excluded.cleanup_state, last_error=excluded.last_error,
 			updated_at=excluded.updated_at`,
-		item.OperationID, item.ConnectionID, item.ProviderID, string(item.ResourceType), item.ExternalID,
+		item.OperationID, item.ConnectionID, item.ProviderID, string(item.AccountID),
+		string(item.ResourceType), item.ExternalID,
 		item.State, item.LastError, now, now)
 	return err
 }
@@ -5008,6 +5058,160 @@ func (s *Store) DeleteProviderAccount(ctx context.Context, providerID core.Provi
 		return fmt.Errorf("delete account: %w", err)
 	}
 	return tx.Commit()
+}
+
+// AccountDependency is one thing that stands in the way of removing an account.
+//
+// Reporting only connections was not enough: a resource Portico created and has
+// not yet cleaned up needs the credential that created it, and removing the
+// account takes away the only means of cleaning it up.
+type AccountDependency struct {
+	// Kind is what sort of thing depends on the account: "connection" or
+	// "cleanup_item".
+	Kind string
+	// ID identifies it, and Name is what to call it when explaining.
+	ID   string
+	Name string
+	// Explanation says why this blocks removal, in terms of consequence.
+	Explanation string
+}
+
+// AccountDependencies is everything that blocks removing one account.
+type AccountDependencies []AccountDependency
+
+// ConnectionIDs returns just the connections, for callers that only report those.
+func (d AccountDependencies) ConnectionIDs() []string {
+	var ids []string
+	for _, dep := range d {
+		if dep.Kind == "connection" {
+			ids = append(ids, dep.ID)
+		}
+	}
+	return ids
+}
+
+// DeleteProviderAccountIfUnused removes an account only if nothing depends on
+// it, deciding and deleting inside one write transaction.
+//
+// The check and the delete used to be separate operations under separate locks.
+// A connection created or edited between them would bind an account that was
+// about to be deleted, and because the account reference lives inside the
+// profile's driver JSON rather than behind a foreign key, nothing at the
+// database level would refuse it. The connection would be stranded with a
+// credential that no longer exists.
+//
+// It returns the dependencies when it refuses, so the caller can say what has
+// to change rather than only that something does.
+func (s *Store) DeleteProviderAccountIfUnused(
+	ctx context.Context,
+	providerID core.ProviderID,
+	accountID core.ProviderAccountID,
+) (AccountDependencies, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin remove account: %w", err)
+	}
+	defer tx.Rollback()
+
+	var credentialRef sql.NullString
+	err = tx.QueryRowContext(ctx,
+		"SELECT credential_ref FROM provider_accounts WHERE id = ? AND provider_id = ?",
+		string(accountID), string(providerID)).Scan(&credentialRef)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("provider account not found: %s/%s", providerID, accountID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read account: %w", err)
+	}
+
+	deps, err := accountDependenciesTx(ctx, tx, providerID, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if len(deps) > 0 {
+		// Committing nothing. The caller reports what is in the way.
+		return deps, nil
+	}
+
+	if credentialRef.Valid && credentialRef.String != "" {
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM provider_credentials WHERE credential_ref = ?", credentialRef.String); err != nil {
+			return nil, fmt.Errorf("delete account credential: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM provider_accounts WHERE id = ? AND provider_id = ?",
+		string(accountID), string(providerID)); err != nil {
+		return nil, fmt.Errorf("delete account: %w", err)
+	}
+	return nil, tx.Commit()
+}
+
+// accountDependenciesTx finds everything that depends on an account, inside the
+// caller's transaction so the answer cannot go stale before it is acted on.
+func accountDependenciesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	providerID core.ProviderID,
+	accountID core.ProviderAccountID,
+) (AccountDependencies, error) {
+	var deps AccountDependencies
+
+	rows, err := tx.QueryContext(ctx, "SELECT id, name, driver_json FROM connection_profiles")
+	if err != nil {
+		return nil, fmt.Errorf("list profiles for account dependency check: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, name string
+		var driverJSON []byte
+		if err := rows.Scan(&id, &name, &driverJSON); err != nil {
+			return nil, fmt.Errorf("scan profile driver: %w", err)
+		}
+		var driver core.DriverSelection
+		if err := json.Unmarshal(driverJSON, &driver); err != nil {
+			// A profile whose driver cannot be decoded must not be silently
+			// treated as independent of the account.
+			return nil, fmt.Errorf("profile %s: decode driver: %w", id, err)
+		}
+		if driver.ProviderID == providerID && driver.AccountID == accountID {
+			deps = append(deps, AccountDependency{
+				Kind: "connection", ID: id, Name: name,
+				Explanation: "this connection uses the account and could not open without it",
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// A resource Portico created and has not finished cleaning up needs the
+	// credential that created it. Removing the account would leave the resource
+	// at the provider with nothing able to remove it.
+	cleanupRows, err := tx.QueryContext(ctx, `
+		SELECT resource_type, external_id FROM resource_cleanup_items
+		WHERE provider_id = ? AND provider_account_id = ?`,
+		string(providerID), string(accountID))
+	if err != nil {
+		return nil, fmt.Errorf("list cleanup items for account dependency check: %w", err)
+	}
+	defer cleanupRows.Close()
+	for cleanupRows.Next() {
+		var resourceType, externalID string
+		if err := cleanupRows.Scan(&resourceType, &externalID); err != nil {
+			return nil, fmt.Errorf("scan cleanup item: %w", err)
+		}
+		deps = append(deps, AccountDependency{
+			Kind: "cleanup_item", ID: externalID,
+			Name: resourceType + " " + externalID,
+			Explanation: "Portico still has to remove this from the provider, " +
+				"and this account's credential is what can do it",
+		})
+	}
+	return deps, cleanupRows.Err()
 }
 
 // ConnectionsUsingAccount returns the connections whose driver selects the

@@ -67,6 +67,14 @@ type APIStatusError struct {
 	RecoveryActions  []RecoveryAction
 	TechnicalDetails string
 	Retryable        bool
+
+	// Typed details carried through from the supervisor. These used to be
+	// dropped: the client returned an error and the response body was
+	// discarded, so a caller checking the response for dependent connections
+	// or missing permissions never saw any — while unit tests on each side
+	// passed, because neither exercised the transport between them.
+	AccountDependencies []AccountDependencyDTO
+	ProviderValidation  *ProviderValidationDetails
 }
 
 // Error implements the error interface.
@@ -97,6 +105,8 @@ func checkResponse(resp *http.Response) error {
 			statusErr.RecoveryActions = apiErr.RecoveryActions
 			statusErr.TechnicalDetails = apiErr.TechnicalDetails
 			statusErr.Retryable = apiErr.Retryable
+			statusErr.AccountDependencies = apiErr.AccountDependencies
+			statusErr.ProviderValidation = apiErr.ProviderValidation
 		} else {
 			statusErr.Message = strings.TrimSpace(string(body))
 		}

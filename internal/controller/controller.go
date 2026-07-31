@@ -470,7 +470,12 @@ type CredentialStorer interface {
 // CleanupRecorder persists cleanup obligations for resources that may exist
 // remotely but were never successfully inserted into the normal inventory.
 type CleanupRecorder interface {
-	RecordCleanupItem(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, providerID core.ProviderID, resourceType core.ResourceType, externalID, state, lastError string) error
+	// RecordCleanupItem records an obligation to remove a provider resource.
+	// The account is required: it holds the credential that created the
+	// resource and is therefore the only one that can remove it.
+	RecordCleanupItem(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID,
+		providerID core.ProviderID, accountID core.ProviderAccountID,
+		resourceType core.ResourceType, externalID, state, lastError string) error
 }
 
 // CommittedEventDispatcher delivers rows that have already committed to the
@@ -984,6 +989,7 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 		ConnectionID:    connID,
 		ProfileRevision: profile.Revision,
 		Provider:        profile.GetProvider().ProviderID,
+		Account:         profile.GetProvider().AccountID,
 		Intent:          core.IntentDelete,
 		Steps:           steps,
 		CreatedAt:       time.Now().UTC(),
@@ -1099,6 +1105,7 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 		ConnectionID:    connID,
 		ProfileRevision: profile.Revision,
 		Provider:        profile.GetProvider().ProviderID,
+		Account:         profile.GetProvider().AccountID,
 		Intent:          core.IntentRepair,
 		Steps:           steps,
 		CreatedAt:       time.Now().UTC(),

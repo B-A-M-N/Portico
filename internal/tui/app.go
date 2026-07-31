@@ -333,9 +333,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.Err != nil {
 			m.accountRemovalError = msg.Err.Error()
-			if msg.Response != nil {
-				m.accountRemovalDependents = msg.Response.DependentConnections
-			}
+			// The refusal arrives as an error, and the real client returns a
+			// nil response with it. Reading the response for dependencies
+			// therefore found none through the actual transport, however well
+			// each side tested on its own.
+			m.accountRemovalDependents = accountDependencyLines(msg.Err, msg.Response)
 			// The refusal names what has to change first, so it is shown on the
 			// confirmation rather than as a status line that scrolls away.
 			return m, nil
@@ -3703,4 +3705,39 @@ func (m *Model) planMatchesPreview() bool {
 		m.planConnectionID != "" &&
 		m.plan.ConnectionID != "" &&
 		m.plan.ConnectionID == m.planConnectionID
+}
+
+// accountDependencyLines describes what is blocking a removal.
+//
+// It reads the typed details off the error, because that is where they arrive:
+// a refusal is a non-2xx response, and the client returns an error with a nil
+// body. The response argument covers the callers that do have one.
+func accountDependencyLines(err error, response *ipc.RemoveProviderAccountResponse) []string {
+	var deps []ipc.AccountDependencyDTO
+
+	var status *ipc.APIStatusError
+	if errors.As(err, &status) {
+		deps = status.AccountDependencies
+	}
+	if len(deps) == 0 && response != nil {
+		deps = response.Dependencies
+	}
+
+	var lines []string
+	for _, dep := range deps {
+		name := dep.Name
+		if name == "" {
+			name = dep.ID
+		}
+		if dep.Explanation != "" {
+			lines = append(lines, name+" — "+dep.Explanation)
+			continue
+		}
+		lines = append(lines, name)
+	}
+	// A response that carries only connection IDs is still understood.
+	if len(lines) == 0 && response != nil {
+		lines = append(lines, response.DependentConnections...)
+	}
+	return lines
 }

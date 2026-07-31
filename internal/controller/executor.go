@@ -1123,7 +1123,7 @@ func (c *Controller) recordCleanupResources(ctx context.Context, plan *core.Oper
 		if resource.Type == "" || resource.ExternalID == "" {
 			continue
 		}
-		if err := c.cleanupRecorder.RecordCleanupItem(ctx, rec.oper.ID, plan.ConnectionID, plan.Provider, resource.Type, resource.ExternalID, state, lastError); err != nil {
+		if err := c.cleanupRecorder.RecordCleanupItem(ctx, rec.oper.ID, plan.ConnectionID, plan.Provider, plan.Account, resource.Type, resource.ExternalID, state, lastError); err != nil {
 			slog.Error("record cleanup item", "resource", resource.ExternalID, "state", state, "err", err)
 		}
 	}

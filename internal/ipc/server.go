@@ -39,6 +39,13 @@ type Server struct {
 	dispatchedSequence int64
 }
 
+// Handler returns the HTTP handler serving the IPC routes.
+//
+// It exists so a test can put the real routing behind a real socket and drive
+// it with the real client. Testing each side against its own fake proved they
+// each worked and not that they agreed.
+func (s *Server) Handler() http.Handler { return s.mux }
+
 // RequestHandler is the interface the supervisor implements to handle IPC requests.
 type RequestHandler interface {
 	HandleSnapshot() (*SnapshotDTO, error)
@@ -704,15 +711,21 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 			// a failure to report and forget: each dependent connection is
 			// something the user has to go and deal with, so they are sent as
 			// the recovery actions rather than dropped in favour of a count.
-			if response != nil && len(response.DependentConnections) > 0 {
+			if response != nil && len(response.Dependencies) > 0 {
 				apiErr := APIError{
 					Version: 1, Code: "PROV-008", Summary: err.Error(),
 					ProviderID: id,
+					// Typed, so the caller does not have to parse prose back
+					// into structure to say what is in the way.
+					AccountDependencies: response.Dependencies,
 				}
-				for _, connID := range response.DependentConnections {
+				for _, dep := range response.Dependencies {
+					label := "Reassign or delete connection " + dep.Name
+					if dep.Kind == "cleanup_item" {
+						label = "Portico still has to remove " + dep.Name
+					}
 					apiErr.RecoveryActions = append(apiErr.RecoveryActions, RecoveryAction{
-						Label:  "Reassign or delete connection " + connID,
-						Action: "connection:" + connID,
+						Label: label, Action: dep.Kind + ":" + dep.ID,
 					})
 				}
 				w.Header().Set("Content-Type", "application/json")

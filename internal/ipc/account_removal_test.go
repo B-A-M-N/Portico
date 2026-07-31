@@ -79,6 +79,12 @@ func TestARefusalNamesTheConnectionsThatDependOnTheAccount(t *testing.T) {
 		response: &RemoveProviderAccountResponse{
 			Removed:              false,
 			DependentConnections: []string{"conn-a", "conn-b"},
+			Dependencies: []AccountDependencyDTO{
+				{Kind: "connection", ID: "conn-a", Name: "api-staging",
+					Explanation: "this connection uses the account"},
+				{Kind: "connection", ID: "conn-b", Name: "docs-site",
+					Explanation: "this connection uses the account"},
+			},
 		},
 		err: errors.New("2 connection(s) still use this account"),
 	}
@@ -92,10 +98,22 @@ func TestARefusalNamesTheConnectionsThatDependOnTheAccount(t *testing.T) {
 		t.Fatalf("status = %d, want 409", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, id := range []string{"conn-a", "conn-b"} {
+	for _, id := range []string{"conn-a", "conn-b", "api-staging", "docs-site"} {
 		if !strings.Contains(body, id) {
 			t.Errorf("the refusal does not name %s:\n%s", id, body)
 		}
+	}
+
+	// The dependencies must arrive typed, not only as prose in an action label.
+	var apiErr APIError
+	if err := json.Unmarshal(rec.Body.Bytes(), &apiErr); err != nil {
+		t.Fatal(err)
+	}
+	if len(apiErr.AccountDependencies) != 2 {
+		t.Fatalf("the refusal carries %d typed dependencies, want 2", len(apiErr.AccountDependencies))
+	}
+	if apiErr.AccountDependencies[0].Name != "api-staging" {
+		t.Fatalf("the dependency is unnamed: %#v", apiErr.AccountDependencies[0])
 	}
 }
 

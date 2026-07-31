@@ -377,6 +377,23 @@ type APIError struct {
 	ProviderID       string           `json:"provider_id,omitempty"`
 	RecoveryActions  []RecoveryAction `json:"recovery_actions,omitempty"`
 	TechnicalDetails string           `json:"technical_details,omitempty"`
+
+	// Typed details for refusals a caller has to present as more than a
+	// sentence. Encoding domain data into recovery-action strings would make
+	// every consumer parse prose back into structure.
+	AccountDependencies []AccountDependencyDTO     `json:"account_dependencies,omitempty"`
+	ProviderValidation  *ProviderValidationDetails `json:"provider_validation,omitempty"`
+}
+
+// ProviderValidationDetails explains why a credential was rejected.
+//
+// A caller needs to say which permissions are missing, not merely that the
+// token was refused — the user cannot act on "validation failed".
+type ProviderValidationDetails struct {
+	MissingPermissions []string  `json:"missing_permissions,omitempty"`
+	AvailableZones     []ZoneDTO `json:"available_zones,omitempty"`
+	AccountAccessible  bool      `json:"account_accessible"`
+	VerificationState  string    `json:"verification_state,omitempty"`
 }
 
 // RecoveryAction describes a recovery action.
@@ -641,9 +658,24 @@ type SetupFieldDTO struct {
 // RemoveProviderAccountResponse reports whether an account was removed and, if
 // not, which connections still depend on it.
 type RemoveProviderAccountResponse struct {
-	Removed              bool     `json:"removed"`
-	RestartRequired      bool     `json:"restart_required,omitempty"`
+	Removed         bool `json:"removed"`
+	RestartRequired bool `json:"restart_required,omitempty"`
+	// DependentConnections is kept for callers that only report connections.
 	DependentConnections []string `json:"dependent_connections,omitempty"`
+	// Dependencies is everything in the way, including provider resources that
+	// still need removing with this account's credential — those are not
+	// connections, and reporting only connections hid them entirely.
+	Dependencies []AccountDependencyDTO `json:"dependencies,omitempty"`
+}
+
+// AccountDependencyDTO is one thing standing in the way of removing an account.
+type AccountDependencyDTO struct {
+	// Kind is "connection" or "cleanup_item".
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	// Explanation says why this blocks removal, in terms of consequence.
+	Explanation string `json:"explanation,omitempty"`
 }
 
 // SupportExportDTO is a redacted diagnostic report intended to be attached to a

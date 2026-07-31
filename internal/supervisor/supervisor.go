@@ -69,9 +69,12 @@ type Supervisor struct {
 
 type cleanupRecorder struct{ store *store.Store }
 
-func (r cleanupRecorder) RecordCleanupItem(ctx context.Context, operationID core.OperationID, connectionID core.ConnectionID, providerID core.ProviderID, resourceType core.ResourceType, externalID, state, lastError string) error {
+func (r cleanupRecorder) RecordCleanupItem(ctx context.Context, operationID core.OperationID,
+	connectionID core.ConnectionID, providerID core.ProviderID, accountID core.ProviderAccountID,
+	resourceType core.ResourceType, externalID, state, lastError string) error {
 	return r.store.RecordCleanupItem(ctx, store.CleanupItem{
-		OperationID: operationID, ConnectionID: connectionID, ProviderID: providerID,
+		OperationID: operationID, ConnectionID: connectionID,
+		ProviderID: providerID, AccountID: accountID,
 		ResourceType: resourceType, ExternalID: externalID, State: state, LastError: lastError,
 	})
 }
@@ -1613,35 +1616,65 @@ func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID st
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	dependents, err := h.sup.store.ConnectionsUsingAccount(ctx,
+	// Deciding and deleting happen in one transaction. As two operations, a
+	// connection created or edited in between could bind an account that was
+	// about to be removed — and because the account reference lives inside the
+	// profile's driver JSON rather than behind a foreign key, nothing at the
+	// database level would refuse it.
+	deps, err := h.sup.store.DeleteProviderAccountIfUnused(ctx,
 		core.ProviderID(providerID), core.ProviderAccountID(accountID))
 	if err != nil {
 		return nil, err
 	}
-	if len(dependents) > 0 {
+	if len(deps) > 0 {
 		resp := &ipc.RemoveProviderAccountResponse{Removed: false}
-		for _, id := range dependents {
-			resp.DependentConnections = append(resp.DependentConnections, string(id))
+		for _, dep := range deps {
+			resp.Dependencies = append(resp.Dependencies, ipc.AccountDependencyDTO{
+				Kind: dep.Kind, ID: dep.ID, Name: dep.Name, Explanation: dep.Explanation,
+			})
+			if dep.Kind == "connection" {
+				resp.DependentConnections = append(resp.DependentConnections, dep.ID)
+			}
 		}
-		return resp, core.ErrValidation(fmt.Sprintf(
-			"%d connection(s) still use this account; reassign or delete them before removing it",
-			len(dependents)))
-	}
-
-	if err := h.sup.store.DeleteProviderAccount(ctx,
-		core.ProviderID(providerID), core.ProviderAccountID(accountID)); err != nil {
-		return nil, err
+		return resp, core.ErrValidation(describeAccountDependencies(deps))
 	}
 
 	// Every provider reactivates through the same path, so removing an account
-	// takes effect immediately whichever provider it belonged to. The
-	// provider-ID branch that used to live here was the last one.
+	// takes effect immediately whichever provider it belonged to.
 	restartRequired := false
 	if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(providerID)); activateErr != nil {
 		slog.Warn("could not reactivate the provider in place", "provider", providerID, "err", activateErr)
 		restartRequired = true
 	}
 	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired}, nil
+}
+
+// describeAccountDependencies says what is in the way, in terms of what the
+// user would have to do about it.
+func describeAccountDependencies(deps store.AccountDependencies) string {
+	var connections, cleanups int
+	for _, dep := range deps {
+		switch dep.Kind {
+		case "connection":
+			connections++
+		case "cleanup_item":
+			cleanups++
+		}
+	}
+	switch {
+	case connections > 0 && cleanups > 0:
+		return fmt.Sprintf(
+			"%d connection(s) still use this account, and %d provider resource(s) still need removing "+
+				"with its credential", connections, cleanups)
+	case cleanups > 0:
+		return fmt.Sprintf(
+			"%d provider resource(s) created with this account still need removing; "+
+				"its credential is what can remove them", cleanups)
+	default:
+		return fmt.Sprintf(
+			"%d connection(s) still use this account; reassign or delete them before removing it",
+			connections)
+	}
 }
 
 // HandleConfigureProviderAccount configures any provider that declares a setup

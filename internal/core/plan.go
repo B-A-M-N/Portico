@@ -87,10 +87,15 @@ const (
 
 // OperationPlan represents an immutable operation plan
 type OperationPlan struct {
-	ID                  PlanID
-	ConnectionID        ConnectionID
-	ProfileRevision     uint64
-	Provider            ProviderID
+	ID              PlanID
+	ConnectionID    ConnectionID
+	ProfileRevision uint64
+	Provider        ProviderID
+	// Account is the provider account this plan executes against. It is part of
+	// the plan's identity because it holds the credential: a resource created
+	// here can only be removed by the same account, and a cleanup obligation
+	// that does not record it can be orphaned by removing that account.
+	Account             ProviderAccountID
 	Intent              OperationIntent
 	Steps               []PlanStep
 	Warnings            []PlanWarning
