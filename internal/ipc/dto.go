@@ -103,11 +103,16 @@ type OperationSummaryDTO struct {
 
 // ProviderDTO is the view of a provider sent over IPC.
 type ProviderDTO struct {
-	ID              string               `json:"id"`
-	Name            string               `json:"name"`
-	DisplayName     string               `json:"display_name"`
-	Authenticated   bool                 `json:"authenticated"`
-	Accounts        []ProviderAccountDTO `json:"accounts,omitempty"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	DisplayName   string `json:"display_name"`
+	Authenticated bool   `json:"authenticated"`
+	// Accounts are usable for selection and planning.
+	Accounts []ProviderAccountDTO `json:"accounts,omitempty"`
+	// PendingAccounts are saved but not usable — never verified, expired or
+	// revoked. They are carried separately so a UI can offer to repair them
+	// without any selection path treating them as working accounts.
+	PendingAccounts []ProviderAccountDTO `json:"pending_accounts,omitempty"`
 	Availability    string               `json:"availability"` // "ready", "unconfigured", "binary_missing", "degraded"
 	Readiness       string               `json:"readiness"`    // "ready", "needs_auth", "needs_config", "error"
 	Capabilities    *CapabilitySetDTO    `json:"capabilities,omitempty"`

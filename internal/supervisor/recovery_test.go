@@ -1514,6 +1514,58 @@ func TestGuidanceReasonComesFromTheProvider(t *testing.T) {
 	}
 }
 
+// TestRestartDoesNotPromotePendingAccounts pins the invariant across the
+// startup path, which is where it actually broke.
+//
+// Setup stores an unverified credential as pending and reports it honestly.
+// Startup then reloaded every stored account into the registry, which derived
+// "authenticated" from how many accounts existed — so restarting Portico turned
+// an unverified account into a ready, selectable provider.
+func TestRestartDoesNotPromotePendingAccounts(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	if err := registry.Add(declaredProvider{mock.New(), "acme"}); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	sup := &Supervisor{store: st, registry: registry, mutating: true}
+
+	pending := core.ProviderAccount{
+		ID: "acct-pending", Provider: "acme", Label: "Unverified",
+		CredentialRef: "acme:acct-pending:credential",
+		Status:        core.AccountPending, Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, pending, []byte("unchecked")); err != nil {
+		t.Fatalf("seed pending account: %v", err)
+	}
+
+	// This is what a restart does.
+	if err := sup.loadProviderAccounts(ctx); err != nil {
+		t.Fatalf("loadProviderAccounts: %v", err)
+	}
+
+	for _, snap := range registry.Snapshot() {
+		if snap.ID != "acme" {
+			continue
+		}
+		if snap.Authenticated {
+			t.Fatal("a pending account became authenticated across a restart")
+		}
+		if snap.Availability == provider.AvailabilityReady {
+			t.Fatal("a pending account made the provider ready across a restart")
+		}
+		if len(snap.Accounts) != 0 {
+			t.Fatalf("a pending account was offered as usable: %#v", snap.Accounts)
+		}
+		// It must survive as something the user can repair.
+		if len(snap.PendingAccounts) != 1 {
+			t.Fatalf("the pending account was lost rather than surfaced: %#v", snap.PendingAccounts)
+		}
+		return
+	}
+	t.Fatal("provider not found in snapshot")
+}
+
 // TestRequiredFieldsAreEnforcedFromTheDeclaration ensures the requirement comes
 // from the provider rather than from a hardcoded check.
 func TestRequiredFieldsAreEnforcedFromTheDeclaration(t *testing.T) {

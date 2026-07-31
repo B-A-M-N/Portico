@@ -60,12 +60,22 @@ const (
 
 // ProviderSnapshot is a frozen provider summary for listing
 type ProviderSnapshot struct {
-	ID            core.ProviderID
-	Name          string
-	DisplayName   string
-	Capabilities  core.Capabilities
+	ID           core.ProviderID
+	Name         string
+	DisplayName  string
+	Capabilities core.Capabilities
+	// Authenticated reports that at least one account can actually be used.
+	// It is derived from account status, not from how many accounts exist: an
+	// account saved without its credential being checked must not make a
+	// provider look ready.
 	Authenticated bool
-	Accounts      []AccountInfo
+	// Accounts are the accounts usable for planning, selection and opening.
+	Accounts []AccountInfo
+	// PendingAccounts are configured but not usable — saved without
+	// verification, expired or revoked. They are reported separately so they
+	// can be repaired from the provider screen rather than silently
+	// disappearing, and so nothing offers them for work.
+	PendingAccounts []AccountInfo
 
 	// Availability and Reason explain why a catalogued provider is not usable.
 	// Registered adapters report ready or unconfigured; catalog-only entries
@@ -79,6 +89,26 @@ type ProviderSnapshot struct {
 	// presenting a zero-valued capability set as fact.
 	CapabilityError string
 }
+
+// Usable reports whether an account may be selected, planned against or opened.
+//
+// The check is an allowlist. "authenticated" is an account whose credential was
+// confirmed against the provider; "configured" is the registry's own marker for
+// an adapter that reported its own accounts, which exist only because a working
+// credential built that adapter. Every other value — pending, expired, revoked,
+// or anything unrecognised — is not usable, so a status Portico does not
+// understand fails closed rather than being presented as working.
+func (a AccountInfo) Usable() bool {
+	switch a.Status {
+	case string(core.AccountAuthenticated), accountStatusConfigured:
+		return true
+	}
+	return false
+}
+
+// accountStatusConfigured marks an account reported by a live adapter rather
+// than loaded from the account store.
+const accountStatusConfigured = "configured"
 
 // CatalogEntry describes a provider Portico knows about but has no live adapter
 // for. Registering one keeps the provider visible with an explanation.
@@ -221,13 +251,26 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 		caps, capErr := h.provider.Capabilities(capCtx)
 		cancel()
 
+		// An account is only usable if its credential was actually accepted.
+		// Counting rows here is what let an unverified account make a provider
+		// look ready after a restart.
+		var usable, pending []AccountInfo
+		for _, account := range h.accounts {
+			if account.Usable() {
+				usable = append(usable, account)
+			} else {
+				pending = append(pending, account)
+			}
+		}
+
 		snap := ProviderSnapshot{
-			ID:            ident.ID,
-			Name:          ident.Name,
-			DisplayName:   ident.DisplayName,
-			Capabilities:  caps,
-			Authenticated: len(h.accounts) > 0,
-			Accounts:      h.accounts,
+			ID:              ident.ID,
+			Name:            ident.Name,
+			DisplayName:     ident.DisplayName,
+			Capabilities:    caps,
+			Authenticated:   len(usable) > 0,
+			Accounts:        usable,
+			PendingAccounts: pending,
 		}
 		switch {
 		case capErr != nil:
@@ -236,8 +279,15 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 			snap.Availability = AvailabilityDegraded
 			snap.CapabilityError = capErr.Error()
 			snap.Reason = "provider capabilities could not be read: " + capErr.Error()
-		case len(h.accounts) > 0:
+		case len(usable) > 0:
 			snap.Availability = AvailabilityReady
+		case len(pending) > 0:
+			// Distinguishing this from "no account" is the difference between
+			// "add one" and "finish the one you started".
+			snap.Availability = AvailabilityUnconfigured
+			snap.Reason = fmt.Sprintf(
+				"%d account(s) are saved but not usable yet; their credentials were never confirmed",
+				len(pending))
 		default:
 			snap.Availability = AvailabilityUnconfigured
 		}

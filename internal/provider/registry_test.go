@@ -110,6 +110,86 @@ func TestRegisteredAdapterSupersedesCatalogEntry(t *testing.T) {
 	}
 }
 
+// TestAPendingAccountDoesNotMakeAProviderReady pins the restart half of the
+// authenticated-only-after-validation invariant.
+//
+// Setup correctly stores an unverified credential as pending and says so. The
+// registry then derived "authenticated" from how many accounts existed, so
+// after a restart that same pending account made the provider look ready and
+// selectable — the invariant held in the database and broke on reconstruction.
+func TestAPendingAccountDoesNotMakeAProviderReady(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Add(&stubProvider{id: "acme"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	r.SetAccountInfo("acme", []AccountInfo{
+		{ID: "acct-pending", Label: "Unverified", Status: string(core.AccountPending)},
+	})
+
+	snaps := r.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("got %d entries, want 1", len(snaps))
+	}
+	if snaps[0].Authenticated {
+		t.Fatal("a pending account made the provider report as authenticated")
+	}
+	if snaps[0].Availability == AvailabilityReady {
+		t.Fatal("a pending account made the provider report as ready")
+	}
+	// The account must remain visible so it can be repaired rather than
+	// silently vanishing from the provider screen.
+	if len(snaps[0].PendingAccounts) != 1 {
+		t.Fatalf("pending account not surfaced for management: %#v", snaps[0].PendingAccounts)
+	}
+	// It must not be offered for selection or operations.
+	if len(snaps[0].Accounts) != 0 {
+		t.Fatalf("a pending account was offered as usable: %#v", snaps[0].Accounts)
+	}
+}
+
+// TestAnAuthenticatedAccountAlongsideAPendingOneKeepsTheProviderUsable ensures
+// the pending status is a per-account fact, not a provider-wide downgrade.
+func TestAnAuthenticatedAccountAlongsideAPendingOneKeepsTheProviderUsable(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Add(&stubProvider{id: "acme"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	r.SetAccountInfo("acme", []AccountInfo{
+		{ID: "acct-good", Label: "Verified", Status: string(core.AccountAuthenticated)},
+		{ID: "acct-pending", Label: "Unverified", Status: string(core.AccountPending)},
+	})
+
+	snap := r.Snapshot()[0]
+	if !snap.Authenticated || snap.Availability != AvailabilityReady {
+		t.Fatal("a verified account did not keep the provider usable")
+	}
+	if len(snap.Accounts) != 1 || snap.Accounts[0].ID != "acct-good" {
+		t.Fatalf("usable accounts = %#v, want only the verified one", snap.Accounts)
+	}
+	if len(snap.PendingAccounts) != 1 {
+		t.Fatalf("pending account not surfaced: %#v", snap.PendingAccounts)
+	}
+}
+
+// TestRevokedAndExpiredAccountsAreNotUsable covers the other statuses that mean
+// a credential cannot be relied on.
+func TestRevokedAndExpiredAccountsAreNotUsable(t *testing.T) {
+	for _, status := range []core.ProviderAccountStatus{core.AccountRevoked, core.AccountExpired} {
+		t.Run(string(status), func(t *testing.T) {
+			r := NewRegistry()
+			if err := r.Add(&stubProvider{id: "acme"}); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+			r.SetAccountInfo("acme", []AccountInfo{{ID: "acct", Status: string(status)}})
+
+			snap := r.Snapshot()[0]
+			if snap.Authenticated || snap.Availability == AvailabilityReady {
+				t.Fatalf("a %s account left the provider usable", status)
+			}
+		})
+	}
+}
+
 // TestCapabilityErrorIsReportedNotDiscarded ensures a failed capability query
 // is not presented as an authoritative empty capability set.
 func TestCapabilityErrorIsReportedNotDiscarded(t *testing.T) {

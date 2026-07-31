@@ -67,6 +67,19 @@ func (h *supervisorHandler) HandleReadiness() (*ipc.ReadinessDTO, error) {
 				Description: fmt.Sprintf("%d account(s) configured in Portico.", len(snap.Accounts)),
 			})
 		}
+		// A saved but unusable account is reported as a gap, not as a
+		// credential. Counting it as present is what made an unverified
+		// account look like a working one.
+		if len(snap.PendingAccounts) > 0 {
+			entry.Credentials = append(entry.Credentials, ipc.CredentialSourceDTO{
+				Kind:     string(credentials.SourcePortico),
+				Location: "saved in Portico, not verified",
+				Present:  false,
+				Description: fmt.Sprintf("%d account(s) saved but never confirmed against the provider.",
+					len(snap.PendingAccounts)),
+				Action: "Open setup for this provider to finish or replace the credential.",
+			})
+		}
 
 		entry.Summary, entry.Blocked = summariseProviderReadiness(snap, entry.Credentials)
 		readiness.Providers = append(readiness.Providers, entry)

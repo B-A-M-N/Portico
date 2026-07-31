@@ -2146,6 +2146,20 @@ func (m *Model) renderProviders() string {
 			}
 			b.WriteString(fmt.Sprintf("      • %s — %s\n", accLabel, accountStatus))
 		}
+		// A saved but unusable account must stay visible and say what to do
+		// about it. Hiding it would leave the user with a provider that says
+		// "needs setup" after they completed setup.
+		for _, account := range p.PendingAccounts {
+			accLabel := account.Label
+			if accLabel == "" {
+				accLabel = account.ID
+			}
+			b.WriteString(m.theme.Style("intervention").Render(
+				fmt.Sprintf("      • %s — %s, not usable", accLabel, account.Status)))
+			b.WriteString("\n")
+			b.WriteString(m.theme.Style("muted").Render(
+				"        Its credential was never confirmed. Set the provider up again to replace it.") + "\n")
+		}
 		b.WriteString("\n")
 	}
 	b.WriteString("[a] add account    [esc] back    [q] quit\n")

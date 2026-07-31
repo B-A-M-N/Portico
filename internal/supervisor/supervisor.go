@@ -502,7 +502,10 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 		case provider.AvailabilityReady:
 			dto.Readiness = "ready"
 		case provider.AvailabilityUnconfigured:
-			if len(p.Accounts) > 0 {
+			// An account that exists but is not usable needs finishing, not
+			// adding. Reporting "needs_config" would tell the user to start
+			// over on setup they already did.
+			if len(p.PendingAccounts) > 0 {
 				dto.Readiness = "needs_auth"
 			} else {
 				dto.Readiness = "needs_config"
@@ -518,7 +521,7 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 		default:
 			if p.Authenticated {
 				dto.Availability, dto.Readiness = "ready", "ready"
-			} else if len(p.Accounts) > 0 {
+			} else if len(p.PendingAccounts) > 0 {
 				dto.Availability, dto.Readiness = "unconfigured", "needs_auth"
 			} else {
 				dto.Availability, dto.Readiness = "unconfigured", "needs_config"
@@ -527,6 +530,13 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 
 		for _, account := range p.Accounts {
 			dto.Accounts = append(dto.Accounts, ipc.ProviderAccountDTO{
+				ID: string(account.ID), Label: account.Label, Status: account.Status,
+			})
+		}
+		// Kept separate from Accounts so nothing offers them for selection or
+		// planning, while the provider screen can still show and repair them.
+		for _, account := range p.PendingAccounts {
+			dto.PendingAccounts = append(dto.PendingAccounts, ipc.ProviderAccountDTO{
 				ID: string(account.ID), Label: account.Label, Status: account.Status,
 			})
 		}
