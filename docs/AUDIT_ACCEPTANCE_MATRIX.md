@@ -1,7 +1,11 @@
-# Audit acceptance matrix
+# Acceptance matrix — production-readiness audit
 
 Every finding in the production-readiness audit, mapped to the test that pins
 it, the behaviour that test asserts, and the commit that introduced it.
+
+**This is not the only matrix.** `ACCEPTANCE_MATRIX.md` covers the later
+beginner-trust audit. The two describe different audits and neither supersedes
+the other.
 
 Verification commands, all clean on this branch:
 

@@ -150,19 +150,31 @@ lacks environment references and shell-mode configuration.
 
 ### Connection editing and account/provider visibility
 
-**Current state**
+**Current state — mostly done; one item remains.**
 
-The TUI provides create, open/close, inspect, diagnostics, and repair basics;
-it does not yet present a complete edit workflow for existing desired state or
-provider-account lifecycle.
+1. **Done.** Edit and clone flows exist, reachable with `e` and `c` from the
+   list and the inspect screen. The edit carries the revision it was built
+   from, and `HandlePlanEdit` refuses a stale one
+   (`TestAnEditCarriesTheRevisionItWasBuiltFrom`,
+   `TestPlanEditRefusesAStaleRevision`). Copying is done by the supervisor's
+   deep copy rather than rebuilt from the detail DTO, which would lose a
+   command's environment and an existing service's health check
+   (`TestTheCopyIsMadeBySupervisorNotRebuiltFromTheDetail`).
 
-**Implementation**
+2. **Partly done.** The inspect screen shows the provider, the selected account
+   and unresolved findings. **Origin ownership is still not shown** — nothing
+   on any screen says whether Portico started the local service or merely
+   connected to one it found, which is what a user needs before assuming
+   closing the connection will stop their server.
 
-1. Add profile edit/clone flows backed by revision-aware update endpoints.
-2. Show provider, selected account, origin ownership, and unresolved findings
-   in inspect and provider screens.
-3. When an edit changes remote desired state, route through normal plan,
-   confirmation, apply, operation progress, and verification—not a direct save.
+3. **Done.** An edit produces a plan and goes through the normal preview,
+   approval, apply and progress path rather than a direct save
+   (`TestAConnectionCanBeEdited`). A refused edit stays on the screen that made
+   it with its values intact, and abandoning the preview returns to the edit
+   rather than discarding it (`TestARefusedEditStaysOnTheScreenThatMadeIt`,
+   `TestAbandoningThePreviewReturnsToTheEdit`).
+
+See `ACCEPTANCE_MATRIX.md` §6 for the full mapping.
 
 **Acceptance**
 
