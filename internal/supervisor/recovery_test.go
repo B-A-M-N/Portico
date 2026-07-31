@@ -1696,6 +1696,77 @@ func TestManualLaunchModeArmsNothing(t *testing.T) {
 	}
 }
 
+// TestSetLaunchModeReportsTheModeInEffect pins that the handler answers with
+// the mode the supervisor is actually using. An environment override wins over
+// the stored value, so echoing the request would tell the caller something
+// untrue about the machine it is running on.
+func TestSetLaunchModeReportsTheModeInEffect(t *testing.T) {
+	handler := &supervisorHandler{sup: &Supervisor{}}
+
+	result, err := handler.HandleSetLaunchMode(LaunchManual)
+	if err != nil {
+		t.Fatalf("HandleSetLaunchMode: %v", err)
+	}
+	if result.Mode != LaunchManual {
+		t.Fatalf("mode = %q, want manual", result.Mode)
+	}
+	if result.Pinned {
+		t.Fatal("mode reported as pinned with no override set")
+	}
+	// Portico has no settings store, so the mode lasts only as long as the
+	// process. The response must not imply the choice is remembered.
+	if result.Persistent {
+		t.Fatal("mode reported as persistent; nothing writes it to durable state")
+	}
+
+	t.Run("an unrecognised mode is rejected, not coerced", func(t *testing.T) {
+		// Coercing a typo to auto would arm every connection marked to start,
+		// which is the opposite of what this gate is for.
+		if _, err := handler.HandleSetLaunchMode("manaul"); err == nil {
+			t.Fatal("a misspelled mode was accepted")
+		}
+		if got := handler.sup.launchMode(); got != LaunchManual {
+			t.Fatalf("a rejected mode still changed the gate to %q", got)
+		}
+	})
+
+	t.Run("an override is reported rather than silently winning", func(t *testing.T) {
+		t.Setenv("PORTICO_LAUNCH_MODE", "manual")
+		result, err := handler.HandleSetLaunchMode(LaunchAuto)
+		if err != nil {
+			t.Fatalf("HandleSetLaunchMode: %v", err)
+		}
+		if result.Mode != LaunchManual {
+			t.Fatalf("mode = %q, want the override's manual", result.Mode)
+		}
+		if !result.Pinned || result.PinnedBy != "PORTICO_LAUNCH_MODE" {
+			t.Fatalf("override not reported: pinned=%v by=%q", result.Pinned, result.PinnedBy)
+		}
+	})
+}
+
+// TestReadinessReportsTheLaunchModeOverride ensures the setup screen can say
+// why the launch-mode key will not take effect.
+func TestReadinessReportsTheLaunchModeOverride(t *testing.T) {
+	st := newRecoveryTestStore(t)
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	t.Setenv("PORTICO_LAUNCH_MODE", "manual")
+	readiness, err := handler.HandleReadiness()
+	if err != nil {
+		t.Fatalf("HandleReadiness: %v", err)
+	}
+	if readiness.LaunchMode != LaunchManual {
+		t.Fatalf("launch mode = %q, want manual", readiness.LaunchMode)
+	}
+	if !readiness.LaunchModePinned || readiness.LaunchModePinnedBy != "PORTICO_LAUNCH_MODE" {
+		t.Fatalf("override not surfaced: pinned=%v by=%q",
+			readiness.LaunchModePinned, readiness.LaunchModePinnedBy)
+	}
+}
+
 // TestReadinessReportsAFailedCheckAsAFailure ensures a broken check never reads
 // as a clean bill of health.
 func TestReadinessReportsAFailedCheckAsAFailure(t *testing.T) {

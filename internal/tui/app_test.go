@@ -37,6 +37,12 @@ type fakeClient struct {
 	logs      *ipc.ConnectionLogsDTO
 	readiness *ipc.ReadinessDTO
 
+	launchMode    *ipc.LaunchModeDTO
+	launchModeErr error
+	// launchModeAsked records every mode the TUI requested, so a test can pin
+	// which direction the toggle asked for rather than only what it displayed.
+	launchModeAsked []string
+
 	snapshotCalls  int
 	planOpenCalls  int
 	planCloseCalls int
@@ -53,6 +59,19 @@ func (f *fakeClient) Readiness(_ context.Context) (*ipc.ReadinessDTO, error) {
 		return f.readiness, nil
 	}
 	return &ipc.ReadinessDTO{Summary: "nothing configured", LaunchMode: "auto"}, nil
+}
+
+func (f *fakeClient) SetLaunchMode(_ context.Context, mode string) (*ipc.LaunchModeDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.launchModeAsked = append(f.launchModeAsked, mode)
+	if f.launchModeErr != nil {
+		return nil, f.launchModeErr
+	}
+	if f.launchMode != nil {
+		return f.launchMode, nil
+	}
+	return &ipc.LaunchModeDTO{Mode: mode}, nil
 }
 
 func (f *fakeClient) ConnectionLogs(_ context.Context, _ string, _ int) (*ipc.ConnectionLogsDTO, error) {
@@ -1670,6 +1689,128 @@ func TestSetupScreenShowsWhatIsNeededAndWhatIsAlreadyThere(t *testing.T) {
 	// The launch gate must be legible rather than a bare mode name.
 	if !strings.Contains(view, "nothing opens by itself") {
 		t.Fatalf("setup view does not explain the launch mode:\n%s", view)
+	}
+}
+
+// openSetupWith puts the model on the setup screen with a loaded readiness
+// view, which is the state the launch-mode key operates in.
+func openSetupWith(t *testing.T, fake *fakeClient, readiness *ipc.ReadinessDTO) Model {
+	t.Helper()
+	m := readyModel(fake, testSnapshot())
+	next, _ := m.Update(keyMsg("s"))
+	m = next.(Model)
+	next, _ = m.Update(readinessMsg{Readiness: readiness})
+	return next.(Model)
+}
+
+// TestLaunchModeKeyTogglesTheGate pins that the advertised [l] key actually
+// changes the launch mode. The hint was previously displayed with no binding
+// behind it, so the screen described a control that did nothing.
+func TestLaunchModeKeyTogglesTheGate(t *testing.T) {
+	t.Run("auto asks for manual", func(t *testing.T) {
+		fake := &fakeClient{}
+		m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
+
+		_, cmd := m.Update(keyMsg("l"))
+		if cmd == nil {
+			t.Fatal("pressing l issued no command; the key is not bound")
+		}
+		cmd()
+
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if len(fake.launchModeAsked) != 1 || fake.launchModeAsked[0] != "manual" {
+			t.Fatalf("requested modes = %v, want [manual]", fake.launchModeAsked)
+		}
+	})
+
+	t.Run("manual asks for auto", func(t *testing.T) {
+		fake := &fakeClient{}
+		m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "manual"})
+
+		_, cmd := m.Update(keyMsg("l"))
+		if cmd == nil {
+			t.Fatal("pressing l issued no command; the key is not bound")
+		}
+		cmd()
+
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if len(fake.launchModeAsked) != 1 || fake.launchModeAsked[0] != "auto" {
+			t.Fatalf("requested modes = %v, want [auto]", fake.launchModeAsked)
+		}
+	})
+
+	t.Run("the new mode is shown with its lifetime", func(t *testing.T) {
+		fake := &fakeClient{}
+		m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
+
+		next, _ := m.Update(launchModeMsg{Result: &ipc.LaunchModeDTO{Mode: "manual"}})
+		m = next.(Model)
+
+		view := m.View().Content
+		if !strings.Contains(view, "nothing opens by itself") {
+			t.Fatalf("view does not show the new mode:\n%s", view)
+		}
+		// A mode that silently reverts on restart must say so; Portico has no
+		// settings store to remember it.
+		if !strings.Contains(m.status, "until the supervisor restarts") {
+			t.Fatalf("status does not state the mode's lifetime: %q", m.status)
+		}
+	})
+}
+
+// TestPinnedLaunchModeIsReportedNotSilentlyIgnored pins that when
+// PORTICO_LAUNCH_MODE decides the mode, the screen says so. Echoing the
+// requested mode would claim a change the supervisor did not make, and the key
+// would read as broken rather than overridden.
+func TestPinnedLaunchModeIsReportedNotSilentlyIgnored(t *testing.T) {
+	fake := &fakeClient{
+		launchMode: &ipc.LaunchModeDTO{
+			Mode: "auto", Pinned: true, PinnedBy: "PORTICO_LAUNCH_MODE",
+		},
+	}
+	m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
+
+	_, cmd := m.Update(keyMsg("l"))
+	if cmd == nil {
+		t.Fatal("pressing l issued no command")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+
+	if !strings.Contains(m.status, "PORTICO_LAUNCH_MODE") {
+		t.Fatalf("status does not name the override: %q", m.status)
+	}
+	// The requested mode was manual; the effective mode is auto. The screen
+	// must show the effective one.
+	view := m.View().Content
+	if !strings.Contains(view, "connections marked to start will open on launch") {
+		t.Fatalf("view shows the requested mode rather than the effective one:\n%s", view)
+	}
+	if strings.Contains(view, "nothing opens by itself") {
+		t.Fatalf("view claims a change the supervisor refused:\n%s", view)
+	}
+	if !strings.Contains(view, "fixed by PORTICO_LAUNCH_MODE") {
+		t.Fatalf("view does not explain why the key had no effect:\n%s", view)
+	}
+}
+
+// TestLaunchModeFailureIsReported ensures a failed toggle says so rather than
+// leaving the old mode on screen as though the change succeeded.
+func TestLaunchModeFailureIsReported(t *testing.T) {
+	fake := &fakeClient{launchModeErr: errors.New("supervisor unreachable")}
+	m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
+
+	_, cmd := m.Update(keyMsg("l"))
+	next, _ := m.Update(cmd())
+	m = next.(Model)
+
+	if !strings.Contains(m.status, "Could not change launch mode") {
+		t.Fatalf("failed toggle not reported: %q", m.status)
+	}
+	if !strings.Contains(m.status, "supervisor unreachable") {
+		t.Fatalf("failed toggle does not give the reason: %q", m.status)
 	}
 }
 

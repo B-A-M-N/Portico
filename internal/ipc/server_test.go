@@ -80,6 +80,9 @@ func (nullHandler) HandleConnectionLogs(string, int) (*ConnectionLogsDTO, error)
 func (nullHandler) HandleReadiness() (*ReadinessDTO, error) {
 	return &ReadinessDTO{}, nil
 }
+func (nullHandler) HandleSetLaunchMode(mode string) (*LaunchModeDTO, error) {
+	return &LaunchModeDTO{Mode: mode}, nil
+}
 func (nullHandler) HandleSupportExport() (*SupportExportDTO, error) {
 	return &SupportExportDTO{}, nil
 }

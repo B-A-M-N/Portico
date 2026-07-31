@@ -26,11 +26,8 @@ const launchModeEnv = "PORTICO_LAUNCH_MODE"
 //
 // The default is auto so an existing setup keeps behaving as it did.
 func (s *Supervisor) launchMode() string {
-	if mode := strings.ToLower(strings.TrimSpace(os.Getenv(launchModeEnv))); mode != "" {
-		if mode == LaunchManual {
-			return LaunchManual
-		}
-		return LaunchAuto
+	if mode, pinned := launchModeOverride(); pinned {
+		return mode
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -38,6 +35,36 @@ func (s *Supervisor) launchMode() string {
 		return LaunchManual
 	}
 	return LaunchAuto
+}
+
+// launchModeOverride reports the mode forced by the environment, if any.
+//
+// This is separated from launchMode so callers can tell "the mode is auto"
+// apart from "the mode is auto and nothing you do here will change it". A
+// toggle that silently fails to take effect reads as a bug; one that says it is
+// pinned, and by what, is actionable.
+func launchModeOverride() (string, bool) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv(launchModeEnv)))
+	if mode == "" {
+		return "", false
+	}
+	if mode == LaunchManual {
+		return LaunchManual, true
+	}
+	return LaunchAuto, true
+}
+
+// ValidLaunchMode reports whether a mode name is one Portico accepts.
+//
+// Callers at a boundary must reject an unrecognised mode rather than letting
+// SetLaunchMode's fallback coerce it: a typo silently arming every connection
+// is the opposite of what this gate is for.
+func ValidLaunchMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case LaunchManual, LaunchAuto:
+		return true
+	}
+	return false
 }
 
 // SetLaunchMode changes the gate at runtime, so it can be toggled from the UI

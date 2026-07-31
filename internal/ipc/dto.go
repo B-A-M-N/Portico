@@ -653,9 +653,43 @@ type ReadinessDTO struct {
 	// Summary states the overall position in one sentence.
 	Summary string `json:"summary"`
 	// LaunchMode is "manual" or "auto".
-	LaunchMode  string                   `json:"launch_mode"`
-	Providers   []ProviderReadinessDTO   `json:"providers,omitempty"`
-	Connections []ConnectionReadinessDTO `json:"connections,omitempty"`
+	LaunchMode string `json:"launch_mode"`
+	// LaunchModePinned reports that an environment override is deciding the
+	// launch mode. The screen must say so, because otherwise a toggle that
+	// cannot take effect looks broken rather than overridden.
+	LaunchModePinned bool `json:"launch_mode_pinned,omitempty"`
+	// LaunchModePinnedBy names the override to unset.
+	LaunchModePinnedBy string                   `json:"launch_mode_pinned_by,omitempty"`
+	Providers          []ProviderReadinessDTO   `json:"providers,omitempty"`
+	Connections        []ConnectionReadinessDTO `json:"connections,omitempty"`
+}
+
+// LaunchModeRequest asks the supervisor to change the startup gate.
+type LaunchModeRequest struct {
+	// Mode is "manual" or "auto". Anything else is rejected rather than
+	// coerced, so a typo cannot silently arm every connection.
+	Mode string `json:"mode"`
+}
+
+// LaunchModeDTO reports the mode actually in effect after a change.
+//
+// It is not simply an echo of the request. PORTICO_LAUNCH_MODE overrides the
+// stored value, so a request to change the mode can legitimately have no
+// effect; reporting the requested mode back would tell the caller something
+// untrue about the machine it is running on.
+type LaunchModeDTO struct {
+	// Mode is the mode now in effect.
+	Mode string `json:"mode"`
+	// Pinned reports that an environment override is deciding the mode, so the
+	// stored value is not being consulted.
+	Pinned bool `json:"pinned,omitempty"`
+	// PinnedBy names the override, so the caller can say what to unset.
+	PinnedBy string `json:"pinned_by,omitempty"`
+	// Persistent reports whether the mode survives a supervisor restart.
+	// Portico has no settings store yet, so a mode set at runtime lasts only
+	// as long as the process. Callers must say so rather than implying the
+	// choice is remembered.
+	Persistent bool `json:"persistent"`
 }
 
 // ProviderReadinessDTO is one provider's position, with the credential sources

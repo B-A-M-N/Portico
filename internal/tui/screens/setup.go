@@ -76,6 +76,14 @@ func (m *SetupModel) View() string {
 	b.WriteString("\n\n")
 
 	b.WriteString(fmt.Sprintf("Launch mode: %s\n", launchModeLabel(m.Readiness.LaunchMode)))
+	// A mode fixed by the environment cannot be changed from here. Saying so
+	// keeps an unresponsive-looking key from reading as a broken one.
+	if m.Readiness.LaunchModePinned {
+		b.WriteString(fmt.Sprintf("             fixed by %s; unset it to change this here\n",
+			m.Readiness.LaunchModePinnedBy))
+	} else {
+		b.WriteString("             applies until the supervisor restarts\n")
+	}
 	b.WriteString("\n")
 
 	b.WriteString("PROVIDERS\n")

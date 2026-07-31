@@ -66,6 +66,7 @@ type RequestHandler interface {
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
 	HandleConnectionLogs(id string, lines int) (*ConnectionLogsDTO, error)
 	HandleReadiness() (*ReadinessDTO, error)
+	HandleSetLaunchMode(mode string) (*LaunchModeDTO, error)
 	HandleSupportExport() (*SupportExportDTO, error)
 	HandleSupervisorStop(ctx context.Context) error
 }
@@ -119,6 +120,7 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/supervisor/stop", s.handleSupervisorStop)
 	mux.HandleFunc("/v1/support/export", s.handleSupportExport)
 	mux.HandleFunc("/v1/readiness", s.handleReadiness)
+	mux.HandleFunc("/v1/launch-mode", s.handleLaunchMode)
 	s.mux = mux
 
 	return s, nil
@@ -877,6 +879,30 @@ func (s *Server) handleSupportExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(export)
+}
+
+// handleLaunchMode changes the startup gate.
+//
+// POST only: reading the mode is already answered by /v1/readiness, and a
+// second read path would be a second thing to keep true.
+func (s *Server) handleLaunchMode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "PTO-LAUNCH-METHOD", "method not allowed")
+		return
+	}
+	var req LaunchModeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "PTO-LAUNCH-BODY", "invalid request body")
+		return
+	}
+	result, err := s.handler.HandleSetLaunchMode(req.Mode)
+	if err != nil {
+		writeHandlerError(w, "PTO-LAUNCH", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(result)
 }
 
 // handleReadiness serves the aggregated setup view.

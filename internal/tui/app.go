@@ -37,6 +37,14 @@ const (
 	ScreenQuit              ScreenID = "quit"
 )
 
+// Launch mode wire values, as carried by ipc.ReadinessDTO and
+// ipc.LaunchModeRequest. They are duplicated here rather than imported from the
+// supervisor package because the TUI reaches the supervisor only over IPC.
+const (
+	launchManual = "manual"
+	launchAuto   = "auto"
+)
+
 // Model is the root Bubble Tea model (SPEC §17.3).
 type Model struct {
 	width      int
@@ -260,6 +268,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// of health.
 		m.setup.Err = msg.Err
 		m.setup.Readiness = msg.Readiness
+		return m, nil
+
+	case launchModeMsg:
+		if msg.Err != nil {
+			m.status = "Could not change launch mode: " + msg.Err.Error()
+			return m, nil
+		}
+		if msg.Result == nil {
+			return m, nil
+		}
+		// The supervisor's answer replaces the local view rather than the mode
+		// that was requested, so a pinned mode does not appear to have changed.
+		if m.setup != nil && m.setup.Readiness != nil {
+			m.setup.Readiness.LaunchMode = msg.Result.Mode
+			m.setup.Readiness.LaunchModePinned = msg.Result.Pinned
+			m.setup.Readiness.LaunchModePinnedBy = msg.Result.PinnedBy
+		}
+		switch {
+		case msg.Result.Pinned:
+			m.status = fmt.Sprintf(
+				"Launch mode is fixed at %s by %s. Unset it to change the mode here.",
+				msg.Result.Mode, msg.Result.PinnedBy)
+		case !msg.Result.Persistent:
+			m.status = fmt.Sprintf(
+				"Launch mode is now %s, until the supervisor restarts.", msg.Result.Mode)
+		default:
+			m.status = fmt.Sprintf("Launch mode is now %s.", msg.Result.Mode)
+		}
 		return m, nil
 
 	case connectionLogsMsg:
@@ -597,6 +633,11 @@ type readinessMsg struct {
 	Err       error
 }
 
+type launchModeMsg struct {
+	Result *ipc.LaunchModeDTO
+	Err    error
+}
+
 type connectionLogsMsg struct {
 	ConnectionID string
 	Logs         *ipc.ConnectionLogsDTO
@@ -647,6 +688,25 @@ func (m *Model) readinessCmd() tea.Cmd {
 		defer cancel()
 		readiness, err := client.Readiness(readyCtx)
 		return readinessMsg{Readiness: readiness, Err: err}
+	}
+}
+
+// setLaunchModeCmd changes the startup gate.
+//
+// The supervisor answers with the mode actually in effect, which the caller
+// must display in preference to the mode it asked for: an environment override
+// wins, and echoing the request would claim a change that did not happen.
+func (m *Model) setLaunchModeCmd(mode string) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return launchModeMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		setCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		result, err := client.SetLaunchMode(setCtx, mode)
+		return launchModeMsg{Result: result, Err: err}
 	}
 }
 
@@ -993,6 +1053,10 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			return m, m.readinessCmd()
+		case "l":
+			// Flip the gate. The mode shown is whatever the supervisor reports
+			// afterwards, so this never claims a change it did not make.
+			return m, m.setLaunchModeCmd(oppositeLaunchMode(m.currentLaunchMode()))
 		case "enter":
 			// Setting up the highlighted provider goes through the existing
 			// account flow rather than a second, parallel one.
@@ -1248,6 +1312,26 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 	}
 
 	return m, m.wizard.HandleKey(key)
+}
+
+// currentLaunchMode reports the mode the screen is currently showing.
+//
+// It defaults to auto, matching the supervisor's own default, so the first
+// press of the toggle on a screen that has not loaded yet asks for manual —
+// the safe direction, since manual arms nothing.
+func (m Model) currentLaunchMode() string {
+	if m.setup != nil && m.setup.Readiness != nil && m.setup.Readiness.LaunchMode != "" {
+		return m.setup.Readiness.LaunchMode
+	}
+	return launchAuto
+}
+
+// oppositeLaunchMode returns the mode to switch to.
+func oppositeLaunchMode(mode string) string {
+	if mode == launchManual {
+		return launchAuto
+	}
+	return launchManual
 }
 
 // clearProviderSetupSecret drops the credential from model memory.

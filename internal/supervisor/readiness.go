@@ -26,6 +26,10 @@ func (h *supervisorHandler) HandleReadiness() (*ipc.ReadinessDTO, error) {
 	readiness := &ipc.ReadinessDTO{
 		LaunchMode: h.sup.launchMode(),
 	}
+	if _, pinned := launchModeOverride(); pinned {
+		readiness.LaunchModePinned = true
+		readiness.LaunchModePinnedBy = launchModeEnv
+	}
 
 	detected := credentials.Detect()
 	bySource := map[string][]credentials.Detected{}

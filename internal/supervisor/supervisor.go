@@ -1467,6 +1467,30 @@ func (h *supervisorHandler) HandlePlanDelete(id string) (*ipc.PlanDTO, error) {
 	return dto, nil
 }
 
+// HandleSetLaunchMode changes the startup gate at runtime.
+//
+// It reports the mode actually in effect rather than echoing the request. An
+// environment override wins over the stored value, so a caller that assumed
+// success would display a mode the supervisor is not using.
+func (h *supervisorHandler) HandleSetLaunchMode(mode string) (*ipc.LaunchModeDTO, error) {
+	if !ValidLaunchMode(mode) {
+		return nil, core.ErrValidation(fmt.Sprintf(
+			"launch mode must be %q or %q, not %q", LaunchManual, LaunchAuto, mode))
+	}
+	h.sup.SetLaunchMode(mode)
+
+	dto := &ipc.LaunchModeDTO{Mode: h.sup.launchMode()}
+	if _, pinned := launchModeOverride(); pinned {
+		dto.Pinned = true
+		dto.PinnedBy = launchModeEnv
+	}
+	// The mode lives in the supervisor process only; Portico has no settings
+	// store to write it to. Saying so is the difference between a user
+	// deliberately leaving it manual and being surprised on the next restart.
+	dto.Persistent = false
+	return dto, nil
+}
+
 func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 	prov := h.sup.registry.Get(core.ProviderID(id))
 	if prov == nil {

@@ -487,6 +487,30 @@ func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string
 	return &result, nil
 }
 
+// SetLaunchMode changes whether the supervisor arms connections at startup.
+//
+// The returned mode is the one now in effect, which is not necessarily the one
+// requested: an environment override takes precedence over the stored value.
+func (c *Client) SetLaunchMode(ctx context.Context, mode string) (*LaunchModeDTO, error) {
+	body, err := json.Marshal(LaunchModeRequest{Mode: mode})
+	if err != nil {
+		return nil, fmt.Errorf("marshal launch mode: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/launch-mode", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result LaunchModeDTO
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // --------------- Event stream ---------------
 
 // EventStream connects to the SSE event stream.
