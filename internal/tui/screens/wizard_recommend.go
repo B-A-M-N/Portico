@@ -139,8 +139,11 @@ func (m *WizardModel) recommendedChoices() []wizardChoice {
 			Reason: filtered.Reason,
 		}
 		// The reasons are the engine's, so the refusal is explained in the same
-		// terms the engine used to decide.
-		choice.Detail = append(choice.Detail, filtered.Reasons...)
+		// terms the engine used to decide. A single reason already appears on
+		// the line, so repeating it under the line says nothing twice.
+		if len(filtered.Reasons) > 1 {
+			choice.Detail = append(choice.Detail, filtered.Reasons...)
+		}
 		if len(filtered.SetupActions) > 0 {
 			choice.Detail = append(choice.Detail, "", "To make this usable:")
 			for _, action := range filtered.SetupActions {
