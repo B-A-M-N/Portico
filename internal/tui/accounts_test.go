@@ -189,3 +189,55 @@ func TestTheProvidersScreenSaysHowToRemoveAnAccount(t *testing.T) {
 		t.Fatalf("the providers screen does not offer removal:\n%s", view)
 	}
 }
+
+// TestAddingAnAccountUsesTheSelectedProvider pins that provider management is
+// provider-neutral.
+//
+// The providers screen had no provider selection, so adding an account fell
+// back to Cloudflare by name — in a codebase whose entire setup mechanism is
+// declarative and knows nothing about any specific provider.
+func TestAddingAnAccountUsesTheSelectedProvider(t *testing.T) {
+	snap := testSnapshot()
+	snap.Providers = []ipc.ProviderDTO{
+		{ID: "ngrok", DisplayName: "ngrok", Accounts: []ipc.ProviderAccountDTO{
+			{ID: "ngrok-default", Label: "Default", Status: "authenticated"},
+		}},
+		{ID: "cloudflare", DisplayName: "Cloudflare", Accounts: []ipc.ProviderAccountDTO{
+			{ID: "cf-work", Label: "Work", Status: "authenticated"},
+		}},
+	}
+	m := readyModel(&fakeClient{}, snap)
+	m.transitionTo(ScreenProviders)
+
+	// The cursor starts on ngrok's account, so that is the provider in context.
+	if got := m.selectedProviderID(); got != "ngrok" {
+		t.Fatalf("selected provider = %q, want ngrok", got)
+	}
+
+	// Moving to Cloudflare's account changes it.
+	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
+	if got := m.selectedProviderID(); got != "cloudflare" {
+		t.Fatalf("after moving, selected provider = %q, want cloudflare", got)
+	}
+}
+
+// TestTheSelectedAccountIsVisible pins that the screen shows which account an
+// action will apply to. It offered "↑↓ select account" and drew no marker, so
+// the target was invisible until the confirmation appeared.
+func TestTheSelectedAccountIsVisible(t *testing.T) {
+	m := readyModel(&fakeClient{}, accountSnapshot())
+	m.transitionTo(ScreenProviders)
+
+	view := m.renderProviders()
+	if !strings.Contains(view, "▸") {
+		t.Fatalf("no account is marked as selected:\n%s", view)
+	}
+
+	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
+	moved := m.renderProviders()
+	if moved == view {
+		t.Fatal("moving the cursor did not change what is marked")
+	}
+}

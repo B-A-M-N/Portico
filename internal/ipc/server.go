@@ -782,6 +782,25 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 		}
 		response, err := s.handler.HandleConfigureProviderAccount(id, req)
 		if err != nil {
+			// A rejected credential is not just a failure: the response says
+			// which permissions are missing, and a user cannot act on
+			// "validation failed". Those details were computed and discarded
+			// with the response, so the client saw only the summary.
+			if response != nil && (len(response.MissingPermissions) > 0 || len(response.Zones) > 0) {
+				apiErr := APIError{
+					Version: 1, Code: "PROV-005", Summary: err.Error(), ProviderID: id,
+					ProviderValidation: &ProviderValidationDetails{
+						MissingPermissions: response.MissingPermissions,
+						AvailableZones:     response.Zones,
+						AccountAccessible:  response.Validated,
+						VerificationState:  response.Status,
+					},
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_ = json.NewEncoder(w).Encode(apiErr)
+				return
+			}
 			writeHandlerError(w, "PROV-005", err)
 			return
 		}

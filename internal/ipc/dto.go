@@ -653,6 +653,11 @@ type SetupFieldDTO struct {
 	Secret      bool   `json:"secret,omitempty"`
 	Required    bool   `json:"required,omitempty"`
 	Placeholder string `json:"placeholder,omitempty"`
+	// EnvVars name the environment variables a non-interactive caller may
+	// supply this field through. Portico never accepts a secret as a command
+	// argument — it would be in the shell history and in the process list — so
+	// this is how the CLI collects one.
+	EnvVars []string `json:"env_vars,omitempty"`
 }
 
 // RemoveProviderAccountResponse reports whether an account was removed and, if

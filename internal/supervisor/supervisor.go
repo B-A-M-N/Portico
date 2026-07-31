@@ -1575,6 +1575,7 @@ func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDT
 			Secret:      field.Secret,
 			Required:    field.Required,
 			Placeholder: field.Placeholder,
+			EnvVars:     field.EnvVars,
 		})
 	}
 	return dto, nil

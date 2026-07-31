@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -614,43 +615,156 @@ func handleProviderList(cmd *cobra.Command) error {
 			}
 			fmt.Printf("  - %s (%s)\n", label, state)
 		}
+		// An account that exists but cannot be used is the thing most likely to
+		// be causing a problem. Listing only usable accounts made a provider
+		// that says "needs setup" after setup look inexplicable.
+		for _, account := range p.PendingAccounts {
+			label := account.Label
+			if label == "" {
+				label = account.ID
+			}
+			state := account.Status
+			if state == "" {
+				state = "unverified"
+			}
+			fmt.Printf("  ! %s (%s — not usable)\n", label, state)
+		}
 	}
 	return nil
 }
 
+// handleProviderLogin configures any provider that declares a setup flow.
+//
+// It used to be Cloudflare and nothing else, and it required a zone that the
+// provider's own declaration marks optional — so the CLI enforced a stricter
+// contract than the supervisor, and refused a tunnel-only setup the TUI accepts.
+// One provider contract, declared by the provider, read by both interfaces.
 func handleProviderLogin(cmd *cobra.Command, id string) error {
-	if id != "cloudflare" {
-		return fmt.Errorf("provider login for %q is not supported", id)
-	}
-	accountID, _ := cmd.Flags().GetString("account-id")
-	zoneID, _ := cmd.Flags().GetString("zone-id")
-	if accountID == "" || zoneID == "" {
-		return fmt.Errorf("cloudflare login requires --account-id and --zone-id")
-	}
-	token := strings.TrimSpace(os.Getenv("PORTICO_CLOUDFLARE_API_TOKEN"))
-	if token == "" {
-		token = strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN"))
-	}
-	if token == "" {
-		return fmt.Errorf("set CLOUDFLARE_API_TOKEN or PORTICO_CLOUDFLARE_API_TOKEN before logging in; Portico never accepts provider tokens on the command line")
-	}
-	label, _ := cmd.Flags().GetString("label")
 	client, err := getClient(cmd)
 	if err != nil {
 		return err
 	}
-	response, err := client.ConfigureProviderAccount(cmd.Context(), "cloudflare", ipc.ConfigureProviderAccountRequest{
-		AccountID: accountID, ZoneID: zoneID, Label: label, Credential: token,
-	})
+
+	flow, err := client.ProviderSetupFlow(cmd.Context(), id)
 	if err != nil {
-		return fmt.Errorf("save Cloudflare account: %w", err)
+		return fmt.Errorf("ask %s what it needs: %w", id, err)
 	}
-	if response.RestartRequired {
-		fmt.Println("Cloudflare account saved securely. Run 'portico supervisor stop' then 'portico supervisor start' to activate it.")
+	if !flow.StoresAccount() {
+		// A guidance flow describes what to do elsewhere. Collecting values
+		// here would store something nothing reads.
+		fmt.Printf("%s cannot be configured through Portico.\n\n", id)
+		if flow.GuidanceReason != "" {
+			fmt.Println(flow.GuidanceReason)
+			fmt.Println()
+		}
+		fmt.Println("What this provider needs:")
+		for _, field := range flow.Fields {
+			fmt.Printf("  • %s\n", field.Label)
+			if field.Description != "" {
+				fmt.Printf("    %s\n", field.Description)
+			}
+		}
 		return nil
 	}
-	fmt.Println("Cloudflare account saved securely.")
+
+	values, err := collectSetupValues(cmd, flow)
+	if err != nil {
+		return err
+	}
+
+	req := ipc.ConfigureProviderAccountRequest{Fields: values}
+	// The identity and secret fields have dedicated request fields, so they are
+	// lifted out of the generic map rather than duplicated in it.
+	req.AccountID = values["account_id"]
+	req.ZoneID = values["zone_id"]
+	req.Label = values["label"]
+	req.Credential = values["credential"]
+
+	response, err := client.ConfigureProviderAccount(cmd.Context(), id, req)
+	if err != nil {
+		return describeProviderSetupFailure(id, err)
+	}
+
+	fmt.Printf("%s account saved.\n", id)
+	// What the account can actually do. A zone is needed only for DNS and
+	// custom hostnames, so an account saved without one is useful and limited,
+	// and saying which is the difference between a working setup and a puzzle.
+	if response.CapabilityLevel != "" {
+		fmt.Printf("  Capability: %s\n", response.CapabilityLevel)
+	}
+	if !response.Validated {
+		fmt.Println("  The credential could not be confirmed with the provider; " +
+			"the account is saved as unverified.")
+	}
+	if response.RestartRequired {
+		fmt.Println("Run 'portico supervisor stop' then 'portico supervisor start' to activate it.")
+	}
 	return nil
+}
+
+// collectSetupValues gathers the fields a provider declared.
+//
+// Non-secret values come from flags or the environment. Secrets come only from
+// the environment: a secret passed as an argument is in the shell history and
+// visible in the process list to every user on the machine.
+func collectSetupValues(cmd *cobra.Command, flow *ipc.SetupFlowDTO) (map[string]string, error) {
+	values := map[string]string{}
+
+	for _, field := range flow.Fields {
+		var value string
+
+		if !field.Secret {
+			// A flag named after the field, so --account-id still works.
+			flagName := strings.ReplaceAll(field.ID, "_", "-")
+			if f := cmd.Flags().Lookup(flagName); f != nil {
+				value = strings.TrimSpace(f.Value.String())
+			}
+		}
+		if value == "" {
+			for _, name := range field.EnvVars {
+				if fromEnv := strings.TrimSpace(os.Getenv(name)); fromEnv != "" {
+					value = fromEnv
+					break
+				}
+			}
+		}
+
+		if value == "" && field.Required {
+			if field.Secret {
+				return nil, fmt.Errorf(
+					"%s is required; set %s in the environment — Portico never accepts a secret "+
+						"as a command argument, because arguments are recorded in shell history "+
+						"and visible in the process list",
+					field.Label, strings.Join(field.EnvVars, " or "))
+			}
+			return nil, fmt.Errorf("%s is required; pass --%s or set %s",
+				field.Label, strings.ReplaceAll(field.ID, "_", "-"),
+				strings.Join(field.EnvVars, " or "))
+		}
+		if value != "" {
+			values[field.ID] = value
+		}
+	}
+	return values, nil
+}
+
+// describeProviderSetupFailure reports why a credential was refused, using the
+// typed detail the supervisor sends rather than only its summary.
+func describeProviderSetupFailure(id string, err error) error {
+	var status *ipc.APIStatusError
+	if !errors.As(err, &status) || status.ProviderValidation == nil {
+		return fmt.Errorf("save %s account: %w", id, err)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "save %s account: %s", id, status.Message)
+	if len(status.ProviderValidation.MissingPermissions) > 0 {
+		b.WriteString("\n\nThe token is missing:")
+		for _, permission := range status.ProviderValidation.MissingPermissions {
+			b.WriteString("\n  • " + permission)
+		}
+	}
+	return errors.New(b.String())
 }
 
 func handleDiscover(cmd *cobra.Command) error {

@@ -69,6 +69,7 @@ type Model struct {
 
 	// Account lifecycle on the providers screen.
 	accountSelected          int
+	providerSelected         int
 	accountRequests          requestTracker
 	accountRemovalTarget     *accountRow
 	accountRemovalError      string
@@ -2235,7 +2236,13 @@ func (m Model) selectedProviderID() string {
 			return selected.ID
 		}
 	}
-	return "cloudflare"
+	// The providers screen now has a selection, so this no longer has to guess.
+	// It named Cloudflare because there was nothing to ask — in a codebase whose
+	// setup mechanism is entirely provider-neutral.
+	if provider, ok := m.selectedProvider(); ok {
+		return provider.ID
+	}
+	return ""
 }
 
 // beginProviderSetup starts configuring a provider by asking it what it needs.
@@ -2860,7 +2867,9 @@ func (m *Model) renderProviders() string {
 			renderCapability(len(p.Capabilities.ProtectionModes) > 0, "Access protection")
 		}
 
-		// Show configured accounts
+		// Configured accounts, with the cursor visible. The screen offered
+		// "↑↓ select account" and drew no marker, so which account [x] would
+		// remove was invisible until the confirmation appeared.
 		for _, account := range p.Accounts {
 			accLabel := account.Label
 			if accLabel == "" {
@@ -2870,7 +2879,13 @@ func (m *Model) renderProviders() string {
 			if accountStatus == "" {
 				accountStatus = "configured"
 			}
-			b.WriteString(fmt.Sprintf("      • %s — %s\n", accLabel, accountStatus))
+			line := fmt.Sprintf("      %s %s — %s", accountMarker(m, p.ID, account.ID), accLabel, accountStatus)
+			if isSelectedAccount(m, p.ID, account.ID) {
+				b.WriteString(m.theme.Style("attention").Render(line))
+			} else {
+				b.WriteString(line)
+			}
+			b.WriteString("\n")
 		}
 		// A saved but unusable account must stay visible and say what to do
 		// about it. Hiding it would leave the user with a provider that says
@@ -2881,7 +2896,8 @@ func (m *Model) renderProviders() string {
 				accLabel = account.ID
 			}
 			b.WriteString(m.theme.Style("intervention").Render(
-				fmt.Sprintf("      • %s — %s, not usable", accLabel, account.Status)))
+				fmt.Sprintf("      %s %s — %s, not usable",
+					accountMarker(m, p.ID, account.ID), accLabel, account.Status)))
 			b.WriteString("\n")
 			b.WriteString(m.theme.Style("muted").Render(
 				"        Its credential was never confirmed. Set the provider up again to replace it.") + "\n")
@@ -3740,4 +3756,19 @@ func accountDependencyLines(err error, response *ipc.RemoveProviderAccountRespon
 		lines = append(lines, response.DependentConnections...)
 	}
 	return lines
+}
+
+// isSelectedAccount reports whether the cursor is on this account.
+func isSelectedAccount(m *Model, providerID, accountID string) bool {
+	selected, ok := m.selectedAccount()
+	return ok && selected.ProviderID == providerID && selected.AccountID == accountID
+}
+
+// accountMarker draws the cursor, so the account an action applies to is
+// visible before the action is taken.
+func accountMarker(m *Model, providerID, accountID string) string {
+	if isSelectedAccount(m, providerID, accountID) {
+		return "▸"
+	}
+	return "•"
 }

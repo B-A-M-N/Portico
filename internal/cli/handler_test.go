@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 func TestReopenRotatedLogSwitchesToPathReplacement(t *testing.T) {
@@ -110,5 +114,90 @@ func TestRemoveAccountIsReachable(t *testing.T) {
 	}
 	if remove.Name() != "remove-account" {
 		t.Fatalf("found %q, want remove-account", remove.Name())
+	}
+}
+
+// TestProviderLoginDoesNotRequireAZone pins that the CLI enforces the contract
+// the provider declares, not a stricter one of its own.
+//
+// Cloudflare's setup flow marks the zone optional — it is needed only for DNS
+// and custom hostnames — and the TUI accepts a tunnel-only setup. The CLI
+// required it, so the same account could be configured in one interface and
+// refused in the other.
+func TestProviderLoginDoesNotRequireAZone(t *testing.T) {
+	flow := &ipc.SetupFlowDTO{
+		ProviderID: "cloudflare", Kind: "account",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "account_id", Label: "Account ID", Required: true,
+				EnvVars: []string{"TEST_ACCOUNT_ID"}},
+			{ID: "zone_id", Label: "Zone ID", EnvVars: []string{"TEST_ZONE_ID"}},
+			{ID: "credential", Label: "API token", Secret: true, Required: true,
+				EnvVars: []string{"TEST_TOKEN"}},
+		},
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().String("account-id", "acct-1", "")
+	cmd.Flags().String("zone-id", "", "")
+	cmd.Flags().String("label", "", "")
+	t.Setenv("TEST_TOKEN", "cf-token")
+
+	values, err := collectSetupValues(cmd, flow)
+	if err != nil {
+		t.Fatalf("a tunnel-only setup was refused: %v", err)
+	}
+	if values["account_id"] != "acct-1" {
+		t.Fatalf("account = %q", values["account_id"])
+	}
+	if _, present := values["zone_id"]; present {
+		t.Fatalf("an unset optional field was submitted: %#v", values)
+	}
+	if values["credential"] != "cf-token" {
+		t.Fatal("the credential was not read from the environment")
+	}
+}
+
+// TestASecretIsNeverTakenFromAnArgument pins the rule the whole flow rests on:
+// a secret passed as an argument is in the shell history and visible in the
+// process list to every user on the machine.
+func TestASecretIsNeverTakenFromAnArgument(t *testing.T) {
+	flow := &ipc.SetupFlowDTO{
+		ProviderID: "cloudflare", Kind: "account",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "credential", Label: "API token", Secret: true, Required: true,
+				EnvVars: []string{"TEST_TOKEN_UNSET"}},
+		},
+	}
+	cmd := &cobra.Command{}
+	// A flag with the field's name exists and holds a value. It must be ignored.
+	cmd.Flags().String("credential", "cf-token-from-argv", "")
+
+	_, err := collectSetupValues(cmd, flow)
+	if err == nil {
+		t.Fatal("a secret was accepted from a command argument")
+	}
+	if !strings.Contains(err.Error(), "shell history") {
+		t.Fatalf("the refusal does not say why: %v", err)
+	}
+}
+
+// TestARequiredFieldIsRefusedByName pins that a missing value says which one
+// and how to supply it.
+func TestARequiredFieldIsRefusedByName(t *testing.T) {
+	flow := &ipc.SetupFlowDTO{
+		ProviderID: "cloudflare", Kind: "account",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "account_id", Label: "Account ID", Required: true,
+				EnvVars: []string{"TEST_ACCOUNT_UNSET"}},
+		},
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().String("account-id", "", "")
+
+	_, err := collectSetupValues(cmd, flow)
+	if err == nil {
+		t.Fatal("a missing required field was accepted")
+	}
+	if !strings.Contains(err.Error(), "Account ID") || !strings.Contains(err.Error(), "--account-id") {
+		t.Fatalf("the refusal does not say what to supply: %v", err)
 	}
 }

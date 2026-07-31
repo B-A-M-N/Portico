@@ -21,6 +21,11 @@ type SetupField struct {
 	Required bool
 	// Placeholder is an example value, never a default to submit.
 	Placeholder string
+	// EnvVars name the environment variables a non-interactive caller may
+	// supply this field through, most in preference first. A secret is never
+	// accepted as a command argument — it would end up in shell history and in
+	// the process list — so for the CLI this is the only way to provide one.
+	EnvVars []string
 }
 
 // SetupKind states what completing a flow actually does.

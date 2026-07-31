@@ -1596,6 +1596,7 @@ func cloudflareSetupFlow() core.SetupFlow {
 				Label:       "Account ID",
 				Description: "Found on the Cloudflare dashboard overview page.",
 				Required:    true,
+				EnvVars:     []string{"PORTICO_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"},
 			},
 			{
 				ID:          "label",
@@ -1603,8 +1604,9 @@ func cloudflareSetupFlow() core.SetupFlow {
 				Description: "A name for this account inside Portico. Defaults to the account ID.",
 			},
 			{
-				ID:    "zone_id",
-				Label: "Zone ID",
+				ID:      "zone_id",
+				Label:   "Zone ID",
+				EnvVars: []string{"PORTICO_CLOUDFLARE_ZONE_ID", "CLOUDFLARE_ZONE_ID"},
 				Description: "Only needed for permanent hostnames and DNS. " +
 					"Leave blank to use tunnels with temporary addresses.",
 			},
@@ -1614,6 +1616,10 @@ func cloudflareSetupFlow() core.SetupFlow {
 				Description: "A token that can read your account and manage tunnels.",
 				Secret:      true,
 				Required:    true,
+				// Read from the environment, never from a command argument: an
+				// argument is in the shell history and visible in the process
+				// list to every user on the machine.
+				EnvVars: []string{"PORTICO_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"},
 			},
 		},
 		CapabilityNotes: []string{

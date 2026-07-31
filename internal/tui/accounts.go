@@ -40,6 +40,61 @@ func (r accountRow) Name() string {
 	return r.AccountID
 }
 
+// providerRow is one provider on the providers screen, with its accounts.
+type providerRow struct {
+	ID       string
+	Name     string
+	Accounts []accountRow
+}
+
+// providerRows lists providers and their accounts in the order drawn.
+func (m *Model) providerRows() []providerRow {
+	var rows []providerRow
+	for _, p := range m.snapshot.Providers {
+		row := providerRow{ID: p.ID, Name: p.DisplayName}
+		for _, account := range p.Accounts {
+			row.Accounts = append(row.Accounts, accountRow{
+				ProviderID: p.ID, ProviderName: p.DisplayName,
+				AccountID: account.ID, Label: account.Label, Status: account.Status,
+			})
+		}
+		for _, account := range p.PendingAccounts {
+			row.Accounts = append(row.Accounts, accountRow{
+				ProviderID: p.ID, ProviderName: p.DisplayName,
+				AccountID: account.ID, Label: account.Label, Status: account.Status,
+				Pending: true,
+			})
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// selectedProvider names the provider the cursor is within.
+//
+// The providers screen had no provider selection at all, so adding an account
+// fell back to Cloudflare by name — in a codebase whose whole setup mechanism is
+// declarative and provider-neutral.
+func (m *Model) selectedProvider() (providerRow, bool) {
+	rows := m.providerRows()
+	if len(rows) == 0 {
+		return providerRow{}, false
+	}
+	// The cursor addresses accounts; the provider is the one owning the account
+	// under it, or the first provider when there are no accounts at all.
+	if account, ok := m.selectedAccount(); ok {
+		for _, row := range rows {
+			if row.ID == account.ProviderID {
+				return row, true
+			}
+		}
+	}
+	if m.providerSelected >= 0 && m.providerSelected < len(rows) {
+		return rows[m.providerSelected], true
+	}
+	return rows[0], true
+}
+
 // accountRows lists every stored account in the order the screen draws them, so
 // a cursor index means the same thing to the renderer and to the action.
 func (m *Model) accountRows() []accountRow {
