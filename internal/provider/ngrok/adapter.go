@@ -385,8 +385,14 @@ func (p *Provider) executeValidateAccount(step core.PlanStep) core.StepResult {
 }
 
 // hasCredential reports whether the agent will be able to authenticate.
+// AuthTokenEnvVar is the variable the ngrok agent reads its token from.
+//
+// The agent resolves it itself, so a machine with this set is usable without
+// Portico storing the token anywhere.
+const AuthTokenEnvVar = "NGROK_AUTHTOKEN"
+
 func (p *Provider) hasCredential() bool {
-	if p.apiKey != "" || os.Getenv("NGROK_AUTHTOKEN") != "" {
+	if p.apiKey != "" || os.Getenv(AuthTokenEnvVar) != "" {
 		return true
 	}
 	return ngrokConfigHasAuthtoken()
@@ -460,7 +466,7 @@ func (p *Provider) agentProcessSpec(step core.PlanStep, configPath string) core.
 	// left alone so the agent falls back to its own configuration file.
 	token := p.apiKey
 	if token == "" {
-		token = os.Getenv("NGROK_AUTHTOKEN")
+		token = os.Getenv(AuthTokenEnvVar)
 	}
 	spec := core.ProcessSpec{
 		Executable: p.binPath,
@@ -470,7 +476,7 @@ func (p *Provider) agentProcessSpec(step core.PlanStep, configPath string) core.
 	if token != "" {
 		// Setting Env replaces the child environment wholesale, so the entries
 		// the agent needs to find its own configuration must be carried along.
-		spec.Env = []string{"NGROK_AUTHTOKEN=" + token}
+		spec.Env = []string{AuthTokenEnvVar + "=" + token}
 		if home := os.Getenv("HOME"); home != "" {
 			spec.Env = append(spec.Env, "HOME="+home)
 		}

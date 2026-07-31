@@ -2364,7 +2364,7 @@ func TestBootstrapDoesNotOverwriteConfiguredAccountState(t *testing.T) {
 
 	// A stale environment from an earlier install, applied on the next start,
 	// through the same helper both provider bootstraps use.
-	seedBootstrapAccount(st, "cloudflare", "acct-1", "token-stale",
+	seedBootstrapAccount(ctx, st, "cloudflare", "acct-1", "token-stale",
 		map[string]string{"zone_id": "zone-stale"}, acceptingVerifier)
 
 	accounts, err := st.ListProviderAccounts(ctx)
@@ -2392,7 +2392,7 @@ func TestBootstrapDoesNotOverwriteConfiguredAccountState(t *testing.T) {
 // environment token replaced a validated one while the account row kept its
 // label, zone and status. The adapter was then built from the wrong token.
 func TestBootstrapImportKeepsTheValidatedCredential(t *testing.T) {
-	for _, providerID := range []core.ProviderID{"cloudflare", "ngrok"} {
+	for _, providerID := range []core.ProviderID{"cloudflare"} {
 		t.Run(string(providerID), func(t *testing.T) {
 			ctx := context.Background()
 			st := newRecoveryTestStore(t)
@@ -2407,7 +2407,7 @@ func TestBootstrapImportKeepsTheValidatedCredential(t *testing.T) {
 				t.Fatalf("seed configured account: %v", err)
 			}
 
-			seedBootstrapAccount(st, providerID, "acct-1", "token-stale",
+			seedBootstrapAccount(ctx, st, providerID, "acct-1", "token-stale",
 				map[string]string{"zone_id": "zone-stale"}, acceptingVerifier)
 
 			secret, err := st.LoadProviderCredential(ctx, providerID, ref)
@@ -2431,7 +2431,7 @@ func TestBootstrapImportCreatesTheAccountWhenThereIsNone(t *testing.T) {
 	ctx := context.Background()
 	st := newRecoveryTestStore(t)
 
-	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
+	seedBootstrapAccount(ctx, st, "cloudflare", "acct-env", "token-env",
 		map[string]string{"zone_id": "z1"}, acceptingVerifier)
 
 	accounts, err := st.ListProviderAccounts(ctx)
@@ -2615,7 +2615,7 @@ func TestAnUnconfirmedEnvironmentCredentialIsNotImported(t *testing.T) {
 	refuse := func(context.Context, core.ProviderID, string, string) error {
 		return errors.New("the provider could not be reached")
 	}
-	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
+	seedBootstrapAccount(ctx, st, "cloudflare", "acct-env", "token-env",
 		map[string]string{"zone_id": "z1"}, refuse)
 
 	accounts, err := st.ListProviderAccounts(ctx)
@@ -2628,7 +2628,7 @@ func TestAnUnconfirmedEnvironmentCredentialIsNotImported(t *testing.T) {
 
 	// Confirming later must still import it, so an offline first boot is not
 	// permanent.
-	seedBootstrapAccount(st, "cloudflare", "acct-env", "token-env",
+	seedBootstrapAccount(ctx, st, "cloudflare", "acct-env", "token-env",
 		map[string]string{"zone_id": "z1"}, acceptingVerifier)
 	accounts, _ = st.ListProviderAccounts(ctx)
 	if len(accounts) != 1 || accounts[0].Status != core.AccountAuthenticated {
@@ -2656,7 +2656,7 @@ func TestExistingAccountsAreNotReverifiedOnEveryStart(t *testing.T) {
 		called = true
 		return errors.New("network is unreachable")
 	}
-	seedBootstrapAccount(st, "cloudflare", "acct-1", "token", map[string]string{}, verify)
+	seedBootstrapAccount(ctx, st, "cloudflare", "acct-1", "token", map[string]string{}, verify)
 
 	if called {
 		t.Fatal("an already-configured account was re-verified, making startup depend on the network")
@@ -2664,5 +2664,139 @@ func TestExistingAccountsAreNotReverifiedOnEveryStart(t *testing.T) {
 	accounts, _ := st.ListProviderAccounts(ctx)
 	if len(accounts) != 1 || accounts[0].Status != core.AccountAuthenticated {
 		t.Fatalf("an existing account was disturbed: %#v", accounts)
+	}
+}
+
+// TestAnUnusableAccountIsNeverImplicitlySelected pins the worst shape this
+// package could produce: a provider reporting ready while every connection
+// creation fails.
+//
+// The registry's account-ID projection is what the controller uses to bind a
+// profile to an account when the user names none. Including an unverified
+// account there meant Cloudflare — ready, because Quick Tunnels need no account
+// — would durably bind new profiles to an account it could not serve, and fail
+// identically after a restart because the binding had been persisted.
+func TestAnUnusableAccountIsNeverImplicitlySelected(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	pending := core.ProviderAccount{
+		ID: "acct-pending", Provider: "cloudflare", Label: "Unverified",
+		CredentialRef: providerCredentialRef("cloudflare", "acct-pending"),
+		Status:        core.AccountPending, Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, pending, []byte("unchecked")); err != nil {
+		t.Fatalf("seed pending account: %v", err)
+	}
+
+	sup, registry := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+	sup.activateAll(ctx)
+
+	// Quick Tunnels keep the provider usable, which is exactly the state that
+	// made this dangerous.
+	if registry.Get("cloudflare") == nil {
+		t.Fatal("expected a Quick Tunnel adapter")
+	}
+	if ids := registry.GetAccounts("cloudflare"); len(ids) != 0 {
+		t.Fatalf("an unverified account is offered for implicit selection: %v", ids)
+	}
+	// It must still be visible for repair.
+	for _, snap := range registry.Snapshot() {
+		if snap.ID == "cloudflare" && len(snap.PendingAccounts) != 1 {
+			t.Fatalf("the pending account was hidden: %#v", snap.PendingAccounts)
+		}
+	}
+}
+
+// TestAccountsStayVisibleWhenAProviderCannotRun pins that configured accounts do
+// not vanish when a provider is switched off or its client is missing.
+//
+// Installing a catalog entry with no accounts made a user's accounts disappear
+// from the provider screen the moment the client was uninstalled, and made the
+// same durable state project differently depending on how activation was
+// reached.
+func TestAccountsStayVisibleWhenAProviderCannotRun(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	account := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Configured",
+		CredentialRef: providerCredentialRef("cloudflare", "acct-1"),
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("token")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	registry := provider.NewRegistry()
+	ctrl := controller.New(registry, st)
+	sup := &Supervisor{
+		store: st, controller: ctrl, registry: registry, mutating: true,
+		procMgr: process.NewManager(), paths: app.Paths{ConnectorDir: t.TempDir()},
+	}
+	// The client is not installed.
+	sup.SetProviderDefinitions(
+		[]provider.Definition{cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"})},
+		provider.RuntimeServices{
+			Processes: &processManagerAdapter{mgr: sup.procMgr},
+			LookPath:  func(string) (string, error) { return "", errors.New("not installed") },
+			Getenv:    func(string) string { return "" },
+		})
+	sup.activateAll(ctx)
+
+	for _, snap := range registry.Snapshot() {
+		if snap.ID != "cloudflare" {
+			continue
+		}
+		if snap.Availability != provider.AvailabilityClientMissing {
+			t.Fatalf("availability = %q, want client_missing", snap.Availability)
+		}
+		if len(snap.Accounts) != 1 {
+			t.Fatalf("a configured account vanished when the client was missing: %#v", snap.Accounts)
+		}
+		return
+	}
+	t.Fatal("cloudflare missing from the snapshot")
+}
+
+// TestBootstrapVerificationCannotHangStartup pins a bound on the one network
+// call that runs before the IPC listener binds.
+//
+// Without it, a network that blackholes rather than refuses stops the
+// supervisor from ever starting, with no way to interrupt it, and makes the
+// observable startup result depend on network reachability.
+func TestBootstrapVerificationCannotHangStartup(t *testing.T) {
+	st := newRecoveryTestStore(t)
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+	hang := func(ctx context.Context, _ core.ProviderID, _, _ string) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-blocked:
+			return nil
+		}
+	}
+
+	// A cancelled caller context must abandon the import immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		seedBootstrapAccount(ctx, st, "cloudflare", "acct-1", "token", map[string]string{}, hang)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bootstrap import did not observe caller cancellation")
+	}
+
+	accounts, _ := st.ListProviderAccounts(context.Background())
+	if len(accounts) != 0 {
+		t.Fatalf("an unconfirmed credential was imported: %#v", accounts)
 	}
 }

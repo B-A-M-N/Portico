@@ -152,9 +152,22 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 		s.registry.Install(provider.Installation{Catalog: entry})
 	}
 
+	// Accounts are loaded before any early return, because a provider that
+	// cannot run right now must still show the accounts already configured for
+	// it. Omitting them made a user's accounts vanish from the provider screen
+	// the moment its client was uninstalled, and made the same durable state
+	// project differently at startup than after a live change.
+	accounts, unusable := s.activationAccounts(ctx, def)
+	defer func() {
+		for i := range accounts {
+			zeroBytes(accounts[i].Secret)
+		}
+	}()
+	knownAccounts := append(accountInfos(accounts), unusable...)
+
 	// 2. Explicit opt-in.
 	if gated, ok := def.(gatedDefinition); ok && !gated.Enabled() {
-		s.registry.Install(provider.Installation{Catalog: entry})
+		s.registry.Install(provider.Installation{Catalog: entry, Accounts: knownAccounts})
 		return
 	}
 
@@ -167,19 +180,13 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 			}
 			if _, err := lookPath(bin); err != nil {
 				slog.Info("provider client not found", "provider", id, "bin", bin)
-				s.registry.Install(provider.Installation{Catalog: req.MissingBinaryEntry()})
+				s.registry.Install(provider.Installation{
+					Catalog: req.MissingBinaryEntry(), Accounts: knownAccounts,
+				})
 				return
 			}
 		}
 	}
-
-	// 4. Usable accounts, with their credentials resolved.
-	accounts, unusable := s.activationAccounts(ctx, def)
-	defer func() {
-		for i := range accounts {
-			zeroBytes(accounts[i].Secret)
-		}
-	}()
 
 	// 5. Build, containing a panic so one provider cannot take down startup or
 	// an IPC handler goroutine.
@@ -195,14 +202,11 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 		failed.Availability = provider.AvailabilityDegraded
 		failed.Reason = "this provider could not be started: " + err.Error()
 		slog.Warn("provider activation failed", "provider", id, "err", err)
-		if existing := s.registry.Get(id); existing != nil {
-			s.registry.Install(provider.Installation{
-				Provider: existing, Catalog: failed,
-				Accounts: append(accountInfos(accounts), unusable...),
-			})
-			return
-		}
-		s.registry.Install(provider.Installation{Catalog: failed})
+		// The account projection is the same either way: a failure must not
+		// change which accounts exist, only whether a runtime does.
+		s.registry.Install(provider.Installation{
+			Provider: s.registry.Get(id), Catalog: failed, Accounts: knownAccounts,
+		})
 		return
 	}
 

@@ -113,7 +113,7 @@ func RunSupervisor(ctx context.Context) error {
 
 	// Environment credentials are imported before activation, so an import and
 	// a restart produce the same durable state in either order.
-	seedBootstrapAccounts(st, sup.verifyBootstrapCredential)
+	seedBootstrapAccounts(ctx, st, sup.verifyBootstrapCredential)
 	sup.activateAll(ctx)
 
 	slog.Info("Portico supervisor starting", "socket", paths.SocketPath, "db", paths.DatabasePath)
@@ -126,7 +126,7 @@ func RunSupervisor(ctx context.Context) error {
 // This is a durable write and is deliberately not part of activation, which is
 // a pure read. Keeping them separate is what lets activation carry no store
 // handle at all.
-func seedBootstrapAccounts(st *store.Store, verify bootstrapVerifier) {
+func seedBootstrapAccounts(ctx context.Context, st *store.Store, verify bootstrapVerifier) {
 	apiToken := config.APIToken()
 	accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 	if accountID == "" {
@@ -137,18 +137,15 @@ func seedBootstrapAccounts(st *store.Store, verify bootstrapVerifier) {
 		zoneID = config.ZoneID()
 	}
 	if apiToken != "" && accountID != "" && zoneID != "" {
-		seedBootstrapAccount(st, "cloudflare", accountID, apiToken,
+		seedBootstrapAccount(ctx, st, "cloudflare", accountID, apiToken,
 			map[string]string{"zone_id": zoneID}, verify)
 	}
 
-	ngrokToken := config.NgrokAPIToken()
-	ngrokAccount := os.Getenv("NGROK_ACCOUNT_ID")
-	if ngrokAccount == "" {
-		ngrokAccount = config.NgrokAccountID()
-	}
-	if ngrokToken != "" && ngrokAccount != "" {
-		seedBootstrapAccount(st, "ngrok", ngrokAccount, ngrokToken, map[string]string{}, verify)
-	}
+	// ngrok is deliberately absent. Its agent reads NGROK_AUTHTOKEN from the
+	// environment itself, so importing that token as an account was never
+	// necessary — and because Portico cannot check an ngrok token, importing it
+	// could only ever produce an account claiming to be verified when it was
+	// not. The definition activates from the environment instead.
 }
 
 // isDevMode returns true when PORTICO_DEV=true is set.

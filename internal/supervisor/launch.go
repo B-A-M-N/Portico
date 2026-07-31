@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/store"
@@ -46,10 +47,9 @@ type bootstrapVerifier func(ctx context.Context, providerID core.ProviderID, acc
 // on a later start. That is deliberate: an account Portico could not confirm
 // must not become the thing every connection is planned against.
 func seedBootstrapAccount(
-	st *store.Store, providerID core.ProviderID, accountID, token string,
+	ctx context.Context, st *store.Store, providerID core.ProviderID, accountID, token string,
 	metadata map[string]string, verify bootstrapVerifier,
 ) {
-	ctx := context.Background()
 	credentialRef := providerCredentialRef(string(providerID), accountID)
 
 	// Only a new import is verified, so a machine that is offline keeps working
@@ -67,7 +67,13 @@ func seedBootstrapAccount(
 			"provider", providerID, "account", accountID)
 		return
 	}
-	if err := verify(ctx, providerID, accountID, token); err != nil {
+	// Bounded, and derived from the caller's context. This runs before the IPC
+	// listener binds, so an unbounded network call here does not fail slowly —
+	// it prevents the supervisor from ever starting, on a network that
+	// blackholes rather than refuses, with no way to interrupt it.
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := verify(verifyCtx, providerID, accountID, token); err != nil {
 		slog.Warn("environment credential was not imported because it could not be confirmed",
 			"provider", providerID, "account", accountID, "err", err)
 		return

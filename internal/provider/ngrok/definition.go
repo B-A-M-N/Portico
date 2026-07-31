@@ -76,10 +76,26 @@ func (d *Definition) MissingBinaryEntry() provider.CatalogEntry {
 // with the reason it is not in use rather than disappearing.
 func (d *Definition) Activate(_ context.Context, req provider.ActivationRequest) (provider.Installation, error) {
 	entry := d.CatalogEntry()
+
+	// With no account configured, the agent's own environment token still
+	// works: ngrok reads NGROK_AUTHTOKEN itself when starting, so a machine
+	// configured that way is usable without Portico storing anything. Importing
+	// that token as an account was never necessary, and Portico cannot check an
+	// ngrok token, so an import could only ever claim a verification that had
+	// not happened.
 	if len(req.Accounts) == 0 {
-		entry.Availability = provider.AvailabilityUnconfigured
-		entry.Reason = "no ngrok account is configured"
-		return provider.Installation{Catalog: entry}, nil
+		if req.Services.Getenv == nil || req.Services.Getenv(AuthTokenEnvVar) == "" {
+			entry.Availability = provider.AvailabilityUnconfigured
+			entry.Reason = "no ngrok account is configured and " + AuthTokenEnvVar + " is not set"
+			return provider.Installation{Catalog: entry}, nil
+		}
+		adapter, err := New("", d.cfg.Bin, req.Services.Processes)
+		if err != nil {
+			return provider.Installation{}, fmt.Errorf("build ngrok adapter: %w", err)
+		}
+		entry.Availability = provider.AvailabilityExperimental
+		entry.Reason = "using the token in " + AuthTokenEnvVar + "; " + entry.Reason
+		return provider.Installation{Provider: adapter, Catalog: entry}, nil
 	}
 
 	serving := req.Accounts[0]

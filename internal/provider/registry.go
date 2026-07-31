@@ -422,7 +422,15 @@ func (r *registry) Install(inst Installation) {
 			account.Status = accountStatusConfigured
 		}
 		infos = append(infos, account)
-		ids = append(ids, account.ID)
+		// The ID projection is what selection and validation consume, so only
+		// usable accounts belong in it. Including an unverified one let the
+		// controller durably bind a profile to an account the provider cannot
+		// serve: the provider reported ready and every connection creation
+		// then failed with "provider account unavailable", identically after a
+		// restart because the binding had been persisted.
+		if account.Usable() {
+			ids = append(ids, account.ID)
+		}
 	}
 
 	r.mu.Lock()
