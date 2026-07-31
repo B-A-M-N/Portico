@@ -97,6 +97,10 @@ type WizardState struct {
 	AllowedDomains []string
 	Provider       string
 	AccountID      string
+	// Advanced records that the user chose to describe the connection
+	// themselves rather than picking a prepared outcome, which is what decides
+	// whether the intent question belongs in the sequence.
+	Advanced bool
 }
 
 // Wizard step constants
@@ -310,6 +314,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			if recipe.Advanced {
+				m.state.Advanced = true
 				m.state.Step = WizardStepIntent
 				m.selected = 0
 				return nil
@@ -344,8 +349,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepName:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepOutcome
-			m.selected = 0
+			m.goBack()
 		case "enter":
 			if strings.TrimSpace(m.input) == "" {
 				m.err = fmt.Errorf("name is required")
@@ -379,20 +383,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepSource
 			m.input = m.state.SourceAddress
 		case "esc":
-			m.state.Step = WizardStepName
-			m.input = m.state.Name
+			m.goBack()
 		}
 
 	case WizardStepSource:
 		switch key {
 		case "esc":
-			if m.state.SourceType == "mcp_server" {
-				m.state.Step = WizardStepMCPMode
-				m.selected = boolIndex(m.state.MCPCommand)
-			} else {
-				m.state.Step = WizardStepName
-				m.input = m.state.Name
-			}
+			m.goBack()
 		case "enter":
 			if strings.TrimSpace(m.input) == "" && m.state.SourceType != "existing_service" {
 				m.err = fmt.Errorf("value is required")
@@ -420,8 +417,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepPort:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepSource
-			m.input = m.state.SourceAddress
+			m.goBack()
 		case "enter":
 			port := strings.TrimSpace(m.input)
 			if port == "" && m.isCommandOrigin() {
@@ -465,8 +461,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		protocols := []string{"http", "https"}
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepPort
-			m.input = m.state.Port
+			m.goBack()
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
@@ -484,8 +479,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepCommandArgs:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepPort
-			m.input = m.state.Port
+			m.goBack()
 		case "enter":
 			args, err := parseCommandArgs(m.input)
 			if err != nil {
@@ -503,8 +497,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepCommandWorkingDir:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepCommandArgs
-			m.input = commandArgsInput(m.state.CommandArgs)
+			m.goBack()
 		case "enter":
 			m.err = nil
 			m.state.WorkingDir = strings.TrimSpace(m.input)
@@ -544,8 +537,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = firstAvailable(m.exposureChoices())
 			}
 		case "esc":
-			m.state.Step = WizardStepSource
-			m.input = m.state.SourceAddress
+			m.goBack()
 		}
 
 	case WizardStepDirectorySPA:
@@ -563,8 +555,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepExposure
 			m.selected = firstAvailable(m.exposureChoices())
 		case "esc":
-			m.state.Step = WizardStepDirectoryMode
-			m.selected = m.directoryModeIndex()
+			m.goBack()
 		}
 
 	case WizardStepMCPTransport:
@@ -582,8 +573,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepExposure
 			m.selected = firstAvailable(m.exposureChoices())
 		case "esc":
-			m.state.Step = WizardStepSource
-			m.input = m.state.SourceAddress
+			m.goBack()
 		}
 
 	case WizardStepExposure:
@@ -618,34 +608,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = firstAvailable(m.protectionChoices())
 			}
 		case "esc":
-			if m.isCommandOrigin() {
-				m.state.Step = WizardStepCommandWorkingDir
-				m.input = m.state.WorkingDir
-			} else if m.state.SourceType == "directory" {
-				if m.state.DirectoryMode == "read" {
-					m.state.Step = WizardStepDirectorySPA
-					m.selected = boolIndex(m.state.DirectorySPA)
-				} else {
-					m.state.Step = WizardStepDirectoryMode
-					m.selected = m.directoryModeIndex()
-				}
-			} else if m.state.SourceType == "mcp_server" {
-				m.state.Step = WizardStepMCPTransport
-				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
-			} else if m.hasPortStep() {
-				m.state.Step = WizardStepPort
-				m.input = m.state.Port
-			} else {
-				m.state.Step = WizardStepSource
-				m.input = m.state.SourceAddress
-			}
+			m.goBack()
 		}
 
 	case WizardStepHostname:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepExposure
-			m.selected = firstAvailable(m.exposureChoices())
+			m.goBack()
 		case "enter":
 			if strings.TrimSpace(m.input) == "" {
 				m.err = fmt.Errorf("permanent exposure requires a hostname")
@@ -691,20 +660,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepProvider
 			m.selected = 0
 		case "esc":
-			if m.state.ExposureMode == "permanent_public" {
-				m.state.Step = WizardStepHostname
-				m.input = m.state.Hostname
-			} else {
-				m.state.Step = WizardStepExposure
-				m.selected = firstAvailable(m.exposureChoices())
-			}
+			m.goBack()
 		}
 
 	case WizardStepProtectionRules:
 		switch key {
 		case "esc":
-			m.state.Step = WizardStepProtection
-			m.selected = protectionIndex(m.protections(), m.state.Protection)
+			m.goBack()
 		case "enter":
 			emails, domains, err := parseProtectionRules(m.input)
 			if err != nil {
@@ -744,13 +706,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.selected = 0
 		case "esc":
-			if m.state.Protection == "email_otp" {
-				m.state.Step = WizardStepProtectionRules
-				m.input = protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains)
-			} else {
-				m.state.Step = WizardStepProtection
-				m.selected = protectionIndex(m.protections(), m.state.Protection)
-			}
+			m.goBack()
 		}
 
 	case WizardStepAccount:
@@ -768,8 +724,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepReview
 			m.selected = 0
 		case "esc":
-			m.state.Step = WizardStepProvider
-			m.selected = 0
+			m.goBack()
 		}
 
 	case WizardStepReview:
@@ -788,8 +743,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected++
 			}
 		case "esc":
-			m.state.Step = WizardStepProvider
-			m.selected = 0
+			m.goBack()
 		}
 
 	case WizardStepPlanPreview:
@@ -1770,13 +1724,4 @@ func protectionRulesInput(emails, domains []string) string {
 	values := append([]string(nil), emails...)
 	values = append(values, domains...)
 	return strings.Join(values, ", ")
-}
-
-func protectionIndex(options []string, selected string) int {
-	for i, option := range options {
-		if option == selected {
-			return i
-		}
-	}
-	return 0
 }
