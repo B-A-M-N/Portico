@@ -1,0 +1,475 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+
+	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/tui/screens"
+)
+
+// Editing a connection.
+//
+// The supervisor could edit a connection, and could preview the edit as a plan
+// before applying it — a route, a handler, a delta description and a client
+// method, all working. Nothing called any of it. A connection created with the
+// wrong hostname, or pointing at an account that has since been removed, could
+// only be deleted and made again from scratch.
+//
+// This reuses the existing preview and apply path rather than building a second
+// one: an edit produces a plan, and a plan is already something this interface
+// knows how to show and approve.
+
+// editableField identifies one property of a connection that can be changed.
+type editableField int
+
+const (
+	editName editableField = iota
+	editHostname
+	editProtection
+	editAutoStart
+	editOnDisconnect
+	editAccount
+)
+
+// editState holds an edit in progress.
+type editState struct {
+	connectionID string
+	// revision is what the edit was built against. It is sent with the request
+	// so an edit computed from a stale view is refused rather than silently
+	// overwriting a change made elsewhere.
+	revision uint64
+	detail   *ipc.ConnectionDetailDTO
+
+	cursor int
+	// editing is the field currently being typed into, if any.
+	editing  editableField
+	typing   bool
+	field    textinput.Model
+	requests requestTracker
+	err      string
+
+	// Pending values. A nil pointer means "unchanged", which is what the
+	// update request itself means by an absent field.
+	name         *string
+	hostname     *string
+	protection   *string
+	autoStart    *bool
+	onDisconnect *string
+	accountID    *string
+}
+
+// editRow is one line on the edit screen.
+type editRow struct {
+	field   editableField
+	label   string
+	current string
+	pending string
+	// editable is false for a property this connection kind cannot carry, which
+	// is stated rather than hidden so the absence is not mistaken for an
+	// oversight.
+	editable bool
+	reason   string
+}
+
+// changed reports whether the row carries an edit.
+func (r editRow) changed() bool { return r.pending != "" && r.pending != r.current }
+
+// editRows describes what can be changed about this connection.
+//
+// Only a published service has an address or an access policy, so a port
+// forward is told that rather than offered a hostname field that its spec has
+// nowhere to put.
+func (s *editState) rows() []editRow {
+	if s.detail == nil {
+		return nil
+	}
+	summary := s.detail.Summary
+	exposed := s.detail.DesiredSpec.ServiceExposure
+
+	rows := []editRow{{
+		field: editName, label: "Name", current: summary.Name,
+		pending: derefString(s.name), editable: true,
+	}}
+
+	if exposed != nil {
+		hostname := exposed.Exposure.RequestedAddress
+		if exposed.Exposure.Mode != "permanent_public" {
+			rows = append(rows, editRow{
+				field: editHostname, label: "Hostname", current: hostname,
+				editable: false,
+				reason:   "this connection uses a temporary address, which the provider assigns",
+			})
+		} else {
+			rows = append(rows, editRow{
+				field: editHostname, label: "Hostname", current: hostname,
+				pending: derefString(s.hostname), editable: true,
+			})
+		}
+		rows = append(rows, editRow{
+			field: editProtection, label: "Protection", current: exposed.Protection.Kind,
+			pending: derefString(s.protection), editable: true,
+		})
+	} else {
+		rows = append(rows, editRow{
+			field: editHostname, label: "Hostname", editable: false,
+			reason: "a " + screens.ConnectionKindLabel(summary.Kind) + " has no public address",
+		}, editRow{
+			field: editProtection, label: "Protection", editable: false,
+			reason: "access is not controlled by a policy for this kind of connection",
+		})
+	}
+
+	rows = append(rows,
+		editRow{
+			field: editAutoStart, label: "Open at startup",
+			current: yesNo(s.detail.Lifecycle.AutoStart), pending: pendingYesNo(s.autoStart),
+			editable: true,
+		},
+		editRow{
+			field: editOnDisconnect, label: "On disconnect",
+			current: s.detail.Lifecycle.OnDisconnect, pending: derefString(s.onDisconnect),
+			editable: true,
+		},
+		editRow{
+			field: editAccount, label: "Account", current: summary.ProviderAccountID,
+			pending: derefString(s.accountID), editable: true,
+		},
+	)
+	return rows
+}
+
+// dirty reports whether anything would change.
+func (s *editState) dirty() bool {
+	for _, row := range s.rows() {
+		if row.changed() {
+			return true
+		}
+	}
+	return false
+}
+
+// request builds the update from the pending values only.
+//
+// Sending the unchanged values back would make every edit a full overwrite, so
+// a field the user did not touch is absent rather than resubmitted.
+func (s *editState) request() ipc.UpdateConnectionRequest {
+	req := ipc.UpdateConnectionRequest{ExpectedRevision: s.revision}
+	if s.name != nil {
+		req.Name = s.name
+	}
+	if s.autoStart != nil || s.onDisconnect != nil {
+		lifecycle := ipc.LifecycleDTO{
+			AutoStart:    s.detail.Lifecycle.AutoStart,
+			OnDisconnect: s.detail.Lifecycle.OnDisconnect,
+		}
+		if s.autoStart != nil {
+			lifecycle.AutoStart = *s.autoStart
+		}
+		if s.onDisconnect != nil {
+			lifecycle.OnDisconnect = *s.onDisconnect
+		}
+		req.Lifecycle = &lifecycle
+	}
+	if s.accountID != nil {
+		req.Driver = &ipc.DriverSelectionDTO{
+			ProviderID: s.detail.Driver.ProviderID,
+			AccountID:  *s.accountID,
+			Options:    s.detail.Driver.Options,
+		}
+	}
+	if (s.hostname != nil || s.protection != nil) && s.detail.DesiredSpec.ServiceExposure != nil {
+		// The spec arm is sent whole because the supervisor merges it into the
+		// existing profile field by field; the unchanged parts must therefore
+		// carry their current values rather than zeroes.
+		exposed := *s.detail.DesiredSpec.ServiceExposure
+		// The source is not editable here, and the supervisor rebuilds it from
+		// whatever the request carries. Sending it back would replace a spec
+		// the DTO cannot fully describe — a health check has no wire form at
+		// all — with a lesser copy of itself, as a side effect of changing the
+		// protection.
+		exposed.Source = ipc.SourceDTO{}
+		if s.hostname != nil {
+			exposed.Exposure.RequestedAddress = *s.hostname
+		}
+		if s.protection != nil {
+			exposed.Protection.Kind = *s.protection
+			if *s.protection == "none" {
+				exposed.Protection.AllowedEmails = nil
+				exposed.Protection.AllowedDomains = nil
+			}
+		}
+		req.Spec = &exposed
+	}
+	return req
+}
+
+// protectionCycle is the order the protection choice steps through.
+var protectionCycle = []string{"none", "email_otp"}
+
+// disconnectCycle is the order the disconnect policy steps through.
+var disconnectCycle = []string{"keep_alive", "close"}
+
+// cycleNext returns the value after the current one, wrapping.
+func cycleNext(values []string, current string) string {
+	for i, v := range values {
+		if v == current {
+			return values[(i+1)%len(values)]
+		}
+	}
+	if len(values) > 0 {
+		return values[0]
+	}
+	return current
+}
+
+// editPlannedMsg carries the plan produced by previewing an edit.
+type editPlannedMsg struct {
+	Generation   requestGeneration
+	ConnectionID string
+	Plan         *ipc.PlanDTO
+	Err          error
+}
+
+// planEditCmd asks the supervisor what the edit would do, without doing it.
+func (m *Model) planEditCmd() tea.Cmd {
+	if m.edit == nil {
+		return nil
+	}
+	generation := m.edit.requests.next()
+	connID := m.edit.connectionID
+	req := m.edit.request()
+	client := m.client
+	rootCtx := m.rootCtx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(rootCtx, 20*time.Second)
+		defer cancel()
+		plan, err := client.PlanEdit(ctx, connID, req)
+		return editPlannedMsg{Generation: generation, ConnectionID: connID, Plan: plan, Err: err}
+	}
+}
+
+// renderEdit draws the properties of a connection and which of them would change.
+func (m *Model) renderEdit() string {
+	var b strings.Builder
+	b.WriteString(m.theme.Style("header").Render(" EDIT CONNECTION "))
+	b.WriteString("\n\n")
+
+	if m.edit == nil || m.edit.detail == nil {
+		b.WriteString("Loading the connection...\n")
+		return b.String()
+	}
+	b.WriteString(m.edit.detail.Summary.Name + "\n\n")
+
+	rows := m.edit.rows()
+	for i, row := range rows {
+		cursor := "  "
+		if i == m.edit.cursor {
+			cursor = "> "
+		}
+
+		value := row.current
+		if value == "" {
+			value = "(not set)"
+		}
+		line := fmt.Sprintf("%s%-18s %s", cursor, row.label+":", value)
+
+		switch {
+		case m.edit.typing && m.edit.editing == row.field && i == m.edit.cursor:
+			b.WriteString(fmt.Sprintf("%s%-18s %s\n", cursor, row.label+":", m.edit.field.View()))
+			continue
+		case row.changed():
+			b.WriteString(m.theme.Style("stable").Render(
+				fmt.Sprintf("%s%-18s %s → %s", cursor, row.label+":", value, row.pending)))
+			b.WriteString("\n")
+			continue
+		case !row.editable:
+			b.WriteString(m.theme.Style("muted").Render(line))
+			b.WriteString("\n")
+			if i == m.edit.cursor && row.reason != "" {
+				b.WriteString(m.theme.Style("muted").Render("    " + row.reason))
+				b.WriteString("\n")
+			}
+			continue
+		}
+		b.WriteString(line + "\n")
+	}
+
+	if m.edit.err != "" {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("intervention").Render(m.edit.err))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	if m.edit.dirty() {
+		b.WriteString("[enter] change    [p] preview the change    [esc] cancel\n")
+	} else {
+		b.WriteString("[enter] change    [esc] back\n")
+		b.WriteString(m.theme.Style("muted").Render("Nothing has been changed yet.") + "\n")
+	}
+	return b.String()
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func pendingYesNo(p *bool) string {
+	if p == nil {
+		return ""
+	}
+	return yesNo(*p)
+}
+
+// handleEditKey drives the edit screen.
+//
+// It is a screen-local handler rather than more cases in the global switch,
+// which is what let navigation keys leak into screens that were asking a
+// question.
+func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
+	if m.edit == nil {
+		m.screen = ScreenHome
+		return m, nil
+	}
+	rows := m.edit.rows()
+
+	// While typing, the field owns everything except committing and abandoning.
+	if m.edit.typing {
+		switch key {
+		case "enter":
+			m.commitEditField(m.edit.field.Value())
+			m.edit.typing = false
+		case "esc":
+			m.edit.typing = false
+		}
+		return m, nil
+	}
+
+	switch key {
+	case "up", "k":
+		if m.edit.cursor > 0 {
+			m.edit.cursor--
+		}
+	case "down", "j":
+		if m.edit.cursor < len(rows)-1 {
+			m.edit.cursor++
+		}
+
+	case "enter":
+		if m.edit.cursor >= len(rows) {
+			return m, nil
+		}
+		row := rows[m.edit.cursor]
+		if !row.editable {
+			// The row already says why it cannot be changed; repeating it as
+			// an error would be noise on top of an answer already on screen.
+			return m, nil
+		}
+		return m.beginEditingField(row), nil
+
+	case "p":
+		if !m.edit.dirty() {
+			return m, nil
+		}
+		m.edit.err = ""
+		return m, m.planEditCmd()
+
+	case "esc":
+		m.edit.requests.cancel()
+		m.edit = nil
+		if !m.popScreen() {
+			m.screen = ScreenHome
+		}
+	}
+	return m, nil
+}
+
+// beginEditingField opens the right editor for a property: a text field for a
+// free value, and an immediate step for a property with a fixed set of answers.
+func (m Model) beginEditingField(row editRow) Model {
+	m.edit.editing = row.field
+	m.edit.err = ""
+
+	switch row.field {
+	case editAutoStart:
+		current := m.edit.detail.Lifecycle.AutoStart
+		if m.edit.autoStart != nil {
+			current = *m.edit.autoStart
+		}
+		next := !current
+		m.edit.autoStart = &next
+		return m
+
+	case editProtection:
+		current := m.edit.detail.DesiredSpec.ServiceExposure.Protection.Kind
+		if m.edit.protection != nil {
+			current = *m.edit.protection
+		}
+		next := cycleNext(protectionCycle, current)
+		m.edit.protection = &next
+		return m
+
+	case editOnDisconnect:
+		current := m.edit.detail.Lifecycle.OnDisconnect
+		if m.edit.onDisconnect != nil {
+			current = *m.edit.onDisconnect
+		}
+		next := cycleNext(disconnectCycle, current)
+		m.edit.onDisconnect = &next
+		return m
+	}
+
+	m.edit.typing = true
+	m.edit.field = screens.NewField()
+	value := row.pending
+	if value == "" {
+		value = row.current
+	}
+	m.edit.field.SetValue(value)
+	m.edit.field.CursorEnd()
+	return m
+}
+
+// commitEditField records a typed value.
+func (m *Model) commitEditField(value string) {
+	value = strings.TrimSpace(value)
+	switch m.edit.editing {
+	case editName:
+		if value == "" {
+			m.edit.err = "a connection needs a name"
+			return
+		}
+		m.edit.name = &value
+	case editHostname:
+		m.edit.hostname = &value
+	case editAccount:
+		m.edit.accountID = &value
+	}
+	m.edit.err = ""
+}
+
+// beginEdit opens the edit screen for a connection, loading its current state.
+//
+// The edit is built against a specific revision, so it starts from what the
+// supervisor holds now rather than from whatever the list last showed.
+func (m Model) beginEdit(connID string) (Model, tea.Cmd) {
+	m.edit = &editState{connectionID: connID}
+	m.pushScreen(ScreenEdit)
+	return m, m.connectionDetailCmd(connID)
+}

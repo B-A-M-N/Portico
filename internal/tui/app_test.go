@@ -36,6 +36,14 @@ type fakeClient struct {
 	removeAccountResponse *ipc.RemoveProviderAccountResponse
 	removeAccountErr      error
 
+	createRequest *ipc.CreateConnectionRequest
+	cloneSource   string
+	cloneRequest  *ipc.CloneConnectionRequest
+	cloneErr      error
+	editRequest   *ipc.UpdateConnectionRequest
+	editPlan      *ipc.PlanDTO
+	editErr       error
+
 	detail    *ipc.ConnectionDetailDTO
 	detailErr error
 	history   *ipc.OperationHistoryDTO
@@ -200,6 +208,7 @@ func (f *fakeClient) CreateConnection(ctx context.Context, req ipc.CreateConnect
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls++
+	f.createRequest = &req
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -227,6 +236,28 @@ func (f *fakeClient) RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, e
 
 func (f *fakeClient) ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
 	return &ipc.ConfigureProviderAccountResponse{RestartRequired: false}, nil
+}
+
+func (f *fakeClient) CloneConnection(ctx context.Context, id string, req ipc.CloneConnectionRequest) (*ipc.ConnectionDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cloneSource = id
+	f.cloneRequest = &req
+	if f.cloneErr != nil {
+		return nil, f.cloneErr
+	}
+	return &ipc.ConnectionDTO{ID: "conn-copy", Name: req.Name}, nil
+}
+
+func (f *fakeClient) PlanEdit(ctx context.Context, connID string, req ipc.UpdateConnectionRequest) (*ipc.PlanDTO, error) {
+	f.editRequest = &req
+	if f.editErr != nil {
+		return nil, f.editErr
+	}
+	if f.editPlan != nil {
+		return f.editPlan, nil
+	}
+	return &ipc.PlanDTO{ID: "plan-edit", ConnectionID: connID, Intent: "edit"}, nil
 }
 
 // removeAccountErr, when set, is what the supervisor answers a removal with.

@@ -2800,3 +2800,74 @@ func TestBootstrapVerificationCannotHangStartup(t *testing.T) {
 		t.Fatalf("an unconfirmed credential was imported: %#v", accounts)
 	}
 }
+
+// TestPlanEditRefusesAStaleRevision pins a defect an adversarial review found
+// in the edit flow.
+//
+// ExpectedRevision was enforced only on the PATCH path, which the TUI never
+// calls. On the plan path it was ignored entirely, so an edit prepared from an
+// old view was planned against the current profile: fields the user never
+// touched carried the values they held when the screen loaded, and applying the
+// plan silently reverted whatever someone else had changed in between.
+//
+// ApplyPlan's own revision check does not catch this. The plan was built
+// against the current revision, so by the time it is applied everything agrees
+// — with the wrong values.
+func TestPlanEditRefusesAStaleRevision(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	connID := core.ConnectionID("conn-edit-stale")
+
+	profile := recoveryTestProfile(connID)
+	profile.Spec.ServiceExposure.Exposure.Mode = core.ExposurePermanent
+	profile.Spec.ServiceExposure.Exposure.RequestedAddress = "old.example.com"
+	profile.Revision = 8
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	registry := provider.NewRegistry()
+	if err := registry.Add(mock.New()); err != nil {
+		t.Fatalf("register mock: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.SetConnectionStorer(st)
+	ctrl.SetProfileUpdater(st)
+	ctrl.RestoreProfile(profile)
+	ctrl.RestoreRuntime(&core.ConnectionRuntime{ConnectionID: connID, State: core.RuntimeClosed})
+
+	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
+
+	// An edit prepared when the connection was at revision 7.
+	_, err := handler.HandlePlanEdit(string(connID), ipc.UpdateConnectionRequest{
+		ExpectedRevision: 7,
+		Spec: &ipc.ServiceExposureSpecDTO{
+			Exposure: ipc.ExposureDTO{Mode: "permanent_public", RequestedAddress: "new.example.com"},
+		},
+	})
+	if err == nil {
+		t.Fatal("an edit prepared from a stale view was planned")
+	}
+	if !strings.Contains(err.Error(), "changed by someone else") {
+		t.Fatalf("the refusal does not say why: %v", err)
+	}
+
+	// The current revision is still accepted.
+	if _, err := handler.HandlePlanEdit(string(connID), ipc.UpdateConnectionRequest{
+		ExpectedRevision: 8,
+		Spec: &ipc.ServiceExposureSpecDTO{
+			Exposure: ipc.ExposureDTO{Mode: "permanent_public", RequestedAddress: "new.example.com"},
+		},
+	}); err != nil {
+		t.Fatalf("an edit prepared from the current revision was refused: %v", err)
+	}
+
+	// A caller that states no expectation is unaffected.
+	if _, err := handler.HandlePlanEdit(string(connID), ipc.UpdateConnectionRequest{
+		Spec: &ipc.ServiceExposureSpecDTO{
+			Exposure: ipc.ExposureDTO{Mode: "permanent_public", RequestedAddress: "new.example.com"},
+		},
+	}); err != nil {
+		t.Fatalf("an edit with no stated revision was refused: %v", err)
+	}
+}

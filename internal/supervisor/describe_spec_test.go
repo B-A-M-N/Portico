@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 // TestTheSpecCrossesTheWireAsTheKindItIs pins that the detail DTO carries the
@@ -149,5 +150,72 @@ func TestTheListAndTheDetailAgreeOnWhatAConnectionIs(t *testing.T) {
 	}
 	if summary.PublicAddress != "" {
 		t.Fatalf("a port forward reports a public address: %q", summary.PublicAddress)
+	}
+}
+
+// TestAnEditOfProtectionDoesNotRebuildTheSource pins a defect an adversarial
+// review found in the edit flow.
+//
+// applyEditRequest rebuilds the source from whatever the request carries. The
+// detail DTO reported only an existing service's address — not its network or
+// protocol, and it has no field at all for a health check — so an edit built
+// from the detail and sent back would replace the source with a lesser copy of
+// itself. Changing the protection would have silently destroyed the origin
+// scheme, leaving a URL of "://127.0.0.1:8443".
+func TestAnEditOfProtectionDoesNotRebuildTheSource(t *testing.T) {
+	current := previewProfile(core.ExposurePermanent, core.ProtectionSpec{Kind: core.ProtectionNone})
+	current.Spec.ServiceExposure.Source = core.SourceSpec{
+		Kind: core.SourceExisting,
+		Existing: &core.ExistingServiceSpec{
+			Network: "tcp", Address: "127.0.0.1:8443", Protocol: core.ProtocolHTTPS,
+		},
+	}
+
+	// An edit that changes only the protection, with no source in the request.
+	proposed, err := applyEditRequest(current, ipc.UpdateConnectionRequest{
+		Spec: &ipc.ServiceExposureSpecDTO{
+			Protection: ipc.ProtectionDTO{Kind: "email_otp", AllowedEmails: []string{"a@example.com"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("applyEditRequest: %v", err)
+	}
+
+	source := proposed.Spec.ServiceExposure.Source
+	if source.Existing == nil {
+		t.Fatal("the edit removed the source")
+	}
+	if source.Existing.Protocol != core.ProtocolHTTPS {
+		t.Fatalf("the edit changed the protocol to %q", source.Existing.Protocol)
+	}
+	if source.Existing.Network != "tcp" {
+		t.Fatalf("the edit changed the network to %q", source.Existing.Network)
+	}
+	if source.Existing.Address != "127.0.0.1:8443" {
+		t.Fatalf("the edit changed the address to %q", source.Existing.Address)
+	}
+}
+
+// TestTheDetailReportsTheWholeExistingSource pins the other half: a view that
+// omits fields is a lossy view, which was harmless only while nothing read it
+// back.
+func TestTheDetailReportsTheWholeExistingSource(t *testing.T) {
+	profile := previewProfile(core.ExposureTemporary, core.ProtectionSpec{Kind: core.ProtectionNone})
+	profile.Spec.ServiceExposure.Source = core.SourceSpec{
+		Kind: core.SourceExisting,
+		Existing: &core.ExistingServiceSpec{
+			Network: "tcp", Address: "127.0.0.1:8443", Protocol: core.ProtocolHTTPS,
+		},
+	}
+
+	existing := describeSpec(profile).ServiceExposure.Source.Existing
+	if existing == nil {
+		t.Fatal("the source is missing from the detail")
+	}
+	if existing.Protocol != "https" {
+		t.Fatalf("the detail reports protocol %q", existing.Protocol)
+	}
+	if existing.Network != "tcp" {
+		t.Fatalf("the detail reports network %q", existing.Network)
 	}
 }

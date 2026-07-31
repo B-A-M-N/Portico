@@ -1234,6 +1234,19 @@ func (h *supervisorHandler) HandlePlanEdit(id string, req ipc.UpdateConnectionRe
 		return nil, core.ErrProfileNotFound(cid)
 	}
 
+	// Honour the revision the caller built its edit from. Without this an edit
+	// computed against a stale view is planned against the current profile:
+	// fields the caller did not intend to change carry the values they held
+	// when it loaded, and applying the plan silently reverts whatever someone
+	// else changed in between. ApplyPlan's own revision check does not catch
+	// it, because the plan was built against the current revision.
+	if req.ExpectedRevision != 0 && req.ExpectedRevision != current.Revision {
+		return nil, core.ErrValidation(fmt.Sprintf(
+			"this connection was changed by someone else (it is now at revision %d, "+
+				"and this edit was prepared from revision %d); reopen it and make the change again",
+			current.Revision, req.ExpectedRevision))
+	}
+
 	proposed, err := applyEditRequest(current, req)
 	if err != nil {
 		return nil, err

@@ -62,6 +62,7 @@ var DefaultKeyMap = KeyMap{
 
 // helpRow renders a help text row with context-sensitive bindings.
 func helpRow(km KeyMap, th Theme) string {
-	help := "  ↑↓ Navigate  Enter Inspect  Space Open/Close  n New  a Discover  r Repair  d Delete  q Quit  ? Help"
+	help := "  ↑↓ Navigate  Enter Inspect  Space Open/Close  n New  e Edit  c Copy  " +
+		"a Discover  r Repair  d Delete  q Quit  ? Help"
 	return th.Style("help").Render(help)
 }

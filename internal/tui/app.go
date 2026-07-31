@@ -37,6 +37,8 @@ const (
 	ScreenHelp              ScreenID = "help"
 	ScreenSetup             ScreenID = "setup"
 	ScreenAccountRemoval    ScreenID = "account_removal"
+	ScreenEdit              ScreenID = "edit"
+	ScreenClone             ScreenID = "clone"
 	ScreenQuit              ScreenID = "quit"
 )
 
@@ -69,6 +71,11 @@ type Model struct {
 	accountRemovalTarget     *accountRow
 	accountRemovalError      string
 	accountRemovalDependents []string
+
+	// edit is the connection edit in progress, if any.
+	edit *editState
+	// clone is the connection copy in progress, if any.
+	clone *cloneState
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -224,6 +231,57 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// retype it by hand.
 		cmd, _ := m.routeTextEntry(msg)
 		return m, cmd
+
+	case connectionClonedMsg:
+		if m.clone == nil {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.clone.err = msg.Err.Error()
+			return m, nil
+		}
+		name := ""
+		if msg.Connection != nil {
+			name = msg.Connection.Name
+			m.selectedID = msg.Connection.ID
+		}
+		m.clone = nil
+		m.status = "Created " + name + ", closed."
+		if !m.popScreen() {
+			m.screen = ScreenHome
+		}
+		return m, m.requestSnapshot()
+
+	case editPlannedMsg:
+		if m.edit == nil || !m.edit.requests.accepts(msg.Generation) {
+			return m, nil
+		}
+		if msg.Err != nil {
+			// A refused edit — a stale revision, or a change core validation
+			// rejects — is reported on the screen that made it, where the
+			// values it objects to are still visible and editable.
+			m.edit.err = msg.Err.Error()
+			return m, nil
+		}
+		if msg.Plan == nil {
+			m.edit.err = "the supervisor returned no plan for this change"
+			return m, nil
+		}
+		if msg.Plan.Noop {
+			m.edit.err = "that change would have no effect"
+			return m, nil
+		}
+		// An edit is approved the same way every other change is: as a plan.
+		m.plan = msg.Plan
+		m.planConnectionID = msg.ConnectionID
+		// Any plan still in flight from elsewhere is abandoned: this is the
+		// plan now on screen, and a late one must not replace it.
+		m.planRequests.cancel()
+		// The edit is kept. Abandoning the preview returns to the edit screen
+		// with the changes still on it: discarding them there would throw away
+		// the user's work for pressing escape on a screen that offers it.
+		m.pushScreen(ScreenPlanPreview)
+		return m, nil
 
 	case accountRemovedMsg:
 		// A reply for an account the user has moved on from must not report
@@ -453,6 +511,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case connectionDetailMsg:
+		// An edit in progress is built from the detail, and it is keyed to its
+		// own connection rather than to the cursor: the cursor can move while
+		// the detail loads, and the edit must still receive the connection it
+		// was opened for.
+		if m.edit != nil && msg.ConnectionID == m.edit.connectionID {
+			if msg.Err != nil {
+				m.edit.err = statusLine("could not load this connection", msg.Err)
+			} else if msg.Detail != nil {
+				m.edit.detail = msg.Detail
+				m.edit.revision = msg.Detail.Revision
+			}
+		}
+		if m.clone != nil && msg.ConnectionID == m.clone.sourceID {
+			if msg.Err != nil {
+				m.clone.err = statusLine("could not load the connection to copy", msg.Err)
+			} else if msg.Detail != nil {
+				m.clone.detail = msg.Detail
+				// A permanent hostname cannot be shared, so the supervisor
+				// requires a different one. Asking for it here means the copy
+				// is refused before it is attempted rather than after.
+				if exposed := msg.Detail.DesiredSpec.ServiceExposure; exposed != nil &&
+					exposed.Exposure.Mode == "permanent_public" {
+					m.clone.needsHostname = true
+				}
+			}
+		}
 		// A late reply for a connection the user has already navigated away
 		// from must not overwrite the current one's detail.
 		if msg.ConnectionID != m.selectedID {
@@ -716,6 +800,10 @@ func (m Model) View() tea.View {
 		content = m.renderOperations()
 	case ScreenAccountRemoval:
 		content = m.renderAccountRemoval()
+	case ScreenEdit:
+		content = m.renderEdit()
+	case ScreenClone:
+		content = m.renderClone()
 	case ScreenSetup:
 		if m.setup != nil {
 			content = m.setup.View()
@@ -1285,6 +1373,15 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleWizardKey(key)
 	}
 
+	// The edit screen owns the keyboard: it has a text field, and its keys
+	// mean something different from the same keys elsewhere.
+	if m.screen == ScreenEdit {
+		return m.handleEditKey(key)
+	}
+	if m.screen == ScreenClone {
+		return m.handleCloneKey(key)
+	}
+
 	// While provider setup is active, handle it specially.
 	if m.providerSetupStep > 0 {
 		return m.handleProviderSetupKey(key)
@@ -1494,6 +1591,19 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.pushScreen(ScreenRepair)
 			m.diagnostics = nil
 			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+		}
+
+	case "e":
+		// Editing was reachable from nowhere: the supervisor could do it, and
+		// no screen asked.
+		if (m.screen == ScreenHome || m.screen == ScreenInspect) && m.SelectedConnection() != nil {
+			return m.beginEdit(m.SelectedConnection().ID)
+		}
+
+	case "c":
+		if (m.screen == ScreenHome || m.screen == ScreenInspect) && m.SelectedConnection() != nil {
+			conn := m.SelectedConnection()
+			return m.beginClone(conn.ID, conn.Name)
 		}
 
 	case "x":
@@ -2922,6 +3032,8 @@ func (m *Model) renderHelp() string {
 		b.WriteString("  space    Open/close selected connection\n")
 		b.WriteString("  r        Repair selected connection\n")
 		b.WriteString("  a        Discover local services\n")
+		b.WriteString("  e        Edit selected connection\n")
+		b.WriteString("  c        Copy selected connection\n")
 		b.WriteString("  d        Preview deletion of selected connection\n")
 		b.WriteString("  o        View operations\n")
 		b.WriteString("  p        Providers\n")
@@ -2932,6 +3044,8 @@ func (m *Model) renderHelp() string {
 		b.WriteString("Inspect Screen:\n")
 		b.WriteString("  ←/h      Previous tab\n")
 		b.WriteString("  →/l      Next tab\n")
+		b.WriteString("  e        Edit this connection\n")
+		b.WriteString("  c        Copy this connection\n")
 		b.WriteString("  esc      Back to home\n")
 	case ScreenPlanPreview:
 		b.WriteString("Plan Preview:\n")
@@ -3156,6 +3270,17 @@ func (m *Model) routeTextEntry(msg tea.Msg) (tea.Cmd, bool) {
 	if m.providerSetupStep > 0 {
 		return m.updateProviderSetupField(msg)
 	}
+	if m.screen == ScreenClone && m.clone != nil && screens.FieldAccepts(msg) {
+		field := m.clone.activeField()
+		var cmd tea.Cmd
+		*field, cmd = field.Update(msg)
+		return cmd, true
+	}
+	if m.screen == ScreenEdit && m.edit != nil && m.edit.typing && screens.FieldAccepts(msg) {
+		var cmd tea.Cmd
+		m.edit.field, cmd = m.edit.field.Update(msg)
+		return cmd, true
+	}
 	return nil, false
 }
 
@@ -3187,7 +3312,8 @@ func (m *Model) abandonScreenWork() {
 func acceptsGlobalNavigation(screen ScreenID) bool {
 	switch screen {
 	case ScreenPlanPreview, ScreenRepair, ScreenOperationProgress,
-		ScreenNewConnection, ScreenAccountRemoval, ScreenBoot, ScreenQuit:
+		ScreenNewConnection, ScreenAccountRemoval, ScreenEdit, ScreenClone,
+		ScreenBoot, ScreenQuit:
 		return false
 	default:
 		return true

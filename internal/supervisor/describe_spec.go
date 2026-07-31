@@ -88,7 +88,14 @@ func describeSpec(p *core.ConnectionProfile) ipc.ConnectionSpecDTO {
 func describeSource(src core.SourceSpec) ipc.SourceDTO {
 	dto := ipc.SourceDTO{Kind: string(src.Kind)}
 	if src.Existing != nil {
-		dto.Existing = &ipc.ExistingSourceDTO{Address: src.Existing.Address}
+		// Network and Protocol are projected too. Reporting only the address
+		// made the detail a lossy view, which was harmless while nothing read
+		// it back — and became data loss the moment an edit was built from it.
+		dto.Existing = &ipc.ExistingSourceDTO{
+			Network:  src.Existing.Network,
+			Address:  src.Existing.Address,
+			Protocol: string(src.Existing.Protocol),
+		}
 	}
 	if src.Directory != nil {
 		dto.Directory = &ipc.DirectorySourceDTO{
