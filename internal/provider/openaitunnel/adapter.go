@@ -153,7 +153,7 @@ func (p *Provider) Authenticate(context.Context, core.AuthRequest) error {
 //
 // The tunnel ID is not account state either: it belongs to the connection
 // (ClientTunnelSpec.TunnelID) and reaches the client through step parameters.
-func (p *Provider) SetupFlow() core.SetupFlow {
+func openAITunnelSetupFlow() core.SetupFlow {
 	return core.SetupFlow{
 		Kind:    core.SetupGuidance,
 		Summary: "Connect a local MCP server to ChatGPT over a private, outbound-only tunnel.",
@@ -182,6 +182,8 @@ func (p *Provider) SetupFlow() core.SetupFlow {
 		},
 	}
 }
+
+func (p *Provider) SetupFlow() core.SetupFlow { return openAITunnelSetupFlow() }
 
 // Plan produces the operation plan for a client tunnel.
 //

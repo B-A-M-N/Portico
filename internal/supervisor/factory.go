@@ -6,9 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/app"
@@ -16,11 +14,8 @@ import (
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/process"
 	"github.com/B-A-M-N/portico/internal/provider"
-	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
+	"github.com/B-A-M-N/portico/internal/provider/builtin"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
-	"github.com/B-A-M-N/portico/internal/provider/ngrok"
-	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
-	"github.com/B-A-M-N/portico/internal/provider/portforward"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -78,241 +73,60 @@ func RunSupervisor(ctx context.Context) error {
 		return fmt.Errorf("store open: %w", err)
 	}
 
-	// Register production providers. Persisted account rows are loaded and
-	// validated against the concrete adapter during startup; doing it before
-	// adapter construction would advertise credentials it cannot actually use.
-	registerProviderCatalog(reg)
-	// A local forward needs no account, binary or remote service, so it is
-	// always available.
-	if err := reg.Add(portforward.New()); err != nil {
-		slog.Warn("port forward provider register failed", "err", err)
-	}
-	registerOpenAITunnel(reg, &processManagerAdapter{mgr: procMgr})
-	hasRealProvider := registerCloudflareWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st)
-	hasRealProvider = registerNgrokWithAccounts(reg, paths, &processManagerAdapter{mgr: procMgr}, st) || hasRealProvider
+	// Configure production logging
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	// Register mock provider only in explicit development mode.
-	// Never silently fall back to mock when no real provider is configured,
-	// as that would report fake success to production users.
+	// Create the supervisor (shares the same process manager).
+	sup, err := New(paths, reg, procMgr, st)
+	if err != nil {
+		return fmt.Errorf("supervisor init: %w", err)
+	}
+
+	// Providers are named in one composition list and activated by one path,
+	// so adding a provider needs no supervisor change and a live account change
+	// produces the same result as a restart.
+	services := provider.RuntimeServices{
+		Processes:         &processManagerAdapter{mgr: procMgr},
+		TunnelCredentials: st,
+		ConnectorDir:      paths.ConnectorDir,
+		LogDir:            paths.LogDir,
+		LookPath:          exec.LookPath,
+		Getenv:            os.Getenv,
+	}
+	definitions := builtin.Definitions(builtin.Config{
+		CloudflaredBin:      config.CloudflaredBin(),
+		NgrokBin:            config.NgrokBin(),
+		NgrokEnabled:        os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_NGROK") == "1",
+		OpenAITunnelEnabled: os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") == "1",
+	})
+	// The mock provider is never a silent fallback: it appears only on an
+	// explicit development opt-in, because reporting fake success to a
+	// production user is worse than reporting no provider at all.
 	if isDevMode() {
 		if err := reg.Add(mock.New()); err != nil {
 			slog.Warn("mock provider register failed", "err", err)
 		} else {
 			slog.Info("mock provider registered (PORTICO_DEV=true)")
 		}
-	} else if !hasRealProvider {
-		slog.Warn("no real provider configured and PORTICO_DEV not set; connections will be unavailable")
 	}
+	sup.SetProviderDefinitions(definitions, services)
 
-	// Configure production logging
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
-
-	// Create and start the supervisor (shares the same process manager).
-	sup, err := New(paths, reg, procMgr, st)
-	if err != nil {
-		return fmt.Errorf("supervisor init: %w", err)
-	}
+	// Environment credentials are imported before activation, so an import and
+	// a restart produce the same durable state in either order.
+	seedBootstrapAccounts(st)
+	sup.activateAll(ctx)
 
 	slog.Info("Portico supervisor starting", "socket", paths.SocketPath, "db", paths.DatabasePath)
 	return sup.Start(ctx)
 }
 
-// registerProviderCatalog records the providers Portico names but ships no
-// adapter for. Without these entries the UI cannot distinguish a provider that
-// does not exist from one that is merely unconfigured, and documentation
-// claiming support for them has nothing to contradict it.
+// seedBootstrapAccounts imports provider credentials found in the supervisor's
+// environment.
 //
-// Entries are added before adapter construction so a successful registration
-// supersedes them.
-func registerProviderCatalog(reg provider.Registry) {
-	for _, entry := range []provider.CatalogEntry{
-		{
-			ID: "tailscale", Name: "tailscale", DisplayName: "Tailscale",
-			Availability: provider.AvailabilityNotImplemented,
-			Reason:       "Portico ships no Tailscale adapter yet",
-		},
-		{
-			ID: "zrok", Name: "zrok", DisplayName: "zrok",
-			Availability: provider.AvailabilityNotImplemented,
-			Reason:       "Portico ships no zrok adapter yet",
-		},
-		{
-			ID: "openai_tunnel", Name: "openai_tunnel", DisplayName: "OpenAI Secure MCP Tunnel",
-			Availability: provider.AvailabilityExperimental,
-			Reason: "the adapter has not been exercised against a live tunnel; " +
-				"it can start and observe the client but does not create tunnels or verify ChatGPT app registration",
-			SetupActions: []string{
-				"Install tunnel-client from the OpenAI platform's tunnel settings",
-				"Create a tunnel there and note its ID; Portico does not create tunnels",
-				"Export CONTROL_PLANE_API_KEY before starting the supervisor",
-				"Set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1 to register the provider",
-			},
-		},
-	} {
-		reg.AddCatalogEntry(entry)
-	}
-}
-
-// registerOpenAITunnel registers the Secure MCP Tunnel provider behind an
-// explicit opt-in. The adapter is experimental and has not been run against a
-// live tunnel, so it stays out of standard flows for the same reason ngrok
-// does.
-func registerOpenAITunnel(reg provider.Registry, procMgr core.ConnectorProcessService) bool {
-	if os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") != "1" {
-		return false
-	}
-	if err := reg.Add(openaitunnel.New("", procMgr)); err != nil {
-		slog.Warn("OpenAI tunnel provider register failed", "err", err)
-		return false
-	}
-	slog.Warn("registering EXPERIMENTAL OpenAI Secure MCP Tunnel provider; " +
-		"it has not been exercised against a live tunnel")
-	return true
-}
-
-// RebuildCloudflareProvider reconstructs the Cloudflare adapter from the
-// accounts currently in the store and installs it in place.
-//
-// Account changes used to take effect only at startup, so saving or removing an
-// account left the running supervisor using adapters built from the previous
-// account set and the response had to tell the user to restart.
-func (s *Supervisor) RebuildCloudflareProvider() error {
-	// A rebuild needs the process manager to construct adapters. Without one
-	// there is nothing to rebuild into, and the caller must fall back to
-	// reporting that a restart is required.
-	if s.procMgr == nil || s.registry == nil || s.store == nil {
-		return fmt.Errorf("the supervisor is not fully initialised; provider rebuild is unavailable")
-	}
-	cloudflaredBin := config.CloudflaredBin()
-	if cloudflaredBin == "" {
-		cloudflaredBin = "cloudflared"
-	}
-	if _, err := exec.LookPath(cloudflaredBin); err != nil {
-		return fmt.Errorf("%s is not installed", cloudflaredBin)
-	}
-
-	children, infos, err := buildCloudflareChildren(s.store, s.paths, &processManagerAdapter{mgr: s.procMgr}, cloudflaredBin)
-	if err != nil {
-		return err
-	}
-
-	if len(children) == 0 {
-		// The last usable account is gone. Drop the adapter and leave a catalog
-		// entry, rather than keeping a provider that can no longer act.
-		s.registry.Remove("cloudflare")
-		s.registry.AddCatalogEntry(provider.CatalogEntry{
-			ID: "cloudflare", Name: "cloudflare", DisplayName: "Cloudflare",
-			Availability: provider.AvailabilityUnconfigured,
-			Reason:       "no Cloudflare account is configured",
-			SetupActions: []string{"Add a Cloudflare account"},
-		})
-		return nil
-	}
-
-	accountsProvider, err := cloudflare.NewAccountsProvider(children)
-	if err != nil {
-		return fmt.Errorf("rebuild Cloudflare provider: %w", err)
-	}
-	s.registry.Replace(accountsProvider)
-	s.registry.SetAccountInfo("cloudflare", infos)
-	s.controller.SetAccounts(accountIDsOf(infos))
-	return nil
-}
-
-func accountIDsOf(infos []provider.AccountInfo) []core.ProviderAccountID {
-	ids := make([]core.ProviderAccountID, 0, len(infos))
-	for _, info := range infos {
-		ids = append(ids, info.ID)
-	}
-	return ids
-}
-
-// buildCloudflareChildren constructs one adapter per usable account. It is the
-// single construction path, shared by startup registration and rebuild, so the
-// two cannot drift.
-func buildCloudflareChildren(st *store.Store, paths app.Paths, procMgr core.ConnectorProcessService, cloudflaredBin string) (
-	map[core.ProviderAccountID]*cloudflare.Provider, []provider.AccountInfo, error,
-) {
-	accounts, err := st.ListProviderAccounts(context.Background())
-	if err != nil {
-		return nil, nil, fmt.Errorf("list Cloudflare accounts: %w", err)
-	}
-
-	children := make(map[core.ProviderAccountID]*cloudflare.Provider)
-	details := make(map[core.ProviderAccountID]core.ProviderAccount)
-	for _, account := range accounts {
-		if account.Provider != "cloudflare" || account.Status != core.AccountAuthenticated {
-			continue
-		}
-		if account.CredentialRef == "" {
-			slog.Warn("Cloudflare account is missing a credential reference", "account", account.ID)
-			continue
-		}
-		zone := strings.TrimSpace(account.Metadata["zone_id"])
-		token, loadErr := st.LoadProviderCredential(context.Background(), "cloudflare", account.CredentialRef)
-		if loadErr != nil || token == "" {
-			slog.Warn("Cloudflare account credential is unavailable", "account", account.ID, "err", loadErr)
-			continue
-		}
-		child, newErr := cloudflare.New(token, string(account.ID), zone, cloudflaredBin, paths.ConnectorDir, procMgr)
-		if newErr != nil {
-			slog.Warn("Cloudflare account adapter init failed", "account", account.ID, "err", newErr)
-			continue
-		}
-		child.SetCredentialStore(st)
-		children[account.ID] = child
-		details[account.ID] = account
-	}
-
-	ids := make([]core.ProviderAccountID, 0, len(children))
-	for id := range children {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	infos := make([]provider.AccountInfo, 0, len(ids))
-	for _, id := range ids {
-		account := details[id]
-		label := account.Label
-		if label == "" {
-			label = string(id)
-		}
-		infos = append(infos, provider.AccountInfo{ID: id, Label: label, Status: string(account.Status)})
-	}
-	return children, infos, nil
-}
-
-// registerCloudflareWithAccounts attempts to register the Cloudflare provider
-// using accounts loaded from the store. Returns true if the provider was
-// successfully registered.
-func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, procMgr core.ConnectorProcessService, st *store.Store) bool {
-	cloudflaredBin := config.CloudflaredBin()
-	if cloudflaredBin == "" {
-		cloudflaredBin = "cloudflared"
-	}
-
-	// Check if cloudflared is available. A missing client is a setup gap, not a
-	// reason for the provider to vanish: record it in the catalog so the UI can
-	// say "install cloudflared" instead of silently omitting Cloudflare.
-	if _, err := exec.LookPath(cloudflaredBin); err != nil {
-		slog.Info("cloudflared not found, Cloudflare provider unavailable", "bin", cloudflaredBin)
-		reg.AddCatalogEntry(provider.CatalogEntry{
-			ID:           "cloudflare",
-			Name:         "cloudflare",
-			DisplayName:  "Cloudflare",
-			Availability: provider.AvailabilityClientMissing,
-			Reason:       fmt.Sprintf("the %q client was not found on PATH", cloudflaredBin),
-			SetupActions: []string{
-				"Install cloudflared from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
-				"Ensure cloudflared is on PATH, or set the cloudflared binary path in Portico's configuration",
-			},
-		})
-		return false
-	}
-
-	// Environment/configured token credentials are a one-time bootstrap path.
-	// Move them to the supervisor's encrypted account store before constructing
-	// adapters, so subsequent operations resolve the account selected by the
-	// profile rather than a process-global environment token.
+// This is a durable write and is deliberately not part of activation, which is
+// a pure read. Keeping them separate is what lets activation carry no store
+// handle at all.
+func seedBootstrapAccounts(st *store.Store) {
 	apiToken := config.APIToken()
 	accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 	if accountID == "" {
@@ -322,195 +136,19 @@ func registerCloudflareWithAccounts(reg provider.Registry, paths app.Paths, proc
 	if zoneID == "" {
 		zoneID = config.ZoneID()
 	}
-
 	if apiToken != "" && accountID != "" && zoneID != "" {
 		seedBootstrapAccount(st, "cloudflare", accountID, apiToken,
 			map[string]string{"zone_id": zoneID})
 	}
 
-	accounts, err := st.ListProviderAccounts(context.Background())
-	if err != nil {
-		slog.Warn("list Cloudflare accounts", "err", err)
-		accounts = nil
+	ngrokToken := config.NgrokAPIToken()
+	ngrokAccount := os.Getenv("NGROK_ACCOUNT_ID")
+	if ngrokAccount == "" {
+		ngrokAccount = config.NgrokAccountID()
 	}
-	children := make(map[core.ProviderAccountID]*cloudflare.Provider)
-	accountDetails := make(map[core.ProviderAccountID]core.ProviderAccount)
-	for _, account := range accounts {
-		if account.Provider != "cloudflare" || account.Status != core.AccountAuthenticated {
-			continue
-		}
-		// A zone is required only for DNS and custom hostnames. Skipping
-		// zone-less accounts here would silently discard an account that setup
-		// accepted, leaving the user with a saved account and no adapter.
-		zone := strings.TrimSpace(account.Metadata["zone_id"])
-		if account.CredentialRef == "" {
-			slog.Warn("Cloudflare account is missing a credential reference", "account", account.ID)
-			continue
-		}
-		if zone == "" {
-			slog.Info("Cloudflare account has no zone; tunnels available without DNS or custom hostnames",
-				"account", account.ID)
-		}
-		token, loadErr := st.LoadProviderCredential(context.Background(), "cloudflare", account.CredentialRef)
-		if loadErr != nil || token == "" {
-			slog.Warn("Cloudflare account credential is unavailable", "account", account.ID, "err", loadErr)
-			continue
-		}
-		child, newErr := cloudflare.New(token, string(account.ID), zone, cloudflaredBin, paths.ConnectorDir, procMgr)
-		if newErr != nil {
-			slog.Warn("Cloudflare account adapter init failed", "account", account.ID, "err", newErr)
-			continue
-		}
-		child.SetCredentialStore(st)
-		children[account.ID] = child
-		accountDetails[account.ID] = account
+	if ngrokToken != "" && ngrokAccount != "" {
+		seedBootstrapAccount(st, "ngrok", ngrokAccount, ngrokToken, map[string]string{})
 	}
-	if len(children) > 0 {
-		accountsProvider, newErr := cloudflare.NewAccountsProvider(children)
-		if newErr != nil {
-			slog.Warn("Cloudflare multi-account provider init failed", "err", newErr)
-			return false
-		}
-		if err := reg.Add(accountsProvider); err != nil {
-			slog.Warn("Cloudflare provider register failed", "err", err)
-			return false
-		}
-		accountIDs := make([]core.ProviderAccountID, 0, len(children))
-		for id := range children {
-			accountIDs = append(accountIDs, id)
-		}
-		sort.Slice(accountIDs, func(i, j int) bool { return accountIDs[i] < accountIDs[j] })
-		infos := make([]provider.AccountInfo, 0, len(accountIDs))
-		for _, id := range accountIDs {
-			account := accountDetails[id]
-			infos = append(infos, provider.AccountInfo{ID: id, Label: account.Label, Status: string(account.Status)})
-		}
-		reg.SetAccountInfo("cloudflare", infos)
-		slog.Info("Cloudflare provider registered", "accounts", len(accountIDs))
-		return true
-	}
-
-	// No API token — register for Quick Tunnels only
-	cf, err := cloudflare.NewQuickTunnel(cloudflaredBin, paths.ConnectorDir, procMgr)
-	if err != nil {
-		slog.Warn("cloudflare quick tunnel provider init failed", "err", err)
-		return false
-	}
-
-	// Wire credential store for durable tunnel token storage (P0 #4).
-	cf.SetCredentialStore(st)
-
-	if err := reg.Add(cf); err != nil {
-		slog.Warn("cloudflare provider register failed", "err", err)
-		return false
-	}
-
-	slog.Info("cloudflare provider registered (Quick Tunnels only — no API token)")
-	return true
-}
-
-// registerNgrokWithAccounts attempts to register the Ngrok provider
-// using accounts loaded from the store. Returns true if the provider was
-// successfully registered.
-func registerNgrokWithAccounts(reg provider.Registry, paths app.Paths, procMgr core.ConnectorProcessService, st *store.Store) bool {
-	// The Ngrok adapter is experimental and is not lifecycle-complete: it
-	// synthesises tunnel identifiers rather than creating provider resources,
-	// targets a hardcoded local port, cannot reconstruct observed state after a
-	// supervisor restart, and implements delete and protection as no-ops. It
-	// must therefore stay out of standard flows until it is rebuilt, and is
-	// registered only when the operator opts in explicitly.
-	if os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_NGROK") != "1" {
-		slog.Info("Ngrok provider is experimental and disabled; " +
-			"set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to register it")
-		reg.AddCatalogEntry(provider.CatalogEntry{
-			ID:           "ngrok",
-			Name:         "ngrok",
-			DisplayName:  "ngrok",
-			Availability: provider.AvailabilityExperimental,
-			Reason: "ngrok is off by default. It creates real tunnels and rebuilds state after a " +
-				"restart, but Portico applies no access protection to ngrok connections, so anyone " +
-				"with the URL can reach them",
-			SetupActions: []string{
-				"Set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to enable it",
-				"Make sure a token is available: NGROK_AUTHTOKEN, or run: ngrok config add-authtoken <token>",
-			},
-		})
-		return false
-	}
-
-	ngrokBin := config.NgrokBin()
-	if ngrokBin == "" {
-		ngrokBin = "ngrok"
-	}
-
-	// Check if ngrok is available
-	if _, err := exec.LookPath(ngrokBin); err != nil {
-		slog.Info("ngrok not found, Ngrok provider unavailable", "bin", ngrokBin)
-		reg.AddCatalogEntry(provider.CatalogEntry{
-			ID:           "ngrok",
-			Name:         "ngrok",
-			DisplayName:  "ngrok",
-			Availability: provider.AvailabilityClientMissing,
-			Reason:       fmt.Sprintf("the %q client was not found on PATH", ngrokBin),
-			SetupActions: []string{"Install ngrok and ensure it is on PATH"},
-		})
-		return false
-	}
-
-	slog.Warn("registering EXPERIMENTAL Ngrok provider; " +
-		"it is not lifecycle-complete and must not be relied on")
-
-	// Environment/configured token credentials are a one-time bootstrap path.
-	// Move them to the supervisor's encrypted account store before constructing
-	// adapters, so subsequent operations resolve the account selected by the
-	// profile rather than a process-global environment token.
-	apiToken := config.NgrokAPIToken()
-	accountID := os.Getenv("NGROK_ACCOUNT_ID")
-	if accountID == "" {
-		accountID = config.NgrokAccountID()
-	}
-
-	if apiToken != "" && accountID != "" {
-		seedBootstrapAccount(st, "ngrok", accountID, apiToken, map[string]string{})
-	}
-
-	accounts, err := st.ListProviderAccounts(context.Background())
-	if err != nil {
-		slog.Warn("list Ngrok accounts", "err", err)
-		accounts = nil
-	}
-
-	for _, account := range accounts {
-		if account.Provider != "ngrok" || account.Status != core.AccountAuthenticated {
-			continue
-		}
-		if account.CredentialRef == "" {
-			slog.Warn("Ngrok account is missing a credential reference", "account", account.ID)
-			continue
-		}
-		token, loadErr := st.LoadProviderCredential(context.Background(), "ngrok", account.CredentialRef)
-		if loadErr != nil || token == "" {
-			slog.Warn("Ngrok account credential is unavailable", "account", account.ID, "err", loadErr)
-			continue
-		}
-		child, newErr := ngrok.New(token, ngrokBin, procMgr)
-		if newErr != nil {
-			slog.Warn("Ngrok account adapter init failed", "account", account.ID, "err", newErr)
-			continue
-		}
-		// Ngrok doesn't need multi-account routing like Cloudflare
-		if err := reg.Add(child); err != nil {
-			slog.Warn("Ngrok provider register failed", "err", err)
-			return false
-		}
-		reg.SetAccountInfo("ngrok", []provider.AccountInfo{{ID: account.ID, Label: account.Label, Status: string(account.Status)}})
-		slog.Info("Ngrok provider registered", "account", account.ID)
-		return true
-	}
-
-	// No API token — register with default config (will fail at Authenticate)
-	slog.Info("Ngrok provider registered without API token (requires configuration)")
-	return false
 }
 
 // isDevMode returns true when PORTICO_DEV=true is set.

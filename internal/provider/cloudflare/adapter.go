@@ -1566,7 +1566,7 @@ func splitNonEmpty(value string) []string {
 // The fields are declared here rather than hardcoded in the TUI, so the setup
 // screen renders a form it does not have to understand and a new provider does
 // not require a UI change.
-func (p *Provider) SetupFlow() core.SetupFlow {
+func cloudflareSetupFlow() core.SetupFlow {
 	return core.SetupFlow{
 		Kind:          core.SetupAccount,
 		IdentityField: "account_id",
@@ -1605,3 +1605,5 @@ func (p *Provider) SetupFlow() core.SetupFlow {
 		},
 	}
 }
+
+func (p *Provider) SetupFlow() core.SetupFlow { return cloudflareSetupFlow() }

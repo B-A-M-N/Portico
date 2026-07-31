@@ -158,6 +158,11 @@ type registry struct {
 	accounts    map[core.ProviderID][]core.ProviderAccountID
 	accountInfo map[core.ProviderID][]AccountInfo
 	catalog     map[core.ProviderID]CatalogEntry
+	// declared records the availability a definition reported when it
+	// successfully activated. Only the definition knows whether an adapter with
+	// no accounts is still usable, so this wins over the account-derived
+	// default.
+	declared map[core.ProviderID]Availability
 }
 
 // NewRegistry creates a new provider registry
@@ -167,6 +172,7 @@ func NewRegistry() *registry {
 		accounts:    make(map[core.ProviderID][]core.ProviderAccountID),
 		accountInfo: make(map[core.ProviderID][]AccountInfo),
 		catalog:     make(map[core.ProviderID]CatalogEntry),
+		declared:    make(map[core.ProviderID]Availability),
 	}
 }
 
@@ -234,6 +240,8 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 	}
 	catalog := make(map[core.ProviderID]CatalogEntry, len(r.catalog))
 	maps.Copy(catalog, r.catalog)
+	declared := make(map[core.ProviderID]Availability, len(r.declared))
+	maps.Copy(declared, r.declared)
 	r.mu.RUnlock()
 
 	ids := make([]core.ProviderID, 0, len(live)+len(catalog))
@@ -296,6 +304,14 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 			snap.Availability = AvailabilityDegraded
 			snap.CapabilityError = capErr.Error()
 			snap.Reason = "provider capabilities could not be read: " + capErr.Error()
+		case declared[id] != "":
+			// A definition that successfully activated states its own
+			// availability, and only it knows whether an accountless adapter is
+			// still usable. Cloudflare with no account still serves Quick
+			// Tunnels, and a local port forward needs no account at all;
+			// deriving availability from account count alone reported both as
+			// needing configuration while they were able to open connections.
+			snap.Availability = declared[id]
 		case len(usable) > 0:
 			snap.Availability = AvailabilityReady
 		case len(pending) > 0:
@@ -395,8 +411,14 @@ func (r *registry) Install(inst Installation) {
 	r.catalog[id] = entry
 	if inst.Provider == nil {
 		delete(r.providers, id)
+		delete(r.declared, id)
 	} else {
 		r.providers[id] = inst.Provider
+		if entry.Availability != "" {
+			r.declared[id] = entry.Availability
+		} else {
+			delete(r.declared, id)
+		}
 	}
 	r.accounts[id] = ids
 	r.accountInfo[id] = infos
@@ -409,6 +431,7 @@ func (r *registry) Remove(id core.ProviderID) {
 	delete(r.providers, id)
 	delete(r.accounts, id)
 	delete(r.accountInfo, id)
+	delete(r.declared, id)
 }
 
 // SetAccounts associates accounts with a provider

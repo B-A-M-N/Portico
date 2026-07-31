@@ -48,6 +48,11 @@ type Supervisor struct {
 	// launch gates whether connections are armed at startup.
 	launch string
 
+	// activation turns durable account state into installed providers. It is
+	// the only path that mutates the registry, so startup and a live account
+	// change cannot produce different results from the same state.
+	activation *activationCoordinator
+
 	// Discovery, diagnostics, and origins
 	discoverer discovery.Discoverer
 	diagEngine *diagnostics.Engine
@@ -1629,12 +1634,13 @@ func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID st
 		return nil, err
 	}
 
+	// Every provider reactivates through the same path, so removing an account
+	// takes effect immediately whichever provider it belonged to. The
+	// provider-ID branch that used to live here was the last one.
 	restartRequired := false
-	if providerID == "cloudflare" {
-		if rebuildErr := h.sup.RebuildCloudflareProvider(); rebuildErr != nil {
-			slog.Warn("could not rebuild the Cloudflare provider in place", "err", rebuildErr)
-			restartRequired = true
-		}
+	if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(providerID)); activateErr != nil {
+		slog.Warn("could not reactivate the provider in place", "provider", providerID, "err", activateErr)
+		restartRequired = true
 	}
 	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired}, nil
 }
@@ -1788,10 +1794,14 @@ func (h *supervisorHandler) configureDeclaredAccount(
 		return nil, fmt.Errorf("save %s account: %w", id, err)
 	}
 
-	// Adapters are built at supervisor startup, and only Cloudflare can be
-	// rebuilt in place, so a newly stored account for any other provider needs
-	// a restart before it is selectable.
-	resp.RestartRequired = true
+	// Any provider reactivates in place, so a newly stored account is usable in
+	// this process. This used to be an unconditional "restart required", into a
+	// restart that changed nothing because no code built an adapter for a
+	// provider the supervisor did not know by name.
+	if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(id)); activateErr != nil {
+		slog.Warn("could not activate the provider in place", "provider", id, "err", activateErr)
+		resp.RestartRequired = true
+	}
 	resp.Status = string(status)
 	return resp, nil
 }
@@ -1880,11 +1890,11 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 		return nil, fmt.Errorf("save Cloudflare account: %w", err)
 	}
 
-	// Rebuild the adapter in place so the account is usable immediately. Only
-	// report a restart if the rebuild could not be done.
+	// Reactivate so the account is usable immediately. A restart is reported
+	// only when activation could not be attempted at all.
 	restartRequired := false
-	if rebuildErr := h.sup.RebuildCloudflareProvider(); rebuildErr != nil {
-		slog.Warn("could not rebuild the Cloudflare provider in place", "err", rebuildErr)
+	if activateErr := h.sup.ActivateProvider(ctx, "cloudflare"); activateErr != nil {
+		slog.Warn("could not reactivate Cloudflare in place", "err", activateErr)
 		restartRequired = true
 	}
 

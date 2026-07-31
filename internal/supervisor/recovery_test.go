@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1909,16 +1908,11 @@ func TestPlanEditReportsANoOpAsSuch(t *testing.T) {
 	}
 }
 
-// TestProviderRebuildMakesAnAccountUsableWithoutRestart pins the removal of the
-// restart requirement. Account changes previously took effect only at startup,
-// so a newly saved account was inert until the user restarted the supervisor.
-func TestProviderRebuildMakesAnAccountUsableWithoutRestart(t *testing.T) {
-	if _, err := exec.LookPath("cloudflared"); err != nil {
-		t.Skip("cloudflared is required to construct the Cloudflare adapter")
-	}
-	ctx := context.Background()
-	st := newRecoveryTestStore(t)
-
+// activationTestSupervisor builds a supervisor wired to one provider
+// definition, with binary lookup stubbed so the test does not depend on what is
+// installed on the machine running it.
+func activationTestSupervisor(t *testing.T, st *store.Store, defs ...provider.Definition) (*Supervisor, provider.Registry) {
+	t.Helper()
 	registry := provider.NewRegistry()
 	ctrl := controller.New(registry, st)
 	sup := &Supervisor{
@@ -1926,10 +1920,24 @@ func TestProviderRebuildMakesAnAccountUsableWithoutRestart(t *testing.T) {
 		procMgr: process.NewManager(),
 		paths:   app.Paths{ConnectorDir: t.TempDir()},
 	}
+	sup.SetProviderDefinitions(defs, provider.RuntimeServices{
+		Processes:         &processManagerAdapter{mgr: sup.procMgr},
+		TunnelCredentials: st,
+		ConnectorDir:      sup.paths.ConnectorDir,
+		LookPath:          func(name string) (string, error) { return name, nil },
+		Getenv:            func(string) string { return "" },
+	})
+	return sup, registry
+}
 
-	if registry.Get("cloudflare") != nil {
-		t.Fatal("cloudflare adapter exists before any account is configured")
-	}
+// TestActivationMakesAnAccountUsableWithoutRestart pins the removal of the
+// restart requirement. Account changes previously took effect only at startup,
+// so a newly saved account was inert until the user restarted the supervisor.
+func TestActivationMakesAnAccountUsableWithoutRestart(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	sup, registry := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
 
 	account := core.ProviderAccount{
 		ID: "acct-live", Provider: "cloudflare", Label: "Live",
@@ -1940,38 +1948,74 @@ func TestProviderRebuildMakesAnAccountUsableWithoutRestart(t *testing.T) {
 		t.Fatalf("UpsertProviderAccountCredential: %v", err)
 	}
 
-	if err := sup.RebuildCloudflareProvider(); err != nil {
-		t.Fatalf("RebuildCloudflareProvider: %v", err)
+	if err := sup.ActivateProvider(ctx, "cloudflare"); err != nil {
+		t.Fatalf("ActivateProvider: %v", err)
 	}
 	// A zone-less account must still produce a usable adapter: a zone is
 	// required only for DNS and custom hostnames.
 	if registry.Get("cloudflare") == nil {
 		t.Fatal("a zone-less account produced no adapter")
 	}
+	var usable int
+	for _, snap := range registry.Snapshot() {
+		if snap.ID == "cloudflare" {
+			usable = len(snap.Accounts)
+		}
+	}
+	if usable != 1 {
+		t.Fatalf("usable accounts = %d, want 1", usable)
+	}
+}
 
-	// Removing the last account drops the adapter rather than leaving one that
-	// can no longer act.
+// TestRemovingTheLastAccountKeepsQuickTunnelsAvailable resolves a divergence
+// between two construction paths that produced different capabilities from the
+// same durable state.
+//
+// Startup fell back to a Quick Tunnel adapter when no account was configured;
+// the rebuild path removed Cloudflare entirely when the last account was
+// deleted. A Quick Tunnel needs no account and works, so withdrawing it because
+// an account was removed was the bug. Fresh startup and post-removal must agree.
+func TestRemovingTheLastAccountKeepsQuickTunnelsAvailable(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	sup, registry := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+
+	account := core.ProviderAccount{
+		ID: "acct-live", Provider: "cloudflare", Label: "Live",
+		CredentialRef: "cloudflare:acct-live:api-token", Status: core.AccountAuthenticated,
+		Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("token")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if err := sup.ActivateProvider(ctx, "cloudflare"); err != nil {
+		t.Fatalf("ActivateProvider: %v", err)
+	}
 	if err := st.DeleteProviderAccount(ctx, "cloudflare", "acct-live"); err != nil {
 		t.Fatalf("DeleteProviderAccount: %v", err)
 	}
-	if err := sup.RebuildCloudflareProvider(); err != nil {
-		t.Fatalf("RebuildCloudflareProvider after removal: %v", err)
+	if err := sup.ActivateProvider(ctx, "cloudflare"); err != nil {
+		t.Fatalf("ActivateProvider after removal: %v", err)
 	}
-	if registry.Get("cloudflare") != nil {
-		t.Fatal("adapter survived removal of its last account")
+
+	if registry.Get("cloudflare") == nil {
+		t.Fatal("removing the last account withdrew Quick Tunnels, which need no account")
 	}
-	// It must remain visible in the catalog with a reason.
-	var seen bool
-	for _, snap := range registry.Snapshot() {
-		if snap.ID == "cloudflare" {
-			seen = true
-			if snap.Availability != provider.AvailabilityUnconfigured || snap.Reason == "" {
-				t.Fatalf("catalog entry after removal = %#v", snap)
-			}
+
+	// A supervisor starting fresh against the same database must agree.
+	fresh, freshRegistry := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+	fresh.activateAll(ctx)
+	if freshRegistry.Get("cloudflare") == nil {
+		t.Fatal("a fresh start produced no Cloudflare adapter from the same state")
+	}
+
+	// It must say why it is limited rather than appearing fully configured.
+	for _, snap := range freshRegistry.Snapshot() {
+		if snap.ID == "cloudflare" && snap.Reason == "" {
+			t.Fatal("an accountless Cloudflare does not explain what it can do")
 		}
-	}
-	if !seen {
-		t.Fatal("cloudflare vanished from the catalog after its account was removed")
 	}
 }
 
@@ -2376,4 +2420,153 @@ func TestBootstrapImportCreatesTheAccountWhenThereIsNone(t *testing.T) {
 	if err != nil || secret != "token-env" {
 		t.Fatalf("credential not imported with the account: %q err=%v", secret, err)
 	}
+}
+
+// TestAnAccountlessProviderThatWorksReportsReady pins that availability comes
+// from what a provider can actually do, not from how many accounts it has.
+//
+// Deriving it from account count reported a local port forward — which needs no
+// account — and Cloudflare with Quick Tunnels — which needs none either — as
+// "needs configuration" while both could open a connection immediately.
+func TestAnAccountlessProviderThatWorksReportsReady(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	sup, registry := activationTestSupervisor(t, st,
+		portforward.NewDefinition(),
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}),
+	)
+	sup.activateAll(ctx)
+
+	byID := map[core.ProviderID]provider.ProviderSnapshot{}
+	for _, snap := range registry.Snapshot() {
+		byID[snap.ID] = snap
+	}
+
+	pf, ok := byID["portforward"]
+	if !ok {
+		t.Fatal("port forward provider missing")
+	}
+	if pf.Availability != provider.AvailabilityReady {
+		t.Fatalf("a provider needing no account reports %q", pf.Availability)
+	}
+
+	cf, ok := byID["cloudflare"]
+	if !ok {
+		t.Fatal("cloudflare provider missing")
+	}
+	if cf.Availability != provider.AvailabilityReady {
+		t.Fatalf("Cloudflare with Quick Tunnels reports %q", cf.Availability)
+	}
+	if cf.Reason == "" {
+		t.Fatal("an accountless Cloudflare claims full capability with no qualification")
+	}
+}
+
+// panickingDefinition models an adapter constructor that blows up.
+type panickingDefinition struct{}
+
+func (panickingDefinition) Identity() core.ProviderIdentity {
+	return core.ProviderIdentity{ID: "exploding", Name: "exploding", DisplayName: "Exploding"}
+}
+func (panickingDefinition) CatalogEntry() provider.CatalogEntry {
+	return provider.CatalogEntry{ID: "exploding", DisplayName: "Exploding"}
+}
+func (panickingDefinition) Activate(context.Context, provider.ActivationRequest) (provider.Installation, error) {
+	panic("construction exploded")
+}
+
+// TestActivationSurvivesAProviderThatPanics ensures one bad definition cannot
+// take down startup or an IPC handler goroutine.
+func TestActivationSurvivesAProviderThatPanics(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	sup, registry := activationTestSupervisor(t, st, panickingDefinition{}, portforward.NewDefinition())
+
+	sup.activateAll(ctx)
+
+	var seen bool
+	for _, snap := range registry.Snapshot() {
+		if snap.ID == "exploding" {
+			seen = true
+			if snap.Availability != provider.AvailabilityDegraded || snap.Reason == "" {
+				t.Fatalf("a panicking provider is not reported as degraded: %#v", snap)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("a panicking provider vanished instead of reporting why")
+	}
+	if registry.Get("portforward") == nil {
+		t.Fatal("one bad provider prevented the others from activating")
+	}
+}
+
+// TestActivationNeverWritesToTheAccountStore pins that activation is a pure
+// read. The account rows must be unchanged before and after.
+func TestActivationNeverWritesToTheAccountStore(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	account := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Live",
+		CredentialRef: "cloudflare:acct-1:api-token", Status: core.AccountAuthenticated,
+		Metadata: map[string]string{"zone_id": "z1"},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, account, []byte("token")); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	before, _ := st.ListProviderAccounts(ctx)
+
+	sup, _ := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+	sup.activateAll(ctx)
+
+	after, _ := st.ListProviderAccounts(ctx)
+	if len(before) != len(after) {
+		t.Fatalf("activation changed the number of accounts: %d -> %d", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Status != after[i].Status || before[i].Label != after[i].Label ||
+			before[i].CredentialRef != after[i].CredentialRef {
+			t.Fatalf("activation modified an account:\nbefore %#v\nafter  %#v", before[i], after[i])
+		}
+	}
+}
+
+// TestAnAccountWithAnUnreadableCredentialIsExplained pins that an authenticated
+// account whose credential cannot be resolved stays visible with a reason,
+// rather than being skipped and looking like it was never configured.
+func TestAnAccountWithAnUnreadableCredentialIsExplained(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	// An account row whose credential was never written.
+	if err := st.UpsertProviderAccount(ctx, core.ProviderAccount{
+		ID: "acct-broken", Provider: "cloudflare", Label: "Broken",
+		CredentialRef: "cloudflare:acct-broken:api-token",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	sup, registry := activationTestSupervisor(t, st,
+		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: "cloudflared"}))
+	sup.activateAll(ctx)
+
+	for _, snap := range registry.Snapshot() {
+		if snap.ID != "cloudflare" {
+			continue
+		}
+		if len(snap.Accounts) != 0 {
+			t.Fatalf("an account with no readable credential was offered: %#v", snap.Accounts)
+		}
+		if len(snap.PendingAccounts) != 1 {
+			t.Fatalf("the account was hidden rather than explained: %#v", snap.PendingAccounts)
+		}
+		if snap.PendingAccounts[0].UnusableReason == "" {
+			t.Fatal("no reason given, so it is indistinguishable from never having been verified")
+		}
+		return
+	}
+	t.Fatal("cloudflare missing from the snapshot")
 }

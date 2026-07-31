@@ -83,14 +83,29 @@ type ActivationRequest struct {
 // and a store handle would make "activation never writes" a convention instead
 // of an impossibility.
 type RuntimeServices struct {
-	Processes    core.ConnectorProcessService
-	ConnectorDir string
-	LogDir       string
+	Processes core.ConnectorProcessService
+	// TunnelCredentials persists per-connection tunnel tokens. It is a narrow
+	// capability rather than the store, so a definition can save the tokens it
+	// creates without being able to touch provider accounts.
+	TunnelCredentials TunnelCredentialStore
+	ConnectorDir      string
+	LogDir            string
 	// LookPath resolves an executable, injectable so a test does not depend on
 	// what happens to be installed.
 	LookPath func(name string) (string, error)
 	// Getenv reads the supervisor's environment, injectable for the same reason.
 	Getenv func(key string) string
+}
+
+// TunnelCredentialStore is durable storage for tokens a provider creates while
+// opening a connection.
+//
+// It is deliberately not the account store: a provider may persist the tunnel
+// token it just minted, and may not read or write provider accounts.
+type TunnelCredentialStore interface {
+	SaveTunnelCredential(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string, token []byte) error
+	LoadTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) (string, error)
+	DeleteTunnelCredentialExact(ctx context.Context, connID core.ConnectionID, providerID core.ProviderID, tunnelID string) error
 }
 
 // Installation is the complete result of activating a provider: the runtime,
