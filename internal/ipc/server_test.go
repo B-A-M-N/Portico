@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -422,5 +423,44 @@ func TestConnectionDetailRouteMapsTypedErrors(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+}
+
+// TestProviderRecommendationIsReachable pins the route onto the recommendation
+// engine.
+//
+// The engine and its handler existed and were tested, and nothing could call
+// them: there was no route and no client method. Every caller therefore chose a
+// provider by other means, which in the TUI meant a hardcoded list of one.
+func TestProviderRecommendationIsReachable(t *testing.T) {
+	st := openTestStore(t)
+	s := newTestServer(t, st)
+
+	body, err := json.Marshal(ProviderRecommendationRequest{
+		ConnectionKind: "service_exposure",
+		SourceKind:     "existing_service",
+		ExposureMode:   "temporary_public",
+		Protocol:       "http",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/providers/recommend", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var resp ProviderRecommendationResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode recommendation: %v", err)
+	}
+
+	// A GET must not be mistaken for a recommendation request.
+	getRec := httptest.NewRecorder()
+	s.mux.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/v1/providers/recommend", nil))
+	if getRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", getRec.Code)
 	}
 }

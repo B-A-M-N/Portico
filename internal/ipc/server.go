@@ -120,6 +120,7 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/diagnostics/", s.handleDiagnostics)
 	mux.HandleFunc("/v1/supervisor/stop", s.handleSupervisorStop)
 	mux.HandleFunc("/v1/support/export", s.handleSupportExport)
+	mux.HandleFunc("/v1/providers/recommend", s.handleProviderRecommendation)
 	mux.HandleFunc("/v1/readiness", s.handleReadiness)
 	mux.HandleFunc("/v1/launch-mode", s.handleLaunchMode)
 	s.mux = mux
@@ -896,6 +897,38 @@ func (s *Server) handleSupportExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(export)
+}
+
+// handleProviderRecommendation answers which provider suits a set of stated
+// requirements.
+//
+// The engine behind this has existed and been tested for some time with no
+// route to reach it, so every caller picked a provider by other means — which
+// in the TUI meant a hardcoded list of one.
+//
+// It is a POST because the requirements are a body, not because it changes
+// anything: recommending is a pure function of the request and current provider
+// state.
+func (s *Server) handleProviderRecommendation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "PTO-RECOMMEND-METHOD", "method not allowed")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	defer r.Body.Close()
+	var req ProviderRecommendationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "PTO-RECOMMEND-BODY", "invalid request body")
+		return
+	}
+	result, err := s.handler.HandleProviderRecommendation(req)
+	if err != nil {
+		writeHandlerError(w, "PTO-RECOMMEND", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 // handleLaunchMode changes the startup gate.

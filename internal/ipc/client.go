@@ -487,6 +487,33 @@ func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string
 	return &result, nil
 }
 
+// RecommendProvider asks which provider suits a set of stated requirements.
+//
+// The answer names a provider and an account, and carries the reasons and
+// tradeoffs behind the choice plus why each other provider was excluded, so a
+// caller can present a decision rather than a verdict.
+func (c *Client) RecommendProvider(ctx context.Context, req ProviderRecommendationRequest) (
+	*ProviderRecommendationResponse, error,
+) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal recommendation request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/providers/recommend", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result ProviderRecommendationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // ProviderSetupFlow fetches what a provider needs in order to be configured.
 //
 // A provider that declares no flow returns an error rather than an empty form,
