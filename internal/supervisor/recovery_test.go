@@ -1388,15 +1388,15 @@ func TestTheOpenAITunnelDeclaresGuidance(t *testing.T) {
 	}
 }
 
-// TestOneProviderCannotHijackAnotherProvidersAccount pins the collision the
-// generic setup path made reachable.
+// TestConfiguringOneProviderLeavesAnotherProvidersSameNamedAccountIntact is the
+// inverse of the guard this package removed.
 //
-// Account rows are keyed on ID alone and the upsert rewrites provider_id, so a
-// provider whose identity field is free text could take over an existing
-// Cloudflare account: the row changes owner, the Cloudflare adapter loses it at
-// the next start, and every connection bound to it fails with an unexplained
-// "provider account unavailable".
-func TestOneProviderCannotHijackAnotherProvidersAccount(t *testing.T) {
+// Account identity is the pair (provider, ID), so an account named "acct-1"
+// belongs to whichever provider owns it and another provider may use the same
+// name. The old supervisor check enforced global uniqueness and would have
+// refused this outright; the schema now enforces the pairing instead, which is
+// both correct and covers every write path rather than one of four.
+func TestConfiguringOneProviderLeavesAnotherProvidersSameNamedAccountIntact(t *testing.T) {
 	ctx := context.Background()
 	st := newRecoveryTestStore(t)
 	registry := provider.NewRegistry()
@@ -1406,33 +1406,96 @@ func TestOneProviderCannotHijackAnotherProvidersAccount(t *testing.T) {
 	handler := &supervisorHandler{sup: &Supervisor{store: st, registry: registry, mutating: true}}
 
 	existing := core.ProviderAccount{
-		ID: "acct-1", Provider: "cloudflare", Label: "Personal",
-		CredentialRef: "cloudflare:acct-1:api-token",
+		ID: "shared", Provider: "cloudflare", Label: "Personal",
+		CredentialRef: "cloudflare:shared:api-token",
 		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
 	}
 	if err := st.UpsertProviderAccountCredential(ctx, existing, []byte("cloudflare-secret")); err != nil {
 		t.Fatalf("seed cloudflare account: %v", err)
 	}
 
-	// The same identity value, submitted for a different provider.
-	_, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
-		Fields: map[string]string{"workspace": "acct-1", "token": "acme-token"},
-	})
-	if err == nil {
-		t.Fatal("one provider was allowed to claim another provider's account ID")
+	// The same name, for a different provider. This must succeed.
+	if _, err := handler.HandleConfigureProviderAccount("acme", ipc.ConfigureProviderAccountRequest{
+		Fields: map[string]string{"workspace": "shared", "token": "acme-token"},
+	}); err != nil {
+		t.Fatalf("a legitimate same-named account for another provider was refused: %v", err)
 	}
 
 	accounts, listErr := st.ListProviderAccounts(ctx)
 	if listErr != nil {
 		t.Fatalf("ListProviderAccounts: %v", listErr)
 	}
-	for _, account := range accounts {
-		if account.ID == "acct-1" && account.Provider != "cloudflare" {
-			t.Fatalf("the Cloudflare account was taken over by %q", account.Provider)
+	if len(accounts) != 2 {
+		t.Fatalf("stored %d accounts, want 2", len(accounts))
+	}
+
+	var cloudflareAccount *core.ProviderAccount
+	for i := range accounts {
+		if accounts[i].Provider == "cloudflare" && accounts[i].ID == "shared" {
+			cloudflareAccount = &accounts[i]
 		}
-		if account.ID == "acct-1" && account.Status != core.AccountAuthenticated {
-			t.Fatalf("the Cloudflare account was downgraded to %q", account.Status)
+	}
+	if cloudflareAccount == nil {
+		t.Fatal("the Cloudflare account was taken over")
+	}
+	if cloudflareAccount.Label != "Personal" || cloudflareAccount.Status != core.AccountAuthenticated {
+		t.Fatalf("the Cloudflare account was modified: %#v", cloudflareAccount)
+	}
+	secret, err := st.LoadProviderCredential(ctx, "cloudflare", "cloudflare:shared:api-token")
+	if err != nil {
+		t.Fatalf("the Cloudflare credential no longer loads: %v", err)
+	}
+	if secret != "cloudflare-secret" {
+		t.Fatalf("the Cloudflare credential changed: %q", secret)
+	}
+}
+
+// TestCloudflareSetupCannotOverwriteAnotherProvidersAccount covers the write
+// path that never had a guard.
+//
+// The removed supervisor check lived only in the generic setup path. Ordinary
+// Cloudflare setup wrote straight through, so it could reassign another
+// provider's account until the key made that impossible.
+func TestCloudflareSetupCannotOverwriteAnotherProvidersAccount(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+	handler := &supervisorHandler{sup: &Supervisor{
+		store: st, registry: cloudflareTestRegistry(t), mutating: true,
+		accountValidator: &stubAccountValidator{result: &AccountValidation{AccountAccessible: true}},
+	}}
+
+	other := core.ProviderAccount{
+		ID: "acct-x", Provider: "acme", Label: "Someone else's",
+		CredentialRef: "acme:acct-x:credential",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, other, []byte("acme-secret")); err != nil {
+		t.Fatalf("seed acme account: %v", err)
+	}
+
+	if _, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{
+		AccountID:  "acct-x",
+		Credential: "a-real-looking-token",
+	}); err != nil {
+		t.Fatalf("HandleConfigureProviderAccount: %v", err)
+	}
+
+	accounts, _ := st.ListProviderAccounts(ctx)
+	var acme *core.ProviderAccount
+	for i := range accounts {
+		if accounts[i].Provider == "acme" && accounts[i].ID == "acct-x" {
+			acme = &accounts[i]
 		}
+	}
+	if acme == nil {
+		t.Fatal("Cloudflare setup took over another provider's account")
+	}
+	if acme.Label != "Someone else's" || acme.CredentialRef != "acme:acct-x:credential" {
+		t.Fatalf("the other provider's account was modified: %#v", acme)
+	}
+	secret, err := st.LoadProviderCredential(ctx, "acme", "acme:acct-x:credential")
+	if err != nil || secret != "acme-secret" {
+		t.Fatalf("the other provider's credential was damaged: %q err=%v", secret, err)
 	}
 }
 
@@ -2188,5 +2251,70 @@ func TestReadinessReportsAFailedCheckAsAFailure(t *testing.T) {
 	// everything is fine.
 	if !strings.Contains(readiness.Summary, "No provider") {
 		t.Fatalf("summary with no providers = %q", readiness.Summary)
+	}
+}
+
+// TestEveryWriterDerivesTheSameCredentialReference pins the fix for a secret
+// that outlived its account.
+//
+// The generic setup path built "<provider>:<account>:credential" while the
+// environment bootstrap built "<provider>:<account>:api-token". Two writers,
+// two encrypted rows, one account — and because deletion removes only the
+// reference the account currently carries, the other survived being deleted.
+func TestEveryWriterDerivesTheSameCredentialReference(t *testing.T) {
+	if got, want := providerCredentialRef("ngrok", "acct-1"), "ngrok:acct-1:api-token"; got != want {
+		t.Fatalf("reference = %q, want %q", got, want)
+	}
+	// The property that matters is agreement, not the format itself: the same
+	// account must produce one reference no matter which path writes it.
+	if providerCredentialRef("cloudflare", "a") == providerCredentialRef("cloudflare", "b") {
+		t.Fatal("different accounts share a credential reference")
+	}
+	if providerCredentialRef("cloudflare", "a") == providerCredentialRef("ngrok", "a") {
+		t.Fatal("different providers share a credential reference for the same account name")
+	}
+}
+
+// TestBootstrapDoesNotOverwriteConfiguredAccountState covers the supervisor
+// path end to end: an account configured through Portico must survive a restart
+// that also has environment credentials set for it.
+func TestBootstrapDoesNotOverwriteConfiguredAccountState(t *testing.T) {
+	ctx := context.Background()
+	st := newRecoveryTestStore(t)
+
+	configured := core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "Production",
+		CredentialRef: providerCredentialRef("cloudflare", "acct-1"),
+		Status:        core.AccountAuthenticated,
+		Metadata:      map[string]string{"zone_id": "zone-production"},
+	}
+	if err := st.UpsertProviderAccountCredential(ctx, configured, []byte("configured-secret")); err != nil {
+		t.Fatalf("seed configured account: %v", err)
+	}
+
+	// A stale environment from an earlier install, applied on the next start.
+	if _, err := st.CreateProviderAccountIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "acct-1",
+		CredentialRef: providerCredentialRef("cloudflare", "acct-1"),
+		Status:        core.AccountAuthenticated,
+		Metadata:      map[string]string{"zone_id": "zone-stale"},
+	}); err != nil {
+		t.Fatalf("bootstrap write: %v", err)
+	}
+
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("stored %d accounts, want 1", len(accounts))
+	}
+	// The zone decides which Cloudflare zone the adapter is built against, so
+	// reverting it silently points DNS work at the wrong place.
+	if accounts[0].Metadata["zone_id"] != "zone-production" {
+		t.Fatalf("the configured zone was reverted to %q", accounts[0].Metadata["zone_id"])
+	}
+	if accounts[0].Label != "Production" {
+		t.Fatalf("the configured label was reverted to %q", accounts[0].Label)
 	}
 }

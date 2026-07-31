@@ -1,12 +1,15 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // buildV7Fixture creates a database migrated only through version 7 and
@@ -342,7 +345,16 @@ CREATE TABLE connection_runtime (
 CREATE TABLE provider_accounts (
     id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, label TEXT NOT NULL, credential_ref TEXT,
     metadata_json BLOB, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);`)
+);
+-- Accounts predating the provider-scoped key. credential_ref is written as ''
+-- rather than NULL on purpose: the column is nullable and ListProviderAccounts
+-- scans it into a plain string, which is a separate defect that must not be
+-- conflated with this migration.
+INSERT INTO provider_accounts VALUES
+    ('acct-1', 'cloudflare', 'Personal', 'cloudflare:acct-1:api-token',
+     '{"zone_id":"zone-a"}', 'authenticated', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'),
+    ('acct-2', 'ngrok', 'Work', 'ngrok:acct-2:api-token',
+     '', 'pending', '2026-01-03T00:00:00Z', '2026-01-04T00:00:00Z');`)
 	if err != nil {
 		db.Close()
 		t.Fatalf("seed released v1 schema: %v", err)
@@ -394,6 +406,65 @@ CREATE TABLE provider_accounts (
 	if key != "legacy-key" {
 		t.Fatalf("idempotency key = %q", key)
 	}
+
+	// Migration 19 rebuilds provider_accounts around a provider-scoped key.
+	// Every column must survive the rebuild byte for byte: the copy moves
+	// metadata as an opaque blob and timestamps verbatim, so nothing is
+	// recomputed and no credential reference is rewritten.
+	type accountRow struct{ label, ref, meta, status, created, updated string }
+	accounts := map[string]accountRow{}
+	rows, err := s.DB().Query(
+		`SELECT id, provider_id, label, credential_ref, COALESCE(metadata_json, ''), status, created_at, updated_at
+		 FROM provider_accounts`)
+	if err != nil {
+		t.Fatalf("read migrated provider accounts: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, providerID string
+		var row accountRow
+		if err := rows.Scan(&id, &providerID, &row.label, &row.ref, &row.meta,
+			&row.status, &row.created, &row.updated); err != nil {
+			t.Fatalf("scan migrated provider account: %v", err)
+		}
+		accounts[providerID+"/"+id] = row
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("migrated %d provider accounts, want 2", len(accounts))
+	}
+	cf, ok := accounts["cloudflare/acct-1"]
+	if !ok {
+		t.Fatalf("cloudflare account did not survive migration: %#v", accounts)
+	}
+	if cf.label != "Personal" || cf.ref != "cloudflare:acct-1:api-token" ||
+		cf.meta != `{"zone_id":"zone-a"}` || cf.status != "authenticated" ||
+		cf.created != "2026-01-01T00:00:00Z" || cf.updated != "2026-01-02T00:00:00Z" {
+		t.Fatalf("cloudflare account changed during migration: %#v", cf)
+	}
+	// A pending account must not be quietly promoted by the rebuild.
+	if ng := accounts["ngrok/acct-2"]; ng.status != "pending" || ng.created != "2026-01-03T00:00:00Z" {
+		t.Fatalf("ngrok account changed during migration: %#v", ng)
+	}
+
+	// The new key must actually be in force: the same account ID under a
+	// different provider is a different row, and re-upserting one provider's
+	// account must not disturb the other's.
+	ctx := context.Background()
+	if err := s.UpsertProviderAccount(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "ngrok", Label: "Same name, other provider",
+		CredentialRef: "ngrok:acct-1:api-token", Status: core.AccountAuthenticated,
+	}); err != nil {
+		t.Fatalf("insert same account ID under another provider: %v", err)
+	}
+	var cfLabel string
+	if err := s.DB().QueryRow(
+		`SELECT label FROM provider_accounts WHERE provider_id = 'cloudflare' AND id = 'acct-1'`,
+	).Scan(&cfLabel); err != nil {
+		t.Fatalf("read cloudflare account after cross-provider insert: %v", err)
+	}
+	if cfLabel != "Personal" {
+		t.Fatalf("another provider's account overwrote the Cloudflare one: label = %q", cfLabel)
+	}
 }
 
 // seedV17ProfileSchema creates a database at schema version 17: the
@@ -423,6 +494,13 @@ CREATE TABLE connection_profiles (
 CREATE TABLE operations (
     id TEXT PRIMARY KEY, connection_id TEXT NOT NULL,
     FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
+);
+-- A real database at version 17 has this table, created by migration 1.
+-- Migration 19 rebuilds it, so the fixture must carry it or it is testing a
+-- database shape that cannot exist.
+CREATE TABLE provider_accounts (
+    id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, label TEXT NOT NULL, credential_ref TEXT,
+    metadata_json BLOB, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );`); err != nil {
 		t.Fatalf("seed v17 schema: %v", err)
 	}
@@ -657,5 +735,117 @@ func TestMigration18TakesRecoveryBackupAndIsIdempotent(t *testing.T) {
 	}
 	if applied != 1 {
 		t.Fatalf("migration 18 recorded %d times, want 1", applied)
+	}
+}
+
+// seedPreScopedAccountsDB writes a database carrying the pre-19 account shape.
+func seedPreScopedAccountsDB(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE provider_accounts (
+    id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, label TEXT NOT NULL, credential_ref TEXT,
+    metadata_json BLOB, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+INSERT INTO provider_accounts VALUES
+    ('acct-1','cloudflare','Personal','cloudflare:acct-1:api-token','{"zone_id":"z"}','authenticated','c1','u1'),
+    ('acct-2','ngrok','Work','ngrok:acct-2:api-token','','pending','c2','u2');`); err != nil {
+		db.Close()
+		t.Fatalf("seed pre-19 accounts: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+}
+
+// accountsTableDDL returns the stored CREATE statement for provider_accounts.
+func accountsTableDDL(t *testing.T, s *Store) string {
+	t.Helper()
+	var ddl string
+	if err := s.DB().QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name='provider_accounts'`).Scan(&ddl); err != nil {
+		t.Fatalf("read provider_accounts DDL: %v", err)
+	}
+	return ddl
+}
+
+// TestFreshAndMigratedDatabasesHaveTheSameAccountSchema guards against the
+// classic migration split, where new installs and upgraded ones diverge and
+// only one of them is ever tested.
+func TestFreshAndMigratedDatabasesHaveTheSameAccountSchema(t *testing.T) {
+	freshPath := filepath.Join(t.TempDir(), "fresh.db")
+	fresh, err := Open(freshPath)
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	defer fresh.Close()
+
+	migratedPath := filepath.Join(t.TempDir(), "migrated.db")
+	seedPreScopedAccountsDB(t, migratedPath)
+	migrated, err := Open(migratedPath)
+	if err != nil {
+		t.Fatalf("Open migrating: %v", err)
+	}
+	defer migrated.Close()
+
+	if got, want := accountsTableDDL(t, migrated), accountsTableDDL(t, fresh); got != want {
+		t.Fatalf("migrated schema differs from fresh:\nmigrated:\n%s\nfresh:\n%s", got, want)
+	}
+
+	// The rebuild must not touch the rows it copies. A pending account being
+	// silently promoted here would defeat the verification invariant at the
+	// one moment nobody is watching.
+	var status, createdAt string
+	if err := migrated.DB().QueryRow(
+		`SELECT status, created_at FROM provider_accounts WHERE provider_id='ngrok' AND id='acct-2'`,
+	).Scan(&status, &createdAt); err != nil {
+		t.Fatalf("read migrated pending account: %v", err)
+	}
+	if status != "pending" || createdAt != "c2" {
+		t.Fatalf("migration altered a pending account: status=%q created_at=%q", status, createdAt)
+	}
+}
+
+// TestProviderAccountMigrationIsIdempotent ensures reopening an already
+// migrated database neither reruns the rebuild nor disturbs the rows.
+func TestProviderAccountMigrationIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repeat.db")
+	seedPreScopedAccountsDB(t, path)
+
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (first): %v", err)
+	}
+	ddl := accountsTableDDL(t, first)
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (second): %v", err)
+	}
+	defer second.Close()
+
+	if got := accountsTableDDL(t, second); got != ddl {
+		t.Fatalf("schema changed on reopen:\n%s\n---\n%s", got, ddl)
+	}
+	var applied int
+	if err := second.DB().QueryRow(
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = 19`).Scan(&applied); err != nil {
+		t.Fatalf("read migration record: %v", err)
+	}
+	if applied != 1 {
+		t.Fatalf("migration 19 recorded %d times, want 1", applied)
+	}
+	var accounts int
+	if err := second.DB().QueryRow(`SELECT COUNT(*) FROM provider_accounts`).Scan(&accounts); err != nil {
+		t.Fatalf("count accounts: %v", err)
+	}
+	if accounts != 2 {
+		t.Fatalf("accounts after reopen = %d, want 2", accounts)
 	}
 }

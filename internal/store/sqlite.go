@@ -507,6 +507,85 @@ CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider ON provider_credent
 		version: 18,
 		onApply: migrateProfilesToVersionedSpec,
 	},
+	{
+		version: 19,
+		onApply: migrateProviderAccountsToProviderScopedKey,
+	},
+}
+
+// migrateProviderAccountsToProviderScopedKey rebuilds provider_accounts with a
+// composite primary key of (provider_id, id).
+//
+// The table was keyed on id alone, and both upserts declared
+// ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id, so any writer
+// supplying a colliding account ID silently reassigned another provider's
+// account — its owner, its credential reference and its status. Two providers
+// also could not each hold an account named "default".
+//
+// Widening the key cannot produce a duplicate: the old schema declared
+// id TEXT PRIMARY KEY, so every existing row already has a distinct id, and a
+// set of tuples unique in one component is unique in any superset of them. The
+// row-count check below proves that at runtime instead of relying on the
+// argument, and turns any surprise into a refusal — the store has already
+// written a pre-migration backup by the time this runs.
+//
+// Rows corrupted by the original defect are NOT repaired here and must not be.
+// A takeover rewrote provider_id and credential_ref together, so the row is
+// internally consistent and indistinguishable from a legitimate one; any
+// heuristic would invent history. Recovery is from the .backup-* file.
+func migrateProviderAccountsToProviderScopedKey(tx *sql.Tx) error {
+	var before int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM provider_accounts`).Scan(&before); err != nil {
+		return fmt.Errorf("count provider accounts before rebuild: %w", err)
+	}
+
+	// Column names, declared types and nullability are identical to the
+	// original table. credential_ref stays nullable on purpose: making it NOT
+	// NULL here would conflate this change with a separate read-path defect.
+	if _, err := tx.Exec(`
+		CREATE TABLE provider_accounts_new (
+			id TEXT NOT NULL,
+			provider_id TEXT NOT NULL,
+			label TEXT NOT NULL,
+			credential_ref TEXT,
+			metadata_json BLOB,
+			status TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (provider_id, id)
+		)`); err != nil {
+		return fmt.Errorf("create provider_accounts with provider-scoped key: %w", err)
+	}
+
+	// Explicit column list, no re-encoding: metadata_json moves as an opaque
+	// blob and both timestamps move verbatim, so nothing is recomputed.
+	if _, err := tx.Exec(`
+		INSERT INTO provider_accounts_new
+			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
+		SELECT id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at
+		FROM provider_accounts`); err != nil {
+		return fmt.Errorf("copy provider accounts: %w", err)
+	}
+
+	var after int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM provider_accounts_new`).Scan(&after); err != nil {
+		return fmt.Errorf("count provider accounts after rebuild: %w", err)
+	}
+	if before != after {
+		// Refuse rather than lose. The transaction rolls back, the database
+		// stays at the previous version, and the pre-migration backup stands.
+		return fmt.Errorf(
+			"provider account rebuild would lose rows: %d before, %d after; "+
+				"the database is unchanged and a pre-migration backup was written", before, after)
+	}
+
+	if _, err := tx.Exec(`DROP TABLE provider_accounts`); err != nil {
+		return fmt.Errorf("drop old provider_accounts: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE provider_accounts_new RENAME TO provider_accounts`); err != nil {
+		return fmt.Errorf("rename provider_accounts: %w", err)
+	}
+	return nil
 }
 
 // migrateProfilesToVersionedSpec converts connection_profiles from the
@@ -4672,9 +4751,57 @@ func (s *Store) ListProviderAccounts(ctx context.Context) ([]core.ProviderAccoun
 	return accounts, rows.Err()
 }
 
+// CreateProviderAccountIfAbsent records an account only when the provider does
+// not already have one under that ID, leaving an existing row untouched.
+//
+// It exists for writers that discovered a credential rather than verified one —
+// the environment bootstrap paths. Those run on every supervisor start, and an
+// unconditional upsert let them overwrite state they had not earned the right
+// to set: an account saved as pending because its credential could not be
+// checked was silently promoted to authenticated, and an operator's label and
+// metadata (including the Cloudflare zone the adapter is built against) were
+// reverted to whatever the environment happened to say.
+//
+// Reports whether a row was created, so a caller can tell "I added this" from
+// "one was already there".
+func (s *Store) CreateProviderAccountIfAbsent(ctx context.Context, account core.ProviderAccount) (bool, error) {
+	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" {
+		return false, fmt.Errorf("provider account ID, provider, label, and credential reference are required")
+	}
+	if account.Status == "" {
+		account.Status = core.AccountPending
+	}
+	metadata, err := json.Marshal(account.Metadata)
+	if err != nil {
+		return false, fmt.Errorf("marshal provider account metadata: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO provider_accounts
+			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider_id, id) DO NOTHING`,
+		string(account.ID), string(account.Provider), account.Label, account.CredentialRef,
+		metadata, string(account.Status), now, now)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 // UpsertProviderAccount records account metadata and an opaque credential
 // reference. The secret belongs in provider_credentials and is never encoded
 // in this row or its metadata.
+//
+// This overwrites label, metadata and status, so it is for writers that have
+// established those facts. A writer that merely found a credential lying about
+// must use CreateProviderAccountIfAbsent.
 func (s *Store) UpsertProviderAccount(ctx context.Context, account core.ProviderAccount) error {
 	if account.ID == "" || account.Provider == "" || strings.TrimSpace(account.Label) == "" || strings.TrimSpace(account.CredentialRef) == "" {
 		return fmt.Errorf("provider account ID, provider, label, and credential reference are required")
@@ -4697,8 +4824,10 @@ func (s *Store) UpsertProviderAccount(ctx context.Context, account core.Provider
 		INSERT INTO provider_accounts
 			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			provider_id=excluded.provider_id,
+		-- The conflict target is the composite key, and provider_id is absent
+		-- from the SET list, so an upsert can never change which provider owns
+		-- an existing account.
+		ON CONFLICT(provider_id, id) DO UPDATE SET
 			label=excluded.label,
 			credential_ref=excluded.credential_ref,
 			metadata_json=excluded.metadata_json,
@@ -4754,8 +4883,10 @@ func (s *Store) UpsertProviderAccountCredential(ctx context.Context, account cor
 		INSERT INTO provider_accounts
 			(id, provider_id, label, credential_ref, metadata_json, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			provider_id=excluded.provider_id,
+		-- The conflict target is the composite key, and provider_id is absent
+		-- from the SET list, so an upsert can never change which provider owns
+		-- an existing account.
+		ON CONFLICT(provider_id, id) DO UPDATE SET
 			label=excluded.label,
 			credential_ref=excluded.credential_ref,
 			metadata_json=excluded.metadata_json,
@@ -4824,7 +4955,7 @@ func (s *Store) RecordIdempotentKey(ctx context.Context, key string, opID core.O
 // DeleteProviderAccount removes an account row and its stored credential.
 //
 // Callers must confirm no connection depends on the account first;
-// CountConnectionsUsingAccount exists for exactly that check. Removing an
+// ConnectionsUsingAccount exists for exactly that check. Removing an
 // account still referenced by a profile would strand that connection with an
 // opaque "provider account unavailable" error and no way to see why.
 func (s *Store) DeleteProviderAccount(ctx context.Context, providerID core.ProviderID, accountID core.ProviderAccountID) error {

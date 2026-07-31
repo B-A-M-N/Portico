@@ -1751,24 +1751,11 @@ func (h *supervisorHandler) configureDeclaredAccount(
 	if accountID == "" {
 		accountID = id
 	}
-	// Account rows are keyed on ID alone, and the upsert rewrites the owning
-	// provider. Without this check a provider whose identity field is free text
-	// could take over another provider's account: the row would change owner,
-	// the original adapter would lose it at the next start, and every
-	// connection bound to it would fail with an unexplained "provider account
-	// unavailable".
-	existing, err := h.sup.store.ListProviderAccounts(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("check existing accounts: %w", err)
-	}
-	for _, account := range existing {
-		if string(account.ID) == accountID && string(account.Provider) != id {
-			return nil, core.ErrValidation(fmt.Sprintf(
-				"%q is already the ID of a %s account; choose a different value",
-				accountID, account.Provider))
-		}
-	}
-
+	// No cross-provider ID check here. Account identity is the pair
+	// (provider, ID), enforced by the store's primary key, so two providers may
+	// each hold an account called "default". A check here would enforce global
+	// uniqueness instead, contradicting the schema and refusing a legitimate
+	// name — and it only ever covered this one of four write paths anyway.
 	label := values["label"]
 	if label == "" {
 		label = accountID
@@ -1790,7 +1777,7 @@ func (h *supervisorHandler) configureDeclaredAccount(
 		ID:            core.ProviderAccountID(accountID),
 		Provider:      core.ProviderID(id),
 		Label:         label,
-		CredentialRef: fmt.Sprintf("%s:%s:credential", id, accountID),
+		CredentialRef: providerCredentialRef(id, accountID),
 		Metadata:      metadata,
 		Status:        status,
 	}
@@ -1880,7 +1867,7 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 	if zoneID != "" {
 		metadata["zone_id"] = zoneID
 	}
-	credentialRef := fmt.Sprintf("cloudflare:%s:api-token", accountID)
+	credentialRef := providerCredentialRef("cloudflare", accountID)
 	account := core.ProviderAccount{
 		ID:            core.ProviderAccountID(accountID),
 		Provider:      "cloudflare",

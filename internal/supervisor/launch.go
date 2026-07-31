@@ -1,9 +1,22 @@
 package supervisor
 
 import (
+	"fmt"
 	"os"
 	"strings"
 )
+
+// providerCredentialRef derives the credential reference for one account.
+//
+// Every writer must derive it here. Two writers building the reference
+// differently for the same account produced two encrypted credential rows, and
+// because provider_credentials is keyed on the reference while deletion removes
+// only the one the account currently points at, the other survived the account
+// being deleted — a secret left in the database after the user was told it was
+// gone, reachable by nothing.
+func providerCredentialRef(providerID, accountID string) string {
+	return fmt.Sprintf("%s:%s:api-token", providerID, accountID)
+}
 
 // Launch modes.
 const (

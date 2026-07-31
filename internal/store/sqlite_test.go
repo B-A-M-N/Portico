@@ -1170,3 +1170,270 @@ func TestClientTunnelProfileRoundTrips(t *testing.T) {
 		t.Fatalf("loaded client tunnel failed validation: %v", err)
 	}
 }
+
+// providerAccount builds an account for the identity tests.
+func providerAccount(providerID core.ProviderID, id core.ProviderAccountID, label, ref string) core.ProviderAccount {
+	return core.ProviderAccount{
+		ID: id, Provider: providerID, Label: label, CredentialRef: ref,
+		Status: core.AccountAuthenticated, Metadata: map[string]string{"note": label},
+	}
+}
+
+// findAccount returns the stored account for a provider/ID pair.
+func findAccount(t *testing.T, s *Store, providerID core.ProviderID, id core.ProviderAccountID) *core.ProviderAccount {
+	t.Helper()
+	accounts, err := s.ListProviderAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	for i := range accounts {
+		if accounts[i].Provider == providerID && accounts[i].ID == id {
+			return &accounts[i]
+		}
+	}
+	return nil
+}
+
+// TestProviderAccountsAreScopedPerProvider pins that an account name belongs to
+// its provider. Two providers can legitimately call an account "default"; the
+// table keyed them globally, so the second silently replaced the first.
+func TestProviderAccountsAreScopedPerProvider(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	cf := providerAccount("cloudflare", "default", "Cloudflare default", "cloudflare:default:api-token")
+	ng := providerAccount("ngrok", "default", "ngrok default", "ngrok:default:api-token")
+	if err := s.UpsertProviderAccountCredential(ctx, cf, []byte("cloudflare-secret")); err != nil {
+		t.Fatalf("save cloudflare account: %v", err)
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, ng, []byte("ngrok-secret")); err != nil {
+		t.Fatalf("save ngrok account: %v", err)
+	}
+
+	accounts, err := s.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListProviderAccounts: %v", err)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("stored %d accounts, want 2 — one provider's account replaced the other's", len(accounts))
+	}
+	if got := findAccount(t, s, "cloudflare", "default"); got == nil || got.Label != "Cloudflare default" {
+		t.Fatalf("cloudflare account = %#v", got)
+	}
+	if got := findAccount(t, s, "ngrok", "default"); got == nil || got.Label != "ngrok default" {
+		t.Fatalf("ngrok account = %#v", got)
+	}
+}
+
+// TestUpsertCannotChangeAnAccountsOwningProvider is the takeover, at the layer
+// that now enforces the rule. It was previously prevented by a check in one of
+// four write paths; the other three, including ordinary Cloudflare setup, could
+// still reassign another provider's account.
+func TestUpsertCannotChangeAnAccountsOwningProvider(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	original := providerAccount("cloudflare", "acct-1", "Personal", "cloudflare:acct-1:api-token")
+	if err := s.UpsertProviderAccountCredential(ctx, original, []byte("cloudflare-secret")); err != nil {
+		t.Fatalf("seed cloudflare account: %v", err)
+	}
+	before := findAccount(t, s, "cloudflare", "acct-1")
+	if before == nil {
+		t.Fatal("seeded account not found")
+	}
+
+	// The same ID, claimed by a different provider.
+	intruder := providerAccount("ngrok", "acct-1", "Taken over", "ngrok:acct-1:api-token")
+	intruder.Status = core.AccountPending
+	if err := s.UpsertProviderAccountCredential(ctx, intruder, []byte("ngrok-secret")); err != nil {
+		t.Fatalf("save ngrok account: %v", err)
+	}
+
+	after := findAccount(t, s, "cloudflare", "acct-1")
+	if after == nil {
+		t.Fatal("the Cloudflare account was taken over and no longer exists")
+	}
+	if after.Label != before.Label {
+		t.Fatalf("label changed: %q -> %q", before.Label, after.Label)
+	}
+	if after.CredentialRef != before.CredentialRef {
+		t.Fatalf("credential reference changed: %q -> %q", before.CredentialRef, after.CredentialRef)
+	}
+	if after.Status != core.AccountAuthenticated {
+		t.Fatalf("status changed: %q -> %q", core.AccountAuthenticated, after.Status)
+	}
+	if findAccount(t, s, "ngrok", "acct-1") == nil {
+		t.Fatal("the ngrok account was not created as its own row")
+	}
+
+	// The original secret must still decrypt.
+	secret, err := s.LoadProviderCredential(ctx, "cloudflare", before.CredentialRef)
+	if err != nil {
+		t.Fatalf("cloudflare credential no longer loads: %v", err)
+	}
+	if secret != "cloudflare-secret" {
+		t.Fatalf("cloudflare credential changed: %q", secret)
+	}
+}
+
+// TestDeleteProviderAccountRemovesOnlyTheNamedProvidersRow ensures removing one
+// provider's account leaves an identically named account, and its credential,
+// untouched.
+func TestDeleteProviderAccountRemovesOnlyTheNamedProvidersRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	cf := providerAccount("cloudflare", "default", "Cloudflare", "cloudflare:default:api-token")
+	ng := providerAccount("ngrok", "default", "ngrok", "ngrok:default:api-token")
+	if err := s.UpsertProviderAccountCredential(ctx, cf, []byte("cloudflare-secret")); err != nil {
+		t.Fatalf("save cloudflare: %v", err)
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, ng, []byte("ngrok-secret")); err != nil {
+		t.Fatalf("save ngrok: %v", err)
+	}
+
+	if err := s.DeleteProviderAccount(ctx, "ngrok", "default"); err != nil {
+		t.Fatalf("DeleteProviderAccount: %v", err)
+	}
+
+	if findAccount(t, s, "ngrok", "default") != nil {
+		t.Fatal("the ngrok account was not removed")
+	}
+	if findAccount(t, s, "cloudflare", "default") == nil {
+		t.Fatal("deleting one provider's account removed another provider's")
+	}
+	// Deletion cascades by credential reference, so cross-provider credential
+	// loss is the real risk here.
+	secret, err := s.LoadProviderCredential(ctx, "cloudflare", "cloudflare:default:api-token")
+	if err != nil {
+		t.Fatalf("the surviving account's credential no longer loads: %v", err)
+	}
+	if secret != "cloudflare-secret" {
+		t.Fatalf("surviving credential changed: %q", secret)
+	}
+}
+
+// TestDeleteProviderAccountRejectsAWrongProviderPair ensures a delete naming the
+// wrong provider removes nothing.
+func TestDeleteProviderAccountRejectsAWrongProviderPair(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	ng := providerAccount("ngrok", "default", "ngrok", "ngrok:default:api-token")
+	if err := s.UpsertProviderAccountCredential(ctx, ng, []byte("ngrok-secret")); err != nil {
+		t.Fatalf("save ngrok: %v", err)
+	}
+
+	if err := s.DeleteProviderAccount(ctx, "cloudflare", "default"); err == nil {
+		t.Fatal("deleting an account under the wrong provider was accepted")
+	}
+	if findAccount(t, s, "ngrok", "default") == nil {
+		t.Fatal("a delete naming the wrong provider removed the row anyway")
+	}
+}
+
+// TestBootstrapWriteCannotPromoteAPendingAccount pins the invariant against the
+// path that runs on every supervisor start.
+//
+// The environment bootstrap verifies nothing — it finds a token and records an
+// account. It used an unconditional upsert whose SET list included status, so
+// an account deliberately saved as pending, because its credential could not be
+// checked, was promoted to authenticated by a restart.
+func TestBootstrapWriteCannotPromoteAPendingAccount(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	pending := core.ProviderAccount{
+		ID: "acct-1", Provider: "ngrok", Label: "Configured in Portico",
+		CredentialRef: "ngrok:acct-1:api-token",
+		Status:        core.AccountPending, Metadata: map[string]string{"note": "unverified"},
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, pending, []byte("unchecked")); err != nil {
+		t.Fatalf("seed pending account: %v", err)
+	}
+
+	// What the bootstrap does on the next start.
+	created, err := s.CreateProviderAccountIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "ngrok", Label: "acct-1",
+		CredentialRef: "ngrok:acct-1:api-token",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	})
+	if err != nil {
+		t.Fatalf("CreateProviderAccountIfAbsent: %v", err)
+	}
+	if created {
+		t.Fatal("an existing account was reported as newly created")
+	}
+
+	got := findAccount(t, s, "ngrok", "acct-1")
+	if got == nil {
+		t.Fatal("the account disappeared")
+	}
+	if got.Status != core.AccountPending {
+		t.Fatalf("an unverified account was promoted to %q by a bootstrap write", got.Status)
+	}
+	// Label and metadata are operator state and must survive too.
+	if got.Label != "Configured in Portico" {
+		t.Fatalf("the operator's label was reverted to %q", got.Label)
+	}
+	if got.Metadata["note"] != "unverified" {
+		t.Fatalf("account metadata was destroyed: %#v", got.Metadata)
+	}
+}
+
+// TestBootstrapWriteCreatesAnAccountWhenThereIsNone keeps the other half: a
+// machine configured only through the environment still gets its account.
+func TestBootstrapWriteCreatesAnAccountWhenThereIsNone(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	created, err := s.CreateProviderAccountIfAbsent(ctx, core.ProviderAccount{
+		ID: "acct-1", Provider: "cloudflare", Label: "acct-1",
+		CredentialRef: "cloudflare:acct-1:api-token",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{"zone_id": "z1"},
+	})
+	if err != nil {
+		t.Fatalf("CreateProviderAccountIfAbsent: %v", err)
+	}
+	if !created {
+		t.Fatal("a new account was not created")
+	}
+	got := findAccount(t, s, "cloudflare", "acct-1")
+	if got == nil || got.Metadata["zone_id"] != "z1" {
+		t.Fatalf("account not stored as given: %#v", got)
+	}
+}
+
+// TestDeletingAnAccountLeavesNoOrphanedCredential pins that removing an account
+// removes its secret.
+//
+// Two writers built the credential reference differently for the same account,
+// so a second encrypted row existed that nothing pointed at. Deletion removes
+// only the reference the account currently carries, so that secret stayed in
+// the database after the user was told the account was gone, reachable by
+// nothing.
+func TestDeletingAnAccountLeavesNoOrphanedCredential(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	account := core.ProviderAccount{
+		ID: "acct-1", Provider: "ngrok", Label: "Work",
+		CredentialRef: "ngrok:acct-1:api-token",
+		Status:        core.AccountAuthenticated, Metadata: map[string]string{},
+	}
+	if err := s.UpsertProviderAccountCredential(ctx, account, []byte("ngrok-secret")); err != nil {
+		t.Fatalf("save account: %v", err)
+	}
+	if err := s.DeleteProviderAccount(ctx, "ngrok", "acct-1"); err != nil {
+		t.Fatalf("DeleteProviderAccount: %v", err)
+	}
+
+	var remaining int
+	if err := s.DB().QueryRow(
+		`SELECT COUNT(*) FROM provider_credentials WHERE provider_id = 'ngrok'`).Scan(&remaining); err != nil {
+		t.Fatalf("count credentials: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("%d encrypted credential(s) survived the account being deleted", remaining)
+	}
+}
