@@ -3,7 +3,7 @@ name: portico-auditor
 description: Fast read-only auditor and debugger for Portico remediation. Use after a complete work package passes targeted tests for adversarial review, or after repeated failures for triage.
 model: opus
 permissionMode: plan
-maxTurns: 10
+maxTurns: 30
 background: false
 tools:
   - Read

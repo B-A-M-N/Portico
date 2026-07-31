@@ -3,7 +3,7 @@ name: portico-architect
 description: Architecture authority for Portico audit remediation. Use proactively before source edits for schema migrations, transaction-boundary changes, lifecycle ownership changes, cross-package state-machine changes, security-boundary redesigns, or corrected contracts after an implementation and auditor triage still fail.
 model: opus
 permissionMode: plan
-maxTurns: 12
+maxTurns: 40
 background: false
 tools:
   - Read
