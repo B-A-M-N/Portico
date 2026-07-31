@@ -37,6 +37,10 @@ type fakeClient struct {
 	logs      *ipc.ConnectionLogsDTO
 	readiness *ipc.ReadinessDTO
 
+	recommendation    *ipc.ProviderRecommendationResponse
+	recommendErr      error
+	recommendRequests []ipc.ProviderRecommendationRequest
+
 	setupFlow      *ipc.SetupFlowDTO
 	setupFlowErr   error
 	setupFlowAsked []string
@@ -63,6 +67,26 @@ func (f *fakeClient) Readiness(_ context.Context) (*ipc.ReadinessDTO, error) {
 		return f.readiness, nil
 	}
 	return &ipc.ReadinessDTO{Summary: "nothing configured", LaunchMode: "auto"}, nil
+}
+
+// RecommendProvider stands in for the supervisor's evaluation. Returning a
+// Cloudflare recommendation keeps the existing walkthrough tests describing the
+// same flow they always did.
+func (f *fakeClient) RecommendProvider(_ context.Context, req ipc.ProviderRecommendationRequest) (
+	*ipc.ProviderRecommendationResponse, error,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recommendRequests = append(f.recommendRequests, req)
+	if f.recommendErr != nil {
+		return nil, f.recommendErr
+	}
+	if f.recommendation != nil {
+		return f.recommendation, nil
+	}
+	return &ipc.ProviderRecommendationResponse{
+		Recommended: &ipc.ProviderChoiceDTO{ProviderID: "cloudflare", DisplayName: "Cloudflare"},
+	}, nil
 }
 
 func (f *fakeClient) ProviderSetupFlow(_ context.Context, providerID string) (*ipc.SetupFlowDTO, error) {

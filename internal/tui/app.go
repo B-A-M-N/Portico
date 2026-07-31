@@ -446,6 +446,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.requestSnapshot()
 
+	case screens.ProviderRecommendationMsg:
+		if m.wizard != nil {
+			m.wizard.HandleRecommendation(msg)
+		}
+		return m, nil
+
 	case screens.ConnectionCreatedMsg:
 		if m.wizard != nil {
 			cmd := m.wizard.HandleCreated(msg)

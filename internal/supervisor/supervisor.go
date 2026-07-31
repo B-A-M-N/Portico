@@ -741,6 +741,8 @@ func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecomme
 			DisplayName: bad.DisplayName,
 			Reason:      strings.Join(bad.BlockingReasons, "; "),
 			Reasons:     bad.BlockingReasons,
+			// What to do about it is the half the user can act on.
+			SetupActions: bad.SetupActions,
 		})
 	}
 	return resp, nil

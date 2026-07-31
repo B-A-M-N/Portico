@@ -356,6 +356,11 @@ type fakeWizardClient struct {
 	planCalls   int
 	applyCalls  int
 	getOpCalls  int
+
+	recommendation       *ipc.ProviderRecommendationResponse
+	recommendErr         error
+	recommendCalls       int
+	lastRecommendRequest ipc.ProviderRecommendationRequest
 }
 
 func (f *fakeWizardClient) CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
@@ -741,4 +746,23 @@ func quickTunnelOnlySnapshot() []ipc.ProviderDTO {
 			Protocols:          []string{"http", "https"},
 		},
 	}}
+}
+
+// RecommendProvider lets the fake stand in for a supervisor that evaluates
+// providers. The zero response means "no recommendation", which the wizard must
+// handle without defaulting to a provider it never evaluated.
+func (f *fakeWizardClient) RecommendProvider(_ context.Context, req ipc.ProviderRecommendationRequest) (
+	*ipc.ProviderRecommendationResponse, error,
+) {
+	f.recommendCalls++
+	f.lastRecommendRequest = req
+	if f.recommendErr != nil {
+		return nil, f.recommendErr
+	}
+	if f.recommendation != nil {
+		return f.recommendation, nil
+	}
+	return &ipc.ProviderRecommendationResponse{
+		Recommended: &ipc.ProviderChoiceDTO{ProviderID: "cloudflare", DisplayName: "Cloudflare"},
+	}, nil
 }

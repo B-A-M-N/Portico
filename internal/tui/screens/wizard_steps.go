@@ -98,6 +98,14 @@ func (m *WizardModel) goBack() {
 	m.err = nil
 	m.state.Step = previous
 	m.restoreStepInput()
+
+	// Stepping back invalidates any recommendation: it was computed from
+	// answers the user is now revisiting, and showing it against changed
+	// requirements would describe a different connection.
+	m.recommendation = nil
+	m.recommendFingerprint = ""
+	m.recommendPending = false
+	m.recommendErr = nil
 }
 
 // restoreStepInput puts the stored answer back on screen for the current step.

@@ -16,6 +16,8 @@ type SupervisorClient interface {
 	Readiness(ctx context.Context) (*ipc.ReadinessDTO, error)
 	SetLaunchMode(ctx context.Context, mode string) (*ipc.LaunchModeDTO, error)
 	ProviderSetupFlow(ctx context.Context, providerID string) (*ipc.SetupFlowDTO, error)
+	RecommendProvider(ctx context.Context, req ipc.ProviderRecommendationRequest) (
+		*ipc.ProviderRecommendationResponse, error)
 	PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanClose(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanRepair(ctx context.Context, connID string) (*ipc.PlanDTO, error)

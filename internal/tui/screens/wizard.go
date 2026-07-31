@@ -19,6 +19,11 @@ import (
 // The root model passes its client through; tests can pass a fake.
 type ConnectionCreator interface {
 	CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error)
+	// RecommendProvider evaluates the stated requirements against every
+	// provider, so the wizard presents a decision with reasons rather than a
+	// list with no guidance.
+	RecommendProvider(ctx context.Context, req ipc.ProviderRecommendationRequest) (
+		*ipc.ProviderRecommendationResponse, error)
 	PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
 	GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error)
@@ -61,6 +66,15 @@ type WizardModel struct {
 	// "is Cloudflare configured" boolean that decided what the user was shown.
 	caps     providerCapabilities
 	accounts []ipc.ProviderAccountDTO
+
+	// Recommendation state. The fingerprint records what the in-flight request
+	// was built from, so an answer arriving after the user has changed
+	// something is recognised as stale and dropped rather than describing a
+	// connection they are no longer creating.
+	recommendation       *ipc.ProviderRecommendationResponse
+	recommendFingerprint string
+	recommendPending     bool
+	recommendErr         error
 
 	// streamConnected reports whether the root model's event stream is live.
 	// When it is, operation progress arrives as events and polling is only a
@@ -659,6 +673,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.AllowedDomains = nil
 			m.state.Step = WizardStepProvider
 			m.selected = 0
+			// Every requirement is now answered, so this is the first moment a
+			// recommendation can be about the connection actually being made.
+			return m.recommendCmd()
 		case "esc":
 			m.goBack()
 		}
@@ -678,6 +695,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.AllowedDomains = domains
 			m.state.Step = WizardStepProvider
 			m.selected = 0
+			return m.recommendCmd()
 		default:
 			m.input = editInput(m.input, key)
 		}
@@ -1223,55 +1241,6 @@ func (m *WizardModel) renderExposure() string {
 
 func (m *WizardModel) renderProtection() string {
 	return renderChoices("Who should be able to reach it?", m.protectionChoices(), m.selected)
-}
-
-// renderProvider lists the providers that could carry this connection, rather
-// than a single hardcoded name.
-func (m *WizardModel) renderProvider() string {
-	return renderChoices("Which provider should carry the connection?",
-		m.providerChoices(), m.selected)
-}
-
-// providerChoices lists every provider Portico knows about, with the ones that
-// cannot carry this connection marked and explained.
-//
-// Listing only the usable ones hid the fact that other providers exist at all,
-// so a user could not discover what installing or configuring one would give
-// them.
-func (m *WizardModel) providerChoices() []wizardChoice {
-	choices := make([]wizardChoice, 0, len(m.caps.providers))
-	for _, p := range m.caps.providers {
-		name := p.DisplayName
-		if name == "" {
-			name = p.ID
-		}
-		choice := wizardChoice{Value: p.ID, Label: name}
-		switch {
-		case !usableProvider(p):
-			choice.Reason = providerUnavailableReason(p)
-		case p.Readiness == "needs_config" || p.Readiness == "needs_auth":
-			choice.Reason = "needs setup"
-			choice.Detail = append(choice.Detail, p.SetupActions...)
-		default:
-			choice.Available = true
-		}
-		if p.LastError != "" {
-			choice.Detail = append(choice.Detail, p.LastError)
-		}
-		choices = append(choices, choice)
-	}
-	return choices
-}
-
-// providerUnavailableReason states why a provider cannot be used at all.
-func providerUnavailableReason(p ipc.ProviderDTO) string {
-	switch p.Availability {
-	case "not_implemented":
-		return "Portico has no adapter for this yet"
-	case "client_missing":
-		return "its client is not installed"
-	}
-	return "not available"
 }
 
 func (m *WizardModel) renderDirectoryMode() string {

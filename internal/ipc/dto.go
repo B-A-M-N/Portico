@@ -492,6 +492,12 @@ type FilteredChoiceDTO struct {
 	DisplayName string   `json:"display_name,omitempty"`
 	Reason      string   `json:"reason"`
 	Reasons     []string `json:"reasons,omitempty"`
+	// SetupActions are the steps that would make this provider eligible.
+	//
+	// The engine computes them and they were dropped here, so a refused
+	// provider could say why it was refused and not what to do about it —
+	// which is the half the user can act on.
+	SetupActions []string `json:"setup_actions,omitempty"`
 }
 
 // OperationHistoryDTO contains a list of past operations.
