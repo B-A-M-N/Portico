@@ -77,6 +77,11 @@ type Model struct {
 	// clone is the connection copy in progress, if any.
 	clone *cloneState
 
+	// operationsLimit is how many operations the history screen asked for, and
+	// operationsTruncated reports that older ones exist beyond them.
+	operationsLimit     int
+	operationsTruncated bool
+
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
 	operation         *ipc.OperationDTO
@@ -605,7 +610,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.operations = msg.Operations
 		m.operationsAvailable = msg.Available
 		m.operationsUnavailable = msg.Unavailable
-		m.opsSelectedIdx = 0
+		m.operationsTruncated = msg.Truncated
+		m.operationsLimit = msg.Limit
+		if m.opsSelectedIdx >= len(m.operations) {
+			m.opsSelectedIdx = 0
+		}
 		return m, nil
 
 	case providerAccountConfiguredMsg:
@@ -865,6 +874,10 @@ type operationsLoadedMsg struct {
 	Available   bool
 	Unavailable string
 	Err         error
+	// Truncated reports that older operations exist beyond those returned, and
+	// Limit is how many were asked for.
+	Truncated bool
+	Limit     int
 }
 
 type errorMsg struct {
@@ -1072,6 +1085,13 @@ func (m *Model) discoveryCmd() tea.Cmd {
 }
 
 func (m *Model) loadOperationsCmd() tea.Cmd {
+	return m.loadOperationsLimitCmd(m.operationsLimit)
+}
+
+// loadOperationsLimitCmd loads history, asking for a specific number so the
+// screen can offer older operations rather than presenting a capped list as
+// the whole history.
+func (m *Model) loadOperationsLimitCmd(limit int) tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
 	return func() tea.Msg {
@@ -1080,7 +1100,7 @@ func (m *Model) loadOperationsCmd() tea.Cmd {
 		}
 		opsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		history, err := client.GetOperationHistory(opsCtx)
+		history, err := client.GetOperationHistoryLimit(opsCtx, limit)
 		if err != nil {
 			return operationsLoadedMsg{Err: err}
 		}
@@ -1088,6 +1108,8 @@ func (m *Model) loadOperationsCmd() tea.Cmd {
 			Operations:  history.Operations,
 			Available:   history.Available,
 			Unavailable: history.Unavailable,
+			Truncated:   history.Truncated,
+			Limit:       history.Limit,
 		}
 	}
 }
@@ -1320,10 +1342,33 @@ func (m *Model) handleEvent(evt ipc.EventDTO) tea.Cmd {
 		return m.requestSnapshot()
 
 	case strings.HasPrefix(evt.Type, "connection."):
-		// Reload snapshot on change.
-		return m.requestSnapshot()
+		// Reload the list, and the open detail view with it.
+		//
+		// Only the snapshot was refreshed, so a connection watched on the
+		// inspect screen kept the endpoints, resources, findings and route
+		// segments it had when the screen opened. Watching a connection open
+		// showed the list going green next to a detail view still reporting no
+		// address and an unopened route.
+		return tea.Batch(m.requestSnapshot(), m.refreshOpenDetailCmd(evt.ConnectionID))
 	}
 	return nil
+}
+
+// refreshOpenDetailCmd reloads the detail view when the event concerns the
+// connection it is showing.
+//
+// It returns nothing when no detail view is open, so an event storm does not
+// turn into a fetch storm for a screen nobody is looking at.
+func (m *Model) refreshOpenDetailCmd(connectionID string) tea.Cmd {
+	if m.screen != ScreenInspect || m.selectedID == "" {
+		return nil
+	}
+	// An event carrying no connection is a general change; the open detail is
+	// refreshed rather than assumed unaffected.
+	if connectionID != "" && connectionID != m.selectedID {
+		return nil
+	}
+	return m.connectionDetailCmd(m.selectedID)
 }
 
 // --------------- navigation helpers ---------------
@@ -1634,6 +1679,16 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// Re-run diagnostics.
 			m.diagnostics = nil
 			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+		}
+
+	case "m":
+		// Older operations, on the screen that said there were some.
+		if m.screen == ScreenOperations && m.operationsTruncated {
+			next := m.operationsLimit * 2
+			if next <= 0 {
+				next = 100
+			}
+			return m, m.loadOperationsLimitCmd(next)
 		}
 
 	case "o":
@@ -3009,7 +3064,21 @@ func (m *Model) renderOperations() string {
 		}
 	}
 
-	b.WriteString("\n[esc] back    [q] quit\n")
+	// A capped list with no way to tell it was capped reads as the whole
+	// history, which is the one thing a history must not be wrong about.
+	if m.operationsTruncated {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf(
+			"  Showing the %d most recent operations. There are older ones.", len(m.operations))))
+		b.WriteString("\n")
+		b.WriteString("\n[m] show more    [esc] back    [q] quit\n")
+	} else {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf(
+			"  %d operations — this is the complete history.", len(m.operations))))
+		b.WriteString("\n")
+		b.WriteString("\n[esc] back    [q] quit\n")
+	}
 	return b.String()
 }
 

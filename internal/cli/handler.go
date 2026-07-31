@@ -967,3 +967,36 @@ func handleProviderRemoveAccount(cmd *cobra.Command, providerID, accountID strin
 	}
 	return nil
 }
+
+// handleSupportExport writes the redacted diagnostic report.
+func handleSupportExport(cmd *cobra.Command) error {
+	client, err := getClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	export, err := client.SupportExport(cmd.Context())
+	if err != nil {
+		return err
+	}
+
+	encoded, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode report: %w", err)
+	}
+	encoded = append(encoded, '\n')
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "" {
+		_, err = os.Stdout.Write(encoded)
+		return err
+	}
+
+	// 0600: the report is redacted, but it still describes this machine's
+	// services and addresses, which is not something to leave world-readable.
+	if err := os.WriteFile(output, encoded, 0o600); err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Wrote %s\n", output)
+	return nil
+}

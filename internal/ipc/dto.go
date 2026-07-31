@@ -558,6 +558,12 @@ type OperationHistoryDTO struct {
 	Operations  []OperationDTO `json:"operations"`
 	Available   bool           `json:"available"`
 	Unavailable string         `json:"unavailable,omitempty"`
+	// Limit is how many operations were asked for, and Truncated reports that
+	// there are older ones beyond them. A capped list with no way to tell it
+	// was capped reads as the complete history, which is the one thing a
+	// history must not be wrong about.
+	Limit     int  `json:"limit,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // --------------- discovery ---------------

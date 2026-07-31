@@ -63,6 +63,7 @@ type RequestHandler interface {
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
 	HandleOperationHistory() (*OperationHistoryDTO, error)
+	HandleOperationHistoryLimit(limit int) (*OperationHistoryDTO, error)
 	HandleDiscovery() (*DiscoveryDTO, error)
 	HandleRefreshDiscovery() (*DiscoveryDTO, error)
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
@@ -784,7 +785,18 @@ func (s *Server) handleOperationList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "OP-005", "method not allowed")
 		return
 	}
-	history, err := s.handler.HandleOperationHistory()
+	// A caller can ask for more than the default page, which is how the
+	// interface offers "show me older operations" without a cursor protocol.
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "OP-007", "limit must be a non-negative whole number")
+			return
+		}
+		limit = parsed
+	}
+	history, err := s.handler.HandleOperationHistoryLimit(limit)
 	if err != nil {
 		writeHandlerError(w, "OP-006", err)
 		return

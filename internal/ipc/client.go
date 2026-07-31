@@ -431,7 +431,19 @@ func (c *Client) GetOperation(ctx context.Context, operationID string) (*Operati
 
 // GetOperationHistory returns the operation history.
 func (c *Client) GetOperationHistory(ctx context.Context) (*OperationHistoryDTO, error) {
-	resp, err := c.doRequest(ctx, "GET", "/v1/operations", nil)
+	return c.GetOperationHistoryLimit(ctx, 0)
+}
+
+// GetOperationHistoryLimit fetches the most recent operations, up to limit.
+//
+// The response reports whether older operations were left out, so a caller can
+// say so rather than presenting a capped list as the whole history.
+func (c *Client) GetOperationHistoryLimit(ctx context.Context, limit int) (*OperationHistoryDTO, error) {
+	path := "/v1/operations"
+	if limit > 0 {
+		path += "?limit=" + strconv.Itoa(limit)
+	}
+	resp, err := c.doRequest(ctx, "GET", path, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -38,6 +38,7 @@ for connection failures.`,
 	root.AddCommand(newPlanCmd())
 	root.AddCommand(newApplyCmd())
 	root.AddCommand(newProviderCmd())
+	root.AddCommand(newSupportCmd())
 	root.AddCommand(newDiscoverCmd())
 	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newRepairCmd())
@@ -272,6 +273,30 @@ func newApplyCmd() *cobra.Command {
 			return handleApply(cmd, args[0])
 		},
 	}
+}
+
+// newSupportCmd exposes the redacted diagnostic report.
+//
+// The export existed, was carefully redacted, and had no command. A user asked
+// to "attach diagnostics" had no way to produce them.
+func newSupportCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "support",
+		Short: "Produce a diagnostic report for a bug report",
+	}
+	exportCmd := &cobra.Command{
+		Use:   "export",
+		Short: "Write a redacted diagnostic report",
+		Long: "Writes a report describing this installation's connections, providers and recent " +
+			"operations. It carries no credentials, authorization headers, cookies, private keys " +
+			"or command environments.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return handleSupportExport(cmd)
+		},
+	}
+	exportCmd.Flags().String("output", "", "Write to a file instead of standard output")
+	cmd.AddCommand(exportCmd)
+	return cmd
 }
 
 func newProviderCmd() *cobra.Command {

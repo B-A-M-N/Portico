@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,5 +72,43 @@ func TestNormalizeExistingAddress(t *testing.T) {
 func TestNormalizeExistingAddressRejectsURLPath(t *testing.T) {
 	if _, err := normalizeExistingAddress("http://localhost:8080/api", 3000); err == nil {
 		t.Fatal("expected URL path to be rejected")
+	}
+}
+
+// TestSupportExportIsReachable pins audit finding 30.
+//
+// The export existed on the supervisor, was carefully redacted, and had no
+// command. A user asked to attach diagnostics to a bug report had no way to
+// produce them.
+func TestSupportExportIsReachable(t *testing.T) {
+	root := NewCLI()
+
+	support, _, err := root.Find([]string{"support", "export"})
+	if err != nil {
+		t.Fatalf("the support export command is not registered: %v", err)
+	}
+	if support.Name() != "export" {
+		t.Fatalf("found %q, want the export command", support.Name())
+	}
+	if support.Flags().Lookup("output") == nil {
+		t.Fatal("the export cannot be written to a file")
+	}
+	// The description has to state what the report does not contain, since that
+	// is what a user needs to know before attaching it to a public issue.
+	if !strings.Contains(support.Long, "no credentials") {
+		t.Fatalf("the command does not say what it redacts: %q", support.Long)
+	}
+}
+
+// TestRemoveAccountIsReachable pins the account lifecycle command.
+func TestRemoveAccountIsReachable(t *testing.T) {
+	root := NewCLI()
+
+	remove, _, err := root.Find([]string{"provider", "remove-account"})
+	if err != nil {
+		t.Fatalf("the remove-account command is not registered: %v", err)
+	}
+	if remove.Name() != "remove-account" {
+		t.Fatalf("found %q, want remove-account", remove.Name())
 	}
 }

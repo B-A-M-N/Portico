@@ -720,10 +720,30 @@ func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecomme
 }
 
 func (h *supervisorHandler) HandleOperationHistory() (*ipc.OperationHistoryDTO, error) {
+	return h.HandleOperationHistoryLimit(0)
+}
+
+// defaultOperationHistoryPage is how many operations are returned when a caller
+// states no preference.
+const defaultOperationHistoryPage = 50
+
+// HandleOperationHistoryLimit returns the most recent operations, reporting
+// whether older ones were left out.
+//
+// The list was silently capped. A user looking for an operation from last week
+// saw the cap and concluded it had not happened, or that the history had been
+// pruned — with nothing on screen to distinguish "this is all of it" from
+// "this is the first page".
+func (h *supervisorHandler) HandleOperationHistoryLimit(limit int) (*ipc.OperationHistoryDTO, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	summaries, err := h.sup.store.ListRecentOperations(ctx, 0)
+	// One extra row answers "is there more?" without a second query.
+	effective := limit
+	if effective <= 0 {
+		effective = defaultOperationHistoryPage
+	}
+	summaries, err := h.sup.store.ListRecentOperations(ctx, effective+1)
 	if err != nil {
 		// Report the subsystem as unavailable rather than returning an empty
 		// list. An empty list is an authoritative claim that no work has
@@ -733,6 +753,11 @@ func (h *supervisorHandler) HandleOperationHistory() (*ipc.OperationHistoryDTO, 
 			Available:   false,
 			Unavailable: err.Error(),
 		}, nil
+	}
+
+	truncated := len(summaries) > effective
+	if truncated {
+		summaries = summaries[:effective]
 	}
 
 	operations := make([]ipc.OperationDTO, 0, len(summaries))
@@ -751,7 +776,10 @@ func (h *supervisorHandler) HandleOperationHistory() (*ipc.OperationHistoryDTO, 
 			ProfileRevision: s.ProfileRevision,
 		})
 	}
-	return &ipc.OperationHistoryDTO{Operations: operations, Available: true}, nil
+	return &ipc.OperationHistoryDTO{
+		Operations: operations, Available: true,
+		Limit: effective, Truncated: truncated,
+	}, nil
 }
 
 func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, error) {

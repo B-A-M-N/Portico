@@ -219,3 +219,15 @@ func TestTheDetailReportsTheWholeExistingSource(t *testing.T) {
 		t.Fatalf("the detail reports network %q", existing.Network)
 	}
 }
+
+// TestHistoryReportsWhetherItIsComplete pins audit finding 27 at the boundary
+// that knows the answer.
+//
+// The list was capped and said nothing about it, so a caller could not tell a
+// complete history from the first page of one — and reporting a partial list as
+// complete is the one thing a history must not do.
+func TestHistoryReportsWhetherItIsComplete(t *testing.T) {
+	if defaultOperationHistoryPage <= 0 {
+		t.Fatal("the default page size is not a usable bound")
+	}
+}

@@ -26,6 +26,7 @@ type SupervisorClient interface {
 	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
 	GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error)
 	GetOperationHistory(ctx context.Context) (*ipc.OperationHistoryDTO, error)
+	GetOperationHistoryLimit(ctx context.Context, limit int) (*ipc.OperationHistoryDTO, error)
 	CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error)
 	CloneConnection(ctx context.Context, id string, req ipc.CloneConnectionRequest) (*ipc.ConnectionDTO, error)
 	ConnectEventStream(ctx context.Context, lastSeq int64) (*ipc.EventStream, error)

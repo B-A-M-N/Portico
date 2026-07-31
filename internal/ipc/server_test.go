@@ -61,6 +61,9 @@ func (nullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return &ConfigureProviderAccountResponse{}, nil
 }
+func (nullHandler) HandleOperationHistoryLimit(int) (*OperationHistoryDTO, error) {
+	return &OperationHistoryDTO{Operations: []OperationDTO{}, Available: true}, nil
+}
 func (nullHandler) HandleRemoveProviderAccount(string, string) (*RemoveProviderAccountResponse, error) {
 	return &RemoveProviderAccountResponse{Removed: true}, nil
 }

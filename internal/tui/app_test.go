@@ -37,6 +37,7 @@ type fakeClient struct {
 	removeAccountErr      error
 
 	createRequest *ipc.CreateConnectionRequest
+	historyLimit  int
 	cloneSource   string
 	cloneRequest  *ipc.CloneConnectionRequest
 	cloneErr      error
@@ -236,6 +237,16 @@ func (f *fakeClient) RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, e
 
 func (f *fakeClient) ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
 	return &ipc.ConfigureProviderAccountResponse{RestartRequired: false}, nil
+}
+
+func (f *fakeClient) GetOperationHistoryLimit(ctx context.Context, limit int) (*ipc.OperationHistoryDTO, error) {
+	f.mu.Lock()
+	f.historyLimit = limit
+	f.mu.Unlock()
+	if f.history != nil {
+		return f.history, nil
+	}
+	return f.GetOperationHistory(ctx)
 }
 
 func (f *fakeClient) CloneConnection(ctx context.Context, id string, req ipc.CloneConnectionRequest) (*ipc.ConnectionDTO, error) {
