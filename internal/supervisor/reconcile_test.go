@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/B-A-M-N/portico/internal/controller"
@@ -521,5 +522,52 @@ func TestReconciliationStillActsOnAValidConnection(t *testing.T) {
 	}
 	if decision.Action != "repair" {
 		t.Fatalf("a valid connection was not reconciled: %#v", decision)
+	}
+}
+
+// TestABlockedReconciliationIsReportedNotSilent pins the difference between
+// "nothing to do" and "cannot proceed".
+//
+// Both used to return no action, so a connection whose desired state Portico
+// refuses to realise looked identical to one already in the state it wanted —
+// visible only in a log line, and not in the place the user is looking.
+func TestABlockedReconciliationIsReportedNotSilent(t *testing.T) {
+	profile := newReconcileProfile("conn-1", core.DesiredOpen, core.ProtectionSpec{
+		Kind: core.ProtectionEmailOTP, AllowedEmails: []string{"person@example.com"},
+	})
+	profile.Spec.ServiceExposure.Exposure = core.ExposureSpec{Mode: core.ExposureTemporary}
+
+	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
+		Profile: profile,
+		Runtime: &core.ConnectionRuntime{ConnectionID: profile.ID, State: core.RuntimeOpen},
+	})
+	if err != nil {
+		t.Fatalf("computeReconcileDecision: %v", err)
+	}
+	if decision.Action != "none" || decision.Plan != nil {
+		t.Fatalf("reconciliation acted on a connection that cannot be opened: %#v", decision)
+	}
+	if decision.Blocked == nil {
+		t.Fatal("a refusal was indistinguishable from having nothing to do")
+	}
+	// The reason must be the one the user has to act on.
+	if !strings.Contains(decision.Blocked.Error(), "permanent address") {
+		t.Fatalf("the block does not name what is wrong: %v", decision.Blocked)
+	}
+}
+
+// TestAValidConnectionIsNotReportedAsBlocked keeps the signal meaningful.
+func TestAValidConnectionIsNotReportedAsBlocked(t *testing.T) {
+	profile := newReconcileProfile("conn-1", core.DesiredOpen, core.ProtectionSpec{})
+	decision, err := (&Supervisor{}).computeReconcileDecision(context.Background(), ReconcileInput{
+		Profile: profile,
+		Runtime: &core.ConnectionRuntime{ConnectionID: profile.ID, State: core.RuntimeOpen,
+			Connector: core.ConnectorRuntime{Status: core.ConnectorStatusRunning}},
+	})
+	if err != nil {
+		t.Fatalf("computeReconcileDecision: %v", err)
+	}
+	if decision.Blocked != nil {
+		t.Fatalf("a valid connection was reported as blocked: %v", decision.Blocked)
 	}
 }

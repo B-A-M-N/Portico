@@ -459,6 +459,12 @@ func (s *Supervisor) restartDesiredOpen(ctx context.Context) {
 					slog.Warn("restart: reconcile decision failed", "connection", connID, "err", err)
 					return
 				}
+				if decision.Blocked != nil {
+					// A connection stored under a rule that has since tightened
+					// is not restarted at boot, and says why.
+					s.markProfileInvalidForOpen(ctx, input.Profile, decision.Blocked)
+					return
+				}
 				if decision.Action == "none" || decision.Plan == nil {
 					slog.Info("restart: no action needed", "connection", connID)
 					return
@@ -1420,4 +1426,59 @@ func (s *Supervisor) PublishEvent(evt core.Event) {
 		dto.Stage = string(data.Status)
 	}
 	s.ipcServer.PublishEvent(dto)
+}
+
+// markProfileInvalidForOpen records that a connection's desired state can no
+// longer be realised.
+//
+// This is a durable, operator-actionable condition rather than a transient
+// one: the connection says it should be open, Portico refuses to make it so,
+// automatic reconciliation has stopped, and only editing, closing or deleting
+// the connection will change that. Left in the log it is invisible in the place
+// the user is looking.
+//
+// The connection is deliberately not closed. Validation covers far more than
+// safety, and turning every rule that tightens into an automatic outage is too
+// broad a policy to attach to a generic check. Whatever is already running keeps
+// running, and the finding says so.
+func (s *Supervisor) markProfileInvalidForOpen(ctx context.Context, profile *core.ConnectionProfile, reason error) {
+	if profile == nil || reason == nil {
+		return
+	}
+	now := time.Now().UTC()
+	finding := core.DiagnosticFinding{
+		ID:           core.FindingID(fmt.Sprintf("find-%s-profile-invalid-for-open", profile.ID)),
+		ConnectionID: profile.ID,
+		Segment:      core.SegmentProviderEdge,
+		Severity:     core.SeverityError,
+		Summary:      "This connection can no longer be opened as configured",
+		Explanation: fmt.Sprintf(
+			"Portico will not open or repair this connection because its saved settings are no longer "+
+				"valid: %s. Anything already running is left alone and its address may still work, but "+
+				"automatic recovery has stopped. Edit the connection to correct it, or close or delete it.",
+			reason),
+		Evidence: []core.Evidence{{
+			Type: "profile_validation", Source: "supervisor", Message: reason.Error(),
+		}},
+		ObservedAt: now,
+	}
+
+	if rt, ok := s.controller.GetRuntime(profile.ID); ok {
+		// The connector status, endpoint and resource inventory are preserved:
+		// what is broken is the configuration, not necessarily the connection.
+		if profile.Desired == core.DesiredOpen {
+			rt.State = core.RuntimeError
+			rt.LastTransition = now
+		}
+		if !hasFinding(rt.Diagnostics, finding.ID) {
+			rt.Diagnostics = append(rt.Diagnostics, finding)
+		}
+		s.controller.RestoreRuntime(rt)
+		if err := s.store.SaveRuntime(ctx, rt); err != nil {
+			slog.Warn("persist invalid-profile runtime", "connection", profile.ID, "err", err)
+		}
+	}
+	if err := s.store.SaveFinding(ctx, &finding); err != nil {
+		slog.Warn("persist invalid-profile finding", "connection", profile.ID, "err", err)
+	}
 }

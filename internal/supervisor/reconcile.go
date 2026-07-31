@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +25,10 @@ type ReconcileInput struct {
 type reconcileDecision struct {
 	Action string // "none", "open", "close", "repair", "recreate"
 	Plan   *core.OperationPlan
+	// Blocked reports that the desired state cannot be realised at all, so
+	// reconciliation has stopped rather than found nothing to do. The two are
+	// very different to an operator and must not both read as "none".
+	Blocked error
 }
 
 // computeReconcileDecision compares desired vs observed state and
@@ -45,9 +48,10 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 	// must still be closable.
 	if desired == core.DesiredOpen {
 		if err := input.Profile.ValidateForOpen(); err != nil {
-			slog.Warn("not reconciling a connection that can no longer be opened",
-				"connection", input.Profile.ID, "reason", err)
-			return &reconcileDecision{Action: "none"}, nil
+			// Reported rather than logged: this function stays a pure decision,
+			// and the caller records a durable finding. "Nothing to do" and
+			// "cannot proceed" would otherwise be indistinguishable.
+			return &reconcileDecision{Action: "none", Blocked: err}, nil
 		}
 	}
 

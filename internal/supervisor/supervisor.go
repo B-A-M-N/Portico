@@ -353,6 +353,12 @@ func (s *Supervisor) reconcileOne(ctx context.Context, connID core.ConnectionID)
 		slog.Warn("reconcile error", "connection", p.ID, "err", err)
 		return
 	}
+	if decision.Blocked != nil {
+		// Not "nothing to do": the desired state cannot be realised, and that
+		// is recorded where the user will see it.
+		s.markProfileInvalidForOpen(ctx, input.Profile, decision.Blocked)
+		return
+	}
 	if decision == nil || decision.Action == "none" || decision.Plan == nil {
 		return
 	}
@@ -397,6 +403,12 @@ func (s *Supervisor) reconcileAll(ctx context.Context) {
 		decision, err := s.computeReconcileDecision(ctx, input)
 		if err != nil {
 			slog.Warn("reconcile error", "connection", p.ID, "err", err)
+			continue
+		}
+		if decision.Blocked != nil {
+			// One connection that cannot be opened must not stop the others
+			// being reconciled.
+			s.markProfileInvalidForOpen(ctx, input.Profile, decision.Blocked)
 			continue
 		}
 		if decision == nil || decision.Action == "none" || decision.Plan == nil {
