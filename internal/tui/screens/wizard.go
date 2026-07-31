@@ -27,6 +27,7 @@ type ConnectionCreator interface {
 		*ipc.ProviderRecommendationResponse, error)
 	PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
+	ApplyPlanWithIdempotency(ctx context.Context, planID, idempotencyKey string) (*ipc.OperationDTO, error)
 	GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error)
 }
 
@@ -1062,7 +1063,9 @@ func (m *WizardModel) applyPlanCmd() tea.Cmd {
 		if planID == "" {
 			return WizardPlanAppliedMsg{Err: fmt.Errorf("no plan to apply")}
 		}
-		op, err := client.ApplyPlan(ctx, planID)
+		// The same key on every retry of this plan, so a lost response cannot
+		// turn into a second operation.
+		op, err := client.ApplyPlanWithIdempotency(ctx, planID, "apply-"+planID)
 		if err != nil {
 			return WizardPlanAppliedMsg{Err: err}
 		}

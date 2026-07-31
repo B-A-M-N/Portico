@@ -37,6 +37,11 @@ type cloneState struct {
 	// focus is which field is being typed into.
 	focus int
 	err   string
+	// requests correlates the create with the copy it was started for, and
+	// submitting stops a second Enter creating a second connection while the
+	// first is still in flight.
+	requests   subjectTracker
+	submitting bool
 }
 
 // beginClone opens the copy prompt for a connection.
@@ -82,19 +87,24 @@ func (s *cloneState) fieldCount() int {
 
 // connectionClonedMsg reports the outcome of creating a copy.
 type connectionClonedMsg struct {
+	// Token identifies the copy this answers. A reply for a copy the user has
+	// abandoned must not clear the one they have since started.
+	Token      requestToken
 	Connection *ipc.ConnectionDTO
 	Err        error
 }
 
 // cloneConnectionCmd asks the supervisor to copy the connection.
 func (m *Model) cloneConnectionCmd(sourceID string, req ipc.CloneConnectionRequest) tea.Cmd {
+	token := m.clone.requests.start(sourceID)
+	m.clone.submitting = true
 	client := m.client
 	rootCtx := m.rootCtx
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(rootCtx, 30*time.Second)
 		defer cancel()
 		conn, err := client.CloneConnection(ctx, sourceID, req)
-		return connectionClonedMsg{Connection: conn, Err: err}
+		return connectionClonedMsg{Token: token, Connection: conn, Err: err}
 	}
 }
 
@@ -114,6 +124,12 @@ func (m *Model) renderClone() string {
 			return b.String()
 		}
 		b.WriteString("Loading " + m.clone.sourceName + "...\n")
+		return b.String()
+	}
+
+	if m.clone.submitting {
+		b.WriteString("Creating the copy...\n\n")
+		b.WriteString("  Please wait; pressing enter again will not create a second one.\n")
 		return b.String()
 	}
 
@@ -179,14 +195,17 @@ func (m *Model) cloneSourceHostname() string {
 // handleCloneKey drives the copy prompt.
 func (m Model) handleCloneKey(key string) (Model, tea.Cmd) {
 	if m.clone == nil {
-		m.screen = ScreenHome
+		m.transitionTo(ScreenHome)
 		return m, nil
 	}
 	switch key {
 	case "esc":
+		// Abandon the request as well as the screen: a create still in flight
+		// must not report against a copy the user has since started.
+		m.clone.requests.cancel()
 		m.clone = nil
 		if !m.popScreen() {
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 		}
 		return m, nil
 
@@ -199,7 +218,9 @@ func (m Model) handleCloneKey(key string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "enter":
-		if m.clone.detail == nil {
+		// A second Enter would create a second connection. The first has not
+		// answered yet, and creation is not something to do twice by accident.
+		if m.clone.submitting || m.clone.detail == nil {
 			return m, nil
 		}
 		name := strings.TrimSpace(m.clone.nameField.Value())

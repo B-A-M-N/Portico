@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -86,6 +88,15 @@ type Model struct {
 	operationEvents       []ipc.EventDTO
 	operationEventsFor    string
 	operationEventsFailed string
+	// operationRequests correlates refreshes of the operation on screen.
+	operationRequests subjectTracker
+	// historyRequests correlates history pages, so a smaller earlier request
+	// cannot replace a larger one asked for later.
+	historyRequests subjectTracker
+	// eventsRequests correlates one operation's journal.
+	eventsRequests subjectTracker
+	// apply holds the idempotency key for the preview currently approved.
+	apply applyState
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -261,9 +272,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case connectionClonedMsg:
-		if m.clone == nil {
+		// A reply for a copy the user abandoned must not clear the one they
+		// have since started.
+		if m.clone == nil || !m.clone.requests.accepts(msg.Token) {
 			return m, nil
 		}
+		m.clone.submitting = false
 		if msg.Err != nil {
 			m.clone.err = msg.Err.Error()
 			return m, nil
@@ -353,6 +367,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		// An older snapshot must not replace a newer one. Several paths start
+		// snapshot requests concurrently, and the replies can land out of
+		// order. Installing the older one leaves the worst combination:
+		// stale connection state, a newer event cursor, and therefore no
+		// replay of the events that cursor has already skipped past.
+		//
+		// LastSeq is assigned by the supervisor, so it orders replies from any
+		// number of concurrent requests without the client having to track
+		// them.
+		if m.ready && msg.Snapshot.LastSeq < m.snapshot.LastSeq {
+			return m, nil
+		}
 		m.snapshot = msg.Snapshot
 		m.syncInspectModel()
 		m.ready = true
@@ -424,15 +450,35 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.plan = msg.Plan
+		// Verified on arrival as well as on apply, so an unidentifiable plan
+		// is refused before it is drawn as something to approve.
+		if !m.planMatchesPreview() {
+			m.plan = nil
+			m.planRequests.cancel()
+			m.status = "The supervisor returned a plan that could not be identified. Try again."
+			return m, nil
+		}
 		m.pushScreen(ScreenPlanPreview)
 		return m, nil
 
 	case planAppliedMsg:
 		m.applying = false
 		if msg.Err != nil {
+			if msg.Outcome == applyUnknown {
+				// The supervisor may have started this. Saying "failed" would
+				// invite a retry that starts a second operation; the retry is
+				// safe because it carries the same idempotency key, but the
+				// claim would still be false.
+				m.apply.unknown = true
+				m.status = "The supervisor may have started this operation. " +
+					"Press enter to check — it will not be started twice."
+				return m, nil
+			}
+			m.apply.reset()
 			m.status = statusLine("apply failed", msg.Err)
 			return m, nil
 		}
+		m.apply.reset()
 		m.status = ""
 		m.operation = msg.Operation
 		m.opEvents = nil
@@ -441,8 +487,16 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.requestSnapshot(), m.getOperationCmd(msg.Operation.ID))
 
 	case operationLoadedMsg:
+		// A refresh for an operation the user has moved on from must not
+		// replace the one now on screen.
+		if !m.operationRequests.accepts(msg.Token) {
+			return m, nil
+		}
 		if msg.Err != nil {
 			m.status = statusLine("operation refresh failed", msg.Err)
+			return m, nil
+		}
+		if msg.Operation != nil && m.operation != nil && msg.Operation.ID != m.operation.ID {
 			return m, nil
 		}
 		m.operation = msg.Operation
@@ -626,8 +680,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case operationEventsMsg:
 		// A journal for an operation the user has moved off must not be shown
-		// under the one now selected.
-		if msg.OperationID != m.selectedOperationID() {
+		// under the one now selected. Two requests for the same operation can
+		// also be outstanding and return out of order, which the bare ID
+		// comparison this replaced could not see.
+		if !m.eventsRequests.accepts(msg.Token) || msg.OperationID != m.selectedOperationID() {
 			return m, nil
 		}
 		m.operationEventsFor = msg.OperationID
@@ -641,6 +697,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case operationsLoadedMsg:
+		if !m.historyRequests.accepts(msg.Token) {
+			return m, nil
+		}
 		if msg.Err != nil {
 			m.operationsAvailable = false
 			m.operationsUnavailable = msg.Err.Error()
@@ -933,16 +992,26 @@ type planLoadedMsg struct {
 }
 
 type planAppliedMsg struct {
+	// Outcome distinguishes a refusal from an unknown result. A timeout means
+	// the operation may be running, which is not the same as failing.
+	Outcome   string
 	Operation *ipc.OperationDTO
 	Err       error
 }
 
 type operationLoadedMsg struct {
+	// Token identifies which operation was asked about. Without it a refresh
+	// started for one operation could arrive after the user began another and
+	// replace the second's progress screen with the first's.
+	Token     requestToken
 	Operation *ipc.OperationDTO
 	Err       error
 }
 
 type operationsLoadedMsg struct {
+	// Token identifies the page this answers. A smaller earlier request
+	// arriving after "show more" would otherwise replace the larger list.
+	Token       requestToken
 	Operations  []ipc.OperationDTO
 	Available   bool
 	Unavailable string
@@ -1163,21 +1232,24 @@ func (m *Model) discoveryCmd() tea.Cmd {
 // accumulates events from the stream. An operation opened afterwards had only
 // its steps — what actually happened was in the store, and nothing asked.
 func (m *Model) loadOperationEventsCmd(operationID string) tea.Cmd {
+	token := m.eventsRequests.start(operationID)
 	client := m.client
 	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
-			return operationEventsMsg{OperationID: operationID, Err: fmt.Errorf("no supervisor connection")}
+			return operationEventsMsg{Token: token, OperationID: operationID,
+				Err: fmt.Errorf("no supervisor connection")}
 		}
 		evtCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		events, err := client.GetOperationEvents(evtCtx, operationID)
-		return operationEventsMsg{OperationID: operationID, Events: events, Err: err}
+		return operationEventsMsg{Token: token, OperationID: operationID, Events: events, Err: err}
 	}
 }
 
 // operationEventsMsg carries an operation's journal.
 type operationEventsMsg struct {
+	Token       requestToken
 	OperationID string
 	Events      []ipc.EventDTO
 	Err         error
@@ -1191,19 +1263,21 @@ func (m *Model) loadOperationsCmd() tea.Cmd {
 // screen can offer older operations rather than presenting a capped list as
 // the whole history.
 func (m *Model) loadOperationsLimitCmd(limit int) tea.Cmd {
+	token := m.historyRequests.start(strconv.Itoa(limit))
 	client := m.client
 	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
-			return operationsLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			return operationsLoadedMsg{Token: token, Err: fmt.Errorf("no supervisor connection")}
 		}
 		opsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		history, err := client.GetOperationHistoryLimit(opsCtx, limit)
 		if err != nil {
-			return operationsLoadedMsg{Err: err}
+			return operationsLoadedMsg{Token: token, Err: err}
 		}
 		return operationsLoadedMsg{
+			Token:       token,
 			Operations:  history.Operations,
 			Available:   history.Available,
 			Unavailable: history.Unavailable,
@@ -1321,6 +1395,11 @@ func (m *Model) planDeleteCmd(connID string) tea.Cmd {
 }
 
 func (m *Model) applyPlanCmd(planID string) tea.Cmd {
+	// One key per approved preview, reused by every retry of it. The
+	// supervisor records the key against the operation it started, so a retry
+	// after a lost response returns that same operation instead of starting a
+	// second one. All of this existed and nothing used it.
+	key := m.apply.keyFor(planID)
 	client := m.client
 	ctx := m.rootCtx
 	return func() tea.Msg {
@@ -1328,25 +1407,49 @@ func (m *Model) applyPlanCmd(planID string) tea.Cmd {
 			return planAppliedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
 		// Apply is a mutation — use a longer timeout. The server-side
-		// operation continues even if this context is cancelled.
+		// operation continues even if this context is cancelled, which is
+		// exactly why the outcome of a timeout is unknown rather than failed.
 		applyCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
-		op, err := client.ApplyPlan(applyCtx, planID)
-		return planAppliedMsg{Operation: op, Err: err}
+		op, err := client.ApplyPlanWithIdempotency(applyCtx, planID, key)
+		return planAppliedMsg{Operation: op, Err: err, Outcome: applyOutcome(err)}
 	}
 }
 
+// applyOutcome classifies what a failed apply tells us.
+//
+// A refusal is a definite no. A timeout or a lost connection is not: the
+// supervisor may well have started the operation and been unable to say so.
+// Reporting that as failure invites the user to retry, and a retry without an
+// idempotency key starts a second operation.
+func applyOutcome(err error) string {
+	if err == nil {
+		return applyStarted
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return applyUnknown
+	}
+	var status *ipc.APIStatusError
+	if errors.As(err, &status) {
+		// The supervisor answered, so it decided.
+		return applyRefused
+	}
+	// Transport failure: the request may or may not have arrived.
+	return applyUnknown
+}
+
 func (m *Model) getOperationCmd(operationID string) tea.Cmd {
+	token := m.operationRequests.start(operationID)
 	client := m.client
 	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
-			return operationLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			return operationLoadedMsg{Token: token, Err: fmt.Errorf("no supervisor connection")}
 		}
 		opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		operation, err := client.GetOperation(opCtx, operationID)
-		return operationLoadedMsg{Operation: operation, Err: err}
+		return operationLoadedMsg{Token: token, Operation: operation, Err: err}
 	}
 }
 
@@ -1690,12 +1793,13 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.applying {
 				return m, nil
 			}
-			// What is applied must be what was previewed. The plan carries the
-			// connection it was prepared for, and it is checked against the
-			// connection the preview was opened for rather than assumed.
-			if m.planConnectionID != "" && m.plan.ConnectionID != "" &&
-				m.plan.ConnectionID != m.planConnectionID {
-				m.status = "This plan is for a different connection; press esc and try again"
+			// What is applied must be what was previewed. This must fail
+			// closed: the earlier version refused only when both identities
+			// were present and disagreed, so a plan carrying no connection ID
+			// was applied without ever being checked. An identity that cannot
+			// be verified is not an identity that matches.
+			if !m.planMatchesPreview() {
+				m.status = "The plan identity could not be verified. Press esc and request a new preview."
 				return m, nil
 			}
 			// Apply the previewed plan asynchronously.
@@ -3503,6 +3607,8 @@ func (m *Model) abandonScreenWork() {
 	case ScreenPlanPreview, ScreenRepair:
 		m.planRequests.cancel()
 		m.planConnectionID = ""
+	case ScreenOperationProgress:
+		m.operationRequests.cancel()
 	case ScreenAccountRemoval:
 		m.accountRequests.cancel()
 		m.accountRemovalTarget = nil
@@ -3585,4 +3691,16 @@ func (m *Model) syncInspectModel() {
 	m.inspect.Diagnostics = m.diagnostics
 	m.inspect.Detail = m.connectionDetail
 	m.inspect.LogTail = m.connectionLogs
+}
+
+// planMatchesPreview reports whether the loaded plan is for the connection the
+// preview was opened for.
+//
+// Both identities must be present and equal. Treating an absent identity as a
+// match makes the check useless in exactly the case it exists for.
+func (m *Model) planMatchesPreview() bool {
+	return m.plan != nil &&
+		m.planConnectionID != "" &&
+		m.plan.ConnectionID != "" &&
+		m.plan.ConnectionID == m.planConnectionID
 }

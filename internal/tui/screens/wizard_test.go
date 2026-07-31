@@ -359,6 +359,7 @@ type fakeWizardClient struct {
 	createCalls int
 	planCalls   int
 	applyCalls  int
+	applyKey    string
 	getOpCalls  int
 
 	recommendation       *ipc.ProviderRecommendationResponse
@@ -381,6 +382,11 @@ func (f *fakeWizardClient) PlanOpen(ctx context.Context, connID string) (*ipc.Pl
 		return nil, f.planErr
 	}
 	return f.plan, nil
+}
+
+func (f *fakeWizardClient) ApplyPlanWithIdempotency(ctx context.Context, planID, key string) (*ipc.OperationDTO, error) {
+	f.applyKey = key
+	return f.ApplyPlan(ctx, planID)
 }
 
 func (f *fakeWizardClient) ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error) {

@@ -368,7 +368,7 @@ func handleOpen(cmd *cobra.Command, id string) error {
 		}
 	}
 
-	op, err := client.ApplyPlan(cmd.Context(), plan.ID)
+	op, err := client.ApplyPlanWithIdempotency(cmd.Context(), plan.ID, applyKeyFor(plan.ID))
 	if err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
@@ -403,7 +403,7 @@ func handleClose(cmd *cobra.Command, id string) error {
 		}
 	}
 
-	op, err := client.ApplyPlan(cmd.Context(), plan.ID)
+	op, err := client.ApplyPlanWithIdempotency(cmd.Context(), plan.ID, applyKeyFor(plan.ID))
 	if err != nil {
 		return fmt.Errorf("apply close: %w", err)
 	}
@@ -451,7 +451,7 @@ func handleDelete(cmd *cobra.Command, id string) error {
 		}
 	}
 
-	op, err := client.ApplyPlan(cmd.Context(), plan.ID)
+	op, err := client.ApplyPlanWithIdempotency(cmd.Context(), plan.ID, applyKeyFor(plan.ID))
 	if err != nil {
 		return fmt.Errorf("apply delete: %w", err)
 	}
@@ -550,7 +550,7 @@ func handleRepair(cmd *cobra.Command, id string) error {
 	}
 
 	// Apply the repair plan
-	op, err := client.ApplyPlan(cmd.Context(), plan.ID)
+	op, err := client.ApplyPlanWithIdempotency(cmd.Context(), plan.ID, applyKeyFor(plan.ID))
 	if err != nil {
 		return fmt.Errorf("apply repair: %w", err)
 	}
@@ -568,7 +568,7 @@ func handleApply(cmd *cobra.Command, planID string) error {
 	if err != nil {
 		return err
 	}
-	op, err := client.ApplyPlan(cmd.Context(), planID)
+	op, err := client.ApplyPlanWithIdempotency(cmd.Context(), planID, applyKeyFor(planID))
 	if err != nil {
 		return err
 	}
@@ -900,7 +900,7 @@ func handleServe(cmd *cobra.Command, name string) error {
 		}
 	}
 
-	op, err := client.ApplyPlan(cmd.Context(), plan.ID)
+	op, err := client.ApplyPlanWithIdempotency(cmd.Context(), plan.ID, applyKeyFor(plan.ID))
 	if err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
@@ -999,4 +999,15 @@ func handleSupportExport(cmd *cobra.Command) error {
 	}
 	fmt.Fprintf(os.Stderr, "Wrote %s\n", output)
 	return nil
+}
+
+// applyKeyFor derives a stable idempotency key for applying a plan.
+//
+// A plan is applied once. If the response is lost — a timeout, a dropped
+// connection — the supervisor may already have started the operation, and a
+// retry carrying the same key returns that operation rather than starting a
+// second one. The plan ID is the natural key: it identifies exactly the
+// approved change.
+func applyKeyFor(planID string) string {
+	return "apply-" + planID
 }

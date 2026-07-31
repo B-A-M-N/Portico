@@ -38,6 +38,7 @@ type fakeClient struct {
 
 	createRequest      *ipc.CreateConnectionRequest
 	historyLimit       int
+	applyKeys          []string
 	eventsFor          string
 	operationEvents    []ipc.EventDTO
 	operationEventsErr error
@@ -163,6 +164,11 @@ func (f *fakeClient) GetSnapshot(ctx context.Context) (*ipc.SnapshotDTO, error) 
 func (f *fakeClient) PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A real plan always names the connection it was prepared for. A fake that
+	// omitted it let an unidentifiable plan look acceptable in tests.
+	if f.plan != nil && f.plan.ConnectionID == "" {
+		f.plan.ConnectionID = connID
+	}
 	f.planOpenCalls++
 	return f.plan, f.planErr
 }
@@ -170,6 +176,11 @@ func (f *fakeClient) PlanOpen(ctx context.Context, connID string) (*ipc.PlanDTO,
 func (f *fakeClient) PlanClose(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A real plan always names the connection it was prepared for. A fake that
+	// omitted it let an unidentifiable plan look acceptable in tests.
+	if f.plan != nil && f.plan.ConnectionID == "" {
+		f.plan.ConnectionID = connID
+	}
 	f.planCloseCalls++
 	return f.plan, f.planErr
 }
@@ -177,12 +188,22 @@ func (f *fakeClient) PlanClose(ctx context.Context, connID string) (*ipc.PlanDTO
 func (f *fakeClient) PlanRepair(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A real plan always names the connection it was prepared for. A fake that
+	// omitted it let an unidentifiable plan look acceptable in tests.
+	if f.plan != nil && f.plan.ConnectionID == "" {
+		f.plan.ConnectionID = connID
+	}
 	return f.plan, f.planErr
 }
 
 func (f *fakeClient) PlanDelete(ctx context.Context, connID string) (*ipc.PlanDTO, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A real plan always names the connection it was prepared for. A fake that
+	// omitted it let an unidentifiable plan look acceptable in tests.
+	if f.plan != nil && f.plan.ConnectionID == "" {
+		f.plan.ConnectionID = connID
+	}
 	return f.plan, f.planErr
 }
 
@@ -250,6 +271,13 @@ func (f *fakeClient) GetOperationHistoryLimit(ctx context.Context, limit int) (*
 		return f.history, nil
 	}
 	return f.GetOperationHistory(ctx)
+}
+
+func (f *fakeClient) ApplyPlanWithIdempotency(ctx context.Context, planID, idempotencyKey string) (*ipc.OperationDTO, error) {
+	f.mu.Lock()
+	f.applyKeys = append(f.applyKeys, idempotencyKey)
+	f.mu.Unlock()
+	return f.ApplyPlan(ctx, planID)
 }
 
 func (f *fakeClient) GetOperationEvents(ctx context.Context, operationID string) ([]ipc.EventDTO, error) {
@@ -1231,7 +1259,7 @@ func TestOperationsScreen(t *testing.T) {
 		{ID: "op-1", ConnectionID: "conn-1", State: "completed", PlanID: "plan-1"},
 		{ID: "op-2", ConnectionID: "conn-2", State: "failed", PlanID: "plan-2", Error: "test error"},
 	}
-	next, _ := m.Update(operationsLoadedMsg{Operations: ops})
+	next, _ := m.Update(operationsLoadedMsg{Token: m.historyRequests.start("0"), Operations: ops})
 	m = next.(Model)
 
 	if len(m.operations) != 2 {
@@ -1397,7 +1425,7 @@ func TestActivityTabDoesNotFabricateMetrics(t *testing.T) {
 func TestOperationsScreenDistinguishesEmptyFromUnavailable(t *testing.T) {
 	t.Run("available and empty", func(t *testing.T) {
 		m := readyModel(&fakeClient{}, testSnapshot())
-		next, _ := m.Update(operationsLoadedMsg{Operations: nil, Available: true})
+		next, _ := m.Update(operationsLoadedMsg{Token: m.historyRequests.start("0"), Operations: nil, Available: true})
 		m = next.(Model)
 		m.screen = ScreenOperations
 
@@ -1413,6 +1441,7 @@ func TestOperationsScreenDistinguishesEmptyFromUnavailable(t *testing.T) {
 	t.Run("unavailable", func(t *testing.T) {
 		m := readyModel(&fakeClient{}, testSnapshot())
 		next, _ := m.Update(operationsLoadedMsg{
+			Token:       m.historyRequests.start("0"),
 			Operations:  nil,
 			Available:   false,
 			Unavailable: "database is locked",
@@ -1438,6 +1467,7 @@ func TestOperationsScreenDistinguishesEmptyFromUnavailable(t *testing.T) {
 func TestOperationsScreenShowsIntentNotPlanID(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
 	next, _ := m.Update(operationsLoadedMsg{
+		Token:     m.historyRequests.start("0"),
 		Available: true,
 		Operations: []ipc.OperationDTO{{
 			ID: "op-1", PlanID: "plan-7f3a9c", ConnectionID: "conn-1",
@@ -1483,6 +1513,7 @@ func renderOperationStyleFor(t *testing.T, state string) string {
 	t.Helper()
 	m := readyModel(&fakeClient{}, testSnapshot())
 	next, _ := m.Update(operationsLoadedMsg{
+		Token:     m.historyRequests.start("0"),
 		Available: true,
 		Operations: []ipc.OperationDTO{{
 			ID: "op-1", PlanID: "plan-1", ConnectionID: "conn-1",

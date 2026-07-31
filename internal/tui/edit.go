@@ -344,7 +344,7 @@ func pendingYesNo(p *bool) string {
 // question.
 func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 	if m.edit == nil {
-		m.screen = ScreenHome
+		m.transitionTo(ScreenHome)
 		return m, nil
 	}
 	rows := m.edit.rows()
@@ -394,7 +394,7 @@ func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 		m.edit.requests.cancel()
 		m.edit = nil
 		if !m.popScreen() {
-			m.screen = ScreenHome
+			m.transitionTo(ScreenHome)
 		}
 	}
 	return m, nil

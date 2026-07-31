@@ -24,6 +24,7 @@ type SupervisorClient interface {
 	PlanDelete(ctx context.Context, connID string) (*ipc.PlanDTO, error)
 	PlanEdit(ctx context.Context, connID string, req ipc.UpdateConnectionRequest) (*ipc.PlanDTO, error)
 	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
+	ApplyPlanWithIdempotency(ctx context.Context, planID, idempotencyKey string) (*ipc.OperationDTO, error)
 	GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error)
 	GetOperationHistory(ctx context.Context) (*ipc.OperationHistoryDTO, error)
 	GetOperationHistoryLimit(ctx context.Context, limit int) (*ipc.OperationHistoryDTO, error)
