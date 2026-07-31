@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 func numberedLines(n int) string {
@@ -163,5 +164,85 @@ func TestScrollKeysDoNotFireWhileTyping(t *testing.T) {
 
 	if m.scroll.offset != before {
 		t.Fatal("a page key scrolled the screen while the wizard owned the keyboard")
+	}
+}
+
+// TestLeavingThePreviewWithQAbandonsThePlan pins audit finding 19 where it
+// overlaps finding 1.
+//
+// Abandoning the in-flight plan was written into the esc handler alone, so
+// leaving the preview with q left the request live — and the reply reopened the
+// preview behind the user, on a screen they had already dismissed.
+func TestLeavingThePreviewWithQAbandonsThePlan(t *testing.T) {
+	m := readyModel(&fakeClient{}, twoConnectionSnapshot())
+	m.selectedID = "conn-a"
+	m.planOpenCmd("conn-a")
+	generation := m.planRequests.current
+	m.screen = ScreenPlanPreview
+
+	next, _ := m.Update(keyMsg("q"))
+	m = next.(Model)
+	if m.screen != ScreenHome {
+		t.Fatalf("q did not leave the preview: screen = %q", m.screen)
+	}
+
+	next, _ = m.Update(planLoadedMsg{
+		Generation: generation, ConnectionID: "conn-a",
+		Plan: &ipc.PlanDTO{ID: "plan-1", ConnectionID: "conn-a", Intent: "open"},
+	})
+	m = next.(Model)
+
+	if m.screen == ScreenPlanPreview {
+		t.Fatal("a dismissed plan reopened the preview behind the user")
+	}
+}
+
+// TestAJumpKeyDoesNotFireDuringADecision pins that keys meaning "go somewhere
+// else" do not leave a screen that is asking a question. s and p jumped to
+// setup and providers from a plan preview awaiting approval.
+func TestAJumpKeyDoesNotFireDuringADecision(t *testing.T) {
+	for _, screen := range []ScreenID{ScreenPlanPreview, ScreenRepair, ScreenOperationProgress} {
+		for _, key := range []string{"s", "p"} {
+			m := readyModel(&fakeClient{}, testSnapshot())
+			m.screen = screen
+
+			next, _ := m.Update(keyMsg(key))
+			m = next.(Model)
+
+			if m.screen != screen {
+				t.Errorf("%q on %s navigated to %s mid-decision", key, screen, m.screen)
+			}
+		}
+	}
+}
+
+// TestAJumpKeyStillWorksWhereItShould guards the opposite error.
+func TestAJumpKeyStillWorksWhereItShould(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.screen = ScreenHome
+
+	next, _ := m.Update(keyMsg("p"))
+	m = next.(Model)
+	if m.screen != ScreenProviders {
+		t.Fatalf("p from home went to %s, want the providers screen", m.screen)
+	}
+}
+
+// TestHelpDoesNotStrandTheUser pins that ? on the help screen does not record
+// help as the screen to return to.
+func TestHelpDoesNotStrandTheUser(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.screen = ScreenHome
+
+	next, _ := m.Update(keyMsg("?"))
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("?"))
+	m = next.(Model)
+
+	next, _ = m.Update(keyMsg("esc"))
+	m = next.(Model)
+
+	if m.screen != ScreenHome {
+		t.Fatalf("esc from help went to %q, want home", m.screen)
 	}
 }

@@ -1309,6 +1309,10 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			m.clearProviderSetupSecret()
 			return m, tea.Quit
 		}
+		// q leaves the screen exactly as esc does. It did not abandon the
+		// screen's in-flight work, so quitting the plan preview left the plan
+		// request live and a late reply reopened the preview behind the user.
+		m.abandonScreenWork()
 		m.screen = ScreenHome
 		return m, nil
 
@@ -1323,12 +1327,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			// Can't go back from home
 			return m, nil
 		}
-		// Leaving a screen abandons whatever it was waiting for, so a reply
-		// still in flight cannot reopen it behind the user.
-		if m.screen == ScreenPlanPreview || m.screen == ScreenRepair {
-			m.planRequests.cancel()
-			m.planConnectionID = ""
-		}
+		m.abandonScreenWork()
 		// Try to pop the navigation stack
 		if !m.popScreen() {
 			// Stack empty, go to home
@@ -1466,6 +1465,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 
 	case "s":
+		if !acceptsGlobalNavigation(m.screen) {
+			return m, nil
+		}
 		if m.setup == nil {
 			m.setup = screens.NewSetup()
 		}
@@ -1473,9 +1475,18 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m, m.readinessCmd()
 
 	case "p":
+		if !acceptsGlobalNavigation(m.screen) {
+			return m, nil
+		}
 		m.pushScreen(ScreenProviders)
 
 	case "?":
+		// Help is reachable from anywhere, but pressing ? on the help screen
+		// recorded help as the screen to return to, which stranded the user
+		// there.
+		if m.screen == ScreenHelp {
+			return m, nil
+		}
 		m.prevScreen = m.screen
 		m.screen = ScreenHelp
 
@@ -3074,4 +3085,34 @@ func (m *Model) routeTextEntry(msg tea.Msg) (tea.Cmd, bool) {
 		return m.updateProviderSetupField(msg)
 	}
 	return nil, false
+}
+
+// abandonScreenWork drops whatever the current screen was waiting for.
+//
+// A reply still in flight must not reopen a screen the user has left. This was
+// written into the esc handler alone, so every other way of leaving — q, and
+// any future one — left the request live.
+func (m *Model) abandonScreenWork() {
+	switch m.screen {
+	case ScreenPlanPreview, ScreenRepair:
+		m.planRequests.cancel()
+		m.planConnectionID = ""
+	}
+}
+
+// acceptsGlobalNavigation reports whether a screen may be left by pressing a
+// key that jumps somewhere else.
+//
+// s and p jumped to setup and providers from every screen, including from a
+// plan preview waiting for approval and from an operation in progress. A key
+// that means "go here" must not fire while the screen is asking a question,
+// because the answer to that question is what the keypress looks like.
+func acceptsGlobalNavigation(screen ScreenID) bool {
+	switch screen {
+	case ScreenPlanPreview, ScreenRepair, ScreenOperationProgress,
+		ScreenNewConnection, ScreenBoot, ScreenQuit:
+		return false
+	default:
+		return true
+	}
 }
