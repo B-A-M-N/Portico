@@ -709,11 +709,15 @@ type ProviderReadinessDTO struct {
 // CredentialSourceDTO is one place a credential can come from. It reports
 // presence and location only; the value is never read.
 type CredentialSourceDTO struct {
-	Kind        string `json:"kind"`
-	Location    string `json:"location"`
-	Present     bool   `json:"present"`
-	Description string `json:"description,omitempty"`
-	Action      string `json:"action,omitempty"`
+	Kind     string `json:"kind"`
+	Location string `json:"location"`
+	// Searched lists every place this source was looked for, so a negative
+	// result can say where Portico looked rather than implying the credential
+	// does not exist anywhere.
+	Searched    []string `json:"searched,omitempty"`
+	Present     bool     `json:"present"`
+	Description string   `json:"description,omitempty"`
+	Action      string   `json:"action,omitempty"`
 }
 
 // ConnectionReadinessDTO reports whether a connection can open, and what stands

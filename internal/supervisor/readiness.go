@@ -51,6 +51,7 @@ func (h *supervisorHandler) HandleReadiness() (*ipc.ReadinessDTO, error) {
 			entry.Credentials = append(entry.Credentials, ipc.CredentialSourceDTO{
 				Kind:        string(d.Kind),
 				Location:    d.Location,
+				Searched:    append([]string(nil), d.Searched...),
 				Present:     d.Present,
 				Description: d.Description,
 				Action:      d.Action,

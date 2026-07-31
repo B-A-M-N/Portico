@@ -155,6 +155,14 @@ func credentialLine(c ipc.CredentialSourceDTO) string {
 	if c.Present {
 		return fmt.Sprintf("%s found: %s", readinessMark(false), describeLocation(c))
 	}
+	// A negative result states where Portico looked. "Not set" on its own
+	// reads as "you have no credential", when it only means it was not in the
+	// places Portico knows to search — a token kept somewhere else is not
+	// found, and the user is the only one who can say so.
+	if len(c.Searched) > 1 {
+		return fmt.Sprintf("%s not found in: %s",
+			readinessMark(true), strings.Join(c.Searched, ", "))
+	}
 	return fmt.Sprintf("%s not set: %s", readinessMark(true), describeLocation(c))
 }
 

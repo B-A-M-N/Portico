@@ -29,8 +29,16 @@ type Detected struct {
 	Provider string
 	Kind     SourceKind
 	// Location is where this was looked for, in terms a user can act on: an
-	// environment variable name or a file path.
+	// environment variable name or a file path. When several places are
+	// searched it is the one that matched, or the first searched if none did.
 	Location string
+	// Searched lists every place this source was looked for.
+	//
+	// A source can live in more than one place, and the consuming adapter
+	// often accepts any of them. Reporting only "not set" against a single
+	// path implies the credential does not exist, when it may only mean
+	// Portico did not look where the user put it.
+	Searched []string
 	// Present reports whether a credential was found there.
 	Present bool
 	// Description explains what this source gives you, in plain language.
@@ -39,11 +47,13 @@ type Detected struct {
 	Action string
 }
 
-// candidate describes one place to look.
+// candidate describes one source and every place it can live.
 type candidate struct {
-	provider    string
-	kind        SourceKind
-	location    string
+	provider string
+	kind     SourceKind
+	// locations are searched in the order the consuming code searches them, so
+	// what Portico reports and what the adapter will actually use agree.
+	locations   []string
 	description string
 	action      string
 	// configKey is the YAML-ish key to look for when kind is SourceClientConfig.
@@ -60,23 +70,32 @@ func candidates() []candidate {
 
 	return []candidate{
 		{
-			provider:    "cloudflare",
-			kind:        SourceEnvironment,
-			location:    "CLOUDFLARE_API_TOKEN",
+			provider: "cloudflare",
+			kind:     SourceEnvironment,
+			// Both names are honoured by the code that consumes the token:
+			// internal/cli/handler.go prefers the Portico-specific one and
+			// falls back to the standard one, and internal/config binds both.
+			locations:   []string{"PORTICO_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"},
 			description: "Lets Portico create managed tunnels, DNS records and Access policies.",
 			action:      "Create an API token in the Cloudflare dashboard and export CLOUDFLARE_API_TOKEN.",
 		},
 		{
 			provider:    "ngrok",
 			kind:        SourceEnvironment,
-			location:    "NGROK_AUTHTOKEN",
+			locations:   []string{"NGROK_AUTHTOKEN"},
 			description: "Lets the ngrok agent authenticate.",
 			action:      "Export NGROK_AUTHTOKEN, or run: ngrok config add-authtoken <token>",
 		},
 		{
-			provider:    "ngrok",
-			kind:        SourceClientConfig,
-			location:    filepath.Join(home, ".config", "ngrok", "ngrok.yml"),
+			provider: "ngrok",
+			kind:     SourceClientConfig,
+			// Both paths are the ones the ngrok adapter itself searches. A
+			// token in the second was previously reported as missing even
+			// though the adapter would have used it.
+			locations: []string{
+				filepath.Join(home, ".config", "ngrok", "ngrok.yml"),
+				filepath.Join(home, ".ngrok2", "ngrok.yml"),
+			},
 			configKey:   "authtoken",
 			description: "The ngrok agent's own saved token. Portico uses it as-is.",
 			action:      "Run: ngrok config add-authtoken <token>",
@@ -84,7 +103,7 @@ func candidates() []candidate {
 		{
 			provider:    "openai_tunnel",
 			kind:        SourceEnvironment,
-			location:    "CONTROL_PLANE_API_KEY",
+			locations:   []string{"CONTROL_PLANE_API_KEY"},
 			description: "Lets the Secure MCP Tunnel client reach the OpenAI control plane.",
 			action:      "Create a key at platform.openai.com and export CONTROL_PLANE_API_KEY.",
 		},
@@ -95,18 +114,32 @@ func candidates() []candidate {
 func Detect() []Detected {
 	var found []Detected
 	for _, c := range candidates() {
+		if len(c.locations) == 0 {
+			continue
+		}
 		detected := Detected{
 			Provider:    c.provider,
 			Kind:        c.kind,
-			Location:    c.location,
+			Location:    c.locations[0],
+			Searched:    append([]string(nil), c.locations...),
 			Description: c.description,
 			Action:      c.action,
 		}
-		switch c.kind {
-		case SourceEnvironment:
-			detected.Present = strings.TrimSpace(os.Getenv(c.location)) != ""
-		case SourceClientConfig:
-			detected.Present = configFileHasKey(c.location, c.configKey)
+		// The first location that carries a credential is the one reported, so
+		// the screen names the place the adapter will actually read.
+		for _, location := range c.locations {
+			var present bool
+			switch c.kind {
+			case SourceEnvironment:
+				present = strings.TrimSpace(os.Getenv(location)) != ""
+			case SourceClientConfig:
+				present = configFileHasKey(location, c.configKey)
+			}
+			if present {
+				detected.Present = true
+				detected.Location = location
+				break
+			}
 		}
 		found = append(found, detected)
 	}
