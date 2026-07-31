@@ -229,7 +229,26 @@ func (m *WizardModel) renderProvider() string {
 			"…\n\n  Esc Back"
 	}
 
-	view := renderChoices(title, m.providerChoices(), m.selected)
+	choices := m.providerChoices()
+	view := renderChoices(title, choices, m.selected)
+
+	// A provider that is eligible but has only unusable accounts is a distinct
+	// state from having none: the user configured something and it did not take
+	// effect, and telling them "no account" would send them to repeat work they
+	// have already done.
+	if pending := m.pendingAccountsFor(m.state.Provider); len(pending) > 0 &&
+		len(m.accountsFor(m.state.Provider)) == 0 {
+		view += "\n\n  This provider has saved accounts that cannot be used yet:"
+		for _, account := range pending {
+			label := account.Label
+			if label == "" {
+				label = account.ID
+			}
+			view += "\n    • " + label + " — " + account.Status
+		}
+		view += "\n  Finish or replace it from the provider screen."
+	}
+
 	if m.recommendErr != nil {
 		// Say that the list is unevaluated rather than presenting it as a
 		// recommendation.
@@ -262,4 +281,172 @@ func (m *WizardModel) requirementSummary() string {
 		return "this connection"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// accountsFor returns the accounts belonging to one provider that can actually
+// be used.
+//
+// The wizard previously held a single flat list, so with more than one provider
+// configured it would have offered another provider's accounts. Only usable
+// accounts appear: selecting a pending one would bind the connection to an
+// account its provider cannot serve, and the failure would surface at open.
+func (m *WizardModel) accountsFor(providerID string) []ipc.ProviderAccountDTO {
+	var accounts []ipc.ProviderAccountDTO
+	for _, p := range m.caps.providers {
+		if p.ID != providerID {
+			continue
+		}
+		accounts = append(accounts, p.Accounts...)
+	}
+	if len(accounts) == 0 {
+		// Before the snapshot carried per-provider accounts the wizard was
+		// handed a flat list; honour it so an older caller still works.
+		accounts = m.accounts
+	}
+	return accounts
+}
+
+// pendingAccountsFor returns the accounts that exist but cannot be used, so the
+// wizard can say why a provider with accounts still has none to offer.
+func (m *WizardModel) pendingAccountsFor(providerID string) []ipc.ProviderAccountDTO {
+	for _, p := range m.caps.providers {
+		if p.ID == providerID {
+			return p.PendingAccounts
+		}
+	}
+	return nil
+}
+
+// selectAccountFor decides whether the account question needs asking.
+//
+// It is asked only when there is a real choice. The recommendation's preferred
+// account is taken when it names one, because the engine scored the provider
+// against that specific account and picking a different one silently evaluates
+// something else.
+func (m *WizardModel) selectAccountFor(providerID string) {
+	accounts := m.accountsFor(providerID)
+
+	if preferred := m.recommendedAccountFor(providerID); preferred != "" {
+		for _, account := range accounts {
+			if account.ID == preferred {
+				m.state.AccountID = preferred
+				m.state.Step = WizardStepReview
+				return
+			}
+		}
+	}
+
+	switch len(accounts) {
+	case 0:
+		m.state.AccountID = ""
+		m.state.Step = WizardStepReview
+	case 1:
+		m.state.AccountID = accounts[0].ID
+		m.state.Step = WizardStepReview
+	default:
+		m.state.Step = WizardStepAccount
+	}
+}
+
+// recommendedAccountFor returns the account the engine evaluated, if it named
+// one for this provider.
+func (m *WizardModel) recommendedAccountFor(providerID string) string {
+	if m.recommendation == nil {
+		return ""
+	}
+	if r := m.recommendation.Recommended; r != nil && r.ProviderID == providerID {
+		return r.AccountID
+	}
+	for _, alt := range m.recommendation.Alternatives {
+		if alt.ProviderID == providerID {
+			return alt.AccountID
+		}
+	}
+	return ""
+}
+
+// ProvidersChanged updates the wizard when the provider landscape moves under
+// it.
+//
+// A wizard open across a provider being configured, uninstalled or switched off
+// is holding options and a recommendation computed against a world that no
+// longer exists. The user's answers are kept — their intent did not change —
+// but anything derived from the providers is discarded and, if a choice has
+// already been made that is no longer viable, they are returned to make it
+// again rather than carrying a selection that cannot work.
+func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) {
+	if sameProviderLandscape(m.caps.providers, providers) {
+		return
+	}
+	m.caps = providerCapabilities{providers: providers}
+	m.recommendation = nil
+	m.recommendFingerprint = ""
+	m.recommendPending = false
+	m.recommendErr = nil
+
+	if m.state.Provider == "" {
+		return
+	}
+	for _, choice := range m.snapshotChoices() {
+		if choice.Value == m.state.Provider && choice.Available {
+			return
+		}
+	}
+	// The chosen provider cannot carry this any more. Saying so beats
+	// discovering it when the connection refuses to open.
+	m.err = fmt.Errorf("%s is no longer available; choose another provider", m.state.Provider)
+	m.state.Provider = ""
+	m.state.AccountID = ""
+	if m.state.Step > WizardStepProvider {
+		m.state.Step = WizardStepProvider
+		m.selected = 0
+	}
+}
+
+// sameProviderLandscape reports whether anything the wizard derives from has
+// changed. Comparing only what is used avoids discarding a recommendation
+// because an unrelated field moved.
+func sameProviderLandscape(before, after []ipc.ProviderDTO) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	for i := range before {
+		a, b := before[i], after[i]
+		if a.ID != b.ID || a.Availability != b.Availability || a.Readiness != b.Readiness {
+			return false
+		}
+		if len(a.Accounts) != len(b.Accounts) || len(a.PendingAccounts) != len(b.PendingAccounts) {
+			return false
+		}
+		if (a.Capabilities == nil) != (b.Capabilities == nil) {
+			return false
+		}
+		if a.Capabilities != nil && !sameCapabilities(*a.Capabilities, *b.Capabilities) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameCapabilities compares the capability fields the wizard derives options
+// from.
+func sameCapabilities(a, b ipc.CapabilitySetDTO) bool {
+	return a.TemporaryAddresses == b.TemporaryAddresses &&
+		a.CustomHostnames == b.CustomHostnames &&
+		a.PrivateExposure == b.PrivateExposure &&
+		a.ManagedDNS == b.ManagedDNS &&
+		equalStringSlices(a.ProtectionModes, b.ProtectionModes) &&
+		equalStringSlices(a.Protocols, b.Protocols)
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

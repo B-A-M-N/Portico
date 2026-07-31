@@ -49,7 +49,9 @@ var wizardStepOrder = []stepRule{
 	{WizardStepProtectionRules, func(m *WizardModel) bool { return m.state.Protection == "email_otp" }},
 	{WizardStepProvider, always},
 	// The account question is worth asking only when there is a choice to make.
-	{WizardStepAccount, func(m *WizardModel) bool { return len(m.accounts) > 1 }},
+	{WizardStepAccount, func(m *WizardModel) bool {
+		return len(m.accountsFor(m.state.Provider)) > 1
+	}},
 	{WizardStepReview, always},
 }
 

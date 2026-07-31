@@ -96,10 +96,14 @@ func TestProtectionChoicesFollowConfiguredCapabilities(t *testing.T) {
 }
 
 func TestWizardSelectsConfiguredCloudflareAccount(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), []ipc.ProviderAccountDTO{
-		{ID: "account-a", Label: "Personal"},
-		{ID: "account-b", Label: "Work"},
-	})
+	// Accounts belong to their provider in the snapshot, so a wizard with more
+	// than one provider cannot offer another provider's accounts.
+	snapshot := fullCloudflareSnapshot()
+	snapshot[0].Accounts = []ipc.ProviderAccountDTO{
+		{ID: "account-a", Label: "Personal", Status: "authenticated"},
+		{ID: "account-b", Label: "Work", Status: "authenticated"},
+	}
+	m := NewWizard(nil, snapshot, nil)
 	m.state = WizardState{
 		Step: WizardStepProvider, Name: "Service", SourceType: "existing_service",
 		SourceAddress: "127.0.0.1", SourceProtocol: "http", Port: "8080",

@@ -183,6 +183,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.snapshot = msg.Snapshot
 		m.ready = true
+		// A wizard in progress was built against the previous provider
+		// landscape. If that changed underneath it, its options and any
+		// recommendation describe providers that may no longer exist.
+		if m.wizard != nil {
+			m.wizard.ProvidersChanged(m.providerSnapshot())
+		}
 		// Transition to home screen on successful initial load
 		if m.screen == ScreenBoot {
 			m.screen = ScreenHome

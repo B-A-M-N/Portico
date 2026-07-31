@@ -153,7 +153,6 @@ const (
 // Valid enum values (see internal/core/connection.go).
 var (
 	wizardSourceKinds    = []string{"existing_service", "directory", "command", "mcp_server"}
-	wizardProviders      = []string{"cloudflare"}
 	wizardDirectoryModes = []directoryModeChoice{
 		{mode: "read", label: "Read-only static site"},
 		{mode: "writes", label: "File browser (read only)"},
@@ -237,7 +236,7 @@ func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO, accounts [
 		ctx:      context.Background(), // default; root model should call WithContext
 		caps:     providerCapabilities{providers: providers},
 		accounts: append([]ipc.ProviderAccountDTO(nil), accounts...),
-		state:    WizardState{Step: WizardStepOutcome, Provider: wizardProviders[0]},
+		state:    WizardState{Step: WizardStepOutcome},
 	}
 }
 
@@ -707,38 +706,45 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(wizardProviders)-1 {
+			if m.selected < len(m.providerChoices())-1 {
 				m.selected++
 			}
 		case "enter":
-			m.state.Provider = wizardProviders[m.selected]
-			switch len(m.accounts) {
-			case 0:
-				m.state.AccountID = ""
-				m.state.Step = WizardStepReview
-			case 1:
-				m.state.AccountID = m.accounts[0].ID
-				m.state.Step = WizardStepReview
-			default:
-				m.state.Step = WizardStepAccount
+			choice, ok := choiceAt(m.providerChoices(), m.selected)
+			if !ok {
+				return nil
 			}
+			if !choice.Available {
+				// Every blocking reason is a fact about this provider, not a
+				// preference, so proceeding would create a connection that
+				// cannot open. Refusing here is a clear message; refusing at
+				// apply time is one after a row has been saved.
+				m.err = fmt.Errorf("%s: %s", choice.Label, choice.Reason)
+				return nil
+			}
+			m.err = nil
+			m.state.Provider = choice.Value
+			m.selectAccountFor(choice.Value)
 			m.selected = 0
 		case "esc":
 			m.goBack()
 		}
 
 	case WizardStepAccount:
+		accounts := m.accountsFor(m.state.Provider)
 		switch key {
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(m.accounts)-1 {
+			if m.selected < len(accounts)-1 {
 				m.selected++
 			}
 		case "enter":
-			m.state.AccountID = m.accounts[m.selected].ID
+			if m.selected < len(accounts) {
+				m.state.AccountID = accounts[m.selected].ID
+			}
 			m.state.Step = WizardStepReview
 			m.selected = 0
 		case "esc":
@@ -748,6 +754,14 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepReview:
 		switch key {
 		case "enter":
+			// A connection with no provider cannot open, and saving it would
+			// leave a row that fails the moment anyone tries. The wizard
+			// reaches here only if provider selection was skipped or refused,
+			// so it says so rather than creating something inert.
+			if m.state.Provider == "" {
+				m.err = fmt.Errorf("no provider was chosen, so this connection could not open")
+				return nil
+			}
 			// Two outcomes: save closed (default) or open (next step)
 			m.openAfterCreate = (m.selected == 1)
 			m.state.Step = WizardStepCreating
@@ -922,8 +936,14 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 
 	return ipc.CreateConnectionRequest{
 		Version: 1,
-		Name:    s.Name,
-		Source:  src,
+		// Stated rather than inferred. The supervisor defaulted an unset kind
+		// to service exposure, so the wizard happened to work by relying on a
+		// default it never declared — and every recommendation it asked for
+		// named the kind explicitly, so the request and the evaluation behind
+		// it described the same connection only by coincidence.
+		Kind:   "service_exposure",
+		Name:   s.Name,
+		Source: src,
 		Exposure: ipc.ExposureDTO{
 			Mode:             s.ExposureMode,
 			RequestedAddress: s.Hostname,
@@ -1252,10 +1272,9 @@ func (m *WizardModel) renderDirectoryMode() string {
 }
 
 // directoryModeChoices returns the directory mode options filtered by
-// provider capabilities. Without a configured Cloudflare account (Quick
-// Tunnel only), write-enabled modes are not viable because core validation
-// rejects uploads/deletes without protection, and protection requires a
-// permanent hostname.
+// provider capability. Write-enabled modes need protection, protection needs an
+// address that does not move, and that needs a provider able to own a hostname —
+// so the constraint is about capability, not about which provider supplies it.
 func (m *WizardModel) directoryModeChoices() []directoryModeChoice {
 	// Upload and delete require protection, and protection requires an address
 	// that does not move, so write-enabled modes depend on some provider being
@@ -1285,8 +1304,9 @@ func (m *WizardModel) renderMCPTransport() string {
 }
 
 func (m *WizardModel) renderAccount() string {
-	options := make([]string, 0, len(m.accounts))
-	for _, account := range m.accounts {
+	accounts := m.accountsFor(m.state.Provider)
+	options := make([]string, 0, len(accounts))
+	for _, account := range accounts {
 		label := account.Label
 		if label == "" || label == account.ID {
 			label = account.ID
@@ -1295,7 +1315,18 @@ func (m *WizardModel) renderAccount() string {
 		}
 		options = append(options, label)
 	}
-	return renderMenu("Which Cloudflare account should own this connection?", options, m.selected)
+	// The question names whichever provider was chosen. Naming one provider
+	// here was the last place the wizard assumed which one it would be.
+	name := m.state.Provider
+	for _, p := range m.caps.providers {
+		if p.ID == m.state.Provider && p.DisplayName != "" {
+			name = p.DisplayName
+		}
+	}
+	if name == "" {
+		name = "provider"
+	}
+	return renderMenu("Which "+name+" account should own this connection?", options, m.selected)
 }
 
 func (m *WizardModel) renderReview() string {
