@@ -15,8 +15,12 @@ type SnapshotDTO struct {
 
 // ConnectionDTO is the view of a connection sent over IPC.
 type ConnectionDTO struct {
-	ID                string `json:"id"`
-	Name              string `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Kind is what sort of connection this is. Without it a client cannot tell
+	// a port forward from a published service, and every list and detail screen
+	// has to guess — which they did, always guessing "exposed to the internet".
+	Kind              string `json:"kind,omitempty"`
 	DesiredState      string `json:"desired_state"`
 	RuntimeState      string `json:"runtime_state"`
 	UserState         string `json:"user_state"`
@@ -48,10 +52,40 @@ type ConnectionDetailDTO struct {
 }
 
 // ConnectionSpecDTO describes the connection specification.
+//
+// It is a tagged union mirroring core.ConnectionSpec: exactly one arm is
+// populated, and Kind says which. It previously carried the service-exposure
+// fields flat, so a port forward crossed the wire as a service exposure with an
+// empty source, an empty exposure mode and protection "", which readers then
+// rendered as an unprotected public service.
 type ConnectionSpecDTO struct {
+	Kind            string                  `json:"kind"`
+	ServiceExposure *ServiceExposureSpecDTO `json:"service_exposure,omitempty"`
+	PortForward     *PortForwardDTO         `json:"port_forward,omitempty"`
+	PrivateNetwork  *PrivateNetworkSpecDTO  `json:"private_network,omitempty"`
+	ClientTunnel    *ClientTunnelSpecDTO    `json:"client_tunnel,omitempty"`
+}
+
+// ServiceExposureSpecDTO describes a local service published through a provider.
+type ServiceExposureSpecDTO struct {
 	Source     SourceDTO     `json:"source"`
 	Exposure   ExposureDTO   `json:"exposure"`
 	Protection ProtectionDTO `json:"protection"`
+}
+
+// PrivateNetworkSpecDTO describes a private network membership.
+type PrivateNetworkSpecDTO struct {
+	NetworkID   string `json:"network_id"`
+	Mode        string `json:"mode,omitempty"` // "join" or "expose"
+	ExposeLocal bool   `json:"expose_local,omitempty"`
+}
+
+// ClientTunnelSpecDTO describes a client-mediated tunnel with no public address.
+type ClientTunnelSpecDTO struct {
+	Client   string       `json:"client"`
+	TunnelID string       `json:"tunnel_id,omitempty"`
+	Profile  string       `json:"profile,omitempty"`
+	MCP      MCPSourceDTO `json:"mcp"`
 }
 
 // DriverSelectionDTO describes the driver/provider choice.
@@ -454,11 +488,11 @@ type LifecycleDTO struct {
 // UpdateConnectionRequest is the request body for PATCH /v1/connections/{id}.
 // State transitions must exclusively use plan open/close endpoints.
 type UpdateConnectionRequest struct {
-	ExpectedRevision uint64              `json:"expected_revision,omitempty"`
-	Name             *string             `json:"name,omitempty"`
-	Spec             *ConnectionSpecDTO  `json:"spec,omitempty"`
-	Driver           *DriverSelectionDTO `json:"driver,omitempty"`
-	Lifecycle        *LifecycleDTO       `json:"lifecycle,omitempty"`
+	ExpectedRevision uint64                  `json:"expected_revision,omitempty"`
+	Name             *string                 `json:"name,omitempty"`
+	Spec             *ServiceExposureSpecDTO `json:"spec,omitempty"`
+	Driver           *DriverSelectionDTO     `json:"driver,omitempty"`
+	Lifecycle        *LifecycleDTO           `json:"lifecycle,omitempty"`
 }
 
 // ProviderRecommendationRequest asks the supervisor to recommend a driver.

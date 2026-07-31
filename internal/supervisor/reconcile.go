@@ -174,7 +174,7 @@ func resourceDeltaRepairPlan(input ReconcileInput) *core.OperationPlan {
 	// needs a narrow application-and-policy recreation; do not recreate the
 	// tunnel or touch DNS. If only the policy is absent, retain the exact
 	// observed application and restore only that policy.
-	if profile.GetProtection().Kind != core.ProtectionNone {
+	if profile.IsProtected() {
 		if app := missingTrackedResource(input, core.ResourceAccessApp); app != nil {
 			var oldPolicyID string
 			if policy := missingTrackedResource(input, core.ResourceAccessPolicy); policy != nil {

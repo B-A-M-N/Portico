@@ -102,10 +102,27 @@ func describeAccess(plan *core.OperationPlan, profile *core.ConnectionProfile) s
 	if plan.Intent != core.IntentOpen {
 		return ""
 	}
-	if profile == nil || profile.Spec.ServiceExposure == nil {
+	if profile == nil {
 		return ""
 	}
+
+	// Each kind is reachable by a different set of people, and the preview is
+	// where the user decides whether that is what they want. Returning nothing
+	// for the three non-exposed kinds left the one question the preview exists
+	// to answer unanswered.
+	switch profile.EffectiveKind() {
+	case core.ConnectionPortForward:
+		return describePortForwardAccess(profile.Spec.PortForward)
+	case core.ConnectionClientTunnel:
+		return describeClientTunnelAccess(profile.Spec.ClientTunnel)
+	case core.ConnectionPrivateNetwork:
+		return describePrivateNetworkAccess(profile.Spec.PrivateNetwork)
+	}
+
 	spec := profile.Spec.ServiceExposure
+	if spec == nil {
+		return ""
+	}
 
 	if spec.Protection.Kind == "" || spec.Protection.Kind == core.ProtectionNone {
 		if spec.Exposure.Mode == core.ExposureTemporary {
@@ -123,6 +140,49 @@ func describeAccess(plan *core.OperationPlan, profile *core.ConnectionProfile) s
 		return "Access is restricted, but no identities are listed yet."
 	}
 	return fmt.Sprintf("Only %s can sign in.", joinWithAnd(allowed))
+}
+
+// describePortForwardAccess states who can reach a forward, derived from the
+// bind address rather than assumed in either direction.
+func describePortForwardAccess(spec *core.PortForwardSpec) string {
+	if spec == nil {
+		return ""
+	}
+	if spec.Direction == core.PortForwardRemote {
+		return fmt.Sprintf(
+			"Traffic arriving at %s on the remote side will be delivered to port %d on this machine.",
+			joinHostPort(spec.RemoteHost, spec.RemotePort), spec.LocalPort)
+	}
+	return fmt.Sprintf(
+		"Only this machine can use 127.0.0.1:%d; traffic sent there reaches %s. Nothing is published.",
+		spec.LocalPort, joinHostPort(spec.RemoteHost, spec.RemotePort))
+}
+
+// describeClientTunnelAccess states the defining property of the kind: nothing
+// is published and no address is created.
+func describeClientTunnelAccess(spec *core.ClientTunnelSpec) string {
+	if spec == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"Only %s can reach this server, through the tunnel client running on this machine. "+
+			"No public address is created and no inbound port is opened.",
+		clientPlatform(spec.Client))
+}
+
+// describePrivateNetworkAccess states that reachability is membership.
+func describePrivateNetworkAccess(spec *core.PrivateNetworkSpec) string {
+	if spec == nil {
+		return ""
+	}
+	network := spec.NetworkID
+	if network == "" {
+		network = "the private network"
+	}
+	if spec.Mode == core.PrivateNetworkExpose || spec.ExposeLocal {
+		return fmt.Sprintf("Only members of %s can reach this service. It is not published to the internet.", network)
+	}
+	return fmt.Sprintf("This machine joins %s. Nothing local is published.", network)
 }
 
 func describeLocalChanges(plan *core.OperationPlan) []string {

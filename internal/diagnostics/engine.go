@@ -247,7 +247,13 @@ func (e *Engine) checkProvider(ctx context.Context, profile *core.ConnectionProf
 		// Observation errors are treated as unknown, not failure.
 	}
 
-	if rt.State == core.RuntimeOpen && rt.Endpoint.PublicAddress == "" {
+	// An open connection with no public address is a fault only for a
+	// connection that was supposed to get one. This engine is otherwise
+	// kind-blind, so without this guard every healthy port forward, client
+	// tunnel and private-only exposure is diagnosed as a tunnel that failed to
+	// reach the provider edge — a severity-error finding, persisted, shown on
+	// the detail screen, and offered to the user as something to repair.
+	if rt.State == core.RuntimeOpen && rt.Endpoint.PublicAddress == "" && profile.ExpectsPublicAddress() {
 		return &core.DiagnosticFinding{
 			ID:           core.FindingID(fmt.Sprintf("find-%s-edge", profile.ID)),
 			ConnectionID: profile.ID,

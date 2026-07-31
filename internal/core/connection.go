@@ -133,6 +133,55 @@ type DriverSelection struct {
 // DriverID identifies a connection driver.
 type DriverID string
 
+// SpecArmKind returns the connection kind implied by the populated arm of a
+// spec union, requiring exactly one arm to be set. Zero or multiple arms is
+// corruption: the union's whole purpose is that kinds are mutually exclusive.
+//
+// This is the one place that answers "what kind of connection is this?". The
+// store already refused to persist a profile whose declared Kind disagreed with
+// its populated arm, which made the arm the real authority; presentation code
+// that branched on Kind alone was reading a second, weaker answer.
+func SpecArmKind(spec ConnectionSpec) (ConnectionKind, error) {
+	var kinds []ConnectionKind
+	if spec.ServiceExposure != nil {
+		kinds = append(kinds, ConnectionServiceExposure)
+	}
+	if spec.PortForward != nil {
+		kinds = append(kinds, ConnectionPortForward)
+	}
+	if spec.PrivateNetwork != nil {
+		kinds = append(kinds, ConnectionPrivateNetwork)
+	}
+	if spec.ClientTunnel != nil {
+		kinds = append(kinds, ConnectionClientTunnel)
+	}
+	if len(kinds) != 1 {
+		return "", fmt.Errorf("exactly one connection spec arm must be set, got %d", len(kinds))
+	}
+	return kinds[0], nil
+}
+
+// EffectiveKind reports the kind to describe a connection as.
+//
+// It prefers the populated spec arm over the declared Kind because the arm is
+// what the rest of the system acts on: a profile carrying a PortForward spec
+// gets a port forward opened for it whatever its Kind field says. It falls back
+// to the declared Kind for a profile whose spec is not yet populated, and to
+// service exposure only when there is nothing else to go on — the historical
+// default, kept so an empty profile renders rather than blanking the screen.
+func (p *ConnectionProfile) EffectiveKind() ConnectionKind {
+	if p == nil {
+		return ConnectionServiceExposure
+	}
+	if kind, err := SpecArmKind(p.Spec); err == nil {
+		return kind
+	}
+	if p.Kind != "" {
+		return p.Kind
+	}
+	return ConnectionServiceExposure
+}
+
 // Backward compatibility accessors for the old flat profile structure.
 // These allow existing code to continue working while we migrate to the new structure.
 // Note: renamed to GetSource, GetExposure, etc. to avoid JSON serialization conflicts.
@@ -173,6 +222,40 @@ func (p *ConnectionProfile) GetProvider() ProviderSelection {
 		AccountID:  p.Driver.AccountID,
 		Options:    p.Driver.Options,
 	}
+}
+
+// IsProtected reports whether the profile asks for an access policy.
+//
+// The test must be positive. Writing it as "kind is not none" reads the zero
+// value returned by GetProtection() for every non-service-exposure kind as a
+// configured protection, so a port forward — which has no protection spec at
+// all — answers yes.
+func (p *ConnectionProfile) IsProtected() bool {
+	if p == nil || p.Spec.ServiceExposure == nil {
+		return false
+	}
+	kind := p.Spec.ServiceExposure.Protection.Kind
+	return kind != "" && kind != ProtectionNone
+}
+
+// ExpectsPublicAddress reports whether opening this connection should result
+// in a publicly reachable address.
+//
+// Only a service exposure published temporarily or permanently does. A port
+// forward, a client tunnel and a private network never do, and neither does a
+// service exposure asked for as private_only. Code that treats "open but no
+// public address" as a fault must consult this first, or it diagnoses the
+// healthy state of every other kind as a broken tunnel.
+func (p *ConnectionProfile) ExpectsPublicAddress() bool {
+	if p == nil || p.Spec.ServiceExposure == nil {
+		return false
+	}
+	// The test is negative on purpose. An empty mode means the creation
+	// default, which is temporary_public, so treating only the two explicit
+	// public modes as public would suppress a genuine provider-edge fault for
+	// any profile whose mode was never filled in. A diagnostic should fail
+	// toward reporting a fault, not toward hiding one.
+	return p.Spec.ServiceExposure.Exposure.Mode != ExposurePrivate
 }
 
 // DeepCopy returns a deep copy of the profile.

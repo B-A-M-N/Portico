@@ -452,25 +452,7 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 	connDTOs := make([]ipc.ConnectionDTO, 0, len(profiles))
 	for _, p := range profiles {
 		rt := rtMap[p.ID]
-		dto := ipc.ConnectionDTO{
-			ID:                string(p.ID),
-			Name:              p.Name,
-			DesiredState:      string(p.Desired),
-			ProviderID:        string(p.GetProvider().ProviderID),
-			ProviderAccountID: string(p.GetProvider().AccountID),
-		}
-		if rt != nil {
-			dto.RuntimeState = string(rt.State)
-			dto.UserState = rt.State.UserFacingState()
-			dto.PublicAddress = rt.Endpoint.PublicAddress
-			dto.PrivateAddress = rt.Endpoint.PrivateAddress
-			dto.ConnectorPID = rt.Connector.PID
-			dto.ConnectorState = string(rt.Connector.Status)
-			if rt.Error != nil {
-				dto.Error = rt.Error.Message
-			}
-		}
-		connDTOs = append(connDTOs, dto)
+		connDTOs = append(connDTOs, connectionSummaryDTO(p, rt))
 	}
 
 	providers := h.sup.registry.List()
@@ -602,21 +584,9 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 	}
 
 	detail := &ipc.ConnectionDetailDTO{
-		Summary:  *summary,
-		Revision: p.Revision,
-		DesiredSpec: ipc.ConnectionSpecDTO{
-			Source: ipc.SourceDTO{Kind: string(p.GetSource().Kind)},
-			Exposure: ipc.ExposureDTO{
-				Mode:             string(p.GetExposure().Mode),
-				Protocol:         string(p.GetExposure().Protocol),
-				RequestedAddress: p.GetExposure().RequestedAddress,
-			},
-			Protection: ipc.ProtectionDTO{
-				Kind:           string(p.GetProtection().Kind),
-				AllowedEmails:  p.GetProtection().AllowedEmails,
-				AllowedDomains: p.GetProtection().AllowedDomains,
-			},
-		},
+		Summary:     *summary,
+		Revision:    p.Revision,
+		DesiredSpec: describeSpec(p),
 		Lifecycle: ipc.LifecycleDTO{
 			AutoStart:    p.Lifecycle.AutoStart,
 			OnDisconnect: string(p.Lifecycle.OnDisconnect),
@@ -628,31 +598,6 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 		},
 		CreatedAt: p.CreatedAt.Format(time.RFC3339),
 		UpdatedAt: p.UpdatedAt.Format(time.RFC3339),
-	}
-
-	if p.GetSource().Existing != nil {
-		detail.DesiredSpec.Source.Existing = &ipc.ExistingSourceDTO{Address: p.GetSource().Existing.Address}
-	}
-	if p.GetSource().Directory != nil {
-		detail.DesiredSpec.Source.Directory = &ipc.DirectorySourceDTO{
-			Path: p.GetSource().Directory.Path, Mode: string(p.GetSource().Directory.Mode),
-			SPAFallback: p.GetSource().Directory.SPAFallback, AllowUpload: p.GetSource().Directory.AllowUpload, AllowDelete: p.GetSource().Directory.AllowDelete,
-		}
-	}
-	if p.GetSource().Command != nil {
-		detail.DesiredSpec.Source.Command = &ipc.CommandSourceDTO{
-			Executable: p.GetSource().Command.Executable, Args: p.GetSource().Command.Args, WorkingDir: p.GetSource().Command.WorkingDir,
-			Env: p.GetSource().Command.Env, Port: p.GetSource().Command.Port, Protocol: string(p.GetSource().Command.Protocol), UseShell: p.GetSource().Command.UseShell,
-		}
-	}
-	if p.GetSource().MCP != nil {
-		detail.DesiredSpec.Source.MCP = &ipc.MCPSourceDTO{Transport: string(p.GetSource().MCP.Transport), Endpoint: p.GetSource().MCP.Endpoint}
-		if p.GetSource().MCP.Command != nil {
-			detail.DesiredSpec.Source.MCP.Command = &ipc.CommandSourceDTO{
-				Executable: p.GetSource().MCP.Command.Executable, Args: p.GetSource().MCP.Command.Args, WorkingDir: p.GetSource().MCP.Command.WorkingDir,
-				Env: p.GetSource().MCP.Command.Env, Port: p.GetSource().MCP.Command.Port, Protocol: string(p.GetSource().MCP.Command.Protocol), UseShell: p.GetSource().MCP.Command.UseShell,
-			}
-		}
 	}
 
 	if rt != nil {
@@ -817,24 +762,7 @@ func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, 
 	}
 	rt, _ := h.sup.controller.GetRuntime(cid)
 
-	dto := ipc.ConnectionDTO{
-		ID:                string(p.ID),
-		Name:              p.Name,
-		DesiredState:      string(p.Desired),
-		ProviderID:        string(p.GetProvider().ProviderID),
-		ProviderAccountID: string(p.GetProvider().AccountID),
-	}
-	if rt != nil {
-		dto.RuntimeState = string(rt.State)
-		dto.UserState = rt.State.UserFacingState()
-		dto.PublicAddress = rt.Endpoint.PublicAddress
-		dto.PrivateAddress = rt.Endpoint.PrivateAddress
-		dto.ConnectorPID = rt.Connector.PID
-		dto.ConnectorState = string(rt.Connector.Status)
-		if rt.Error != nil {
-			dto.Error = rt.Error.Message
-		}
-	}
+	dto := connectionSummaryDTO(p, rt)
 	return &dto, nil
 }
 

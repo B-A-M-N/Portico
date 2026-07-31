@@ -96,7 +96,7 @@ func (h *supervisorHandler) HandleReadiness() (*ipc.ReadinessDTO, error) {
 		entry := ipc.ConnectionReadinessDTO{
 			ID:        string(profile.ID),
 			Name:      profile.Name,
-			Kind:      string(profile.Kind),
+			Kind:      string(profile.EffectiveKind()),
 			Provider:  string(profile.Driver.ProviderID),
 			AutoStart: profile.Lifecycle.AutoStart,
 			Desired:   string(profile.Desired),

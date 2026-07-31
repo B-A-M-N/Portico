@@ -320,13 +320,19 @@ func handleInspect(cmd *cobra.Command, id string) error {
 
 	fmt.Printf("ID:       %s\n", conn.ID)
 	fmt.Printf("Name:     %s\n", conn.Name)
+	fmt.Printf("Kind:     %s\n", connectionKindLabel(conn.Kind))
 	fmt.Printf("State:    %s\n", conn.UserState)
 	fmt.Printf("Provider: %s\n", conn.ProviderID)
 	if conn.ProviderAccountID != "" {
 		fmt.Printf("Account:  %s\n", conn.ProviderAccountID)
 	}
+	// A port forward and a client tunnel have no public address, so printing
+	// only the public one reported them as having no address at all.
 	if conn.PublicAddress != "" {
 		fmt.Printf("Address:  %s\n", conn.PublicAddress)
+	}
+	if conn.PrivateAddress != "" {
+		fmt.Printf("%-9s %s\n", privateAddressLabel(conn.Kind)+":", conn.PrivateAddress)
 	}
 	return nil
 }
@@ -905,4 +911,32 @@ func handleServe(cmd *cobra.Command, name string) error {
 
 	fmt.Printf("Operation: %s (%s)\n", op.ID, op.State)
 	return nil
+}
+
+// connectionKindLabel names the kind in the words a user would use.
+func connectionKindLabel(kind string) string {
+	switch kind {
+	case "port_forward":
+		return "Port forward"
+	case "private_network":
+		return "Private network"
+	case "client_tunnel":
+		return "Client tunnel (no public address)"
+	case "service_exposure", "":
+		return "Published service"
+	default:
+		return kind
+	}
+}
+
+// privateAddressLabel says what the non-public address is for this kind.
+func privateAddressLabel(kind string) string {
+	switch kind {
+	case "port_forward":
+		return "Listening"
+	case "private_network":
+		return "Network"
+	default:
+		return "Private"
+	}
 }

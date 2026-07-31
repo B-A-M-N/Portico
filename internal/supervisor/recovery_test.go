@@ -986,7 +986,7 @@ func TestUpdateConnectionRefusesSilentlyIgnoredChanges(t *testing.T) {
 		t.Fatalf("refusal does not point at the edit plan: %v", err)
 	}
 
-	spec := ipc.ConnectionSpecDTO{}
+	spec := ipc.ServiceExposureSpecDTO{}
 	if _, err := handler.HandleUpdateConnection(string(connID), ipc.UpdateConnectionRequest{
 		Spec: &spec,
 	}); err == nil {
@@ -1880,7 +1880,7 @@ func TestPlanEditPreviewsWithoutApplying(t *testing.T) {
 
 	handler := &supervisorHandler{sup: &Supervisor{store: st, controller: ctrl, registry: registry, mutating: true}}
 
-	spec := ipc.ConnectionSpecDTO{
+	spec := ipc.ServiceExposureSpecDTO{
 		Exposure: ipc.ExposureDTO{Mode: "permanent_public", RequestedAddress: "new.example.com"},
 	}
 	plan, err := handler.HandlePlanEdit(string(connID), ipc.UpdateConnectionRequest{Spec: &spec})

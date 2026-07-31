@@ -89,7 +89,7 @@ func (h *supervisorHandler) HandleSupportExport() (*ipc.SupportExportDTO, error)
 	for _, profile := range h.sup.controller.ListProfiles() {
 		entry := ipc.SupportConnectionDTO{
 			ID:           string(profile.ID),
-			Kind:         string(profile.Kind),
+			Kind:         string(profile.EffectiveKind()),
 			Revision:     profile.Revision,
 			DesiredState: string(profile.Desired),
 			ProviderID:   string(profile.Driver.ProviderID),

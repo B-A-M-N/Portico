@@ -103,10 +103,23 @@ func (m *InspectModel) renderOverview() []string {
 		"CONNECTION DETAILS",
 		"",
 		fmt.Sprintf("Name:       %s", conn.Name),
+		fmt.Sprintf("Kind:       %s", ConnectionKindLabel(conn.Kind)),
 		fmt.Sprintf("State:      %s", conn.UserState),
 		fmt.Sprintf("Provider:   %s", conn.ProviderID),
-		fmt.Sprintf("Public:     %s", conn.PublicAddress),
-		fmt.Sprintf("Private:    %s", conn.PrivateAddress),
+	}
+
+	// Address lines are printed only when there is an address, and labelled by
+	// what the address is. Printing "Public:" unconditionally gave every port
+	// forward and client tunnel a blank public address, which reads as one that
+	// has not been assigned yet rather than one that will never exist.
+	if conn.PublicAddress != "" {
+		lines = append(lines, fmt.Sprintf("Public:     %s", conn.PublicAddress))
+	}
+	if conn.PrivateAddress != "" {
+		lines = append(lines, fmt.Sprintf("%-11s %s", PrivateAddressLabel(conn.Kind)+":", conn.PrivateAddress))
+	}
+	if conn.PublicAddress == "" && conn.PrivateAddress == "" {
+		lines = append(lines, "Address:    none yet")
 	}
 	if conn.ProviderAccountID != "" {
 		lines = append(lines, fmt.Sprintf("Account:    %s", conn.ProviderAccountID))
@@ -134,35 +147,13 @@ func (m *InspectModel) renderRoute() []string {
 		return append(lines, "Loading route detail...")
 	}
 
-	var hops []string
-
-	if src := m.Detail.DesiredSpec.Source; src.Existing != nil && src.Existing.Address != "" {
-		hops = append(hops, "Local service", "  "+src.Existing.Address)
-	} else if src.Kind != "" {
-		hops = append(hops, "Local source", "  "+src.Kind)
-	}
-
-	for _, p := range m.Detail.Processes {
-		label := fmt.Sprintf("  PID %d · %s", p.PID, p.Status)
-		if p.ExecutablePath != "" {
-			label = fmt.Sprintf("  %s · PID %d · %s", p.ExecutablePath, p.PID, p.Status)
-		}
-		hops = append(hops, "Connector", label)
-	}
-
-	for _, r := range m.Detail.Resources {
-		hops = append(hops, r.Type, fmt.Sprintf("  %s · %s", r.ExternalID, r.Ownership))
-	}
-
-	for _, e := range m.Detail.Endpoints {
-		scope := "private"
-		if e.Public {
-			scope = "public"
-		}
-		hops = append(hops, "Endpoint ("+scope+")", "  "+e.Address)
-	}
-
-	if len(hops) == 0 {
+	// The route is the segment chain the supervisor computed. This screen used
+	// to build a second chain of its own from the source, processes, resources
+	// and endpoints — which restated the same route from kind-blind parts, and
+	// so drew a provider tunnel and a public endpoint for connections that have
+	// neither. There is one authority for what the hops are, and this is a view
+	// of it.
+	if len(m.Detail.Segments) == 0 {
 		lines = append(lines, "No route is established for this connection.")
 		if m.Connection.RuntimeState != "" {
 			lines = append(lines, "Runtime state: "+m.Connection.RuntimeState)
@@ -170,29 +161,57 @@ func (m *InspectModel) renderRoute() []string {
 		return lines
 	}
 
-	// hops alternates label/value; join them with arrows between stages.
-	for i := 0; i < len(hops); i += 2 {
+	for i, seg := range m.Detail.Segments {
 		if i > 0 {
 			lines = append(lines, "        ↓")
 		}
-		lines = append(lines, hops[i], hops[i+1])
-	}
-
-	if len(m.Detail.Segments) > 0 {
-		lines = append(lines, "", "SEGMENT STATUS")
-		for _, s := range m.Detail.Segments {
-			label := s.Label
-			if label == "" {
-				label = s.ID
-			}
-			line := fmt.Sprintf("  %-24s %s", label, s.Status)
-			if s.Error != "" {
-				line += " — " + s.Error
-			}
-			lines = append(lines, line)
+		label := seg.Label
+		if label == "" {
+			label = seg.ID
+		}
+		lines = append(lines, fmt.Sprintf("%s  [%s]", label, seg.Status))
+		if seg.Error != "" {
+			lines = append(lines, "  "+seg.Error)
 		}
 	}
+
+	if len(m.Detail.Resources) > 0 {
+		lines = append(lines, "", "PROVIDER RESOURCES")
+		for _, r := range m.Detail.Resources {
+			lines = append(lines, fmt.Sprintf("  %-20s %s · %s", r.Type, r.ExternalID, r.Ownership))
+		}
+	}
+
 	return lines
+}
+
+// ConnectionKindLabel names the kind in the words a user would use.
+func ConnectionKindLabel(kind string) string {
+	switch kind {
+	case "port_forward":
+		return "Port forward"
+	case "private_network":
+		return "Private network"
+	case "client_tunnel":
+		return "Client tunnel (no public address)"
+	case "service_exposure", "":
+		return "Published service"
+	default:
+		return kind
+	}
+}
+
+// PrivateAddressLabel says what the non-public address is for this kind, since
+// "Private" describes a tunnel's fallback address but not a forward's listener.
+func PrivateAddressLabel(kind string) string {
+	switch kind {
+	case "port_forward":
+		return "Listening"
+	case "private_network":
+		return "Network"
+	default:
+		return "Private"
+	}
 }
 
 // renderActivity reports lifecycle observability rather than fabricated traffic

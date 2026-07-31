@@ -1348,36 +1348,13 @@ const currentProfileSpecVersion = 1
 // reinterpret durable state, so it is refused instead.
 var ErrUnsupportedSpecVersion = errors.New("unsupported connection spec version")
 
-// specArmKind returns the connection kind implied by the populated arm of a
-// spec union, requiring exactly one arm to be set. Zero or multiple arms is
-// corruption: the union's whole purpose is that kinds are mutually exclusive.
-func specArmKind(spec core.ConnectionSpec) (core.ConnectionKind, error) {
-	var kinds []core.ConnectionKind
-	if spec.ServiceExposure != nil {
-		kinds = append(kinds, core.ConnectionServiceExposure)
-	}
-	if spec.PortForward != nil {
-		kinds = append(kinds, core.ConnectionPortForward)
-	}
-	if spec.PrivateNetwork != nil {
-		kinds = append(kinds, core.ConnectionPrivateNetwork)
-	}
-	if spec.ClientTunnel != nil {
-		kinds = append(kinds, core.ConnectionClientTunnel)
-	}
-	if len(kinds) != 1 {
-		return "", fmt.Errorf("exactly one connection spec arm must be set, got %d", len(kinds))
-	}
-	return kinds[0], nil
-}
-
 // encodeProfileSpec marshals a profile's spec union for storage and derives the
 // kind to store alongside it.
 func encodeProfileSpec(p *core.ConnectionProfile) (kind string, specJSON []byte, err error) {
 	if p == nil {
 		return "", nil, fmt.Errorf("profile is nil")
 	}
-	armKind, err := specArmKind(p.Spec)
+	armKind, err := core.SpecArmKind(p.Spec)
 	if err != nil {
 		return "", nil, fmt.Errorf("connection %s: %w", p.ID, err)
 	}
@@ -1406,7 +1383,7 @@ func decodeProfileSpec(id core.ConnectionID, kind string, specVersion int, specJ
 	if err := json.Unmarshal(specJSON, &spec); err != nil {
 		return spec, "", fmt.Errorf("profile %s: unmarshal spec: %w", id, err)
 	}
-	armKind, err := specArmKind(spec)
+	armKind, err := core.SpecArmKind(spec)
 	if err != nil {
 		return spec, "", fmt.Errorf("profile %s: %w", id, err)
 	}

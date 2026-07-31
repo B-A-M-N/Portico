@@ -1918,9 +1918,19 @@ func (m *Model) renderHome() string {
 		default:
 			state = route.RouteUnknown
 		}
+		// The strip draws where the connection ends. Reading only the public
+		// address drew a blank endpoint for every port forward and client
+		// tunnel, which have no public address by construction.
+		endpoint := selected.PublicAddress
+		if endpoint == "" {
+			endpoint = selected.PrivateAddress
+		}
+		if endpoint == "" {
+			endpoint = screens.ConnectionKindLabel(selected.Kind)
+		}
 		vm := route.RouteVM{
 			LocalLabel:    selected.Name,
-			EndpointLabel: selected.PublicAddress,
+			EndpointLabel: endpoint,
 			State:         state,
 		}
 		routeStr := route.RenderRoute(vm, m.width, m.useASCII)
@@ -1991,7 +2001,7 @@ func (m *Model) renderInspect() string {
 		b.WriteString(fmt.Sprintf("Public:   %s\n", conn.PublicAddress))
 	}
 	if conn.PrivateAddress != "" {
-		b.WriteString(fmt.Sprintf("Local:    %s\n", conn.PrivateAddress))
+		b.WriteString(fmt.Sprintf("%-9s %s\n", screens.PrivateAddressLabel(conn.Kind)+":", conn.PrivateAddress))
 	}
 	if conn.Error != "" {
 		b.WriteString("\n")
