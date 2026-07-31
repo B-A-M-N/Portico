@@ -1237,14 +1237,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.planRepairCmd(m.SelectedConnection().ID)
 		} else if m.screen == ScreenDiscovery && len(m.discovery) > 0 {
 			svc := m.discovery[m.discoverySelected]
-			m.wizard = screens.NewWizardForService(m.client, m.hasFullCloudflare(), m.cloudflareAccounts(), svc.Address, svc.Protocol).WithContext(m.rootCtx)
+			m.wizard = screens.NewWizardForService(m.client, m.providerSnapshot(), m.usableAccounts(), svc.Address, svc.Protocol).WithContext(m.rootCtx)
 			m.status = ""
 			m.pushScreen(ScreenNewConnection)
 		}
 
 	case "n":
 		if m.screen == ScreenHome {
-			m.wizard = screens.NewWizard(m.client, m.hasFullCloudflare(), m.cloudflareAccounts()).WithContext(m.rootCtx)
+			m.wizard = screens.NewWizard(m.client, m.providerSnapshot(), m.usableAccounts()).WithContext(m.rootCtx)
 			m.status = ""
 			m.pushScreen(ScreenNewConnection)
 		}
@@ -1322,22 +1322,22 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) hasFullCloudflare() bool {
-	for _, provider := range m.snapshot.Providers {
-		if provider.ID == "cloudflare" {
-			return provider.Authenticated
-		}
-	}
-	return false
+// providerSnapshot returns every provider the supervisor reported, so the
+// wizard can derive its options from declared capability rather than from one
+// provider's configuration state.
+func (m *Model) providerSnapshot() []ipc.ProviderDTO {
+	return append([]ipc.ProviderDTO(nil), m.snapshot.Providers...)
 }
 
-func (m *Model) cloudflareAccounts() []ipc.ProviderAccountDTO {
-	for _, provider := range m.snapshot.Providers {
-		if provider.ID == "cloudflare" {
-			return append([]ipc.ProviderAccountDTO(nil), provider.Accounts...)
-		}
+// usableAccounts returns the accounts that can actually be selected, across
+// every provider. Pending accounts are deliberately excluded: offering one
+// would bind a connection to an account its provider cannot serve.
+func (m *Model) usableAccounts() []ipc.ProviderAccountDTO {
+	var accounts []ipc.ProviderAccountDTO
+	for _, p := range m.snapshot.Providers {
+		accounts = append(accounts, p.Accounts...)
 	}
-	return nil
+	return accounts
 }
 
 // handleWizardKey routes keys to the new-connection wizard.

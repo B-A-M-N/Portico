@@ -51,14 +51,16 @@ type WizardOperationLoadedMsg struct {
 
 // WizardModel is the wizard for creating new connections.
 type WizardModel struct {
-	client         ConnectionCreator
-	ctx            context.Context // application lifetime context for IPC calls
-	state          WizardState
-	selected       int
-	input          string
-	err            error
-	fullCloudflare bool
-	accounts       []ipc.ProviderAccountDTO
+	client   ConnectionCreator
+	ctx      context.Context // application lifetime context for IPC calls
+	state    WizardState
+	selected int
+	input    string
+	err      error
+	// caps derives every menu from what providers declare, replacing a single
+	// "is Cloudflare configured" boolean that decided what the user was shown.
+	caps     providerCapabilities
+	accounts []ipc.ProviderAccountDTO
 
 	// streamConnected reports whether the root model's event stream is live.
 	// When it is, operation progress arrives as events and polling is only a
@@ -211,13 +213,13 @@ type directoryModeChoice struct {
 }
 
 // NewWizard creates a new wizard model.
-func NewWizard(client ConnectionCreator, fullCloudflare bool, accounts []ipc.ProviderAccountDTO) *WizardModel {
+func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO, accounts []ipc.ProviderAccountDTO) *WizardModel {
 	return &WizardModel{
-		client:         client,
-		ctx:            context.Background(), // default; root model should call WithContext
-		fullCloudflare: fullCloudflare,
-		accounts:       append([]ipc.ProviderAccountDTO(nil), accounts...),
-		state:          WizardState{Step: WizardStepOutcome, Provider: wizardProviders[0]},
+		client:   client,
+		ctx:      context.Background(), // default; root model should call WithContext
+		caps:     providerCapabilities{providers: providers},
+		accounts: append([]ipc.ProviderAccountDTO(nil), accounts...),
+		state:    WizardState{Step: WizardStepOutcome, Provider: wizardProviders[0]},
 	}
 }
 
@@ -232,8 +234,8 @@ func (m *WizardModel) WithContext(ctx context.Context) *WizardModel {
 
 // NewWizardForService starts the normal wizard with a discovery result already
 // selected, so a user never has to retype a port discovered by Portico.
-func NewWizardForService(client ConnectionCreator, fullCloudflare bool, accounts []ipc.ProviderAccountDTO, address, protocol string) *WizardModel {
-	m := NewWizard(client, fullCloudflare, accounts)
+func NewWizardForService(client ConnectionCreator, providers []ipc.ProviderDTO, accounts []ipc.ProviderAccountDTO, address, protocol string) *WizardModel {
+	m := NewWizard(client, providers, accounts)
 	m.state.SourceType = "existing_service"
 	m.state.SourceAddress = address
 	m.state.SourceProtocol = protocol
@@ -241,35 +243,36 @@ func NewWizardForService(client ConnectionCreator, fullCloudflare bool, accounts
 	return m
 }
 
+// exposureChoices lists every way the connection can be reachable, including
+// the ones that are not available yet and why.
+func (m *WizardModel) exposureChoices() []wizardChoice {
+	return m.caps.exposureChoices(m.state.SourceType, m.state.MCPTransport)
+}
+
+// exposures returns the values that can currently be picked.
 func (m *WizardModel) exposures() []string {
-	if m.state.SourceType == "mcp_server" && m.state.MCPTransport == "sse" {
-		if m.fullCloudflare {
-			return []string{"permanent_public"}
-		}
-		return nil
-	}
-	if m.fullCloudflare {
-		return []string{"temporary_public", "permanent_public"}
-	}
-	return []string{"temporary_public"}
+	return availableValues(m.exposureChoices())
 }
 
 func (m *WizardModel) mcpTransports() []string {
 	transports := []string{"http", "streamable_http"}
-	if m.fullCloudflare {
+	// SSE needs an address that does not change, so it is offered only when
+	// some provider can supply one.
+	if m.caps.hasCapability(supportsCustomHostname) {
 		transports = append(transports, "sse")
 	}
 	return transports
 }
 
-// protections returns only choices that the selected, configured provider can
-// actually create. Cloudflare Access is available only for named (permanent)
-// tunnels, so a temporary Quick Tunnel never offers an unusable choice.
+// protectionChoices lists who may reach the connection, including options that
+// need something first.
+func (m *WizardModel) protectionChoices() []wizardChoice {
+	return m.caps.protectionChoices(m.state.ExposureMode)
+}
+
+// protections returns the values that can currently be picked.
 func (m *WizardModel) protections() []string {
-	if m.fullCloudflare && m.state.ExposureMode == "permanent_public" {
-		return []string{"none", "email_otp"}
-	}
-	return []string{"none"}
+	return availableValues(m.protectionChoices())
 }
 
 // Step returns the current wizard step.
@@ -408,7 +411,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
 			} else {
 				m.state.Step = WizardStepExposure
-				m.selected = 0
+				m.selected = firstAvailable(m.exposureChoices())
 			}
 		default:
 			m.input = editInput(m.input, key)
@@ -452,7 +455,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = 0 // default to HTTP
 			} else {
 				m.state.Step = WizardStepExposure
-				m.selected = 0
+				m.selected = firstAvailable(m.exposureChoices())
 			}
 		default:
 			m.input = editInput(m.input, key)
@@ -475,7 +478,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "enter":
 			m.state.SourceProtocol = protocols[m.selected]
 			m.state.Step = WizardStepExposure
-			m.selected = 0
+			m.selected = firstAvailable(m.exposureChoices())
 		}
 
 	case WizardStepCommandArgs:
@@ -510,7 +513,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
 			} else {
 				m.state.Step = WizardStepExposure
-				m.selected = 0
+				m.selected = firstAvailable(m.exposureChoices())
 			}
 		default:
 			m.input = editInput(m.input, key)
@@ -538,7 +541,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			} else {
 				m.state.DirectorySPA = false
 				m.state.Step = WizardStepExposure
-				m.selected = 0
+				m.selected = firstAvailable(m.exposureChoices())
 			}
 		case "esc":
 			m.state.Step = WizardStepSource
@@ -558,7 +561,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "enter":
 			m.state.DirectorySPA = m.selected == 1
 			m.state.Step = WizardStepExposure
-			m.selected = 0
+			m.selected = firstAvailable(m.exposureChoices())
 		case "esc":
 			m.state.Step = WizardStepDirectoryMode
 			m.selected = m.directoryModeIndex()
@@ -577,7 +580,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		case "enter":
 			m.state.MCPTransport = m.mcpTransports()[m.selected]
 			m.state.Step = WizardStepExposure
-			m.selected = 0
+			m.selected = firstAvailable(m.exposureChoices())
 		case "esc":
 			m.state.Step = WizardStepSource
 			m.input = m.state.SourceAddress
@@ -590,18 +593,29 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(m.exposures())-1 {
+			if m.selected < len(m.exposureChoices())-1 {
 				m.selected++
 			}
 		case "enter":
-			m.state.ExposureMode = m.exposures()[m.selected]
+			// The list includes options that cannot be picked yet, so choosing
+			// one explains what it needs instead of silently doing nothing.
+			choice, ok := choiceAt(m.exposureChoices(), m.selected)
+			if !ok {
+				return nil
+			}
+			if !choice.Available {
+				m.err = fmt.Errorf("%s: %s", choice.Label, choice.Reason)
+				return nil
+			}
+			m.err = nil
+			m.state.ExposureMode = choice.Value
 			if m.state.ExposureMode == "permanent_public" {
 				m.state.Step = WizardStepHostname
 				m.input = m.state.Hostname
 			} else {
 				m.state.Hostname = ""
 				m.state.Step = WizardStepProtection
-				m.selected = 0
+				m.selected = firstAvailable(m.protectionChoices())
 			}
 		case "esc":
 			if m.isCommandOrigin() {
@@ -631,7 +645,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		switch key {
 		case "esc":
 			m.state.Step = WizardStepExposure
-			m.selected = 0
+			m.selected = firstAvailable(m.exposureChoices())
 		case "enter":
 			if strings.TrimSpace(m.input) == "" {
 				m.err = fmt.Errorf("permanent exposure requires a hostname")
@@ -640,7 +654,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.err = nil
 			m.state.Hostname = strings.TrimSpace(m.input)
 			m.state.Step = WizardStepProtection
-			m.selected = 0
+			m.selected = firstAvailable(m.protectionChoices())
 		default:
 			m.input = editInput(m.input, key)
 		}
@@ -652,11 +666,20 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(m.protections())-1 {
+			if m.selected < len(m.protectionChoices())-1 {
 				m.selected++
 			}
 		case "enter":
-			m.state.Protection = m.protections()[m.selected]
+			choice, ok := choiceAt(m.protectionChoices(), m.selected)
+			if !ok {
+				return nil
+			}
+			if !choice.Available {
+				m.err = fmt.Errorf("%s: %s", choice.Label, choice.Reason)
+				return nil
+			}
+			m.err = nil
+			m.state.Protection = choice.Value
 			if m.state.Protection == "email_otp" {
 				m.state.Step = WizardStepProtectionRules
 				m.input = protectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains)
@@ -673,7 +696,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.input = m.state.Hostname
 			} else {
 				m.state.Step = WizardStepExposure
-				m.selected = 0
+				m.selected = firstAvailable(m.exposureChoices())
 			}
 		}
 
@@ -1241,31 +1264,60 @@ func (m *WizardModel) renderProtocol() string {
 }
 
 func (m *WizardModel) renderExposure() string {
-	options := make([]string, 0, len(m.exposures()))
-	for _, exposure := range m.exposures() {
-		switch exposure {
-		case "temporary_public":
-			options = append(options, "Temporarily, with a generated address")
-		case "permanent_public":
-			options = append(options, "Permanently, with my own hostname")
-		}
-	}
-	return renderMenu("How should it be reachable?", options, m.selected)
+	return renderChoices("How should it be reachable?", m.exposureChoices(), m.selected)
 }
 
 func (m *WizardModel) renderProtection() string {
-	options := []string{"Anyone with the address"}
-	if m.fullCloudflare && m.state.ExposureMode == "permanent_public" {
-		options = append(options, "Email one-time passcode (limit who can sign in)")
-	}
-	return renderMenu("Who should be able to reach it?", options, m.selected)
+	return renderChoices("Who should be able to reach it?", m.protectionChoices(), m.selected)
 }
 
+// renderProvider lists the providers that could carry this connection, rather
+// than a single hardcoded name.
 func (m *WizardModel) renderProvider() string {
-	options := []string{
-		"Cloudflare (default)",
+	return renderChoices("Which provider should carry the connection?",
+		m.providerChoices(), m.selected)
+}
+
+// providerChoices lists every provider Portico knows about, with the ones that
+// cannot carry this connection marked and explained.
+//
+// Listing only the usable ones hid the fact that other providers exist at all,
+// so a user could not discover what installing or configuring one would give
+// them.
+func (m *WizardModel) providerChoices() []wizardChoice {
+	choices := make([]wizardChoice, 0, len(m.caps.providers))
+	for _, p := range m.caps.providers {
+		name := p.DisplayName
+		if name == "" {
+			name = p.ID
+		}
+		choice := wizardChoice{Value: p.ID, Label: name}
+		switch {
+		case !usableProvider(p):
+			choice.Reason = providerUnavailableReason(p)
+		case p.Readiness == "needs_config" || p.Readiness == "needs_auth":
+			choice.Reason = "needs setup"
+			choice.Detail = append(choice.Detail, p.SetupActions...)
+		default:
+			choice.Available = true
+		}
+		if p.LastError != "" {
+			choice.Detail = append(choice.Detail, p.LastError)
+		}
+		choices = append(choices, choice)
 	}
-	return renderMenu("Which provider should carry the connection?", options, m.selected)
+	return choices
+}
+
+// providerUnavailableReason states why a provider cannot be used at all.
+func providerUnavailableReason(p ipc.ProviderDTO) string {
+	switch p.Availability {
+	case "not_implemented":
+		return "Portico has no adapter for this yet"
+	case "client_missing":
+		return "its client is not installed"
+	}
+	return "not available"
 }
 
 func (m *WizardModel) renderDirectoryMode() string {
@@ -1282,8 +1334,10 @@ func (m *WizardModel) renderDirectoryMode() string {
 // rejects uploads/deletes without protection, and protection requires a
 // permanent hostname.
 func (m *WizardModel) directoryModeChoices() []directoryModeChoice {
-	if !m.fullCloudflare {
-		// Quick Tunnel only — offer read-only modes.
+	// Upload and delete require protection, and protection requires an address
+	// that does not move, so write-enabled modes depend on some provider being
+	// able to supply a permanent address — not on any particular provider.
+	if !m.caps.hasCapability(supportsCustomHostname) {
 		return []directoryModeChoice{
 			{mode: "read", label: "Read-only static site"},
 			{mode: "writes", label: "File browser (read only)"},

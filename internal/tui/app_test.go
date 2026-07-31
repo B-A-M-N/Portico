@@ -241,6 +241,21 @@ func testSnapshot() ipc.SnapshotDTO {
 		Connections: []ipc.ConnectionDTO{
 			{ID: "conn-1", Name: "web", DesiredState: "closed", UserState: "Closed"},
 		},
+		// The wizard derives what it can offer from declared capability, so a
+		// snapshot with no providers offers nothing — which is correct, and
+		// means a fixture has to describe a real provider to exercise a flow.
+		Providers: []ipc.ProviderDTO{{
+			ID: "cloudflare", DisplayName: "Cloudflare",
+			Availability: "ready", Readiness: "ready",
+			Accounts: []ipc.ProviderAccountDTO{{ID: "acct-1", Label: "Personal", Status: "authenticated"}},
+			Capabilities: &ipc.CapabilitySetDTO{
+				TemporaryAddresses: true,
+				CustomHostnames:    true,
+				ManagedDNS:         true,
+				ProtectionModes:    []string{"none", "email_otp"},
+				Protocols:          []string{"http", "https"},
+			},
+		}},
 	}
 }
 
