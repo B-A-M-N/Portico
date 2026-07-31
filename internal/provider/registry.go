@@ -60,6 +60,40 @@ const (
 	AvailabilityDegraded Availability = "degraded"
 )
 
+// Selectable reports whether a connection can be planned against a provider in
+// this state.
+//
+// This is the single authority. Every layer used to read the availability
+// string and reach its own conclusion: the recommendation engine refused
+// experimental and degraded providers but accepted unconfigured ones, while the
+// UI refused only missing clients — so a provider could be recommended as best
+// and be unable to open the connection it was recommended for.
+func (a Availability) Selectable() bool {
+	return a == AvailabilityReady
+}
+
+// UnavailableReason explains, in one phrase, why a provider in this state
+// cannot carry a connection.
+func (a Availability) UnavailableReason(capabilityError string) string {
+	switch a {
+	case AvailabilityNotImplemented:
+		return "Portico does not implement this provider yet"
+	case AvailabilityClientMissing:
+		return "the provider's local client is not installed"
+	case AvailabilityExperimental:
+		return "the provider is experimental and not lifecycle-complete"
+	case AvailabilityUnconfigured:
+		return "the provider has no usable account yet"
+	case AvailabilityDegraded:
+		reason := "the provider is not responding"
+		if capabilityError != "" {
+			reason += ": " + capabilityError
+		}
+		return reason
+	}
+	return "the provider is not available"
+}
+
 // ProviderSnapshot is a frozen provider summary for listing
 type ProviderSnapshot struct {
 	ID           core.ProviderID

@@ -398,3 +398,109 @@ func TestADegradedProviderIsNotOfferedAsSelectable(t *testing.T) {
 		t.Fatalf("a degraded provider made options appear available: %v", values)
 	}
 }
+
+// TestRenamingAnAccountDoesNotRestartTheQuestion pins that a display refresh is
+// not a suitability change.
+//
+// Treating every difference in the provider list as significant meant renaming
+// an account ejected the user from review and restarted the recommendation,
+// though nothing about what any provider could do had changed.
+func TestRenamingAnAccountDoesNotRestartTheQuestion(t *testing.T) {
+	before := fullCloudflareSnapshot()
+	before[0].Accounts = []ipc.ProviderAccountDTO{
+		{ID: "acct-a", Label: "Personal", Status: "authenticated"},
+	}
+	m := NewWizard(&fakeWizardClient{}, before)
+	m.state.SourceType = "existing_service"
+	m.state.ExposureMode = "permanent_public"
+	m.state.Protection = "none"
+	m.state.Provider = "cloudflare"
+	m.state.AccountID = "acct-a"
+	m.state.Step = WizardStepReview
+
+	renamed := fullCloudflareSnapshot()
+	renamed[0].Accounts = []ipc.ProviderAccountDTO{
+		{ID: "acct-a", Label: "Home", Status: "authenticated"},
+	}
+	renamed[0].LastError = "a differently worded transient error"
+
+	if cmd := m.ProvidersChanged(renamed); cmd != nil {
+		t.Fatal("renaming an account restarted the provider question")
+	}
+	if m.Step() != WizardStepReview {
+		t.Fatalf("step = %d, want review; nothing about suitability changed", m.Step())
+	}
+	if m.state.AccountID != "acct-a" {
+		t.Fatal("a selection was discarded by a display refresh")
+	}
+	// The new label must still show through.
+	if accounts := m.accountsFor("cloudflare"); accounts[0].Label != "Home" {
+		t.Fatalf("the refreshed label did not reach the wizard: %q", accounts[0].Label)
+	}
+}
+
+// TestLosingSelectabilityRestartsTheQuestion pins the other side: a change that
+// can alter which provider fits must send the user back.
+func TestLosingSelectabilityRestartsTheQuestion(t *testing.T) {
+	m := NewWizard(&fakeWizardClient{}, fullCloudflareSnapshot())
+	m.state.SourceType = "existing_service"
+	m.state.ExposureMode = "permanent_public"
+	m.state.Protection = "none"
+	m.state.Provider = "cloudflare"
+	m.state.Step = WizardStepReview
+
+	degraded := fullCloudflareSnapshot()
+	degraded[0].Selectable = false
+	degraded[0].Availability = "degraded"
+
+	if cmd := m.ProvidersChanged(degraded); cmd == nil {
+		t.Fatal("a provider becoming unusable did not restart the question")
+	}
+	if m.Step() != WizardStepProvider {
+		t.Fatalf("step = %d, want a return to provider selection", m.Step())
+	}
+}
+
+// TestAProviderThatSurvivesIsReturnedTo pins that the earlier choice is a
+// preference rather than being discarded.
+func TestAProviderThatSurvivesIsReturnedTo(t *testing.T) {
+	snapshot := append(fullCloudflareSnapshot(), ipc.ProviderDTO{
+		ID: "acme", DisplayName: "Acme", Availability: "ready", Readiness: "ready",
+		Selectable: true,
+		Capabilities: &ipc.CapabilitySetDTO{
+			TemporaryAddresses: true, CustomHostnames: true,
+			ProtectionModes: []string{"none"},
+		},
+	})
+	m := NewWizard(&fakeWizardClient{}, snapshot)
+	m.state.SourceType = "existing_service"
+	m.state.ExposureMode = "permanent_public"
+	m.state.Protection = "none"
+	m.state.Provider = "acme"
+	m.state.Step = WizardStepReview
+
+	// A third provider appears, which changes suitability but leaves acme fine.
+	changed := append(snapshot, ipc.ProviderDTO{
+		ID: "other", DisplayName: "Other", Availability: "ready", Readiness: "ready",
+		Selectable:   true,
+		Capabilities: &ipc.CapabilitySetDTO{TemporaryAddresses: true},
+	})
+	cmd := m.ProvidersChanged(changed)
+	if cmd == nil {
+		t.Fatal("a new provider did not trigger a fresh evaluation")
+	}
+
+	// The engine recommends Cloudflare, but the user had already chosen acme.
+	m.HandleRecommendation(ProviderRecommendationMsg{
+		Fingerprint: m.recommendFingerprint,
+		Response: &ipc.ProviderRecommendationResponse{
+			Recommended:  &ipc.ProviderChoiceDTO{ProviderID: "cloudflare", DisplayName: "Cloudflare"},
+			Alternatives: []ipc.ProviderChoiceDTO{{ProviderID: "acme", DisplayName: "Acme"}},
+		},
+	})
+
+	choices := m.providerChoices()
+	if choices[m.selected].Value != "acme" {
+		t.Fatalf("cursor on %q, want the provider the user had already chosen", choices[m.selected].Value)
+	}
+}

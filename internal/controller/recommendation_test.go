@@ -188,13 +188,17 @@ func TestRecommendationPrefersAuthenticatedAndSelectedAccount(t *testing.T) {
 	if !credited {
 		t.Fatal("the preferred account was not credited, so the preference did nothing")
 	}
-	// The unauthenticated provider is still eligible, but must be listed as an
-	// alternative with a setup action rather than presented as ready.
+	// The provider without an account is still eligible and must not be
+	// described as needing account setup: a Quick Tunnel and a local port
+	// forward are ready and accountless. Whether a provider can be used is
+	// settled by its availability, not by whether it holds a credential.
 	if len(rec.Alternatives) != 1 || rec.Alternatives[0].ProviderID != "aaa" {
 		t.Fatalf("alternatives = %+v", rec.Alternatives)
 	}
-	if len(rec.Alternatives[0].SetupActions) == 0 {
-		t.Fatal("unauthenticated alternative offers no setup action")
+	for _, tradeoff := range rec.Alternatives[0].Tradeoffs {
+		if strings.Contains(tradeoff, "needs account setup") {
+			t.Fatal("a ready provider was described as needing account setup")
+		}
 	}
 }
 
@@ -347,6 +351,56 @@ func TestAnAccountPreferenceBelongsToItsProvider(t *testing.T) {
 		}
 		if alt.Score >= rec.Recommended.Score {
 			t.Fatalf("scores did not separate: a=%d b=%d", alt.Score, rec.Recommended.Score)
+		}
+	}
+}
+
+// TestAnUnconfiguredProviderIsNotRecommended pins that eligibility and
+// selectability are one answer.
+//
+// An unconfigured provider was eligible: it could be returned as the best
+// choice, shown with "before this can be used", and selected — producing a
+// connection that could not open. Whether a provider can carry a connection is
+// now decided in one place and the engine reads it.
+func TestAnUnconfiguredProviderIsNotRecommended(t *testing.T) {
+	p := capableProvider("cloudflare", false)
+	p.Availability = provider.AvailabilityUnconfigured
+
+	rec := recommendWith(t, []provider.ProviderSnapshot{p},
+		RecommendationInput{ExposureMode: core.ExposureTemporary})
+
+	if rec.Recommended != nil {
+		t.Fatalf("an unconfigured provider was recommended: %+v", rec.Recommended)
+	}
+	if len(rec.Alternatives) != 0 {
+		t.Fatalf("an unconfigured provider was offered as an alternative: %+v", rec.Alternatives)
+	}
+	// It must still be reported, with what would make it usable.
+	if len(rec.Ineligible) != 1 {
+		t.Fatalf("the provider vanished instead of being explained: %+v", rec.Ineligible)
+	}
+	if len(rec.Ineligible[0].BlockingReasons) == 0 {
+		t.Fatal("no reason given for refusing it")
+	}
+}
+
+// TestAReadyAccountlessProviderIsEligible pins the other direction. Quick
+// Tunnels and local port forwards need no account and must not be treated as
+// unusable for lacking one.
+func TestAReadyAccountlessProviderIsEligible(t *testing.T) {
+	p := capableProvider("portforward", false)
+	p.Accounts = nil
+	p.Availability = provider.AvailabilityReady
+
+	rec := recommendWith(t, []provider.ProviderSnapshot{p},
+		RecommendationInput{ExposureMode: core.ExposureTemporary})
+
+	if rec.Recommended == nil {
+		t.Fatalf("a ready accountless provider was not recommended; summary=%q", rec.Summary)
+	}
+	for _, tradeoff := range rec.Recommended.Tradeoffs {
+		if strings.Contains(tradeoff, "needs account setup") {
+			t.Fatal("a provider that needs no account was said to need one")
 		}
 	}
 }

@@ -149,8 +149,19 @@ func (m *WizardModel) HandleRecommendation(msg ProviderRecommendationMsg) {
 		return
 	}
 	m.recommendation = msg.Response
-	// Start on the recommended provider rather than whichever happens to be
-	// first, without preventing the user from choosing another.
+	// Start on the provider the user had already chosen when it survived the
+	// change, and on the recommendation otherwise. Their earlier decision is a
+	// preference the engine does not know about.
+	if m.preferredProvider != "" {
+		for _, choice := range m.providerChoices() {
+			if choice.Value == m.preferredProvider && choice.Available {
+				m.selected = choiceIndex(m.providerChoices(), m.preferredProvider)
+				m.preferredProvider = ""
+				return
+			}
+		}
+		m.preferredProvider = ""
+	}
 	if msg.Response != nil && msg.Response.Recommended != nil {
 		m.selected = choiceIndex(m.providerChoices(), msg.Response.Recommended.ProviderID)
 	}
@@ -437,10 +448,17 @@ func (m *WizardModel) recommendedAccountFor(providerID string) string {
 // So the answers are kept, because the user's intent did not change, and the
 // question of which provider carries them is asked again.
 func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) tea.Cmd {
-	if sameProviderLandscape(m.caps.providers, providers) {
+	// Display metadata is always refreshed, so a renamed account or a reworded
+	// error shows through immediately.
+	changedSuitability := suitabilityFingerprint(m.caps.providers) != suitabilityFingerprint(providers)
+	m.caps = providerCapabilities{providers: providers}
+
+	// Only a change that could alter which provider fits sends the user back.
+	// Treating every difference as significant meant renaming an account
+	// ejected them from review and restarted the recommendation.
+	if !changedSuitability {
 		return nil
 	}
-	m.caps = providerCapabilities{providers: providers}
 	m.recommendation = nil
 	m.recommendFingerprint = ""
 	m.recommendPending = false
@@ -453,8 +471,10 @@ func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) tea.Cmd {
 		return nil
 	}
 
-	// The previous choice becomes a preference rather than a decision, so a
-	// provider that still fits is still favoured.
+	// The previous choice is remembered as a preference, not carried as a
+	// decision: if it still fits, the cursor returns to it once the fresh
+	// answer arrives.
+	m.preferredProvider = m.state.Provider
 	m.state.AccountID = ""
 	m.err = fmt.Errorf("the available providers changed, so this is being reconsidered")
 	m.state.Step = WizardStepProvider
@@ -462,65 +482,30 @@ func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) tea.Cmd {
 	return m.recommendCmd()
 }
 
-// sameProviderLandscape reports whether anything the wizard derives from has
-// changed. Comparing only what is used avoids discarding a recommendation
-// because an unrelated field moved.
-func sameProviderLandscape(before, after []ipc.ProviderDTO) bool {
-	if len(before) != len(after) {
-		return false
-	}
-	for i := range before {
-		a, b := before[i], after[i]
-		if a.ID != b.ID || a.Availability != b.Availability || a.Readiness != b.Readiness {
-			return false
+// suitabilityFingerprint describes only what could change which provider fits.
+//
+// Presentation — account labels, error wording, setup-action wording — is
+// deliberately absent: a display refresh must not bounce the user out of the
+// question they are answering.
+func suitabilityFingerprint(providers []ipc.ProviderDTO) string {
+	var b strings.Builder
+	for _, p := range providers {
+		fmt.Fprintf(&b, "%s|%t|%s;", p.ID, p.Selectable, p.Availability)
+		if p.Capabilities != nil {
+			c := p.Capabilities
+			fmt.Fprintf(&b, "%t%t%t%t|%s|%s;",
+				c.TemporaryAddresses, c.CustomHostnames, c.PrivateExposure, c.ManagedDNS,
+				strings.Join(c.ProtectionModes, ","), strings.Join(c.Protocols, ","))
 		}
-		if !sameAccounts(a.Accounts, b.Accounts) || !sameAccounts(a.PendingAccounts, b.PendingAccounts) {
-			return false
+		// Account identity and status decide whether an account can be used;
+		// its label does not.
+		for _, account := range p.Accounts {
+			fmt.Fprintf(&b, "a:%s=%s,", account.ID, account.Status)
 		}
-		if (a.Capabilities == nil) != (b.Capabilities == nil) {
-			return false
+		for _, account := range p.PendingAccounts {
+			fmt.Fprintf(&b, "p:%s=%s,", account.ID, account.Status)
 		}
-		if a.Capabilities != nil && !sameCapabilities(*a.Capabilities, *b.Capabilities) {
-			return false
-		}
+		b.WriteString("\n")
 	}
-	return true
-}
-
-// sameCapabilities compares the capability fields the wizard derives options
-// from.
-func sameCapabilities(a, b ipc.CapabilitySetDTO) bool {
-	return a.TemporaryAddresses == b.TemporaryAddresses &&
-		a.CustomHostnames == b.CustomHostnames &&
-		a.PrivateExposure == b.PrivateExposure &&
-		a.ManagedDNS == b.ManagedDNS &&
-		equalStringSlices(a.ProtectionModes, b.ProtectionModes) &&
-		equalStringSlices(a.Protocols, b.Protocols)
-}
-
-// sameAccounts compares the account fields the wizard selects from and renders.
-// Comparing only counts treated one account being replaced by another as no
-// change at all, so a selection could survive the account it named going away.
-func sameAccounts(a, b []ipc.ProviderAccountDTO) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].ID != b[i].ID || a[i].Status != b[i].Status || a[i].Label != b[i].Label {
-			return false
-		}
-	}
-	return true
-}
-
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return b.String()
 }

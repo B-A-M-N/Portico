@@ -111,22 +111,15 @@ func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput)
 		eval.DisplayName = string(prov.ID)
 	}
 
-	// Constraint: the provider must actually be usable. A provider whose client
-	// is missing or that Portico does not implement cannot be recommended no
-	// matter how well its declared capabilities match.
-	switch prov.Availability {
-	case provider.AvailabilityNotImplemented:
-		eval.BlockingReasons = append(eval.BlockingReasons, "Portico does not implement this provider yet")
-	case provider.AvailabilityClientMissing:
-		eval.BlockingReasons = append(eval.BlockingReasons, "the provider's local client is not installed")
-	case provider.AvailabilityExperimental:
-		eval.BlockingReasons = append(eval.BlockingReasons, "the provider is experimental and not lifecycle-complete")
-	case provider.AvailabilityDegraded:
-		reason := "the provider is not responding"
-		if prov.CapabilityError != "" {
-			reason += ": " + prov.CapabilityError
-		}
-		eval.BlockingReasons = append(eval.BlockingReasons, reason)
+	// Constraint: the provider must actually be usable, decided by the one
+	// authority rather than by this package's own reading. A provider that
+	// cannot carry a connection must not be recommended however well its
+	// declared capabilities match — including an unconfigured one, which was
+	// previously eligible and could be returned as the best choice for a
+	// connection it had no account to open.
+	if !prov.Availability.Selectable() {
+		eval.BlockingReasons = append(eval.BlockingReasons,
+			prov.Availability.UnavailableReason(prov.CapabilityError))
 	}
 
 	caps := prov.Capabilities
@@ -204,14 +197,13 @@ func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput)
 	eval.Eligible = true
 
 	// Scoring. Only reached by providers that satisfy every hard constraint.
+	// Having an account is a strength, not a requirement: a Quick Tunnel and a
+	// local port forward are ready and accountless, and describing them as
+	// needing account setup was simply false. Whether a provider can be used is
+	// already settled by its availability above.
 	if prov.Authenticated {
 		eval.Score += 10
 		eval.Strengths = append(eval.Strengths, "already authenticated")
-	} else {
-		eval.Tradeoffs = append(eval.Tradeoffs, "needs account setup before it can be used")
-		if len(eval.SetupActions) == 0 {
-			eval.SetupActions = append(eval.SetupActions, "Add an account for this provider")
-		}
 	}
 
 	// An account preference belongs to the provider that owns it. Account

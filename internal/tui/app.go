@@ -186,12 +186,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A wizard in progress was built against the previous provider
 		// landscape. If that changed underneath it, its options and any
 		// recommendation describe providers that may no longer exist.
+		// The command is captured, not returned: returning here skipped the
+		// rest of installing the snapshot — the selection cursor, the event
+		// cursor, and the first stream connection — so the snapshot was applied
+		// while lastEventSeq stayed behind it and the stream replayed events the
+		// snapshot already contained.
+		var wizardCmd tea.Cmd
 		if m.wizard != nil {
-			// Re-asking which provider suits the connection is work, so the
-			// command it returns has to be run.
-			if cmd := m.wizard.ProvidersChanged(m.providerSnapshot()); cmd != nil {
-				return m, cmd
-			}
+			wizardCmd = m.wizard.ProvidersChanged(m.providerSnapshot())
 		}
 		// Transition to home screen on successful initial load
 		if m.screen == ScreenBoot {
@@ -226,9 +228,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// On first boot, connect the event stream now that the cursor is set.
 		if !m.streamConnected {
 			m.streamConnected = true
-			return m, m.connectEventStream()
+			return m, tea.Batch(wizardCmd, m.connectEventStream())
 		}
-		return m, nil
+		return m, wizardCmd
 
 	case planLoadedMsg:
 		if msg.Err != nil {

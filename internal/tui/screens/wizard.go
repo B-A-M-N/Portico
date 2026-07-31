@@ -74,6 +74,9 @@ type WizardModel struct {
 	recommendFingerprint string
 	recommendPending     bool
 	recommendErr         error
+	// preferredProvider remembers a choice made before the providers changed,
+	// so a provider that still fits is returned to rather than replaced.
+	preferredProvider string
 
 	// streamConnected reports whether the root model's event stream is live.
 	// When it is, operation progress arrives as events and polling is only a
