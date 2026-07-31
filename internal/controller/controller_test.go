@@ -72,6 +72,7 @@ func (r *testRegistry) Add(p core.Provider) error             { r.providers[p.Id
 func (r *testRegistry) Get(id core.ProviderID) core.Provider  { return r.providers[id] }
 func (r *testRegistry) List() []provider.ProviderSnapshot     { return nil }
 func (r *testRegistry) AddCatalogEntry(provider.CatalogEntry) {}
+func (r *testRegistry) Install(provider.Installation)         {}
 func (r *testRegistry) Replace(p core.Provider)               { r.providers[p.Identity().ID] = p }
 func (r *testRegistry) Remove(id core.ProviderID)             { delete(r.providers, id) }
 func (r *testRegistry) Snapshot() []provider.ProviderSnapshot { return nil }

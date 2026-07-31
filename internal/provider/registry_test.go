@@ -273,3 +273,118 @@ func TestSnapshotIsConcurrencySafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestInstallReplacesAdapterAccountsAndCatalogTogether pins the atomicity that
+// separate Replace/SetAccountInfo/AddCatalogEntry calls could not give.
+//
+// Three calls take three locks, so a concurrent reader could observe a new
+// adapter beside the previous account list, or a catalog reason contradicting
+// the installed adapter.
+func TestInstallReplacesAdapterAccountsAndCatalogTogether(t *testing.T) {
+	r := NewRegistry()
+	r.Install(Installation{
+		Provider: &stubProvider{id: "acme"},
+		Catalog:  CatalogEntry{ID: "acme", DisplayName: "Acme"},
+		Accounts: []AccountInfo{{ID: "acct-1", Label: "First", Status: string(core.AccountAuthenticated)}},
+	})
+
+	snap := r.Snapshot()[0]
+	if !snap.Authenticated || len(snap.Accounts) != 1 || snap.Accounts[0].ID != "acct-1" {
+		t.Fatalf("first install not visible: %#v", snap)
+	}
+
+	// A second install must swap everything at once.
+	r.Install(Installation{
+		Provider: &stubProvider{id: "acme"},
+		Catalog:  CatalogEntry{ID: "acme", DisplayName: "Acme"},
+		Accounts: []AccountInfo{{ID: "acct-2", Label: "Second", Status: string(core.AccountAuthenticated)}},
+	})
+	snap = r.Snapshot()[0]
+	if len(snap.Accounts) != 1 || snap.Accounts[0].ID != "acct-2" {
+		t.Fatalf("account projection did not follow the adapter: %#v", snap.Accounts)
+	}
+}
+
+// TestInstallWithoutAProviderKeepsItVisible ensures a provider that cannot be
+// used does not disappear.
+func TestInstallWithoutAProviderKeepsItVisible(t *testing.T) {
+	r := NewRegistry()
+	r.Install(Installation{
+		Provider: &stubProvider{id: "acme"},
+		Catalog:  CatalogEntry{ID: "acme", DisplayName: "Acme"},
+	})
+	if r.Get("acme") == nil {
+		t.Fatal("adapter not installed")
+	}
+
+	r.Install(Installation{
+		Catalog: CatalogEntry{
+			ID: "acme", DisplayName: "Acme",
+			Availability: AvailabilityClientMissing,
+			Reason:       "the acme client is not installed",
+		},
+	})
+	if r.Get("acme") != nil {
+		t.Fatal("adapter was not superseded")
+	}
+	snaps := r.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("provider vanished instead of staying visible: %#v", snaps)
+	}
+	if snaps[0].Availability != AvailabilityClientMissing || snaps[0].Reason == "" {
+		t.Fatalf("provider does not explain why it is unusable: %#v", snaps[0])
+	}
+}
+
+// TestInstallCarriesPendingAccountsThrough pins the regression where only
+// successfully constructed accounts reached the registry, so a pending account
+// was invisible after a restart and could not be repaired.
+func TestInstallCarriesPendingAccountsThrough(t *testing.T) {
+	r := NewRegistry()
+	r.Install(Installation{
+		Provider: &stubProvider{id: "acme"},
+		Catalog:  CatalogEntry{ID: "acme", DisplayName: "Acme"},
+		Accounts: []AccountInfo{
+			{ID: "good", Status: string(core.AccountAuthenticated)},
+			{ID: "unverified", Status: string(core.AccountPending)},
+		},
+	})
+
+	snap := r.Snapshot()[0]
+	if len(snap.Accounts) != 1 || snap.Accounts[0].ID != "good" {
+		t.Fatalf("usable accounts = %#v", snap.Accounts)
+	}
+	if len(snap.PendingAccounts) != 1 || snap.PendingAccounts[0].ID != "unverified" {
+		t.Fatalf("pending account was not carried through: %#v", snap.PendingAccounts)
+	}
+}
+
+// TestAnAuthenticatedAccountWithAnUnusableCredentialIsNotOffered separates two
+// facts that would otherwise collapse: a credential that was never verified,
+// and one that was verified but can no longer be resolved.
+func TestAnAuthenticatedAccountWithAnUnusableCredentialIsNotOffered(t *testing.T) {
+	r := NewRegistry()
+	r.Install(Installation{
+		Provider: &stubProvider{id: "acme"},
+		Catalog:  CatalogEntry{ID: "acme", DisplayName: "Acme"},
+		Accounts: []AccountInfo{{
+			ID:             "acct-1",
+			Status:         string(core.AccountAuthenticated),
+			UnusableReason: "its stored credential could not be decrypted",
+		}},
+	})
+
+	snap := r.Snapshot()[0]
+	if len(snap.Accounts) != 0 {
+		t.Fatalf("an account with an unresolvable credential was offered: %#v", snap.Accounts)
+	}
+	if len(snap.PendingAccounts) != 1 {
+		t.Fatalf("the account was hidden rather than explained: %#v", snap.PendingAccounts)
+	}
+	if snap.PendingAccounts[0].UnusableReason == "" {
+		t.Fatal("no reason recorded, so the user cannot tell it apart from an unverified account")
+	}
+	if snap.Authenticated {
+		t.Fatal("provider reported authenticated on an unusable account")
+	}
+}

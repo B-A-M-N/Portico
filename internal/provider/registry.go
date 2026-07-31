@@ -26,6 +26,8 @@ type Registry interface {
 	// AddCatalogEntry keeps a provider visible when no adapter could be
 	// constructed for it, so the UI can explain the gap instead of omitting it.
 	AddCatalogEntry(entry CatalogEntry)
+	// Install replaces adapter, accounts and catalog entry atomically.
+	Install(inst Installation)
 	DiscoverIdentities(ctx context.Context) []ProviderSnapshot
 	SetAccounts(providerID core.ProviderID, accounts []core.ProviderAccountID)
 	SetAccountInfo(providerID core.ProviderID, accounts []AccountInfo)
@@ -99,6 +101,12 @@ type ProviderSnapshot struct {
 // or anything unrecognised — is not usable, so a status Portico does not
 // understand fails closed rather than being presented as working.
 func (a AccountInfo) Usable() bool {
+	// A reason recorded at activation time overrides the durable status: an
+	// account can be authenticated and still unusable, because its credential
+	// could not be resolved.
+	if a.UnusableReason != "" {
+		return false
+	}
 	switch a.Status {
 	case string(core.AccountAuthenticated), accountStatusConfigured:
 		return true
@@ -123,9 +131,18 @@ type CatalogEntry struct {
 
 // AccountInfo describes a configured provider account
 type AccountInfo struct {
-	ID     core.ProviderAccountID
-	Label  string
+	ID    core.ProviderAccountID
+	Label string
+	// Status is the durable account status.
 	Status string
+	// UnusableReason explains why an account cannot currently be used, when
+	// that is not already implied by its status.
+	//
+	// An authenticated account whose credential will not decrypt is unusable,
+	// but that is a different fact from an account whose credential was never
+	// verified, and the user needs to be told which. Without this the two
+	// collapse into "not available" and the actionable difference is lost.
+	UnusableReason string
 }
 
 // FilteredProvider is a provider that was filtered out with a reason
@@ -330,6 +347,59 @@ func (r *registry) Replace(provider core.Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.providers[identity.ID] = provider
+}
+
+// Install replaces a provider's adapter, account projection and catalog entry
+// as one operation.
+//
+// Doing these as three calls takes three locks, so a concurrent snapshot can
+// observe a new adapter alongside the previous account list, or a catalog
+// reason that contradicts the installed adapter. Callers see one state or the
+// other and never a mixture.
+//
+// A nil Provider installs the catalog entry alone, which is how a provider that
+// cannot currently be used stays visible with a reason instead of vanishing.
+func (r *registry) Install(inst Installation) {
+	id := inst.Catalog.ID
+	if inst.Provider != nil {
+		id = inst.Provider.Identity().ID
+	}
+	if id == "" {
+		return
+	}
+
+	entry := inst.Catalog
+	entry.ID = id
+	if entry.Name == "" {
+		entry.Name = string(id)
+	}
+	if entry.DisplayName == "" {
+		entry.DisplayName = entry.Name
+	}
+
+	infos := make([]AccountInfo, 0, len(inst.Accounts))
+	ids := make([]core.ProviderAccountID, 0, len(inst.Accounts))
+	for _, account := range inst.Accounts {
+		if account.Label == "" {
+			account.Label = string(account.ID)
+		}
+		if account.Status == "" {
+			account.Status = accountStatusConfigured
+		}
+		infos = append(infos, account)
+		ids = append(ids, account.ID)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.catalog[id] = entry
+	if inst.Provider == nil {
+		delete(r.providers, id)
+	} else {
+		r.providers[id] = inst.Provider
+	}
+	r.accounts[id] = ids
+	r.accountInfo[id] = infos
 }
 
 // Remove drops a provider and the account projection that went with it.
