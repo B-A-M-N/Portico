@@ -64,8 +64,7 @@ type WizardModel struct {
 	err      error
 	// caps derives every menu from what providers declare, replacing a single
 	// "is Cloudflare configured" boolean that decided what the user was shown.
-	caps     providerCapabilities
-	accounts []ipc.ProviderAccountDTO
+	caps providerCapabilities
 
 	// Recommendation state. The fingerprint records what the in-flight request
 	// was built from, so an answer arriving after the user has changed
@@ -230,13 +229,12 @@ type directoryModeChoice struct {
 }
 
 // NewWizard creates a new wizard model.
-func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO, accounts []ipc.ProviderAccountDTO) *WizardModel {
+func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO) *WizardModel {
 	return &WizardModel{
-		client:   client,
-		ctx:      context.Background(), // default; root model should call WithContext
-		caps:     providerCapabilities{providers: providers},
-		accounts: append([]ipc.ProviderAccountDTO(nil), accounts...),
-		state:    WizardState{Step: WizardStepOutcome},
+		client: client,
+		ctx:    context.Background(), // default; root model should call WithContext
+		caps:   providerCapabilities{providers: providers},
+		state:  WizardState{Step: WizardStepOutcome},
 	}
 }
 
@@ -251,8 +249,8 @@ func (m *WizardModel) WithContext(ctx context.Context) *WizardModel {
 
 // NewWizardForService starts the normal wizard with a discovery result already
 // selected, so a user never has to retype a port discovered by Portico.
-func NewWizardForService(client ConnectionCreator, providers []ipc.ProviderDTO, accounts []ipc.ProviderAccountDTO, address, protocol string) *WizardModel {
-	m := NewWizard(client, providers, accounts)
+func NewWizardForService(client ConnectionCreator, providers []ipc.ProviderDTO, address, protocol string) *WizardModel {
+	m := NewWizard(client, providers)
 	m.state.SourceType = "existing_service"
 	m.state.SourceAddress = address
 	m.state.SourceProtocol = protocol
@@ -295,6 +293,13 @@ func (m *WizardModel) protections() []string {
 // Step returns the current wizard step.
 func (m *WizardModel) Step() int { return m.state.Step }
 
+// SelectedIndex exposes the cursor for tests that drive the wizard through the
+// root model rather than reaching into its state.
+func (m *WizardModel) SelectedIndex() int { return m.selected }
+
+// WizardRecipeCount reports how many prepared outcomes exist.
+func WizardRecipeCount() int { return len(wizardRecipes) }
+
 // hasPortStep reports whether the port step applies to the chosen source.
 func (m *WizardModel) hasPortStep() bool {
 	return m.state.SourceType == "existing_service" || m.isCommandOrigin()
@@ -326,8 +331,12 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				return nil
 			}
 			m.err = nil
+			// Set from the recipe every time, not only when advanced. Leaving
+			// it true after switching to a prepared outcome put the intent
+			// question back in the sequence, so going back from the name
+			// question landed on a question that path never asked.
+			m.state.Advanced = recipe.Advanced
 			if recipe.Advanced {
-				m.state.Advanced = true
 				m.state.Step = WizardStepIntent
 				m.selected = 0
 				return nil
@@ -344,6 +353,8 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 
 	case WizardStepIntent:
 		switch key {
+		case "esc":
+			m.goBack()
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
@@ -730,8 +741,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.Provider = choice.Value
+			// selectAccountFor decides the next question and positions the
+			// cursor for it, so the cursor must not be reset afterwards.
 			m.selectAccountFor(choice.Value)
-			m.selected = 0
 		case "esc":
 			m.goBack()
 		}
@@ -1488,7 +1500,7 @@ func (m *WizardModel) renderComplete() string {
 }
 
 func (m *WizardModel) accountLabel(id string) string {
-	for _, account := range m.accounts {
+	for _, account := range m.accountsFor(m.state.Provider) {
 		if account.ID == id && account.Label != "" {
 			return account.Label
 		}

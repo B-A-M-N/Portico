@@ -14,7 +14,7 @@ import (
 func TestBackNavigationIsTheInverseOfForward(t *testing.T) {
 	for _, sourceKind := range []string{"existing_service", "directory", "command", "mcp_server"} {
 		t.Run(sourceKind, func(t *testing.T) {
-			m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+			m := NewWizard(nil, fullCloudflareSnapshot())
 			m.state.SourceType = sourceKind
 			m.state.ExposureMode = "permanent_public"
 			m.state.Protection = "email_otp"
@@ -51,7 +51,7 @@ func TestBackNavigationIsTheInverseOfForward(t *testing.T) {
 // TestSkippedQuestionsAreSkippedInBothDirections pins that a question which
 // does not apply is absent going forward and going back.
 func TestSkippedQuestionsAreSkippedInBothDirections(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state.SourceType = "existing_service"
 	m.state.ExposureMode = "temporary_public" // no hostname question
 	m.state.Protection = "none"               // no protection-rules question
@@ -82,7 +82,7 @@ func TestSkippedQuestionsAreSkippedInBothDirections(t *testing.T) {
 // even for a user who had reached it through the intent question, so that
 // answer could not be revised.
 func TestTheIntentQuestionIsRevisitedWhenItWasAsked(t *testing.T) {
-	viaIntent := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	viaIntent := NewWizard(nil, fullCloudflareSnapshot())
 	viaIntent.state.Advanced = true
 	viaIntent.state.SourceType = "existing_service"
 	viaIntent.state.Step = WizardStepName
@@ -91,7 +91,7 @@ func TestTheIntentQuestionIsRevisitedWhenItWasAsked(t *testing.T) {
 		t.Fatalf("back from name landed on %d, want the intent question the user answered", previous)
 	}
 
-	viaRecipe := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	viaRecipe := NewWizard(nil, fullCloudflareSnapshot())
 	viaRecipe.state.SourceType = "existing_service"
 	viaRecipe.state.Step = WizardStepName
 	previous, ok = viaRecipe.previousStep()

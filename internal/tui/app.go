@@ -1249,14 +1249,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.planRepairCmd(m.SelectedConnection().ID)
 		} else if m.screen == ScreenDiscovery && len(m.discovery) > 0 {
 			svc := m.discovery[m.discoverySelected]
-			m.wizard = screens.NewWizardForService(m.client, m.providerSnapshot(), m.usableAccounts(), svc.Address, svc.Protocol).WithContext(m.rootCtx)
+			m.wizard = screens.NewWizardForService(m.client, m.providerSnapshot(), svc.Address, svc.Protocol).WithContext(m.rootCtx)
 			m.status = ""
 			m.pushScreen(ScreenNewConnection)
 		}
 
 	case "n":
 		if m.screen == ScreenHome {
-			m.wizard = screens.NewWizard(m.client, m.providerSnapshot(), m.usableAccounts()).WithContext(m.rootCtx)
+			m.wizard = screens.NewWizard(m.client, m.providerSnapshot()).WithContext(m.rootCtx)
 			m.status = ""
 			m.pushScreen(ScreenNewConnection)
 		}
@@ -1341,17 +1341,6 @@ func (m *Model) providerSnapshot() []ipc.ProviderDTO {
 	return append([]ipc.ProviderDTO(nil), m.snapshot.Providers...)
 }
 
-// usableAccounts returns the accounts that can actually be selected, across
-// every provider. Pending accounts are deliberately excluded: offering one
-// would bind a connection to an account its provider cannot serve.
-func (m *Model) usableAccounts() []ipc.ProviderAccountDTO {
-	var accounts []ipc.ProviderAccountDTO
-	for _, p := range m.snapshot.Providers {
-		accounts = append(accounts, p.Accounts...)
-	}
-	return accounts
-}
-
 // handleWizardKey routes keys to the new-connection wizard.
 func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 	if m.wizard == nil {
@@ -1361,8 +1350,12 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 	}
 
 	switch m.wizard.Step() {
-	case screens.WizardStepIntent:
-		// Backing out of the first step returns home.
+	case screens.WizardStepOutcome:
+		// Backing out of the first question returns home. It was the intent
+		// question that exited, which stopped being first when the wizard
+		// began by asking what the user was trying to do — so escaping the
+		// outcome question did nothing, and escaping the intent question left
+		// the wizard entirely instead of returning to the outcome it came from.
 		if key == "esc" || key == "q" {
 			m.wizard = nil
 			m.screen = ScreenHome

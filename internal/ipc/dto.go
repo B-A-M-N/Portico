@@ -460,6 +460,10 @@ type ProviderRecommendationRequest struct {
 	ProtectionKind   string `json:"protection_kind,omitempty"`
 	RequestedAddress string `json:"requested_address,omitempty"`
 	PreferredAccount string `json:"preferred_account,omitempty"`
+	// PreferredProvider owns PreferredAccount. Account identity is the pair, so
+	// a preference carrying only the account ID matches any provider that
+	// happens to have an account of that name.
+	PreferredProvider string `json:"preferred_provider,omitempty"`
 }
 
 // ProviderRecommendationResponse contains the recommendation result.

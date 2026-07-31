@@ -56,7 +56,7 @@ func TestEmailOTPProtectionRulesAreValidatedAndIncludedInRequest(t *testing.T) {
 		t.Fatalf("domains = %#v, want %#v", domains, want)
 	}
 
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{
 		Name:           "Protected service",
 		SourceType:     "existing_service",
@@ -85,10 +85,10 @@ func TestEmailOTPProtectionRulesRejectEmptyAndMalformedValues(t *testing.T) {
 }
 
 func TestProtectionChoicesFollowConfiguredCapabilities(t *testing.T) {
-	if got := NewWizard(nil, quickTunnelOnlySnapshot(), nil).protections(); !reflect.DeepEqual(got, []string{"none"}) {
+	if got := NewWizard(nil, quickTunnelOnlySnapshot()).protections(); !reflect.DeepEqual(got, []string{"none"}) {
 		t.Fatalf("limited choices = %#v", got)
 	}
-	full := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	full := NewWizard(nil, fullCloudflareSnapshot())
 	full.state.ExposureMode = "permanent_public"
 	if got := full.protections(); !reflect.DeepEqual(got, []string{"none", "email_otp"}) {
 		t.Fatalf("full choices = %#v", got)
@@ -103,7 +103,7 @@ func TestWizardSelectsConfiguredCloudflareAccount(t *testing.T) {
 		{ID: "account-a", Label: "Personal", Status: "authenticated"},
 		{ID: "account-b", Label: "Work", Status: "authenticated"},
 	}
-	m := NewWizard(nil, snapshot, nil)
+	m := NewWizard(nil, snapshot)
 	m.state = WizardState{
 		Step: WizardStepProvider, Name: "Service", SourceType: "existing_service",
 		SourceAddress: "127.0.0.1", SourceProtocol: "http", Port: "8080",
@@ -124,7 +124,7 @@ func TestWizardSelectsConfiguredCloudflareAccount(t *testing.T) {
 }
 
 func TestWizardDoesNotOfferUnsupportedProtectionOrExposure(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	if view := m.renderExposure(); !strings.Contains(view, "Permanently") {
 		t.Fatalf("full Cloudflare exposure options omit permanent exposure: %s", view)
 	}
@@ -142,7 +142,7 @@ func TestCommandWizardMapsArgumentsAndWorkingDirectory(t *testing.T) {
 	if want := []string{"serve", "--host", "127.0.0.1", "--title", "hello world"}; !reflect.DeepEqual(args, want) {
 		t.Fatalf("args = %#v, want %#v", args, want)
 	}
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{
 		Name: "Command service", SourceType: "command", SourceAddress: "npm", Port: "3000",
 		CommandArgs: args, WorkingDir: "/work/app", ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
@@ -204,7 +204,7 @@ func TestArgvPreviewShowsExactArguments(t *testing.T) {
 }
 
 func TestDirectoryWizardMapsServingModeAndPermissions(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{
 		Name: "Files", SourceType: "directory", SourceAddress: "/srv/files",
 		DirectoryMode: "writes", AllowUpload: true, AllowDelete: true,
@@ -223,7 +223,7 @@ func TestDirectoryWizardQuickTunnelFiltersWriteModes(t *testing.T) {
 	// Without full Cloudflare (Quick Tunnel only), write-enabled modes
 	// should not be offered because they require protection, which
 	// requires a permanent hostname.
-	m := NewWizard(nil, quickTunnelOnlySnapshot(), nil)
+	m := NewWizard(nil, quickTunnelOnlySnapshot())
 	m.state = WizardState{Step: WizardStepDirectoryMode, SourceType: "directory"}
 
 	choices := m.directoryModeChoices()
@@ -237,7 +237,7 @@ func TestDirectoryWizardQuickTunnelFiltersWriteModes(t *testing.T) {
 	}
 
 	// With full Cloudflare, all 4 modes should be available.
-	full := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	full := NewWizard(nil, fullCloudflareSnapshot())
 	full.state = WizardState{Step: WizardStepDirectoryMode, SourceType: "directory"}
 	fullChoices := full.directoryModeChoices()
 	if len(fullChoices) != 4 {
@@ -246,12 +246,12 @@ func TestDirectoryWizardQuickTunnelFiltersWriteModes(t *testing.T) {
 }
 
 func TestMCPWizardMapsTransportAndConstrainsSSEExposure(t *testing.T) {
-	limited := NewWizard(nil, quickTunnelOnlySnapshot(), nil)
+	limited := NewWizard(nil, quickTunnelOnlySnapshot())
 	if got := limited.mcpTransports(); !reflect.DeepEqual(got, []string{"http", "streamable_http"}) {
 		t.Fatalf("limited MCP transports = %#v", got)
 	}
 
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{
 		Name: "MCP service", SourceType: "mcp_server", SourceAddress: "http://127.0.0.1:3000/mcp",
 		MCPTransport: "sse", ExposureMode: "permanent_public", Protection: "none", Provider: "cloudflare",
@@ -266,7 +266,7 @@ func TestMCPWizardMapsTransportAndConstrainsSSEExposure(t *testing.T) {
 }
 
 func TestMCPCommandWizardMapsOwnedCommand(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{
 		Name: "Managed MCP", SourceType: "mcp_server", MCPCommand: true, SourceAddress: "mcp-server",
 		Port: "3001", CommandArgs: []string{"--port", "3001"}, WorkingDir: "/work/mcp",
@@ -283,7 +283,7 @@ func TestMCPCommandWizardMapsOwnedCommand(t *testing.T) {
 }
 
 func TestCommandOriginRequiresPortBeforeAdvancing(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{Step: WizardStepPort, SourceType: "mcp_server", MCPCommand: true}
 	m.HandleKey("enter")
 	if m.Step() != WizardStepPort || m.err == nil || !strings.Contains(m.err.Error(), "requires a local port") {
@@ -292,7 +292,7 @@ func TestCommandOriginRequiresPortBeforeAdvancing(t *testing.T) {
 }
 
 func TestWizardBuildRequestSetsLifecycleDefaults(t *testing.T) {
-	m := NewWizard(nil, quickTunnelOnlySnapshot(), nil)
+	m := NewWizard(nil, quickTunnelOnlySnapshot())
 	m.state = WizardState{
 		Step:           WizardStepReview,
 		SourceType:     "existing_service",
@@ -320,7 +320,7 @@ func TestWizardBuildRequestSetsLifecycleDefaults(t *testing.T) {
 }
 
 func TestWizardProtocolSelection(t *testing.T) {
-	m := NewWizard(nil, quickTunnelOnlySnapshot(), nil)
+	m := NewWizard(nil, quickTunnelOnlySnapshot())
 	m.state = WizardState{
 		Step:       WizardStepProtocol,
 		SourceType: "existing_service",
@@ -411,7 +411,7 @@ func TestWizardOpenAfterCreateRequestsPlan(t *testing.T) {
 		plan:      plan,
 		operation: &ipc.OperationDTO{ID: "op-1", State: "running"},
 	}
-	m := NewWizard(client, quickTunnelOnlySnapshot(), nil)
+	m := NewWizard(client, quickTunnelOnlySnapshot())
 	m.state = WizardState{
 		Step:          WizardStepReview,
 		SourceType:    "existing_service",
@@ -511,7 +511,7 @@ func TestWizardOpenAfterCreateRequestsPlan(t *testing.T) {
 
 func TestWizardSaveClosedSkipsPlan(t *testing.T) {
 	client := &fakeWizardClient{createdID: "conn-new"}
-	m := NewWizard(client, quickTunnelOnlySnapshot(), nil)
+	m := NewWizard(client, quickTunnelOnlySnapshot())
 	m.state = WizardState{
 		Step:          WizardStepReview,
 		SourceType:    "existing_service",
@@ -578,7 +578,7 @@ func TestWizardEditInputIsRuneAware(t *testing.T) {
 // wizard polled the operation every 750ms regardless of the event stream that
 // already existed, so progress was driven by a timer rather than by events.
 func TestWizardUsesEventStreamRatherThanTightPolling(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.operation = &ipc.OperationDTO{ID: "op-1", State: "running"}
 
 	// With the stream live, polling backs off to a safety net.
@@ -612,7 +612,7 @@ func TestWizardUsesEventStreamRatherThanTightPolling(t *testing.T) {
 // TestWizardExposesItsOperationForEventRouting ensures the root model can match
 // incoming events to the wizard's operation.
 func TestWizardExposesItsOperationForEventRouting(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	if m.OperationID() != "" {
 		t.Fatalf("OperationID = %q before an operation exists", m.OperationID())
 	}
@@ -626,7 +626,7 @@ func TestWizardExposesItsOperationForEventRouting(t *testing.T) {
 // "What should be reachable?", a source-type question, so a user had to
 // understand Portico's internal model before stating a goal.
 func TestWizardOpensOnAnOutcomeQuestion(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	if m.Step() != WizardStepOutcome {
 		t.Fatalf("wizard opens on step %d, want the outcome step", m.Step())
 	}
@@ -644,7 +644,7 @@ func TestWizardOpensOnAnOutcomeQuestion(t *testing.T) {
 // TestChoosingAnOutcomeSkipsTheQuestionsItAnswers ensures a recipe presets what
 // it determines rather than asking again in provider terminology.
 func TestChoosingAnOutcomeSkipsTheQuestionsItAnswers(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.HandleKey("enter") // first recipe: temporary web app
 
 	if m.state.SourceType != "existing_service" {
@@ -664,7 +664,7 @@ func TestChoosingAnOutcomeSkipsTheQuestionsItAnswers(t *testing.T) {
 // TestAdvancedOutcomeFallsBackToTheSourceQuestion keeps the original flow
 // reachable for users who want it.
 func TestAdvancedOutcomeFallsBackToTheSourceQuestion(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	for range len(wizardRecipes) - 1 {
 		m.HandleKey("down")
 	}
@@ -695,7 +695,7 @@ func TestUnavailableOutcomeIsRefusedRatherThanSubstituted(t *testing.T) {
 		t.Fatal("no ChatGPT outcome is offered")
 	}
 
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	for range index {
 		m.HandleKey("down")
 	}

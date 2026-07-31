@@ -124,13 +124,15 @@ type providerCapabilities struct {
 	providers []ipc.ProviderDTO
 }
 
-// usable reports whether a provider can be planned against right now.
+// usableProvider reports whether a provider can be planned against right now.
+//
+// This matches what the recommendation engine will accept. The two used to
+// disagree — the engine also refuses experimental and degraded providers — so
+// when a recommendation failed or was discarded, the fallback list offered
+// providers the engine considers unusable, and their capabilities made options
+// look deliverable that nothing could deliver.
 func usableProvider(p ipc.ProviderDTO) bool {
-	switch p.Availability {
-	case "not_implemented", "client_missing":
-		return false
-	}
-	return true
+	return p.Availability == "ready"
 }
 
 // supporting returns the display names of usable providers satisfying a

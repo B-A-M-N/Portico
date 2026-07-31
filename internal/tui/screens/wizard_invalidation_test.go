@@ -12,7 +12,7 @@ import (
 // validation rejects, and the rejection arrived at create — a long way from the
 // question that caused it.
 func TestChangingTheAddressDiscardsProtectionThatNeedsIt(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state.SourceType = "existing_service"
 	m.state.ExposureMode = "permanent_public"
 	m.state.Protection = "email_otp"
@@ -33,7 +33,7 @@ func TestChangingTheAddressDiscardsProtectionThatNeedsIt(t *testing.T) {
 // TestChangingTheAddressKeepsProtectionThatStillWorks ensures the rule discards
 // only what became impossible.
 func TestChangingTheAddressKeepsProtectionThatStillWorks(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state.SourceType = "existing_service"
 	m.state.ExposureMode = "temporary_public"
 	m.state.Protection = "none"
@@ -52,7 +52,7 @@ func TestChangingTheAddressKeepsProtectionThatStillWorks(t *testing.T) {
 // question after the provider it belonged to went away — would otherwise have
 // nowhere to go back to, because the step is no longer in the sequence.
 func TestAQuestionLeavingTheSequenceDoesNotStrandTheUser(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state.SourceType = "existing_service"
 	m.state.ExposureMode = "temporary_public"
 	m.state.Protection = "none"
@@ -82,7 +82,7 @@ func TestAQuestionLeavingTheSequenceDoesNotStrandTheUser(t *testing.T) {
 // listening. Applying it in only one of the two places scores a provider with
 // no protocol constraint and then creates a connection that has one.
 func TestTheEvaluationAndTheConnectionDescribeTheSameThing(t *testing.T) {
-	m := NewWizard(nil, fullCloudflareSnapshot(), nil)
+	m := NewWizard(nil, fullCloudflareSnapshot())
 	m.state = WizardState{
 		Name: "demo", SourceType: "existing_service",
 		SourceAddress: "127.0.0.1", Port: "8080",
@@ -109,5 +109,58 @@ func TestTheEvaluationAndTheConnectionDescribeTheSameThing(t *testing.T) {
 	}
 	if scored.ConnectionKind != built.Kind {
 		t.Fatalf("scored kind %q, created %q", scored.ConnectionKind, built.Kind)
+	}
+}
+
+// TestChoosingAPreparedOutcomeAfterTheAdvancedOneForgetsIt pins that the
+// intent question belongs to the path that asked it.
+//
+// The advanced flag was set on choosing the advanced route and never cleared,
+// so switching to a prepared outcome left the intent question in the sequence
+// and going back from the name question landed on a question that path never
+// asked.
+func TestChoosingAPreparedOutcomeAfterTheAdvancedOneForgetsIt(t *testing.T) {
+	m := NewWizard(nil, fullCloudflareSnapshot())
+
+	// Choose the advanced route.
+	advanced := -1
+	for i, recipe := range wizardRecipes {
+		if recipe.Advanced {
+			advanced = i
+		}
+	}
+	if advanced < 0 {
+		t.Skip("no advanced recipe to exercise")
+	}
+	m.selected = advanced
+	m.HandleKey("enter")
+	if m.Step() != WizardStepIntent || !m.state.Advanced {
+		t.Fatalf("advanced route not taken: step=%d advanced=%v", m.Step(), m.state.Advanced)
+	}
+
+	// Go back and choose a prepared outcome instead.
+	m.HandleKey("esc")
+	if m.Step() != WizardStepOutcome {
+		t.Fatalf("back from intent landed on %d, want the outcome question", m.Step())
+	}
+	prepared := -1
+	for i, recipe := range wizardRecipes {
+		if !recipe.Advanced && recipe.Unavailable == "" {
+			prepared = i
+			break
+		}
+	}
+	m.selected = prepared
+	m.HandleKey("enter")
+
+	if m.state.Advanced {
+		t.Fatal("the advanced route was still recorded after choosing a prepared outcome")
+	}
+	if m.Step() != WizardStepName {
+		t.Fatalf("step = %d, want the name question", m.Step())
+	}
+	m.HandleKey("esc")
+	if m.Step() != WizardStepOutcome {
+		t.Fatalf("back from name landed on %d, want the outcome question this path came from", m.Step())
 	}
 }

@@ -2077,3 +2077,53 @@ func TestSetupScreenReportsAFailedCheckAsAFailure(t *testing.T) {
 		t.Fatalf("failed check does not disclaim health:\n%s", view)
 	}
 }
+
+// TestEscapingTheFirstWizardQuestionReturnsHome pins which question is first.
+//
+// The root model exited from the intent question, which stopped being first
+// when the wizard began by asking what the user was trying to do. Escaping the
+// outcome question did nothing, and escaping the intent question left the
+// wizard entirely instead of returning to the outcome it came from.
+func TestEscapingTheFirstWizardQuestionReturnsHome(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m, _ = press(t, m, "n")
+	if m.wizard == nil || m.wizard.Step() != screens.WizardStepOutcome {
+		t.Fatalf("wizard did not open on the outcome question")
+	}
+
+	m, _ = press(t, m, "esc")
+	if m.screen != ScreenHome || m.wizard != nil {
+		t.Fatalf("escaping the first question did not return home: screen=%q", m.screen)
+	}
+}
+
+// TestEscapingTheIntentQuestionReturnsToTheOutcome pins that a question reached
+// from another returns to it rather than abandoning the wizard.
+func TestEscapingTheIntentQuestionReturnsToTheOutcome(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m, _ = press(t, m, "n")
+
+	// Walk to the advanced outcome and take it.
+	for m.wizard.Step() == screens.WizardStepOutcome {
+		before := m.wizard.Step()
+		m, _ = press(t, m, "down")
+		if m.wizard.Step() != before {
+			break
+		}
+		if m.wizard.SelectedIndex() >= screens.WizardRecipeCount()-1 {
+			break
+		}
+	}
+	m, _ = press(t, m, "enter")
+	if m.wizard == nil || m.wizard.Step() != screens.WizardStepIntent {
+		t.Skipf("the advanced route was not reached: step=%d", m.wizard.Step())
+	}
+
+	m, _ = press(t, m, "esc")
+	if m.wizard == nil {
+		t.Fatal("escaping the intent question abandoned the wizard")
+	}
+	if m.wizard.Step() != screens.WizardStepOutcome {
+		t.Fatalf("step = %d, want the outcome question it came from", m.wizard.Step())
+	}
+}

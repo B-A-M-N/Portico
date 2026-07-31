@@ -644,15 +644,25 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 		return nil, core.ErrProfileNotFound(connID)
 	}
 
-	prov, err := c.providerForProfile(profile)
-	if err != nil {
-		return nil, err
-	}
-
 	// New profiles are stored as DesiredClosed; the provider needs an
 	// open-intent profile to generate the correct plan.
 	openProfile := profile.DeepCopy()
 	openProfile.Desired = core.DesiredOpen
+
+	// A stored profile is validated here rather than when it is loaded.
+	// Rejecting it at load would make a connection disappear because a rule
+	// tightened; rejecting it here refuses only the attempt to open it, and
+	// says why. Without this a profile saved under an older rule reached the
+	// provider and failed there, far from the reason.
+	if err := openProfile.Validate(); err != nil {
+		return nil, core.ErrValidation(
+			"this saved connection can no longer be opened: " + err.Error())
+	}
+
+	prov, err := c.providerForProfile(profile)
+	if err != nil {
+		return nil, err
+	}
 
 	// Prepare/resolve the local origin before calling the provider. Owned
 	// origins are represented by an explicit plan step and are started only

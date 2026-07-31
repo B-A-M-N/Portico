@@ -41,14 +41,15 @@ func (m *WizardModel) recommendationRequest() ipc.ProviderRecommendationRequest 
 		protocol = "http"
 	}
 	return ipc.ProviderRecommendationRequest{
-		ConnectionKind:   "service_exposure",
-		SourceKind:       m.state.SourceType,
-		MCPTransport:     m.state.MCPTransport,
-		ExposureMode:     m.state.ExposureMode,
-		Protocol:         protocol,
-		ProtectionKind:   m.state.Protection,
-		RequestedAddress: m.state.Hostname,
-		PreferredAccount: m.state.AccountID,
+		ConnectionKind:    "service_exposure",
+		SourceKind:        m.state.SourceType,
+		MCPTransport:      m.state.MCPTransport,
+		ExposureMode:      m.state.ExposureMode,
+		Protocol:          protocol,
+		ProtectionKind:    m.state.Protection,
+		RequestedAddress:  m.state.Hostname,
+		PreferredAccount:  m.state.AccountID,
+		PreferredProvider: m.state.Provider,
 	}
 }
 
@@ -57,7 +58,8 @@ func (m *WizardModel) recommendationRequest() ipc.ProviderRecommendationRequest 
 func requirementFingerprint(req ipc.ProviderRecommendationRequest) string {
 	return strings.Join([]string{
 		req.ConnectionKind, req.SourceKind, req.MCPTransport, req.ExposureMode,
-		req.Protocol, req.ProtectionKind, req.RequestedAddress, req.PreferredAccount,
+		req.Protocol, req.ProtectionKind, req.RequestedAddress,
+		req.PreferredProvider, req.PreferredAccount,
 	}, "|")
 }
 
@@ -294,10 +296,13 @@ func (m *WizardModel) requirementSummary() string {
 // accountsFor returns the accounts belonging to one provider that can actually
 // be used.
 //
-// The wizard previously held a single flat list, so with more than one provider
-// configured it would have offered another provider's accounts. Only usable
-// accounts appear: selecting a pending one would bind the connection to an
-// account its provider cannot serve, and the failure would surface at open.
+// The wizard previously held a single flat list across every provider, and a
+// provider with no accounts of its own fell back to it — so an accountless
+// Cloudflare would have been bound to an ngrok account, and the failure would
+// surface later as an unavailable provider account. There is no fallback: an
+// account belongs to one provider. Only usable accounts appear, because
+// selecting a pending one binds a connection to something its provider cannot
+// serve.
 func (m *WizardModel) accountsFor(providerID string) []ipc.ProviderAccountDTO {
 	var accounts []ipc.ProviderAccountDTO
 	for _, p := range m.caps.providers {
@@ -305,11 +310,6 @@ func (m *WizardModel) accountsFor(providerID string) []ipc.ProviderAccountDTO {
 			continue
 		}
 		accounts = append(accounts, p.Accounts...)
-	}
-	if len(accounts) == 0 {
-		// Before the snapshot carried per-provider accounts the wizard was
-		// handed a flat list; honour it so an older caller still works.
-		accounts = m.accounts
 	}
 	return accounts
 }
@@ -334,26 +334,33 @@ func (m *WizardModel) pendingAccountsFor(providerID string) []ipc.ProviderAccoun
 func (m *WizardModel) selectAccountFor(providerID string) {
 	accounts := m.accountsFor(providerID)
 
-	if preferred := m.recommendedAccountFor(providerID); preferred != "" {
-		for _, account := range accounts {
-			if account.ID == preferred {
-				m.state.AccountID = preferred
-				m.state.Step = WizardStepReview
-				return
-			}
-		}
-	}
-
 	switch len(accounts) {
 	case 0:
 		m.state.AccountID = ""
 		m.state.Step = WizardStepReview
 	case 1:
+		// No choice to offer.
 		m.state.AccountID = accounts[0].ID
 		m.state.Step = WizardStepReview
 	default:
+		// A real choice is always asked. Adopting a recommended account here
+		// would answer a question the user can see is open, and the engine
+		// names an account for a multi-account provider by ordering rather than
+		// by judgement. It is highlighted, not chosen.
 		m.state.Step = WizardStepAccount
+		m.selected = indexOfAccount(accounts, m.recommendedAccountFor(providerID))
 	}
+}
+
+// indexOfAccount positions the cursor on an account, or on the first when it is
+// absent.
+func indexOfAccount(accounts []ipc.ProviderAccountDTO, want string) int {
+	for i, account := range accounts {
+		if account.ID == want {
+			return i
+		}
+	}
+	return 0
 }
 
 // recommendedAccountFor returns the account the engine evaluated, if it named
@@ -395,10 +402,24 @@ func (m *WizardModel) ProvidersChanged(providers []ipc.ProviderDTO) {
 	if m.state.Provider == "" {
 		return
 	}
+	providerStillUsable := false
 	for _, choice := range m.snapshotChoices() {
 		if choice.Value == m.state.Provider && choice.Available {
-			return
+			providerStillUsable = true
+			break
 		}
+	}
+	if providerStillUsable {
+		// The provider survives, but the account it was going to use may not.
+		if m.state.AccountID != "" && !containsAccount(m.accountsFor(m.state.Provider), m.state.AccountID) {
+			m.err = fmt.Errorf("the account this connection was going to use is no longer available")
+			m.state.AccountID = ""
+			if m.state.Step > WizardStepAccount {
+				m.state.Step = WizardStepProvider
+				m.selected = 0
+			}
+		}
+		return
 	}
 	// The chosen provider cannot carry this any more. Saying so beats
 	// discovering it when the connection refuses to open.
@@ -423,7 +444,7 @@ func sameProviderLandscape(before, after []ipc.ProviderDTO) bool {
 		if a.ID != b.ID || a.Availability != b.Availability || a.Readiness != b.Readiness {
 			return false
 		}
-		if len(a.Accounts) != len(b.Accounts) || len(a.PendingAccounts) != len(b.PendingAccounts) {
+		if !sameAccounts(a.Accounts, b.Accounts) || !sameAccounts(a.PendingAccounts, b.PendingAccounts) {
 			return false
 		}
 		if (a.Capabilities == nil) != (b.Capabilities == nil) {
@@ -447,6 +468,21 @@ func sameCapabilities(a, b ipc.CapabilitySetDTO) bool {
 		equalStringSlices(a.Protocols, b.Protocols)
 }
 
+// sameAccounts compares the account fields the wizard selects from and renders.
+// Comparing only counts treated one account being replaced by another as no
+// change at all, so a selection could survive the account it named going away.
+func sameAccounts(a, b []ipc.ProviderAccountDTO) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID || a[i].Status != b[i].Status || a[i].Label != b[i].Label {
+			return false
+		}
+	}
+	return true
+}
+
 func equalStringSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -457,4 +493,14 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// containsAccount reports whether an account is still present.
+func containsAccount(accounts []ipc.ProviderAccountDTO, id string) bool {
+	for _, account := range accounts {
+		if account.ID == id {
+			return true
+		}
+	}
+	return false
 }

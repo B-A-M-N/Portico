@@ -12,7 +12,7 @@ import (
 // recommendation depends on.
 func wizardAtProviderStep(t *testing.T, client ConnectionCreator) *WizardModel {
 	t.Helper()
-	m := NewWizard(client, fullCloudflareSnapshot(), nil)
+	m := NewWizard(client, fullCloudflareSnapshot())
 	m.state.SourceType = "existing_service"
 	m.state.SourceProtocol = "http"
 	m.state.ExposureMode = "permanent_public"

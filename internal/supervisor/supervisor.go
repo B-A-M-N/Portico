@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -492,6 +493,13 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 				dto.Capabilities.Protocols = append(dto.Capabilities.Protocols, string(proto))
 			}
 		}
+		// Protocols come from a map, so their order varies between calls.
+		// Sorting makes the wire representation deterministic: a client
+		// comparing successive snapshots to detect provider changes would
+		// otherwise see the same capabilities as different and discard work
+		// that was still valid.
+		sort.Strings(dto.Capabilities.Protocols)
+		sort.Strings(dto.Capabilities.ProtectionModes)
 		if caps.Expiration.Supported && caps.Expiration.MaxDuration > 0 {
 			dto.Capabilities.ExpirationMaxSecs = int(caps.Expiration.MaxDuration.Seconds())
 		}
@@ -700,14 +708,15 @@ func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecomme
 	// implementation ignored them entirely and returned whichever provider
 	// happened to be authenticated first.
 	input := controller.RecommendationInput{
-		Kind:             core.ConnectionKind(req.ConnectionKind),
-		SourceKind:       core.SourceKind(req.SourceKind),
-		MCPTransport:     core.MCPTransport(req.MCPTransport),
-		ExposureMode:     core.ExposureMode(req.ExposureMode),
-		Protocol:         core.Protocol(req.Protocol),
-		ProtectionKind:   core.ProtectionKind(req.ProtectionKind),
-		RequestedAddress: req.RequestedAddress,
-		PreferredAccount: core.ProviderAccountID(req.PreferredAccount),
+		Kind:              core.ConnectionKind(req.ConnectionKind),
+		SourceKind:        core.SourceKind(req.SourceKind),
+		MCPTransport:      core.MCPTransport(req.MCPTransport),
+		ExposureMode:      core.ExposureMode(req.ExposureMode),
+		Protocol:          core.Protocol(req.Protocol),
+		ProtectionKind:    core.ProtectionKind(req.ProtectionKind),
+		RequestedAddress:  req.RequestedAddress,
+		PreferredAccount:  core.ProviderAccountID(req.PreferredAccount),
+		PreferredProvider: core.ProviderID(req.PreferredProvider),
 	}
 
 	rec, err := h.sup.controller.Recommend(ctx, input)

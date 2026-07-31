@@ -14,14 +14,17 @@ import (
 // evaluates providers against these requirements rather than picking whichever
 // provider happens to be authenticated first.
 type RecommendationInput struct {
-	Kind             core.ConnectionKind
-	SourceKind       core.SourceKind
-	MCPTransport     core.MCPTransport
-	ExposureMode     core.ExposureMode
-	Protocol         core.Protocol
-	ProtectionKind   core.ProtectionKind
-	RequestedAddress string
-	PreferredAccount core.ProviderAccountID
+	// PreferredProvider owns PreferredAccount. Account identity is the pair, so
+	// a preference without its provider is ambiguous.
+	PreferredProvider core.ProviderID
+	Kind              core.ConnectionKind
+	SourceKind        core.SourceKind
+	MCPTransport      core.MCPTransport
+	ExposureMode      core.ExposureMode
+	Protocol          core.Protocol
+	ProtectionKind    core.ProtectionKind
+	RequestedAddress  string
+	PreferredAccount  core.ProviderAccountID
 }
 
 // ProviderEvaluation is the verdict for one provider against the requirements.
@@ -211,15 +214,25 @@ func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput)
 		}
 	}
 
-	for _, acc := range prov.Accounts {
-		if input.PreferredAccount != "" && acc.ID == input.PreferredAccount {
-			eval.Score += 5
-			eval.AccountID = acc.ID
-			eval.Strengths = append(eval.Strengths, "uses the account you selected")
-			break
+	// An account preference belongs to the provider that owns it. Account
+	// identity is the pair, so matching on the ID alone credited a preference
+	// for one provider's "default" to every other provider with an account of
+	// the same name.
+	if input.PreferredAccount != "" && input.PreferredProvider == prov.ID {
+		for _, acc := range prov.Accounts {
+			if acc.ID == input.PreferredAccount {
+				eval.Score += 5
+				eval.AccountID = acc.ID
+				eval.Strengths = append(eval.Strengths, "uses the account you selected")
+				break
+			}
 		}
 	}
-	if eval.AccountID == "" && len(prov.Accounts) > 0 {
+	// Naming an account is a claim that this provider was evaluated with it.
+	// With one account that is true. With several, picking the first is
+	// deterministic ordering rather than a judgement, and naming it caused the
+	// caller to skip asking which one the user wanted.
+	if eval.AccountID == "" && len(prov.Accounts) == 1 {
 		eval.AccountID = prov.Accounts[0].ID
 	}
 

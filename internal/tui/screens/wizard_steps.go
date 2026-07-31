@@ -183,7 +183,7 @@ func (m *WizardModel) restoreStepInput() {
 		m.selected = choiceIndex(m.providerChoices(), m.state.Provider)
 	case WizardStepAccount:
 		m.selected = 0
-		for i, account := range m.accounts {
+		for i, account := range m.accountsFor(m.state.Provider) {
 			if account.ID == m.state.AccountID {
 				m.selected = i
 			}
