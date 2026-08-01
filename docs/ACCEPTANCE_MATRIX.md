@@ -201,6 +201,15 @@ tests on each side could not see. These rows are the corrections.
 | The report is reachable from the interface | `TestTheSupportReportIsReachableFromTheInterface` (`internal/tui/refresh_test.go`) | A CLI-only report is not where a stuck user looks. | `go test ./internal/tui/ -run TheSupportReportIsReachable` | pending |
 | **Provider validation details reach the screen** | `TestProviderValidationDetailsReachTheScreen` (`internal/tui/vertical_test.go`) | Real server, real socket, real client, real model. The same defect as account removal: a rejection is a non-2xx, so the client returns an error with a nil response, and the screen was reading the response. Verified to fail against the previous code. | `go test ./internal/tui/ -run ProviderValidationDetailsReach` | `c3eaa5e` |
 | A rejected credential is not retained | `TestARejectedCredentialIsNotRetained` | It does not stay in memory while the user retypes it, and does not appear in the error text. | `go test ./internal/tui/ -run ARejectedCredentialIsNotRetained` | `c3eaa5e` |
+| **An edit plan can actually be applied** | `TestAnEditPlanCanActuallyBeApplied` (`internal/controller/edit_test.go`) | ApplyPlan's intent dispatch omitted IntentEdit, so every edit plan returned "unknown plan intent: edit". The whole feature could be planned, previewed, approved and never applied — and every test covering it asserted on the plan without applying one. | `go test ./internal/controller/ -run TestAnEditPlanCanActuallyBeApplied` | `77b66a7` |
+| A removal without a preview is refused | `TestARemovalWithoutAPreviewIsRefused` (`internal/store/migration_chain_test.go`) | The fingerprint is required, not optional: treating an empty one as "skip the check" makes every forgetful caller silently unchecked. | `go test ./internal/store/ -run ARemovalWithoutAPreview` | `885f447` |
+| **A preview binds the apply** | `TestARemovalPreviewedBeforeTheCredentialChangedIsRefusedAsStale` | An account removed and re-added under the same key is a different subject; the old preview no longer authorises removing it. | `go test ./internal/store/ -run ARemovalPreviewedBeforeTheCredential` | `885f447` |
+| A dependency appearing after the preview blocks it | `TestARemovalPreviewedBeforeADependencyAppearedIsRefused` | Dependencies are reported before staleness: what blocks it is more use than the fact a preview aged. | `go test ./internal/store/ -run ARemovalPreviewedBeforeADependency` | `885f447` |
+| **A removal is recorded, a refusal is not** | `TestASuccessfulRemovalIsRecorded`, `TestARefusedRemovalIsNotRecorded` | The record is written in the transaction that deletes, so it cannot claim a removal that did not happen. | `go test ./internal/store/ -run ASuccessfulRemovalIsRecorded && go test ./internal/store/ -run ARefusedRemovalIsNotRecorded` | `885f447` |
+| **One dependency query serves preview and apply** | `TestThePreviewAndTheRefusalAgree` | Two would drift, and the drift would be a preview describing a removal that does something else. | `go test ./internal/store/ -run ThePreviewAndTheRefusalAgree` | `885f447` |
+| No client invents what a removal does | `TestTheRemovalScreenShowsWhatTheSupervisorSaid` (`internal/tui/vertical_test.go`) | The screen promised to forget a credential Portico might not hold; the sentence now comes from the supervisor. | `go test ./internal/tui/ -run TheRemovalScreenShowsWhat` | `885f447` |
+| The removal carries the preview's fingerprint | `TestARemovalCarriesThePreviewsFingerprint`, `TestAnUnremovableAccountSendsNoRemoval` | What was confirmed is what is applied, and nothing is sent that the preview said could not be. | `go test ./internal/tui/ -run ARemovalCarriesThePreviews && go test ./internal/tui/ -run AnUnremovableAccountSendsNo` | `885f447` |
+| Only one fourth path segment is accepted | `TestTheRemovalPreviewIsReachable`, `TestOnlyTheRemovalPreviewIsAcceptedAsAFourthSegment` | The parser widened by one literal; every other four-segment path is still refused. | `go test ./internal/ipc/ -run TheRemovalPreviewIsReachable && go test ./internal/ipc/ -run OnlyTheRemovalPreviewIsAccepted` | `885f447` |
 | **The matrix is verified, not trusted** | — | `make acceptance` runs every cited command and checks every cited test name exists. Its first run found four renamed tests and a wrong exit code in itself. | `make acceptance` | pending |
 
 
@@ -250,12 +259,17 @@ none.
   is the condition a developer machine does not reproduce. An earlier version of
   this document claimed no flaky test had been observed; that claim was made
   before anything had looked hard enough.
-- **Account removal is not yet expressed as a previewed plan.** Every other
-  mutation here is an immutable plan the user approves. Removal deletes
-  credential state directly, behind a confirmation screen that states what will
-  happen. The safety problems — stranding a connection, orphaning a cleanup
-  obligation — are fixed transactionally, so what remains is a consistency gap
-  rather than a hazard. It is tracked, not done.
+- **Account removal is deliberately not a plan**, and that is a decision rather
+  than an omission. An architect pass declined the machinery: account creation
+  writes the same durable credential state with no plan, so if removal violated
+  the invariant, creation would violate it equally. The plan boundary governs
+  mutations with provider-visible state, ordered steps that can stop partway,
+  and therefore compensation — removal has none of the three. What a preview
+  actually buys is implemented instead: the preview is computed from the same
+  evidence the removal decides on, a fingerprint binds preview to apply, and the
+  removal is recorded in the transaction that deletes. The reasoning is in
+  `ACCOUNT_REMOVAL_DESIGN.md` so the next non-connection mutation does not have
+  to re-litigate it.
 - **Vertical coverage is partial.** There are now real-server, real-socket,
   real-model tests for account-removal refusals and for provider validation
   details — the two places this defect was found — and the package exposes a
