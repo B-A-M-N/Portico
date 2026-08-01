@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
@@ -316,5 +317,71 @@ func TestProtectionChangeReplacesAccessOnly(t *testing.T) {
 	}
 	if delta.InvalidatedResources[core.ResourceTunnel] || delta.InvalidatedResources[core.ResourceDNSRecord] {
 		t.Fatalf("a protection change churned unrelated resources: %#v", delta.InvalidatedResources)
+	}
+}
+
+// TestAnEditPlanCanActuallyBeApplied pins the boundary the edit tests never
+// crossed.
+//
+// PlanEdit built plans with core.IntentEdit, and ApplyPlan's intent dispatch
+// listed open, close, repair and delete — so every edit plan fell to the
+// default branch and returned "unknown plan intent: edit". The whole edit
+// feature could be previewed and never applied.
+//
+// Every existing edit test asserted on the plan. None applied one, which is why
+// a feature that could not work looked covered.
+func TestAnEditPlanCanActuallyBeApplied(t *testing.T) {
+	ctx := context.Background()
+	current := editProfile("original", "old.example.com", core.ProtectionSpec{Kind: core.ProtectionNone})
+	c := editController(t, current, false, nil)
+
+	proposed := current.DeepCopy()
+	proposed.Name = "renamed"
+
+	plan, _, err := c.PlanEdit(ctx, current.ID, proposed)
+	if err != nil {
+		t.Fatalf("PlanEdit: %v", err)
+	}
+	if len(plan.Steps) == 0 {
+		t.Fatal("the fixture no longer produces an edit with steps")
+	}
+	if err := c.SavePlan(plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+
+	op, err := c.ApplyPlan(ctx, plan.ID)
+	if err != nil {
+		if strings.Contains(err.Error(), "unknown plan intent") {
+			t.Fatalf("an edit plan cannot be applied at all: %v", err)
+		}
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	// Execution is asynchronous, so wait for the operation to finish before
+	// asking whether the edit took effect.
+	deadline := time.Now().Add(10 * time.Second)
+	var final *Operation
+	for time.Now().Before(deadline) {
+		snap, ok := c.GetOperation(op.ID)
+		if ok && (snap.State == OperationStateCompleted || snap.State == OperationStateFailed) {
+			final = snap
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if final == nil {
+		t.Fatal("the edit operation never reached a terminal state")
+	}
+	if final.State != OperationStateCompleted {
+		t.Fatalf("the edit operation ended in %q: %v", final.State, final.Error)
+	}
+
+	// And the edit actually took effect.
+	applied, ok := c.GetProfile(current.ID)
+	if !ok {
+		t.Fatal("the connection is gone after applying an edit")
+	}
+	if applied.Name != "renamed" {
+		t.Fatalf("the applied profile is still named %q", applied.Name)
 	}
 }

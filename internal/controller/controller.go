@@ -1237,9 +1237,16 @@ func (c *Controller) ApplyPlan(ctx context.Context, planID core.PlanID) (Operati
 		return Operation{}, fmt.Errorf("plan validation: %w", err)
 	}
 
-	// Dispatch by plan intent — all intents use the same execPlan path
+	// Dispatch by plan intent — all intents use the same execPlan path.
+	//
+	// IntentEdit was missing from this list while PlanEdit built plans carrying
+	// it, so every edit plan fell to the default branch and reported "unknown
+	// plan intent: edit". The feature could be planned, previewed and approved,
+	// and never applied. Every test covering it asserted on the plan; none
+	// applied one, which is how a whole flow that could not work looked
+	// covered.
 	switch plan.Intent {
-	case core.IntentOpen, core.IntentClose, core.IntentRepair, core.IntentDelete:
+	case core.IntentOpen, core.IntentClose, core.IntentRepair, core.IntentDelete, core.IntentEdit:
 		return c.execPlan(ctx, plan, prov)
 	default:
 		return Operation{}, fmt.Errorf("unknown plan intent: %s", plan.Intent)
