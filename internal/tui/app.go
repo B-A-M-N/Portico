@@ -752,9 +752,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// step, which is what validation almost always rejects. Restarting
 			// at step one discarded correct input for no reason.
 			m.providerSetupError = msg.Err.Error()
-			if msg.Response != nil && len(msg.Response.MissingPermissions) > 0 {
+			// Read from the error, not the response. A rejected credential is
+			// a non-2xx reply, so the real client returns an error and a nil
+			// response — this checked the response and therefore never showed
+			// a missing permission through the actual transport, exactly as
+			// the account-removal path did.
+			if missing := missingPermissions(msg.Err, msg.Response); len(missing) > 0 {
 				m.providerSetupError += "\n\nThe token is missing:\n  • " +
-					strings.Join(msg.Response.MissingPermissions, "\n  • ")
+					strings.Join(missing, "\n  • ")
 			}
 			// The rejected secret must not stay in memory while the user
 			// retypes it. Return to the secret field, which is what validation
@@ -3876,4 +3881,22 @@ func (m *Model) supportExportCmd() tea.Cmd {
 		}
 		return supportExportedMsg{Path: path}
 	}
+}
+
+// missingPermissions reports which permissions a rejected credential lacks.
+//
+// The details arrive on the error, because a refusal is a non-2xx response and
+// the client returns no body with it. The response argument covers the callers
+// that do have one.
+func missingPermissions(err error, response *ipc.ConfigureProviderAccountResponse) []string {
+	var status *ipc.APIStatusError
+	if errors.As(err, &status) && status.ProviderValidation != nil {
+		if len(status.ProviderValidation.MissingPermissions) > 0 {
+			return status.ProviderValidation.MissingPermissions
+		}
+	}
+	if response != nil {
+		return response.MissingPermissions
+	}
+	return nil
 }
