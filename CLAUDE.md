@@ -204,7 +204,17 @@ New work item starts back at its declared tier.
 
 ### Work packages
 
-In order:
+> **Status as of `62903ed`: all three audits have been worked through in full.**
+> The five packages below belong to the first (production-readiness) audit and
+> are complete. A second audit of beginner trust and a third independent review
+> of the completed remediation have also been worked through. The protocol
+> above still applies to new work; the list below is history, not a queue.
+>
+> Completed requirements are mapped to tests in `docs/ACCEPTANCE_MATRIX.md` and
+> `docs/AUDIT_ACCEPTANCE_MATRIX.md`. `make acceptance` checks those mappings.
+> Known remaining gaps are in `docs/REMAINING_WORK.md`.
+
+First audit, in order — all complete:
 
 1. Origin lifecycle and ownership (findings 1, 3, 4, 16, 17)
 2. Mutation and durable-state safety (findings 2, 5, 6, 12)
@@ -215,6 +225,26 @@ In order:
 One package at a time. Commit before starting the next. Combine findings
 that share an interface or lifecycle correction; don't implement them
 individually.
+
+### What the three audits taught, in one place
+
+Worth reading before adding a test, because each of these produced a defect
+that a full green suite did not catch:
+
+- **A test that arranges state production cannot produce proves nothing.**
+  Scrolling shipped with nine passing tests and did not work at all, because
+  they set a viewport height that only `Update` can set.
+- **Two units passing does not make the path between them work.** Account
+  removal and provider validation both computed the right answer on the server
+  and dropped it in the client. Cross the transport in at least one test per
+  contract; `internal/tui/vertical_test.go` shows the shape.
+- **Assert across the boundary, not up to it.** Every edit test asserted on the
+  plan; none applied one, so a feature that could never be applied looked
+  covered.
+- **The same concept in two places will drift, and the copy that drifts is the
+  one nobody is looking at.** Nearly every defect found was one authority and a
+  second, weaker answer beside it.
+- **A claim in a document is a claim about the code.** Verify it or delete it.
 
 The overall remediation architecture lives in `docs/REMEDIATION_PLAN.md`
 (produced by the initial `portico-architect` invocation). Per-package

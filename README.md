@@ -2,7 +2,13 @@
 
 **Terminal-native connection manager for local services.**
 
-Portico discovers local services, creates and manages provider-backed connections (Cloudflare), keeps them alive after the TUI closes, and provides diagnostics for connection failures.
+Portico discovers local services, creates and manages provider-backed
+connections, keeps them alive after the TUI closes, and provides diagnostics for
+connection failures.
+
+Cloudflare and local port forwards work out of the box. ngrok and OpenAI's
+Secure MCP Tunnel are compiled in but disabled by default. See
+[Provider support](#current-provider-support) for what each can actually do.
 
 ```
 portico
@@ -49,12 +55,15 @@ Portico follows a strict layered architecture:
 │ - State Persistence                 │
 └──────────────┬──────────────────────┘
                │
-        ┌──────┴──────┐
-        ▼             ▼
-   Mock Adapter  Cloudflare Adapter
-                 ▼
-           cloudflared
+        ┌──────┴───────┬───────────┬──────────────┐
+        ▼              ▼           ▼              ▼
+   Cloudflare       ngrok      port forward   OpenAI tunnel
+   (cloudflared)   (agent)     (in-process)  (tunnel-client)
 ```
+
+Tailscale and zrok appear in the provider list as catalog entries with no
+adapter, so the interface can explain the gap rather than omit them. A mock
+provider exists for controller tests.
 
 ## Current Features (Implemented)
 
@@ -63,12 +72,22 @@ Portico follows a strict layered architecture:
   served by Portico, an owned HTTP command, or an HTTP/streamable/SSE MCP
   endpoint. Portico starts and stops owned directory/command origins as part
   of the same reviewed plan as the provider connector.
-- **Cloudflare provider** with Quick Tunnel support by default and named
-  tunnels/DNS when a Cloudflare account, zone, and API token are configured.
+- **Cloudflare provider** with Quick Tunnel support by default, named tunnels
+  when an account and API token are configured, and DNS plus Access protection
+  when a zone is configured as well. The zone is optional: an account without
+  one gets managed tunnels with temporary addresses.
+- **Local port forwards**, which bind a loopback port and carry traffic to a
+  remote endpoint. Creatable through the API (`POST /v1/connections` with
+  `kind: port_forward`); the wizard does not yet offer them.
 - **Temporary (Quick Tunnel)** and, when configured, **Permanent (named
   tunnel + DNS)** exposure modes.
-- The beginner TUI offers only configurations it can complete. Private
-  exposure, service tokens, and identity-provider policies are deferred.
+- **Access protection** by email passcode, naming the people or domains
+  allowed. Service tokens and identity-provider policies are deferred.
+- **Edit and copy** an existing connection. An edit is previewed as a plan and
+  carries the revision it was built from, so an edit prepared against a stale
+  view is refused rather than overwriting someone else's change. A copy is made
+  by the supervisor's deep copy and asks for its own hostname, since two
+  connections cannot share one.
 - **Lifecycle control**: auto-start, keep-alive on disconnect
 
 ### Reliability & Correctness
@@ -82,9 +101,17 @@ Portico follows a strict layered architecture:
 ### Diagnostics & Observability
 - **Route segment diagnostics** — local service → connector → provider edge → DNS → endpoint
 - **Finding classification** — errors, warnings with evidence and repair options
-- **Repair workflow** — diagnostics followed by a targeted repair-plan preview
+- **Repair workflow** — diagnostics followed by a targeted repair-plan preview,
+  verified afterwards by which findings were resolved, which remain and which
+  are new, rather than by counting them
 - **SSE event stream** — real-time operation progress with bounded replay and
   snapshot resynchronization after reconnects
+- **Operation history** with the journal of what each one did, and an explicit
+  statement of whether the list is complete or capped
+- **Support export** — a redacted report for a bug report, from the CLI
+  (`portico support export`) or the setup screen. It carries no credentials,
+  authorization headers, cookies, private keys or command environments, and is
+  written readable only by you
 
 ### CLI Interface
 ```bash
@@ -96,9 +123,18 @@ portico delete <id>             # delete connection
 portico plan open <id>          # preview open plan
 portico plan close <id>         # preview close plan
 portico plan repair <id>        # preview repair plan
-portico doctor                  # system health check
+portico apply <plan-id>         # apply a previewed plan
+portico create                  # create a connection without opening it
+portico repair <id>             # diagnose and repair
+portico doctor                  # validate prerequisites and environment
 portico discover                # discover local services
 portico logs                    # show supervisor logs
+
+portico provider list                              # providers and their accounts
+portico provider login <provider>                  # configure an account
+portico provider remove-account <provider> <id>    # forget a stored account
+
+portico support export --output report.json        # redacted diagnostic report
 
 # Serve a directory through a Portico-owned local origin
 portico serve docs --source-type directory --source ./public --yes
@@ -116,6 +152,14 @@ portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp 
 - Inspect view with route visualization
 - Plan preview with step-by-step breakdown
 - Operation progress with SSE events
+- Edit (`e`) and copy (`c`) an existing connection
+- Provider and account management, including removing a stored account —
+  refused while any connection or outstanding cleanup still needs it, and the
+  refusal names them
+- Text fields with a cursor, word motion and paste; credentials are masked as
+  they are typed
+- Scrolling on every screen, with an indicator saying how much is above and
+  below (`pgup`/`pgdn`, `home`/`end`)
 - Provider status, local-service discovery, directory/command/MCP creation,
   repair, and delete-plan previews
 
@@ -123,14 +167,20 @@ portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp 
 
 | Provider | Status | Exposure Modes | Protection |
 |----------|--------|----------------|------------|
-| Cloudflare | ✅ Implemented | Temporary; Permanent when configured | None in the TUI; email OTP with explicit allow rules in the API |
-| Ngrok | ✅ Implemented | Temporary; custom hostname with a reserved domain | Not applied — see below |
-| Tailscale | ❌ Not implemented | — | — |
-| zrok | ❌ Not implemented | — | — |
+| Cloudflare | ✅ Implemented, enabled | Temporary; Permanent when a zone is configured | Email OTP with explicit allow rules, in the TUI and the API |
+| ngrok | ✅ Implemented, disabled by default | Temporary; custom hostname with a reserved domain | Not applied — see below |
+| Port forward | ✅ Implemented, enabled | Local only — binds loopback, no public address | Not applicable; reachable only from this machine |
+| Tailscale | ❌ Not implemented — catalog entry, no adapter | — | — |
+| zrok | ❌ Not implemented — catalog entry, no adapter | — | — |
 | OpenAI Secure MCP Tunnel | ⚠️ Experimental — not usable | Private only (no public address) | Mediated by OpenAI; Portico applies none |
 
-> Cloudflare and ngrok are usable. Tailscale and zrok are planned for future
-> releases but have no implementation yet.
+> Cloudflare and local port forwards are usable out of the box. ngrok and the
+> OpenAI tunnel are compiled in and disabled by default. Tailscale and zrok
+> appear in the provider list so the interface can say Portico does not
+> implement them — a catalog entry is not an implementation.
+>
+> Only local port forwards are supported. A remote forward is refused with the
+> reason rather than accepted and left inert.
 
 **Ngrok is disabled by default and must be enabled explicitly** with
 `PORTICO_ENABLE_EXPERIMENTAL_NGROK=1`. The adapter drives the real ngrok agent
@@ -162,6 +212,12 @@ Enable it with `PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1` after installing
 ## Development
 
 ```bash
+# Everything a release must pass: format, build, vet, staticcheck, tests, race
+make validate
+
+# Check the acceptance matrix against the tests it cites
+make acceptance
+
 # Run tests
 go test ./...
 
@@ -187,9 +243,19 @@ portico supervisor run
 - Linux (for Unix sockets, process identity via /proc)
 - `cloudflared` in `PATH` (for Cloudflare provider)
 - `ngrok` in `PATH` (only for the experimental, disabled-by-default Ngrok provider)
-- For permanent Cloudflare connections: `CLOUDFLARE_API_TOKEN`, an account ID,
-  and a zone ID. Run `portico provider login cloudflare --account-id … --zone-id …`
-  to encrypt and persist this setup locally, then restart the supervisor.
+- For managed Cloudflare tunnels: an account ID and an API token. The token is
+  read from `PORTICO_CLOUDFLARE_API_TOKEN` or `CLOUDFLARE_API_TOKEN` — never
+  from a command argument, which would be recorded in shell history and visible
+  in the process list.
+
+  ```bash
+  export CLOUDFLARE_API_TOKEN=...
+  portico provider login cloudflare --account-id <id>
+  ```
+
+- A **zone ID is optional**. Without one you get managed tunnels with temporary
+  addresses; with one you also get permanent hostnames, DNS records and Access
+  protection. `provider login` reports which you ended up with.
 
 ### XDG Directory Fallback
 
@@ -220,6 +286,16 @@ go test ./internal/controller/... -v
 go vet ./...
 staticcheck ./...
 ```
+
+Two audits and an independent review have been worked through in full.
+`docs/ACCEPTANCE_MATRIX.md` and `docs/AUDIT_ACCEPTANCE_MATRIX.md` map every
+requirement to the test that holds it, the command that runs that test alone,
+and the commit that introduced it. `make acceptance` runs every one of those
+commands and fails if a row cites a test that does not exist — the matrix is
+checked, not trusted.
+
+`internal/docs` holds tests that fail when this README disagrees with the code,
+including the provider table above.
 
 ## License
 

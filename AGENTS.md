@@ -63,12 +63,16 @@ internal/
 4. **Provider status.** Derived from `internal/provider/builtin/catalog.go` and the
    adapters themselves. Check that file before trusting this table.
 
+   Line counts are deliberately not cited: they would be wrong after the next
+   edit to any adapter, and a number nobody re-checks is how documentation
+   starts lying.
+
    | Provider | Adapter | Enabled by default | Account setup | Notes |
    |---|---|---|---|---|
-   | cloudflare | yes (1633 lines) | yes | declarative flow: account ID, optional zone, API token | Tunnels, DNS, Access. Contract tests in `internal/tunnel`, `internal/dns`, `internal/access`. |
-   | ngrok | yes (702 lines) | no — experimental opt-in | agent auth token | Built against the real agent, not a stub. |
-   | openai_tunnel | yes (519 lines) | no — experimental opt-in | guidance only; Portico cannot hold the credential | Client-mediated, no public address. |
-   | port_forward | yes (314 lines) | yes | none needed | Local forwards only; remote forwards are refused with a reason. |
+   | cloudflare | yes, full adapter | yes | declarative flow: account ID, optional zone, API token | Tunnels, DNS, Access. Contract tests in `internal/tunnel`, `internal/dns`, `internal/access`. |
+   | ngrok | yes, full adapter | no — experimental opt-in | agent auth token | Built against the real agent, not a stub. |
+   | openai_tunnel | yes, full adapter | no — experimental opt-in | guidance only; Portico cannot hold the credential | Client-mediated, no public address. |
+   | port_forward | yes, full adapter | yes | none needed | Local forwards only; remote forwards are refused with a reason. |
    | tailscale | no | n/a | n/a | Catalog entry only, so the UI can explain the gap rather than omit it. |
    | zrok | no | n/a | n/a | Catalog entry only. |
    | mock | test only | n/a | n/a | Used by controller tests. |

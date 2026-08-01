@@ -90,6 +90,11 @@ func providerDescriptors(t *testing.T) map[string]releaseStatus {
 	return map[string]releaseStatus{
 		"cloudflare": derivedStatus(cfCaps),
 		"ngrok":      derivedStatus(ngrokCaps),
+		// Both have full adapters. Port forwards are enabled by default; the
+		// OpenAI tunnel is an experimental opt-in. They were absent from this
+		// map, so the README could have said anything about them.
+		"port forward":             statusImplemented,
+		"openai secure mcp tunnel": statusExperimental,
 		// No adapter package exists for these.
 		"tailscale": statusNotImplemented,
 		"zrok":      statusNotImplemented,

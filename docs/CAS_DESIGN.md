@@ -334,6 +334,12 @@ New tests in `internal/store/commit_test.go` and
 
 ### `internal/supervisor/reconcile_test.go`
 
+> **Not written.** The three tests prescribed below do not exist under these or
+> any other names. `reconcile_test.go` covers narrow drift repair thoroughly,
+> but nothing asserts the runtime-persistence rule this contract specifies.
+> A design contract listing tests that were never written is a claim of
+> coverage that is not there; it is recorded here rather than quietly dropped.
+
 5. **`TestObservePersistsRuntimeWhenNoOperationInFlight`** — wire a real
    store + controller, call `Observe`, assert the runtime row in the DB
    reflects the observed connector status. (This replaces the blanket

@@ -1,6 +1,20 @@
 # Connection editing — design contract
 
-Status: accepted (architect pass, Tier 3)
+Status: accepted (architect pass, Tier 3) — **implemented, verified 2026-07-31**
+
+> This contract was accepted and then implemented incompletely for months
+> without anyone noticing. `Controller.ApplyPlan`'s intent dispatch listed
+> open, close, repair and delete; `IntentEdit` was absent, so every edit plan
+> returned "unknown plan intent: edit" and **no edit could ever be applied**.
+>
+> The design was right. The tests were the problem: every one of them asserted
+> on the plan `PlanEdit` produced, and not one applied it, so the boundary
+> between "an edit can be previewed" and "an edit can be made" was never
+> crossed. An accepted contract is not evidence of a working implementation.
+>
+> `TestAnEditPlanCanActuallyBeApplied` now drives PlanEdit, ApplyPlan, waits
+> for the operation to reach a terminal state, and asserts the profile actually
+> changed. It fails against the previous code.
 Scope: audit item 17 — changing a connection's runtime-affecting fields.
 
 ## Invariant

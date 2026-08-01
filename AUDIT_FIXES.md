@@ -1,11 +1,26 @@
-# Production Audit Fixes - Complete
+# Production audit fixes — historical record, 2026-07-27
 
-**Date:** 2026-07-27  
-**Status:** ✅ All critical issues resolved
+> **This is a snapshot, not a current assessment.** It records what one audit
+> found and what was done about it on 2026-07-27. Two further audits have been
+> worked through since, and they found defects this document's conclusion did
+> not anticipate — including a connection-edit feature that could be previewed
+> and approved but never applied, and a scrolling implementation that did not
+> work at all despite nine passing tests.
+>
+> Its "production-ready / Grade A+" verdict below is left as written because
+> deleting it would hide that the judgement was made. It was wrong, and the
+> reason is worth keeping: every gate it cites was green at the time. Green
+> gates are evidence that the tests pass, not that the software works.
+>
+> **For the current state, read `docs/ACCEPTANCE_MATRIX.md` and
+> `docs/AUDIT_ACCEPTANCE_MATRIX.md`**, which map each requirement to the test
+> that holds it, and `make acceptance`, which checks that those tests exist and
+> pass rather than trusting the list.
 
 ## Summary
 
-All 5 critical issues identified in the production audit have been successfully resolved. The codebase now passes all quality gates including race detection stress testing.
+All 5 critical issues identified in the production audit of 2026-07-27 were
+resolved.
 
 ## Fixes Applied
 
@@ -263,19 +278,38 @@ find . -type d -empty -not -path './.git/*' | wc -l
 
 ---
 
-## Production Readiness
+## Production readiness — as judged on 2026-07-27
 
-The codebase is now **production-ready** with:
+> **Superseded.** The assessment below was made against the gates of the day and
+> did not survive contact with two later audits. It is preserved as written.
 
-✅ All critical audit issues resolved  
-✅ Comprehensive test coverage (263 tests)  
-✅ Zero race conditions detected  
-✅ Clean code formatting  
-✅ Proper documentation  
-✅ Systemd service support  
-✅ Enhanced CI/CD pipeline  
+The codebase was then described as **production-ready** with:
+
+✅ All critical audit issues resolved
+✅ Comprehensive test coverage (263 tests)
+✅ Zero race conditions detected
+✅ Clean code formatting
+✅ Proper documentation
+✅ Systemd service support
+✅ Enhanced CI/CD pipeline
 
 **Grade: A+** (upgraded from A-)
+
+### What that verdict missed
+
+Recorded because the failure mode is more useful than the grade:
+
+- **Counted tests are not covered behaviour.** 263 tests passed while a
+  connection edit could not be applied at all, because every test asserted on
+  the plan and none applied one.
+- **A green suite can hide a feature that does not work.** Scrolling shipped
+  with nine tests that set up state production never produces.
+- **Two units passing does not make the path between them work.** Account
+  removal and provider validation both computed the right answer on the server
+  and discarded it in the client; each side's tests passed.
+
+The suite now stands at 667 test functions, and the number is recorded here as
+a fact about the repository, not as evidence of anything.
 
 ---
 

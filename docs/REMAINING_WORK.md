@@ -44,57 +44,102 @@ treated as an implementation defect.
 
 **Implementation**
 
-1. Add account revoke/remove and update endpoints with a plan that protects
-   profiles still bound to that account. Do not remove credentials until no
-   profile or recovery item needs them.
-2. Replace environment-token login with stdin/protected-file-descriptor input
-   where practical, while keeping secrets out of command arguments, logs,
-   events, and responses.
-3. Add account lifecycle controls to the provider-management screen; it already
-   lists account labels/statuses, and inspect shows the selected account ID.
-4. Migrate the one-account config bootstrap into the account repository once.
-   Do not keep a permanent config-file token fallback after successful
-   migration. Retain the old read path only behind an explicit migration action
-   with a visible result.
+1. **Done.** Account removal exists end to end: a `DELETE` route, a client
+   method, `portico provider remove-account`, and an `[x]` action on the
+   providers screen. It refuses while any connection selects the account or any
+   outstanding cleanup obligation needs its credential — the check and the
+   delete happen in one transaction, so a connection bound in between cannot be
+   stranded — and the refusal names what is in the way. It is not expressed as
+   a plan, deliberately: see `ACCOUNT_REMOVAL_DESIGN.md`. What it has instead is
+   a preview computed from the same evidence the removal decides on, a
+   fingerprint binding preview to apply, and a durable record written in the
+   deleting transaction.
+
+   **Still missing:** account *update* — a credential can be replaced by
+   configuring the provider again, but there is no explicit rotate-in-place.
+
+2. **Not done.** The token still comes from the environment. Command arguments
+   are refused with the reason, and the secret stays out of logs, events and
+   responses, but stdin or a protected file descriptor would be better.
+
+3. **Mostly done.** The providers screen selects a provider and an account,
+   draws the cursor, and offers removal. Inspect shows the selected account.
+   **Still missing:** re-verify and replace-credential actions on that screen.
+
+4. **Not done.** The one-account config bootstrap has not been migrated into the
+   account repository, and the old read path is still in place.
 
 **Acceptance**
 
 - Two accounts with different tokens/zones can be added, listed, selected in
   the TUI and CLI, restarted, and used without cross-account API calls.
+  *(Holds. Account identity is the `(provider_id, id)` pair since migration 19;
+  before that a colliding account ID silently reassigned another provider's
+  account.)*
 - A profile created while one account exists retains that account after another
-  is added.
+  is added. *(Holds.)*
 - A missing/revoked account produces a typed availability error before any
-  provider request.
+  provider request. *(Holds, and an edit that would point a connection at an
+  unusable account is now refused at plan time whatever the connection's
+  state — a closed connection generates no reopen steps, so nothing else
+  consulted the provider.)*
 - Tests cover selection, restart reconstruction, wrong-account rejection, and
-  encryption-key rotation of every account credential.
+  encryption-key rotation of every account credential. *(Selection, restart
+  reconstruction and wrong-account rejection hold. **Encryption-key rotation is
+  untested.**)*
 
 ## P0 — provider contract and live Cloudflare confidence
 
 ### Complete Cloudflare contract testing
 
-**Current state**
+**Current state — partly done.**
 
-The Cloudflare adapter has direct unit tests and exact-resource observation,
-but no fake HTTP API suite that proves request construction and response
-classification through the actual Cloudflare client.
+There is now a fake HTTP API suite driving the real Cloudflare client through a
+`cf.BaseURL` seam, in `internal/tunnel/contract_test.go`,
+`internal/dns/contract_test.go` and `internal/access/contract_test.go`. It pins
+request construction (remotely-managed tunnels, proxied CNAMEs pointing at the
+tunnel, Access policies carrying the allowed identities) and the two
+classifications the repair path branches on: a 404 is an absence, a 401/403 is
+not. The first one written found a live defect — a wrapped-error type assertion
+that never matched, so a resource deleted at the provider made every repair fail
+on the lookup instead of recreating it.
 
-**Implementation**
+**What remains**
 
-1. Add a fake Cloudflare API server/transport fixture for tunnel, DNS, Access
-   application, and Access policy endpoints.
-2. Exercise exact-ID observation after a reconstructed supervisor, including
-   404, 401/403, 429, 5xx, malformed JSON, and timeouts.
-3. Verify DNS-only and Access-only drift repair makes the smallest update and
-   does not recreate an intact tunnel or connector.
-4. Verify credential-file creation, readiness, and cleanup for every connector
-   start failure path using the real adapter flow.
+1. **Done.** Fake API fixtures for tunnel, DNS, Access application and policy.
+2. **Partly done.** 404 and 401/403 are covered for every manager. **429, 5xx,
+   malformed JSON and timeouts are not**, and neither is exact-ID observation
+   after a reconstructed supervisor.
+3. **Done at the decision level, not through the fake API.**
+   `internal/supervisor/reconcile_test.go` proves that DNS-only, Access
+   application-only and Access policy-only drift each produce the narrowest
+   repair and do not recreate an intact tunnel or connector
+   (`TestReconcileOpenConnectionRepairsOnlyMissingDNS`,
+   `TestReconcileOpenConnectionUpdatesOnlyDriftedDNSTarget`,
+   `TestReconcileOpenConnectionRepairsOnlyMissingAccessApplication`,
+   `TestReconcileOpenConnectionRepairsOnlyMissingAccessPolicy`,
+   `TestReconcileOpenConnectionUpdatesOnlyDriftedAccessPolicy`).
+
+   Those exercise `computeReconcileDecision` against constructed observations.
+   What is **not** covered is the same drift arriving from the fake HTTP API
+   through the real client, so a change in how a response is classified would
+   not be caught by them.
+4. **Not done.** Credential-file creation, readiness and cleanup across
+   connector start failure paths are not exercised through the real adapter.
 
 **Acceptance**
 
-- No live Cloudflare account is needed in CI.
+- No live Cloudflare account is needed in CI. *(Holds — the suite is served by
+  a local fake.)*
 - Tests prove that unauthorized, rate-limited, and transient observations are
-  never interpreted as a missing managed resource.
+  never interpreted as a missing managed resource. *(Unauthorized holds;
+  rate-limited and transient are untested.)*
 - Tests prove terminal verification uses remote state, not adapter memory.
+  *(Not yet.)*
+
+> These tests pin Portico's half of the contract against a local fake. They are
+> not evidence about how Cloudflare behaves, and would not catch an undocumented
+> change to its API.
 
 ### Remove or isolate obsolete provider execution paths
 
@@ -135,10 +180,17 @@ sources collect HTTP, streamable HTTP, or (for permanent Cloudflare exposure)
 SSE transport. The wizard also supports command-owned MCP servers. It still
 lacks environment references and shell-mode configuration.
 
+Since this was written, the wizard's question sequence became derived rather
+than hand-written: each step declares the condition under which it is asked, so
+going back is the inverse of going forward by construction. Text fields have a
+cursor, word motion and paste. **The wizard still cannot create a port
+forward** — those are reachable only through `POST /v1/connections` with
+`kind: port_forward`.
+
 **Implementation**
 
-1. Make wizard fields capability- and source-specific rather than a static
-   sequence. Reuse the IPC source DTOs; do not construct a parallel model.
+1. **Done.** Steps are derived from predicates over the answers so far
+   (`internal/tui/screens/wizard_steps.go`), not a static sequence.
 2. Add safe tokenized input for command arguments and environment *references*
    (not raw secrets). Validate every screen before advancing.
 3. Provide a directory mode chooser, file-browser permissions, and SPA option.
@@ -167,15 +219,23 @@ lacks environment references and shell-mode configuration.
    command's environment and an existing service's health check
    (`TestTheCopyIsMadeBySupervisorNotRebuiltFromTheDetail`).
 
-2. **Partly done.** The inspect screen shows the provider, the selected account
-   and unresolved findings. **Origin ownership is still not shown** — nothing
-   on any screen says whether Portico started the local service or merely
-   connected to one it found, which is what a user needs before assuming
-   closing the connection will stop their server.
+2. **Done.** The inspect screen shows the provider, the selected account,
+   unresolved findings, and what closing the connection does to the local
+   service — whether Portico started it or merely connected to one already
+   running. That is derived from the runtime where one exists, because the
+   runtime knows what Portico is actually running while the profile only says
+   what was asked for (`TestOriginOwnershipSaysWhatClosingDoes`). The close
+   preview says the same thing in its own words, since that is where the
+   decision is taken.
 
-3. **Done.** An edit produces a plan and goes through the normal preview,
-   approval, apply and progress path rather than a direct save
-   (`TestAConnectionCanBeEdited`). A refused edit stays on the screen that made
+3. **Done — and it did not work when this was first written.** An edit produces
+   a plan and goes through the normal preview, approval, apply and progress
+   path rather than a direct save (`TestAConnectionCanBeEdited`).
+
+   `ApplyPlan`'s intent dispatch omitted `IntentEdit`, so every edit plan
+   returned "unknown plan intent: edit" and no edit could ever be applied. It
+   was covered by tests that all asserted on the plan and never applied one.
+   `TestAnEditPlanCanActuallyBeApplied` now crosses that boundary. A refused edit stays on the screen that made
    it with its values intact, and abandoning the preview returns to the edit
    rather than discarding it (`TestARefusedEditStaysOnTheScreenThatMadeIt`,
    `TestAbandoningThePreviewReturnsToTheEdit`).

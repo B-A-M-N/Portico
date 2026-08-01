@@ -11,6 +11,39 @@
 
 ---
 
+## 0. What this document is, and what is built
+
+This is the design contract. It describes the architecture Portico is meant to
+have, including parts not yet built. **It is not a description of the current
+implementation**, and a section here is not evidence that its subject exists.
+
+For what is actually implemented and proven:
+
+- `docs/ACCEPTANCE_MATRIX.md` and `docs/AUDIT_ACCEPTANCE_MATRIX.md` map each
+  requirement to the test that holds it and the command that runs it.
+- `make acceptance` executes every one of those commands and fails if a cited
+  test does not exist.
+- `docs/REMAINING_WORK.md` is the backlog of what is known to be missing.
+- `AGENTS.md` carries the provider status table.
+
+Reviewed against `62903ed`. Where this document and the code disagree, the code
+is what ships; treat the disagreement as a defect in one of them and say which.
+
+### Implemented providers, in summary
+
+| Provider | Adapter | Default |
+|---|---|---|
+| Cloudflare | yes | enabled |
+| Port forward (local) | yes | enabled |
+| ngrok | yes | disabled — experimental opt-in |
+| OpenAI Secure MCP Tunnel | yes | disabled — experimental opt-in |
+| Tailscale, zrok | none | catalog entries only, so the UI can explain the gap |
+
+Sections below describing Tailscale or zrok behaviour are design, not
+implementation.
+
+---
+
 ## 1. Product definition
 
 Portico is a standalone, terminal-native connection manager that discovers local services, creates and owns provider-backed connections, keeps them alive after the TUI closes, shows the path from local service to public or private endpoint, diagnoses failures by segment, and proposes the smallest safe repair in ordinary language.
@@ -93,11 +126,32 @@ These are explicit deferrals, not missing implementation.
 2. **The supervisor is the only process allowed to open the Portico database.**
 3. **The TUI never calls a provider, connector binary, or database directly.**
 4. **The CLI never duplicates controller logic.**
-5. **Every mutation is represented by an immutable operation plan before it is applied.**
+5. **Every mutation of a connection is represented by an immutable operation
+   plan before it is applied.** A plan is the boundary for mutations that
+   change provider-visible state, execute as an ordered sequence that can stop
+   between steps, and therefore need compensation and a re-observed outcome.
+   The subject is a connection because a connection is what owns provider
+   resources and can be left internally inconsistent.
+
+   Mutations of local durable state that touch no provider, run as a single
+   transaction, and have no intermediate state are outside this boundary —
+   configuring a provider account, and removing one, are both examples. They
+   are not exempt from the *properties* a plan provides: what a caller confirms
+   must be computed from the same evidence the mutation decides on, must bind
+   the mutation by fingerprint, and must leave a durable record. See
+   `docs/ACCOUNT_REMOVAL_DESIGN.md`, which records why forcing such a mutation
+   through connection-scoped plan machinery was declined.
 6. **Every provider-specific behavior is confined to its adapter package.**
 7. **Closing the TUI only disconnects the client. It never implies closing a connection.**
 8. **Profiles express desired state. Runtime records express observed state. They are never merged into one mutable object.**
-9. **Rendering is pure. `View()` performs no I/O, reads no clock, and mutates nothing.**
+9. **Rendering is pure. `View()` performs no I/O, reads no clock, and mutates
+   nothing** — including through a pointer it holds into live model state.
+   `View()` has a value receiver, so anything it writes to the model is written
+   to a copy and discarded; anything it writes *through a pointer* reaches the
+   real model. Both have happened. Scroll state written during render was lost,
+   leaving a feature that could not work; the inspect model was assigned
+   through a live pointer, so drawing a screen changed the program. State is
+   written in `Update` and read in `View`.
 10. **Provider capabilities are structured constraints, not a loose collection of optimistic booleans.**
 
 Any code change that violates one of these boundaries is rejected even if it appears to make a feature easier.
