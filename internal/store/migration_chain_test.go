@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -180,8 +181,13 @@ func TestRemovingAnAccountDecidesAndDeletesTogether(t *testing.T) {
 		t.Fatalf("UpsertProviderAccount: %v", err)
 	}
 
-	// An unused account is removed.
-	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-work")
+	// An unused account is removed. The fingerprint comes from a preview, as
+	// it does in production.
+	preview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-work")
+	if err != nil {
+		t.Fatalf("PreviewProviderAccountRemoval: %v", err)
+	}
+	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-work", preview.Fingerprint)
 	if err != nil {
 		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
 	}
@@ -210,7 +216,11 @@ func TestRemovingAnAccountDecidesAndDeletesTogether(t *testing.T) {
 		t.Fatalf("SaveProfile: %v", err)
 	}
 
-	deps, err = st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-used")
+	usedPreview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-used")
+	if err != nil {
+		t.Fatalf("PreviewProviderAccountRemoval: %v", err)
+	}
+	deps, err = st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-used", usedPreview.Fingerprint)
 	if err != nil {
 		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
 	}
@@ -265,7 +275,11 @@ func TestACleanupObligationBlocksRemovingTheAccountThatCanDischargeIt(t *testing
 		t.Fatalf("RecordCleanupItem: %v", err)
 	}
 
-	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1")
+	preview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-1")
+	if err != nil {
+		t.Fatalf("PreviewProviderAccountRemoval: %v", err)
+	}
+	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", preview.Fingerprint)
 	if err != nil {
 		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
 	}
@@ -274,5 +288,216 @@ func TestACleanupObligationBlocksRemovingTheAccountThatCanDischargeIt(t *testing
 	}
 	if deps[0].Explanation == "" {
 		t.Fatal("the cleanup dependency does not explain the consequence")
+	}
+}
+
+// removableAccount stores an account with a credential and returns the store.
+func removableAccount(t *testing.T, name string) (*Store, context.Context) {
+	t.Helper()
+	st, err := Open(filepath.Join(t.TempDir(), name))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	ctx := context.Background()
+	if err := st.UpsertProviderAccountCredential(ctx, core.ProviderAccount{
+		Provider: "cloudflare", ID: "acct-1", Label: "One",
+		CredentialRef: "cf/acct-1", Status: "authenticated",
+	}, []byte("token")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+	return st, ctx
+}
+
+// TestARemovalWithoutAPreviewIsRefused pins that the fingerprint is required
+// rather than optional.
+//
+// Treating an empty fingerprint as "skip the check" would make every caller
+// that forgets it silently unchecked, which is the opposite of what the check
+// is for.
+func TestARemovalWithoutAPreviewIsRefused(t *testing.T) {
+	st, ctx := removableAccount(t, "nopreview.db")
+
+	if _, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", ""); err == nil {
+		t.Fatal("a removal with no preview fingerprint was performed")
+	}
+
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("the account was removed anyway: %#v", accounts)
+	}
+}
+
+// TestARemovalPreviewedBeforeADependencyAppearedIsRefused pins that the preview
+// binds the apply.
+func TestARemovalPreviewedBeforeADependencyAppearedIsRefused(t *testing.T) {
+	st, ctx := removableAccount(t, "stale-dep.db")
+
+	preview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-1")
+	if err != nil {
+		t.Fatalf("PreviewProviderAccountRemoval: %v", err)
+	}
+	if !preview.Removable {
+		t.Fatal("the fixture is not removable to begin with")
+	}
+
+	// A connection binds the account after the preview was taken.
+	profile := &core.ConnectionProfile{
+		ID: "conn-late", Name: "late-arrival", Kind: core.ConnectionServiceExposure,
+		Driver: core.DriverSelection{ProviderID: "cloudflare", AccountID: "acct-1"},
+		Spec: core.ConnectionSpec{ServiceExposure: &core.ServiceExposureSpec{
+			Source: core.SourceSpec{Kind: core.SourceExisting,
+				Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP}},
+			Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+			Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+		}},
+	}
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", preview.Fingerprint)
+	if err != nil {
+		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
+	}
+	// Dependencies are reported before staleness: what blocks it is more useful
+	// than the fact that the preview aged.
+	if len(deps) != 1 || deps[0].Name != "late-arrival" {
+		t.Fatalf("the new dependency was not reported: %#v", deps)
+	}
+}
+
+// TestARemovalPreviewedBeforeTheCredentialChangedIsRefusedAsStale pins the case
+// the fingerprint exists for: an account removed and re-added under the same
+// key, whose preview would otherwise delete the new one.
+func TestARemovalPreviewedBeforeTheCredentialChangedIsRefusedAsStale(t *testing.T) {
+	st, ctx := removableAccount(t, "stale-cred.db")
+
+	preview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-1")
+	if err != nil {
+		t.Fatalf("PreviewProviderAccountRemoval: %v", err)
+	}
+
+	// The account is re-credentialed after the preview.
+	if err := st.UpsertProviderAccountCredential(ctx, core.ProviderAccount{
+		Provider: "cloudflare", ID: "acct-1", Label: "One",
+		CredentialRef: "cf/acct-1-rotated", Status: "authenticated",
+	}, []byte("new-token")); err != nil {
+		t.Fatalf("UpsertProviderAccountCredential: %v", err)
+	}
+
+	_, err = st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", preview.Fingerprint)
+	var stale *StalePreviewError
+	if !errors.As(err, &stale) {
+		t.Fatalf("a stale preview removed the re-credentialed account: %v", err)
+	}
+	if stale.Current == nil {
+		t.Fatal("the refusal does not carry what is true now")
+	}
+
+	accounts, err := st.ListProviderAccounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("the account was removed anyway: %#v", accounts)
+	}
+}
+
+// TestASuccessfulRemovalIsRecorded pins that a removal leaves a durable record,
+// committed with the deletion.
+func TestASuccessfulRemovalIsRecorded(t *testing.T) {
+	st, ctx := removableAccount(t, "recorded.db")
+
+	preview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", preview.Fingerprint); err != nil {
+		t.Fatalf("DeleteProviderAccountIfUnused: %v", err)
+	}
+
+	var count, credentialRemoved int
+	var fingerprint string
+	if err := st.db.QueryRow(`
+		SELECT COUNT(*), MAX(credential_removed), MAX(preview_fingerprint)
+		FROM provider_account_removals WHERE provider_id = ? AND account_id = ?`,
+		"cloudflare", "acct-1").Scan(&count, &credentialRemoved, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("the removal left %d records, want 1", count)
+	}
+	if credentialRemoved != 1 {
+		t.Error("the record does not say a stored credential was removed")
+	}
+	if fingerprint != preview.Fingerprint {
+		t.Error("the record does not identify the preview that was confirmed")
+	}
+}
+
+// TestARefusedRemovalIsNotRecorded pins that the record cannot claim a removal
+// that did not happen.
+func TestARefusedRemovalIsNotRecorded(t *testing.T) {
+	st, ctx := removableAccount(t, "refused.db")
+
+	if _, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", "not-the-fingerprint"); err == nil {
+		t.Fatal("a removal with a wrong fingerprint succeeded")
+	}
+
+	var count int
+	if err := st.db.QueryRow(
+		"SELECT COUNT(*) FROM provider_account_removals").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("a refused removal was recorded %d times", count)
+	}
+}
+
+// TestThePreviewAndTheRefusalAgree pins that one dependency query serves both.
+// Two would eventually disagree, and the disagreement would be a preview
+// describing a removal that does something else.
+func TestThePreviewAndTheRefusalAgree(t *testing.T) {
+	st, ctx := removableAccount(t, "agree.db")
+
+	profile := &core.ConnectionProfile{
+		ID: "conn-blocking", Name: "blocker", Kind: core.ConnectionServiceExposure,
+		Driver: core.DriverSelection{ProviderID: "cloudflare", AccountID: "acct-1"},
+		Spec: core.ConnectionSpec{ServiceExposure: &core.ServiceExposureSpec{
+			Source: core.SourceSpec{Kind: core.SourceExisting,
+				Existing: &core.ExistingServiceSpec{Address: "127.0.0.1:3000", Protocol: core.ProtocolHTTP}},
+			Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+			Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+		}},
+	}
+	if err := st.SaveProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := st.PreviewProviderAccountRemoval(ctx, "cloudflare", "acct-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps, err := st.DeleteProviderAccountIfUnused(ctx, "cloudflare", "acct-1", preview.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(preview.Dependencies) != len(deps) {
+		t.Fatalf("preview reported %d dependencies, the refusal %d",
+			len(preview.Dependencies), len(deps))
+	}
+	if preview.Removable {
+		t.Error("the preview says removable while the removal refused")
+	}
+	for i := range deps {
+		if preview.Dependencies[i].ID != deps[i].ID {
+			t.Errorf("dependency %d differs: preview %q, refusal %q",
+				i, preview.Dependencies[i].ID, deps[i].ID)
+		}
 	}
 }

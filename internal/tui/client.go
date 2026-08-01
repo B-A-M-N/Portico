@@ -37,7 +37,8 @@ type SupervisorClient interface {
 	Discovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
 	RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
 	ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error)
-	RemoveProviderAccount(ctx context.Context, providerID, accountID string) (*ipc.RemoveProviderAccountResponse, error)
+	RemoveProviderAccount(ctx context.Context, providerID, accountID, fingerprint string) (*ipc.RemoveProviderAccountResponse, error)
+	PreviewProviderAccountRemoval(ctx context.Context, providerID, accountID string) (*ipc.AccountRemovalPreviewDTO, error)
 }
 
 // Ensure the real client satisfies the interface.

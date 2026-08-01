@@ -65,7 +65,8 @@ type RequestHandler interface {
 	HandleProviderRecommendation(req ProviderRecommendationRequest) (*ProviderRecommendationResponse, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
-	HandleRemoveProviderAccount(providerID, accountID string) (*RemoveProviderAccountResponse, error)
+	HandleRemoveProviderAccount(providerID, accountID string, req RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error)
+	HandleAccountRemovalPreview(providerID, accountID string) (*AccountRemovalPreviewDTO, error)
 	HandleProviderSetupFlow(id string) (*SetupFlowDTO, error)
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
@@ -685,7 +686,7 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	// POST /v1/providers/{id}/authenticate
 	// POST /v1/providers/{id}/accounts
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/providers/"), "/"), "/")
-	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+	if len(parts) < 2 || len(parts) > 4 || parts[0] == "" || parts[1] == "" {
 		writeError(w, http.StatusNotFound, "PROV-001", "unknown provider endpoint")
 		return
 	}
@@ -696,6 +697,30 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	// Removal was implemented on the supervisor and never routed, so an account
 	// could be added and never taken away: a revoked token stayed listed as a
 	// working account with no way to say otherwise.
+	// GET /v1/providers/{id}/accounts/{accountID}/removal-preview
+	//
+	// Exactly one fourth segment is accepted. The existing refusal of any other
+	// four-segment path is unchanged; this widens the parser by one literal.
+	if len(parts) == 4 {
+		if action != "accounts" || parts[2] == "" || parts[3] != "removal-preview" {
+			writeError(w, http.StatusNotFound, "PROV-006", "unknown provider endpoint")
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
+			return
+		}
+		preview, err := s.handler.HandleAccountRemovalPreview(id, parts[2])
+		if err != nil {
+			writeHandlerError(w, "PROV-009", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(preview)
+		return
+	}
+
 	if len(parts) == 3 {
 		if action != "accounts" || parts[2] == "" {
 			writeError(w, http.StatusNotFound, "PROV-006", "unknown provider endpoint")
@@ -705,7 +730,15 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
 			return
 		}
-		response, err := s.handler.HandleRemoveProviderAccount(id, parts[2])
+		// The fingerprint of the preview the caller confirmed. A removal
+		// without one is refused by the store rather than performed unchecked.
+		var removeReq RemoveProviderAccountRequest
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+			defer r.Body.Close()
+			_ = json.NewDecoder(r.Body).Decode(&removeReq)
+		}
+		response, err := s.handler.HandleRemoveProviderAccount(id, parts[2], removeReq)
 		if err != nil {
 			// A refusal because connections still depend on the account is not
 			// a failure to report and forget: each dependent connection is
@@ -717,7 +750,8 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 					ProviderID: id,
 					// Typed, so the caller does not have to parse prose back
 					// into structure to say what is in the way.
-					AccountDependencies: response.Dependencies,
+					AccountDependencies:   response.Dependencies,
+					AccountRemovalPreview: response.Preview,
 				}
 				for _, dep := range response.Dependencies {
 					label := "Reassign or delete connection " + dep.Name

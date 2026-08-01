@@ -199,6 +199,8 @@ tests on each side could not see. These rows are the corrections.
 | **Overwriting a permissive file still ends private** | `TestOverwritingAPermissiveFileStillEndsPrivate` (`internal/cli/handler_test.go`) | os.WriteFile's mode applies only on create; the code claimed 0600 and produced 0644. Verified empirically before fixing. | `go test ./internal/cli/ -run OverwritingAPermissiveFile` | `959ec52` |
 | An existing report is not silently replaced | `TestAnExistingReportIsNotSilentlyReplaced`, `TestAFailedWriteLeavesNoPartialReport` | --force required; no half-report left behind. | `go test ./internal/cli/ -run AnExistingReportIsNot && go test ./internal/cli/ -run AFailedWriteLeaves` | `959ec52` |
 | The report is reachable from the interface | `TestTheSupportReportIsReachableFromTheInterface` (`internal/tui/refresh_test.go`) | A CLI-only report is not where a stuck user looks. | `go test ./internal/tui/ -run TheSupportReportIsReachable` | pending |
+| **Provider validation details reach the screen** | `TestProviderValidationDetailsReachTheScreen` (`internal/tui/vertical_test.go`) | Real server, real socket, real client, real model. The same defect as account removal: a rejection is a non-2xx, so the client returns an error with a nil response, and the screen was reading the response. Verified to fail against the previous code. | `go test ./internal/tui/ -run ProviderValidationDetailsReach` | `c3eaa5e` |
+| A rejected credential is not retained | `TestARejectedCredentialIsNotRetained` | It does not stay in memory while the user retypes it, and does not appear in the error text. | `go test ./internal/tui/ -run ARejectedCredentialIsNotRetained` | `c3eaa5e` |
 | **The matrix is verified, not trusted** | — | `make acceptance` runs every cited command and checks every cited test name exists. Its first run found four renamed tests and a wrong exit code in itself. | `make acceptance` | pending |
 
 
@@ -254,8 +256,10 @@ none.
   happen. The safety problems — stranding a connection, orphaning a cleanup
   obligation — are fixed transactionally, so what remains is a consistency gap
   rather than a hazard. It is tracked, not done.
-- **Vertical coverage is partial.** There is now a real-server, real-socket,
-  real-model test for account-removal refusals, and the package exposes a no-op
-  handler to make more of them cheap. Provider validation details, plan apply
-  and the event stream are still proven on each side separately. The account
-  removal defect is what that gap looks like when it bites.
+- **Vertical coverage is partial.** There are now real-server, real-socket,
+  real-model tests for account-removal refusals and for provider validation
+  details — the two places this defect was found — and the package exposes a
+  no-op handler to make more of them cheap. Plan apply and the event stream are
+  still proven on each side separately. Two instances of one defect were found
+  by crossing the transport, so the remaining uncrossed paths should be read as
+  unverified rather than as working.

@@ -34,11 +34,27 @@ type verticalHandler struct {
 
 	configureResponse *ipc.ConfigureProviderAccountResponse
 	configureErr      error
+
+	preview        *ipc.AccountRemovalPreviewDTO
+	gotFingerprint string
 }
 
-func (h *verticalHandler) HandleRemoveProviderAccount(providerID, accountID string) (
-	*ipc.RemoveProviderAccountResponse, error) {
+func (h *verticalHandler) HandleRemoveProviderAccount(providerID, accountID string,
+	req ipc.RemoveProviderAccountRequest) (*ipc.RemoveProviderAccountResponse, error) {
+	h.gotFingerprint = req.Fingerprint
 	return h.removeResponse, h.removeErr
+}
+
+func (h *verticalHandler) HandleAccountRemovalPreview(providerID, accountID string) (
+	*ipc.AccountRemovalPreviewDTO, error) {
+	if h.preview != nil {
+		return h.preview, nil
+	}
+	return &ipc.AccountRemovalPreviewDTO{
+		ProviderID: providerID, AccountID: accountID,
+		Removable: true, CredentialStored: true, Fingerprint: "fp-vertical",
+		Consequences: []string{"Portico will forget the credential it stored for this account."},
+	}, nil
 }
 
 // liveClient starts a real server on a real socket and returns a real client.
@@ -100,8 +116,17 @@ func TestAccountRemovalRefusalReachesTheScreenWithNames(t *testing.T) {
 	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-work", ProviderName: "Cloudflare", Label: "Work"}
 	m.accountRemovalTarget = &row
 
-	cmd := m.removeAccountCmd(row)
-	next, _ := m.Update(cmd())
+	// Preview first, as the interface does, then apply what it described.
+	previewCmd := m.previewAccountRemovalCmd(row)
+	next, _ := m.Update(previewCmd())
+	m = next.(Model)
+
+	fingerprint := ""
+	if m.accountRemovalPreview != nil {
+		fingerprint = m.accountRemovalPreview.Fingerprint
+	}
+	cmd := m.removeAccountCmd(row, fingerprint)
+	next, _ = m.Update(cmd())
 	m = next.(Model)
 
 	view := m.renderAccountRemoval()
@@ -132,8 +157,16 @@ func TestASuccessfulRemovalReachesTheScreen(t *testing.T) {
 	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-work", ProviderName: "Cloudflare", Label: "Work"}
 	m.accountRemovalTarget = &row
 
-	cmd := m.removeAccountCmd(row)
-	next, _ := m.Update(cmd())
+	previewCmd := m.previewAccountRemovalCmd(row)
+	next, _ := m.Update(previewCmd())
+	m = next.(Model)
+
+	fingerprint := ""
+	if m.accountRemovalPreview != nil {
+		fingerprint = m.accountRemovalPreview.Fingerprint
+	}
+	cmd := m.removeAccountCmd(row, fingerprint)
+	next, _ = m.Update(cmd())
 	m = next.(Model)
 
 	if m.accountRemovalError != "" {
@@ -222,5 +255,96 @@ func TestARejectedCredentialIsNotRetained(t *testing.T) {
 	}
 	if strings.Contains(m.providerSetupError, "cf-token-REJECTED") {
 		t.Fatalf("the rejected credential is in the error text:\n%s", m.providerSetupError)
+	}
+}
+
+// TestTheRemovalScreenShowsWhatTheSupervisorSaid pins that no client composes
+// its own factual claim about what a removal does.
+//
+// The screen used to write "Portico will forget the credential it stored for
+// this account" from a cached row, which is false for an account whose
+// credential is not stored. The sentence now comes from the supervisor, which
+// computes it from the same evidence the removal decides on.
+func TestTheRemovalScreenShowsWhatTheSupervisorSaid(t *testing.T) {
+	handler := &verticalHandler{
+		preview: &ipc.AccountRemovalPreviewDTO{
+			ProviderID: "cloudflare", AccountID: "acct-1", Removable: true,
+			CredentialStored: false,
+			Fingerprint:      "fp-from-server",
+			Consequences: []string{
+				"Portico holds no stored credential for this account; removing it only forgets the account itself.",
+				"Nothing is deleted at the provider, and you can add it again.",
+			},
+		},
+	}
+	client := liveClient(t, handler)
+
+	m := readyModel(&fakeClient{}, accountSnapshot())
+	m.client = client
+	m.transitionTo(ScreenAccountRemoval)
+	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-1", ProviderName: "Cloudflare"}
+	m.accountRemovalTarget = &row
+
+	next, _ := m.Update(m.previewAccountRemovalCmd(row)())
+	m = next.(Model)
+
+	view := m.renderAccountRemoval()
+	if !strings.Contains(view, "holds no stored credential") {
+		t.Fatalf("the screen does not show what the supervisor said:\n%s", view)
+	}
+	if strings.Contains(view, "will forget the credential it stored") {
+		t.Fatalf("the screen still claims a stored credential is forgotten:\n%s", view)
+	}
+}
+
+// TestAnUnremovableAccountSendsNoRemoval pins that enter does nothing when the
+// preview says it cannot be removed.
+func TestAnUnremovableAccountSendsNoRemoval(t *testing.T) {
+	m := readyModel(&fakeClient{}, accountSnapshot())
+	m.transitionTo(ScreenAccountRemoval)
+	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-1"}
+	m.accountRemovalTarget = &row
+	m.accountRemovalPreview = &ipc.AccountRemovalPreviewDTO{
+		Removable: false, Fingerprint: "fp",
+		Dependencies: []ipc.AccountDependencyDTO{
+			{Kind: "connection", ID: "conn-a", Name: "blocker", Explanation: "still uses it"},
+		},
+	}
+
+	if _, cmd := m.Update(keyMsg("enter")); cmd != nil {
+		t.Fatal("enter sent a removal the preview said could not be made")
+	}
+	if !strings.Contains(m.renderAccountRemoval(), "blocker") {
+		t.Fatalf("the screen does not say what blocks it:\n%s", m.renderAccountRemoval())
+	}
+}
+
+// TestARemovalCarriesThePreviewsFingerprint pins that what was confirmed is
+// what is applied.
+func TestARemovalCarriesThePreviewsFingerprint(t *testing.T) {
+	handler := &verticalHandler{
+		preview:        &ipc.AccountRemovalPreviewDTO{Removable: true, Fingerprint: "fp-exact"},
+		removeResponse: &ipc.RemoveProviderAccountResponse{Removed: true},
+	}
+	client := liveClient(t, handler)
+
+	m := readyModel(&fakeClient{}, accountSnapshot())
+	m.client = client
+	m.transitionTo(ScreenAccountRemoval)
+	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-1"}
+	m.accountRemovalTarget = &row
+
+	next, _ := m.Update(m.previewAccountRemovalCmd(row)())
+	m = next.(Model)
+
+	next, cmd := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("enter did not send the removal")
+	}
+	cmd()
+
+	if handler.gotFingerprint != "fp-exact" {
+		t.Fatalf("the removal carried fingerprint %q, not the preview's", handler.gotFingerprint)
 	}
 }

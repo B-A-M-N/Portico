@@ -327,7 +327,7 @@ func newProviderCmd() *cobra.Command {
 
 	// Removal existed on the supervisor with no way to ask for it. An account
 	// added by mistake, or whose token has been revoked, had to be lived with.
-	cmd.AddCommand(&cobra.Command{
+	removeCmd := &cobra.Command{
 		Use:   "remove-account <provider> <account-id>",
 		Short: "Forget a stored provider account",
 		Long: "Removes the credential Portico stored for an account. Nothing is deleted at " +
@@ -336,7 +336,9 @@ func newProviderCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return handleProviderRemoveAccount(cmd, args[0], args[1])
 		},
-	})
+	}
+	removeCmd.Flags().Bool("yes", false, "Skip the confirmation prompt")
+	cmd.AddCommand(removeCmd)
 	return cmd
 }
 

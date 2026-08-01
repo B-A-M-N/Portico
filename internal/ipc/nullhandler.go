@@ -36,7 +36,10 @@ func (NullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (NullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return nil, nil
 }
-func (NullHandler) HandleRemoveProviderAccount(string, string) (*RemoveProviderAccountResponse, error) {
+func (NullHandler) HandleAccountRemovalPreview(string, string) (*AccountRemovalPreviewDTO, error) {
+	return nil, nil
+}
+func (NullHandler) HandleRemoveProviderAccount(string, string, RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error) {
 	return nil, nil
 }
 func (NullHandler) HandleProviderSetupFlow(string) (*SetupFlowDTO, error)         { return nil, nil }

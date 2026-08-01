@@ -76,6 +76,10 @@ type Model struct {
 	accountRemovalTarget     *accountRow
 	accountRemovalError      string
 	accountRemovalDependents []string
+	// accountRemovalPreview is what the supervisor says removing the selected
+	// account would do. The screen renders it rather than composing its own
+	// claims about a cached row.
+	accountRemovalPreview *ipc.AccountRemovalPreviewDTO
 
 	// edit is the connection edit in progress, if any.
 	edit *editState
@@ -340,6 +344,17 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pushScreen(ScreenPlanPreview)
 		return m, nil
 
+	case accountRemovalPreviewMsg:
+		if !m.accountRequests.accepts(msg.Generation) {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.accountRemovalError = statusLine("could not check what this would remove", msg.Err)
+			return m, nil
+		}
+		m.accountRemovalPreview = msg.Preview
+		return m, nil
+
 	case accountRemovedMsg:
 		// A reply for an account the user has moved on from must not report
 		// against whichever account is selected now.
@@ -353,6 +368,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// therefore found none through the actual transport, however well
 			// each side tested on its own.
 			m.accountRemovalDependents = accountDependencyLines(msg.Err, msg.Response)
+			// A refusal because the account changed hands back the preview that
+			// is now true, so the user re-confirms against what is real rather
+			// than being told only that theirs expired.
+			if fresh := freshRemovalPreview(msg.Err, msg.Response); fresh != nil {
+				m.accountRemovalPreview = fresh
+			}
 			// The refusal names what has to change first, so it is shown on the
 			// confirmation rather than as a status line that scrolls away.
 			return m, nil
@@ -360,6 +381,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.accountRemovalTarget = nil
 		m.accountRemovalError = ""
 		m.accountRemovalDependents = nil
+		m.accountRemovalPreview = nil
 		m.status = "Removed " + msg.Name + "."
 		if msg.Response != nil && msg.Response.RestartRequired {
 			m.status += " Restart the supervisor to finish applying it."
@@ -1810,7 +1832,12 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			if m.accountRemovalTarget == nil || m.accountRemovalError != "" {
 				return m, nil
 			}
-			return m, m.removeAccountCmd(*m.accountRemovalTarget)
+			// Nothing is removed that was not previewed, and nothing the
+			// preview says cannot be removed.
+			if m.accountRemovalPreview == nil || !m.accountRemovalPreview.Removable {
+				return m, nil
+			}
+			return m, m.removeAccountCmd(*m.accountRemovalTarget, m.accountRemovalPreview.Fingerprint)
 		}
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
 			conn := m.SelectedConnection()
@@ -1903,7 +1930,9 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 				m.accountRemovalTarget = &row
 				m.accountRemovalError = ""
 				m.accountRemovalDependents = nil
+				m.accountRemovalPreview = nil
 				m.pushScreen(ScreenAccountRemoval)
+				return m, m.previewAccountRemovalCmd(row)
 			}
 		}
 
@@ -3668,6 +3697,7 @@ func (m *Model) abandonScreenWork() {
 		m.accountRemovalTarget = nil
 		m.accountRemovalError = ""
 		m.accountRemovalDependents = nil
+		m.accountRemovalPreview = nil
 	}
 }
 
@@ -3897,6 +3927,19 @@ func missingPermissions(err error, response *ipc.ConfigureProviderAccountRespons
 	}
 	if response != nil {
 		return response.MissingPermissions
+	}
+	return nil
+}
+
+// freshRemovalPreview extracts the current state of an account whose removal
+// was refused, from wherever it arrived.
+func freshRemovalPreview(err error, response *ipc.RemoveProviderAccountResponse) *ipc.AccountRemovalPreviewDTO {
+	var status *ipc.APIStatusError
+	if errors.As(err, &status) && status.AccountRemovalPreview != nil {
+		return status.AccountRemovalPreview
+	}
+	if response != nil {
+		return response.Preview
 	}
 	return nil
 }

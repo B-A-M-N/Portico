@@ -406,6 +406,10 @@ type APIError struct {
 	// every consumer parse prose back into structure.
 	AccountDependencies []AccountDependencyDTO     `json:"account_dependencies,omitempty"`
 	ProviderValidation  *ProviderValidationDetails `json:"provider_validation,omitempty"`
+	// AccountRemovalPreview is the current state of an account whose removal
+	// was refused as stale, so the caller can re-confirm against what is now
+	// true instead of being told only that its preview expired.
+	AccountRemovalPreview *AccountRemovalPreviewDTO `json:"account_removal_preview,omitempty"`
 }
 
 // ProviderValidationDetails explains why a credential was rejected.
@@ -694,6 +698,34 @@ type RemoveProviderAccountResponse struct {
 	// still need removing with this account's credential — those are not
 	// connections, and reporting only connections hid them entirely.
 	Dependencies []AccountDependencyDTO `json:"dependencies,omitempty"`
+	// Preview is the current state of the account when a removal was refused
+	// as stale, so the caller can re-confirm against what is true now.
+	Preview *AccountRemovalPreviewDTO `json:"preview,omitempty"`
+}
+
+// AccountRemovalPreviewDTO is what removing an account would do.
+//
+// The supervisor composes it, so every client says the same true thing about
+// the same account. Clients used to write their own description, and the
+// confirmation screen promised to forget a credential Portico might not hold.
+type AccountRemovalPreviewDTO struct {
+	ProviderID       string                 `json:"provider_id"`
+	AccountID        string                 `json:"account_id"`
+	Label            string                 `json:"label,omitempty"`
+	Removable        bool                   `json:"removable"`
+	CredentialStored bool                   `json:"credential_stored"`
+	Dependencies     []AccountDependencyDTO `json:"dependencies,omitempty"`
+	// Consequences are the sentences a client shows, composed from what is
+	// actually true of this account rather than from what is usually true.
+	Consequences []string `json:"consequences,omitempty"`
+	// Fingerprint binds this preview to the removal it describes.
+	Fingerprint string `json:"fingerprint"`
+}
+
+// RemoveProviderAccountRequest carries the fingerprint of the preview the
+// caller confirmed, so applying cannot describe one removal and perform another.
+type RemoveProviderAccountRequest struct {
+	Fingerprint string `json:"fingerprint"`
 }
 
 // AccountDependencyDTO is one thing standing in the way of removing an account.

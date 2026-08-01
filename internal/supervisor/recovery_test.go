@@ -1694,7 +1694,12 @@ func TestRemovingAnAccountReportsDependentConnections(t *testing.T) {
 	}
 
 	handler := &supervisorHandler{sup: &Supervisor{store: st, mutating: true}}
-	resp, err := handler.HandleRemoveProviderAccount("cloudflare", "acct-1")
+	preview1, err := handler.HandleAccountRemovalPreview("cloudflare", "acct-1")
+	if err != nil {
+		t.Fatalf("HandleAccountRemovalPreview: %v", err)
+	}
+	resp, err := handler.HandleRemoveProviderAccount("cloudflare", "acct-1",
+		ipc.RemoveProviderAccountRequest{Fingerprint: preview1.Fingerprint})
 	if err == nil {
 		t.Fatal("an account with a dependent connection was removed")
 	}
@@ -1725,7 +1730,12 @@ func TestRemovingAnUnusedAccountDeletesItsCredential(t *testing.T) {
 	}
 
 	handler := &supervisorHandler{sup: &Supervisor{store: st, mutating: true}}
-	resp, err := handler.HandleRemoveProviderAccount("cloudflare", "acct-unused")
+	preview2, err := handler.HandleAccountRemovalPreview("cloudflare", "acct-unused")
+	if err != nil {
+		t.Fatalf("HandleAccountRemovalPreview: %v", err)
+	}
+	resp, err := handler.HandleRemoveProviderAccount("cloudflare", "acct-unused",
+		ipc.RemoveProviderAccountRequest{Fingerprint: preview2.Fingerprint})
 	if err != nil {
 		t.Fatalf("HandleRemoveProviderAccount: %v", err)
 	}

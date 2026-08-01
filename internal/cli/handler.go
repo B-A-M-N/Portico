@@ -1056,13 +1056,57 @@ func privateAddressLabel(kind string) string {
 }
 
 // handleProviderRemoveAccount forgets a stored provider account.
+//
+// It previews first. The scriptable surface had no preview at all, which made
+// "what the preview describes is exactly what applying does" vacuous here: there
+// was nothing to compare against.
 func handleProviderRemoveAccount(cmd *cobra.Command, providerID, accountID string) error {
 	client, err := getClient(cmd)
 	if err != nil {
 		return err
 	}
 
-	response, err := client.RemoveProviderAccount(cmd.Context(), providerID, accountID)
+	preview, err := client.PreviewProviderAccountRemoval(cmd.Context(), providerID, accountID)
+	if err != nil {
+		return err
+	}
+
+	name := preview.Label
+	if name == "" {
+		name = preview.AccountID
+	}
+	fmt.Printf("Remove %s from %s?\n\n", name, providerID)
+	for _, line := range preview.Consequences {
+		fmt.Printf("  %s\n", line)
+	}
+
+	if !preview.Removable {
+		fmt.Println("\nThis account cannot be removed yet:")
+		for _, dep := range preview.Dependencies {
+			depName := dep.Name
+			if depName == "" {
+				depName = dep.ID
+			}
+			fmt.Printf("  • %s — %s\n", depName, dep.Explanation)
+		}
+		return fmt.Errorf("nothing was removed")
+	}
+
+	assumeYes, _ := cmd.Flags().GetBool("yes")
+	if !assumeYes {
+		fmt.Print("\nType the account ID to confirm: ")
+		var typed string
+		if _, err := fmt.Fscanln(cmd.InOrStdin(), &typed); err != nil {
+			return fmt.Errorf("nothing was removed")
+		}
+		if strings.TrimSpace(typed) != accountID {
+			return fmt.Errorf("that did not match %q; nothing was removed", accountID)
+		}
+	}
+
+	// The fingerprint of the preview just shown. If the account changed in
+	// between, the supervisor refuses rather than removing something else.
+	response, err := client.RemoveProviderAccount(cmd.Context(), providerID, accountID, preview.Fingerprint)
 	if err != nil {
 		return err
 	}

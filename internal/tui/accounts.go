@@ -154,15 +154,47 @@ type accountRemovedMsg struct {
 	Err        error
 }
 
-// removeAccountCmd asks the supervisor to remove an account.
-func (m *Model) removeAccountCmd(row accountRow) tea.Cmd {
+// accountRemovalPreviewMsg carries what removing an account would do.
+type accountRemovalPreviewMsg struct {
+	Generation requestGeneration
+	ProviderID string
+	AccountID  string
+	Preview    *ipc.AccountRemovalPreviewDTO
+	Err        error
+}
+
+// previewAccountRemovalCmd asks the supervisor what removing this would do.
+//
+// The screen used to describe the removal itself, from a cached row, and so
+// promised to forget a credential Portico might not hold. The supervisor
+// answers from the same evidence the removal decides on.
+func (m *Model) previewAccountRemovalCmd(row accountRow) tea.Cmd {
 	generation := m.accountRequests.next()
 	client := m.client
 	rootCtx := m.rootCtx
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(rootCtx, 20*time.Second)
 		defer cancel()
-		response, err := client.RemoveProviderAccount(ctx, row.ProviderID, row.AccountID)
+		preview, err := client.PreviewProviderAccountRemoval(ctx, row.ProviderID, row.AccountID)
+		return accountRemovalPreviewMsg{
+			Generation: generation, ProviderID: row.ProviderID, AccountID: row.AccountID,
+			Preview: preview, Err: err,
+		}
+	}
+}
+
+// removeAccountCmd asks the supervisor to remove an account.
+//
+// It carries the fingerprint of the preview the user confirmed, so a removal
+// cannot describe one thing and do another.
+func (m *Model) removeAccountCmd(row accountRow, fingerprint string) tea.Cmd {
+	generation := m.accountRequests.next()
+	client := m.client
+	rootCtx := m.rootCtx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(rootCtx, 20*time.Second)
+		defer cancel()
+		response, err := client.RemoveProviderAccount(ctx, row.ProviderID, row.AccountID, fingerprint)
 		return accountRemovedMsg{
 			Generation: generation, ProviderID: row.ProviderID, AccountID: row.AccountID,
 			Name: row.Name(), Response: response, Err: err,
@@ -184,14 +216,53 @@ func (m *Model) renderAccountRemoval() string {
 	b.WriteString(m.theme.Style("header").Render(" REMOVE ACCOUNT "))
 	b.WriteString("\n\n")
 	b.WriteString(fmt.Sprintf("Remove %s from %s?\n\n", row.Name(), row.ProviderName))
-	b.WriteString("Portico will forget the credential it stored for this account.\n")
-	b.WriteString("Nothing is deleted at the provider, and you can add it again.\n\n")
+
+	if m.accountRemovalPreview == nil {
+		// No preview yet, either because it is still loading or because the
+		// request failed. Either way there is nothing true to say about the
+		// removal, so nothing is claimed.
+		if m.accountRemovalError != "" {
+			b.WriteString(m.theme.Style("intervention").Render(m.accountRemovalError))
+			b.WriteString("\n")
+			// What is in the way, even without a preview: a refusal that names
+			// nothing leaves the user to go and find it.
+			for _, dep := range m.accountRemovalDependents {
+				b.WriteString(m.theme.Style("muted").Render("  • " + dep))
+				b.WriteString("\n")
+			}
+			b.WriteString("\n[esc] back\n")
+			return b.String()
+		}
+		b.WriteString("Checking what this would remove...\n")
+		return b.String()
+	}
+	// Every factual claim here comes from the supervisor, which computed it
+	// from the same evidence the removal decides on.
+	for _, line := range m.accountRemovalPreview.Consequences {
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("\n")
 
 	if m.accountRemovalError != "" {
 		b.WriteString(m.theme.Style("intervention").Render(m.accountRemovalError))
 		b.WriteString("\n")
 		for _, dep := range m.accountRemovalDependents {
 			b.WriteString(m.theme.Style("muted").Render("  • " + dep))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n[esc] back\n")
+		return b.String()
+	}
+
+	if !m.accountRemovalPreview.Removable {
+		b.WriteString(m.theme.Style("intervention").Render("This account cannot be removed yet:"))
+		b.WriteString("\n")
+		for _, dep := range m.accountRemovalPreview.Dependencies {
+			name := dep.Name
+			if name == "" {
+				name = dep.ID
+			}
+			b.WriteString(m.theme.Style("muted").Render("  • " + name + " — " + dep.Explanation))
 			b.WriteString("\n")
 		}
 		b.WriteString("\n[esc] back\n")

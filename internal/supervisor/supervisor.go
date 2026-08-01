@@ -1619,7 +1619,83 @@ func (s *Supervisor) catalogOnlySetupError(id string) error {
 // on it. An account still selected by a connection is never removed silently,
 // because doing so strands that connection with an unexplained
 // "provider account unavailable" error.
-func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID string) (*ipc.RemoveProviderAccountResponse, error) {
+// HandleAccountRemovalPreview reports what removing an account would do.
+//
+// The supervisor composes the consequences, so every client says the same true
+// thing about the same account. The confirmation screen used to write its own,
+// and promised to forget a credential Portico might not hold.
+func (h *supervisorHandler) HandleAccountRemovalPreview(providerID, accountID string) (
+	*ipc.AccountRemovalPreviewDTO, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	preview, err := h.sup.store.PreviewProviderAccountRemoval(ctx,
+		core.ProviderID(providerID), core.ProviderAccountID(accountID))
+	if err != nil {
+		return nil, err
+	}
+	return accountRemovalPreviewDTO(preview, h.providerAccountCount(providerID)), nil
+}
+
+// providerAccountCount reports how many usable accounts a provider has, so the
+// preview can say whether removing this one leaves the provider unusable.
+func (h *supervisorHandler) providerAccountCount(providerID string) int {
+	// A missing registry is not a reason to crash while explaining a removal.
+	// The conservative answer is zero, which makes the preview say this is the
+	// only usable account — the more cautious of the two sentences.
+	if h.sup == nil || h.sup.registry == nil {
+		return 0
+	}
+	for _, snapshot := range h.sup.registry.Snapshot() {
+		if string(snapshot.ID) == providerID {
+			return len(snapshot.Accounts)
+		}
+	}
+	return 0
+}
+
+// accountRemovalPreviewDTO projects a preview and composes what it means.
+func accountRemovalPreviewDTO(preview *store.AccountRemovalPreview, accountsForProvider int) *ipc.AccountRemovalPreviewDTO {
+	dto := &ipc.AccountRemovalPreviewDTO{
+		ProviderID:       string(preview.ProviderID),
+		AccountID:        string(preview.AccountID),
+		Label:            preview.Label,
+		Removable:        preview.Removable,
+		CredentialStored: preview.CredentialStored,
+		Fingerprint:      preview.Fingerprint,
+	}
+	for _, dep := range preview.Dependencies {
+		dto.Dependencies = append(dto.Dependencies, ipc.AccountDependencyDTO{
+			Kind: dep.Kind, ID: dep.ID, Name: dep.Name, Explanation: dep.Explanation,
+		})
+	}
+	dto.Consequences = describeAccountRemoval(preview, accountsForProvider)
+	return dto
+}
+
+// describeAccountRemoval says what removing this account does, from what is
+// actually true of it.
+func describeAccountRemoval(preview *store.AccountRemovalPreview, accountsForProvider int) []string {
+	var lines []string
+	if preview.CredentialStored {
+		lines = append(lines, "Portico will forget the credential it stored for this account.")
+	} else {
+		lines = append(lines,
+			"Portico holds no stored credential for this account; removing it only forgets the account itself.")
+	}
+	lines = append(lines, "Nothing is deleted at the provider, and you can add it again.")
+
+	if accountsForProvider <= 1 {
+		lines = append(lines,
+			"This is the only usable account for this provider, so afterwards it can only do "+
+				"whatever it supports without an account.")
+	} else {
+		lines = append(lines, "Other accounts for this provider are unaffected.")
+	}
+	return lines
+}
+
+func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID string, req ipc.RemoveProviderAccountRequest) (*ipc.RemoveProviderAccountResponse, error) {
 	if !h.sup.mutating {
 		return nil, fmt.Errorf("supervisor is shutting down and not accepting mutations")
 	}
@@ -1632,8 +1708,18 @@ func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID st
 	// profile's driver JSON rather than behind a foreign key, nothing at the
 	// database level would refuse it.
 	deps, err := h.sup.store.DeleteProviderAccountIfUnused(ctx,
-		core.ProviderID(providerID), core.ProviderAccountID(accountID))
+		core.ProviderID(providerID), core.ProviderAccountID(accountID), req.Fingerprint)
 	if err != nil {
+		// A preview that no longer describes this account is refused, and the
+		// caller is handed the one that does rather than a bare rejection.
+		var stale *store.StalePreviewError
+		if errors.As(err, &stale) {
+			resp := &ipc.RemoveProviderAccountResponse{Removed: false}
+			if stale.Current != nil {
+				resp.Preview = accountRemovalPreviewDTO(stale.Current, h.providerAccountCount(providerID))
+			}
+			return resp, core.ErrValidation(stale.Error())
+		}
 		return nil, err
 	}
 	if len(deps) > 0 {

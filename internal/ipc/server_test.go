@@ -64,7 +64,10 @@ func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccou
 func (nullHandler) HandleOperationHistoryLimit(int) (*OperationHistoryDTO, error) {
 	return &OperationHistoryDTO{Operations: []OperationDTO{}, Available: true}, nil
 }
-func (nullHandler) HandleRemoveProviderAccount(string, string) (*RemoveProviderAccountResponse, error) {
+func (nullHandler) HandleAccountRemovalPreview(string, string) (*AccountRemovalPreviewDTO, error) {
+	return &AccountRemovalPreviewDTO{Removable: true}, nil
+}
+func (nullHandler) HandleRemoveProviderAccount(string, string, RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error) {
 	return &RemoveProviderAccountResponse{Removed: true}, nil
 }
 func (nullHandler) HandleGetOperation(string) (*OperationDTO, error) {

@@ -6,12 +6,14 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -514,6 +516,26 @@ CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider ON provider_credent
 	{
 		version: 20,
 		onApply: migrateCleanupItemsRecordTheirAccount,
+	},
+	{
+		version: 21,
+		sql: `
+-- Removing an account deleted its row and its credential and left no trace.
+-- Every connection mutation leaves an operations row; this one left nothing, so
+-- a support export could not answer "was this credential removed, and when".
+--
+-- There is no foreign key: the thing it refers to is what was deleted.
+CREATE TABLE IF NOT EXISTS provider_account_removals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    credential_ref TEXT,
+    credential_removed INTEGER NOT NULL DEFAULT 0,
+    preview_fingerprint TEXT NOT NULL,
+    removed_at TEXT NOT NULL
+);
+`,
 	},
 }
 
@@ -5090,6 +5112,152 @@ func (d AccountDependencies) ConnectionIDs() []string {
 	return ids
 }
 
+// AccountRemovalPreview is what removing an account would do, computed from the
+// same evidence the removal itself decides on.
+//
+// The alternative — each client composing its own description — is how the
+// confirmation screen came to promise that Portico would "forget the credential
+// it stored" for accounts whose credential is not stored at all.
+type AccountRemovalPreview struct {
+	ProviderID   core.ProviderID
+	AccountID    core.ProviderAccountID
+	Label        string
+	Status       string
+	Dependencies AccountDependencies
+	// Removable is true when nothing blocks the removal.
+	Removable bool
+	// CredentialStored reports that a stored credential row exists for this
+	// account, rather than the account merely naming one.
+	CredentialStored bool
+	// Fingerprint binds this preview to the removal it describes. Applying with
+	// a fingerprint that no longer matches is refused rather than performed
+	// against a subject that has changed underneath it.
+	Fingerprint string
+	ObservedAt  time.Time
+}
+
+// StalePreviewError reports that the account, or what depends on it, changed
+// between previewing a removal and applying it.
+//
+// Current is computed inside the refusing transaction, so what the caller is
+// shown next is coherent with the refusal rather than a second read that could
+// disagree with it.
+type StalePreviewError struct {
+	Expected string
+	Current  *AccountRemovalPreview
+}
+
+func (e *StalePreviewError) Error() string {
+	return "this account changed since the removal was previewed; review it again"
+}
+
+// PreviewProviderAccountRemoval reports what removing an account would do.
+//
+// It calls the same dependency query the removal decides on. Two queries would
+// eventually disagree, and the disagreement would be a preview describing a
+// removal that does something else.
+func (s *Store) PreviewProviderAccountRemoval(
+	ctx context.Context,
+	providerID core.ProviderID,
+	accountID core.ProviderAccountID,
+) (*AccountRemovalPreview, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin removal preview: %w", err)
+	}
+	defer tx.Rollback()
+
+	preview, err := previewAccountRemovalTx(ctx, tx, providerID, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return preview, tx.Rollback()
+}
+
+// previewAccountRemovalTx builds the preview inside a caller's transaction, so
+// the same evidence can serve a preview and a removal decision.
+func previewAccountRemovalTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	providerID core.ProviderID,
+	accountID core.ProviderAccountID,
+) (*AccountRemovalPreview, error) {
+	var credentialRef sql.NullString
+	var label, status, updatedAt sql.NullString
+	err := tx.QueryRowContext(ctx,
+		`SELECT credential_ref, label, status, updated_at FROM provider_accounts
+		 WHERE id = ? AND provider_id = ?`,
+		string(accountID), string(providerID)).Scan(&credentialRef, &label, &status, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("provider account not found: %s/%s", providerID, accountID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read account: %w", err)
+	}
+
+	// Whether a credential is actually held, not merely referenced. An account
+	// row always names a reference; the row it names may not exist.
+	credentialStored := false
+	if credentialRef.Valid && credentialRef.String != "" {
+		var count int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM provider_credentials WHERE credential_ref = ?",
+			credentialRef.String).Scan(&count); err != nil {
+			return nil, fmt.Errorf("check stored credential: %w", err)
+		}
+		credentialStored = count > 0
+	}
+
+	deps, err := accountDependenciesTx(ctx, tx, providerID, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AccountRemovalPreview{
+		ProviderID:       providerID,
+		AccountID:        accountID,
+		Label:            label.String,
+		Status:           status.String,
+		Dependencies:     deps,
+		Removable:        len(deps) == 0,
+		CredentialStored: credentialStored,
+		Fingerprint: fingerprintAccountRemoval(
+			string(providerID), string(accountID), credentialRef.String, updatedAt.String, deps),
+		ObservedAt: time.Now().UTC(),
+	}, nil
+}
+
+// fingerprintAccountRemoval identifies the subject a preview described.
+//
+// It hashes what makes the removal a different act: the account's identity, the
+// credential it references, when the account was last written — so an account
+// removed and re-created under the same key is a different subject — and the
+// set of things that depend on it, so "nothing depends on this" is part of what
+// was shown. Display text is excluded: a relabelled account is the same
+// removal, and a preview must not expire because a sentence changed.
+func fingerprintAccountRemoval(
+	providerID, accountID, credentialRef, accountUpdatedAt string,
+	deps AccountDependencies,
+) string {
+	canonical := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		canonical = append(canonical, dep.Kind+"|"+dep.ID)
+	}
+	sort.Strings(canonical)
+
+	h := sha256.New()
+	for _, part := range append([]string{
+		providerID, accountID, credentialRef, accountUpdatedAt,
+	}, canonical...) {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // DeleteProviderAccountIfUnused removes an account only if nothing depends on
 // it, deciding and deleting inside one write transaction.
 //
@@ -5106,7 +5274,15 @@ func (s *Store) DeleteProviderAccountIfUnused(
 	ctx context.Context,
 	providerID core.ProviderID,
 	accountID core.ProviderAccountID,
+	previewFingerprint string,
 ) (AccountDependencies, error) {
+	// Required, not optional. Treating an empty fingerprint as "skip the check"
+	// would make every caller that forgets it silently unchecked, which is the
+	// opposite of what the check is for.
+	if previewFingerprint == "" {
+		return nil, fmt.Errorf("removing an account requires the fingerprint of the preview it was confirmed from")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -5116,24 +5292,27 @@ func (s *Store) DeleteProviderAccountIfUnused(
 	}
 	defer tx.Rollback()
 
-	var credentialRef sql.NullString
-	err = tx.QueryRowContext(ctx,
-		"SELECT credential_ref FROM provider_accounts WHERE id = ? AND provider_id = ?",
-		string(accountID), string(providerID)).Scan(&credentialRef)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("provider account not found: %s/%s", providerID, accountID)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read account: %w", err)
-	}
-
-	deps, err := accountDependenciesTx(ctx, tx, providerID, accountID)
+	// The preview is recomputed here, inside the transaction that will delete,
+	// so the decision and the deletion still cannot be separated.
+	preview, err := previewAccountRemovalTx(ctx, tx, providerID, accountID)
 	if err != nil {
 		return nil, err
 	}
-	if len(deps) > 0 {
-		// Committing nothing. The caller reports what is in the way.
-		return deps, nil
+
+	// Dependencies first. Someone with a blocking connection should be told
+	// what blocks it, not that their preview expired.
+	if len(preview.Dependencies) > 0 {
+		return preview.Dependencies, nil
+	}
+	if preview.Fingerprint != previewFingerprint {
+		return nil, &StalePreviewError{Expected: previewFingerprint, Current: preview}
+	}
+
+	var credentialRef sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		"SELECT credential_ref FROM provider_accounts WHERE id = ? AND provider_id = ?",
+		string(accountID), string(providerID)).Scan(&credentialRef); err != nil {
+		return nil, fmt.Errorf("read account: %w", err)
 	}
 
 	if credentialRef.Valid && credentialRef.String != "" {
@@ -5147,6 +5326,25 @@ func (s *Store) DeleteProviderAccountIfUnused(
 		string(accountID), string(providerID)); err != nil {
 		return nil, fmt.Errorf("delete account: %w", err)
 	}
+
+	// The record is written in the same transaction as the deletion. One that
+	// could be committed separately would be able to lie in either direction:
+	// a removal with no record, or a record of a removal that did not happen.
+	credentialRemoved := 0
+	if preview.CredentialStored {
+		credentialRemoved = 1
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO provider_account_removals
+			(provider_id, account_id, label, credential_ref, credential_removed,
+			 preview_fingerprint, removed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		string(providerID), string(accountID), preview.Label,
+		credentialRef.String, credentialRemoved,
+		previewFingerprint, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return nil, fmt.Errorf("record account removal: %w", err)
+	}
+
 	return nil, tx.Commit()
 }
 

@@ -15,14 +15,24 @@ import (
 // removalHandler records what the route asked for and answers as told.
 type removalHandler struct {
 	nullHandler
-	gotProvider string
-	gotAccount  string
-	response    *RemoveProviderAccountResponse
-	err         error
+	gotProvider    string
+	gotAccount     string
+	response       *RemoveProviderAccountResponse
+	err            error
+	gotFingerprint string
 }
 
-func (h *removalHandler) HandleRemoveProviderAccount(providerID, accountID string) (
-	*RemoveProviderAccountResponse, error) {
+func (h *removalHandler) HandleAccountRemovalPreview(providerID, accountID string) (
+	*AccountRemovalPreviewDTO, error) {
+	return &AccountRemovalPreviewDTO{
+		ProviderID: providerID, AccountID: accountID,
+		Removable: true, Fingerprint: "fp-test",
+	}, nil
+}
+
+func (h *removalHandler) HandleRemoveProviderAccount(providerID, accountID string,
+	req RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error) {
+	h.gotFingerprint = req.Fingerprint
 	h.gotProvider, h.gotAccount = providerID, accountID
 	return h.response, h.err
 }
@@ -169,5 +179,65 @@ func TestConfiguringAnAccountStillWorks(t *testing.T) {
 
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("configuring an account returned %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheRemovalPreviewIsReachable pins the one widened path.
+func TestTheRemovalPreviewIsReachable(t *testing.T) {
+	h := &removalHandler{response: &RemoveProviderAccountResponse{Removed: true}}
+	s := serverWith(t, h)
+
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/v1/providers/cloudflare/accounts/acct-1/removal-preview", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var preview AccountRemovalPreviewDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.Fingerprint == "" {
+		t.Fatal("the preview carries no fingerprint to confirm against")
+	}
+}
+
+// TestOnlyTheRemovalPreviewIsAcceptedAsAFourthSegment pins that widening the
+// parser by one literal did not open it generally. The existing refusal of
+// other four-segment paths is unchanged.
+func TestOnlyTheRemovalPreviewIsAcceptedAsAFourthSegment(t *testing.T) {
+	h := &removalHandler{response: &RemoveProviderAccountResponse{Removed: true}}
+	s := serverWith(t, h)
+
+	for _, path := range []string{
+		"/v1/providers/cloudflare/accounts/acct-1/extra",
+		"/v1/providers/cloudflare/accounts/acct-1/removal-preview/more",
+		"/v1/providers/cloudflare/authenticate/acct-1/removal-preview",
+	} {
+		rec := httptest.NewRecorder()
+		s.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("%s was accepted", path)
+		}
+	}
+}
+
+// TestTheFingerprintReachesTheHandler pins that what the caller confirmed
+// travels with the removal.
+func TestTheFingerprintReachesTheHandler(t *testing.T) {
+	h := &removalHandler{response: &RemoveProviderAccountResponse{Removed: true}}
+	s := serverWith(t, h)
+
+	body := strings.NewReader(`{"fingerprint":"fp-abc123"}`)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete,
+		"/v1/providers/cloudflare/accounts/acct-1", body))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.gotFingerprint != "fp-abc123" {
+		t.Fatalf("the handler received fingerprint %q", h.gotFingerprint)
 	}
 }

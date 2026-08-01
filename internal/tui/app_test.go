@@ -31,6 +31,8 @@ type fakeClient struct {
 	created     *ipc.ConnectionDTO
 	createErr   error
 
+	removalPreview        *ipc.AccountRemovalPreviewDTO
+	removedFingerprint    string
 	removedProvider       string
 	removedAccount        string
 	removeAccountResponse *ipc.RemoveProviderAccountResponse
@@ -321,8 +323,20 @@ func (f *fakeClient) PlanEdit(ctx context.Context, connID string, req ipc.Update
 }
 
 // removeAccountErr, when set, is what the supervisor answers a removal with.
-func (f *fakeClient) RemoveProviderAccount(ctx context.Context, providerID, accountID string) (*ipc.RemoveProviderAccountResponse, error) {
+func (f *fakeClient) PreviewProviderAccountRemoval(ctx context.Context, providerID, accountID string) (*ipc.AccountRemovalPreviewDTO, error) {
+	if f.removalPreview != nil {
+		return f.removalPreview, nil
+	}
+	return &ipc.AccountRemovalPreviewDTO{
+		ProviderID: providerID, AccountID: accountID,
+		Removable: true, CredentialStored: true, Fingerprint: "fp-fake",
+		Consequences: []string{"Portico will forget the credential it stored for this account."},
+	}, nil
+}
+
+func (f *fakeClient) RemoveProviderAccount(ctx context.Context, providerID, accountID, fingerprint string) (*ipc.RemoveProviderAccountResponse, error) {
 	f.removedProvider, f.removedAccount = providerID, accountID
+	f.removedFingerprint = fingerprint
 	if f.removeAccountErr != nil {
 		return f.removeAccountResponse, f.removeAccountErr
 	}

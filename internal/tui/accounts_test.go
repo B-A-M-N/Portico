@@ -39,12 +39,17 @@ func TestAnAccountCanBeSelectedAndRemoved(t *testing.T) {
 	// Move to the second account and ask to remove it.
 	next, _ := m.Update(keyMsg("down"))
 	m = next.(Model)
-	next, _ = m.Update(keyMsg("x"))
+	next, previewCmd := m.Update(keyMsg("x"))
 	m = next.(Model)
 
 	if m.screen != ScreenAccountRemoval {
 		t.Fatalf("x did not open the confirmation: screen = %q", m.screen)
 	}
+	if previewCmd == nil {
+		t.Fatal("opening the confirmation did not ask what the removal would do")
+	}
+	next, _ = m.Update(previewCmd())
+	m = next.(Model)
 	if m.accountRemovalTarget == nil || m.accountRemovalTarget.AccountID != "acct-personal" {
 		t.Fatalf("the confirmation targets %#v, want acct-personal", m.accountRemovalTarget)
 	}
@@ -85,7 +90,9 @@ func TestARefusalNamesWhatMustChangeFirst(t *testing.T) {
 	m := readyModel(client, accountSnapshot())
 	m.screen = ScreenProviders
 
-	next, _ := m.Update(keyMsg("x"))
+	next, previewCmd := m.Update(keyMsg("x"))
+	m = next.(Model)
+	next, _ = m.Update(previewCmd())
 	m = next.(Model)
 	next, cmd := m.Update(keyMsg("enter"))
 	m = next.(Model)
@@ -110,6 +117,7 @@ func TestARefusedRemovalIsNotResent(t *testing.T) {
 	m.screen = ScreenAccountRemoval
 	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-work", Label: "Work"}
 	m.accountRemovalTarget = &row
+	m.accountRemovalPreview = &ipc.AccountRemovalPreviewDTO{Removable: true, Fingerprint: "fp"}
 	m.accountRemovalError = "2 connection(s) still use this account"
 
 	_, cmd := m.Update(keyMsg("enter"))
@@ -161,7 +169,7 @@ func TestALateRemovalReplyDoesNotReportAgainstAnotherAccount(t *testing.T) {
 	m.screen = ScreenAccountRemoval
 	row := accountRow{ProviderID: "cloudflare", AccountID: "acct-work", Label: "Work"}
 	m.accountRemovalTarget = &row
-	m.removeAccountCmd(row)
+	m.removeAccountCmd(row, "fp-test")
 	stale := m.accountRequests.current
 
 	// The user cancels and starts another.

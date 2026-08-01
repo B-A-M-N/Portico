@@ -73,8 +73,9 @@ type APIStatusError struct {
 	// discarded, so a caller checking the response for dependent connections
 	// or missing permissions never saw any — while unit tests on each side
 	// passed, because neither exercised the transport between them.
-	AccountDependencies []AccountDependencyDTO
-	ProviderValidation  *ProviderValidationDetails
+	AccountDependencies   []AccountDependencyDTO
+	ProviderValidation    *ProviderValidationDetails
+	AccountRemovalPreview *AccountRemovalPreviewDTO
 }
 
 // Error implements the error interface.
@@ -107,6 +108,7 @@ func checkResponse(resp *http.Response) error {
 			statusErr.Retryable = apiErr.Retryable
 			statusErr.AccountDependencies = apiErr.AccountDependencies
 			statusErr.ProviderValidation = apiErr.ProviderValidation
+			statusErr.AccountRemovalPreview = apiErr.AccountRemovalPreview
 		} else {
 			statusErr.Message = strings.TrimSpace(string(body))
 		}
@@ -536,10 +538,36 @@ func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string
 // The supervisor refuses while connections still select the account, and the
 // refusal names them: removing it silently would strand those connections with
 // an unexplained "provider account unavailable" and no way to see why.
-func (c *Client) RemoveProviderAccount(ctx context.Context, providerID, accountID string) (
+// PreviewProviderAccountRemoval reports what removing an account would do.
+func (c *Client) PreviewProviderAccountRemoval(ctx context.Context, providerID, accountID string) (
+	*AccountRemovalPreviewDTO, error) {
+	path := "/v1/providers/" + url.PathEscape(providerID) + "/accounts/" +
+		url.PathEscape(accountID) + "/removal-preview"
+	resp, err := c.doRequest(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var preview AccountRemovalPreviewDTO
+	if err := json.NewDecoder(resp.Body).Decode(&preview); err != nil {
+		return nil, err
+	}
+	return &preview, nil
+}
+
+func (c *Client) RemoveProviderAccount(ctx context.Context, providerID, accountID, fingerprint string) (
 	*RemoveProviderAccountResponse, error) {
 	path := "/v1/providers/" + url.PathEscape(providerID) + "/accounts/" + url.PathEscape(accountID)
-	resp, err := c.doRequest(ctx, "DELETE", path, nil)
+	// The fingerprint is required by the store. Sending it here is what makes
+	// every caller prove it previewed before removing.
+	body, err := json.Marshal(RemoveProviderAccountRequest{Fingerprint: fingerprint})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doRequest(ctx, "DELETE", path, body)
 	if err != nil {
 		return nil, err
 	}
