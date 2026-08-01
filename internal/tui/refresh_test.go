@@ -2,10 +2,12 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/tui/screens"
 )
 
 var errNoJournal = errors.New("operation journal unavailable")
@@ -262,5 +264,44 @@ func TestTheRouteStripNamesWhatCarriesTheTraffic(t *testing.T) {
 		if got := routeMiddleLabel(kind, "cloudflare"); got != want {
 			t.Errorf("kind %s labelled %q, want %q", kind, got, want)
 		}
+	}
+}
+
+// TestTheSupportReportIsReachableFromTheInterface pins that a diagnostic report
+// can be produced from where a stuck user actually is.
+//
+// It existed only as a CLI command, which is not where someone stuck in the
+// interface will look for it.
+func TestTheSupportReportIsReachableFromTheInterface(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.transitionTo(ScreenSetup)
+	m.setup = screens.NewSetup()
+
+	next, cmd := m.Update(keyMsg("E"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("the setup screen offers no way to produce a report")
+	}
+
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+
+	if m.supportExportPath == "" {
+		t.Fatal("no report path was recorded")
+	}
+	t.Cleanup(func() { os.Remove(m.supportExportPath) })
+
+	info, err := os.Stat(m.supportExportPath)
+	if err != nil {
+		t.Fatalf("the report was not written: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("the report is mode %v, want 0600", perm)
+	}
+	if !strings.Contains(m.status, m.supportExportPath) {
+		t.Fatalf("the path is not shown to the user: %q", m.status)
+	}
+	if !strings.Contains(m.status, "before sharing") {
+		t.Fatalf("the user is not told to read it first: %q", m.status)
 	}
 }

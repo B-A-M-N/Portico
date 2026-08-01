@@ -38,6 +38,7 @@ type fakeClient struct {
 
 	createRequest      *ipc.CreateConnectionRequest
 	historyLimit       int
+	supportExportErr   error
 	applyKeys          []string
 	eventsFor          string
 	operationEvents    []ipc.EventDTO
@@ -278,6 +279,13 @@ func (f *fakeClient) ApplyPlanWithIdempotency(ctx context.Context, planID, idemp
 	f.applyKeys = append(f.applyKeys, idempotencyKey)
 	f.mu.Unlock()
 	return f.ApplyPlan(ctx, planID)
+}
+
+func (f *fakeClient) SupportExport(ctx context.Context) (*ipc.SupportExportDTO, error) {
+	if f.supportExportErr != nil {
+		return nil, f.supportExportErr
+	}
+	return &ipc.SupportExportDTO{GeneratedAt: "2026-01-01T00:00:00Z", OS: "linux"}, nil
 }
 
 func (f *fakeClient) GetOperationEvents(ctx context.Context, operationID string) ([]ipc.EventDTO, error) {

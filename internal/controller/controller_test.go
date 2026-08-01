@@ -900,15 +900,22 @@ func TestController_ConcurrentOperationLimit(t *testing.T) {
 	// Wait a moment to ensure previous operations are still running
 	time.Sleep(10 * time.Millisecond)
 
-	// Verify at least one operation is still running
+	// Every slot must still be occupied, not merely one of them.
+	//
+	// The guard used to skip only when nothing was running, so a run where
+	// some operations had finished — leaving a free slot — went on to assert
+	// that the next apply is refused. It is not refused: there is room. That
+	// made the test fail under load, which is exactly when it ran differently
+	// from the developer machine it was written on.
 	runningCount := 0
 	for _, op := range ops {
 		if snap, ok := ctrl.GetOperation(op.ID); ok && snap.State == OperationStateRunning {
 			runningCount++
 		}
 	}
-	if runningCount == 0 {
-		t.Skip("all operations completed too quickly to test concurrency limit")
+	if runningCount < GlobalOpLimit {
+		t.Skipf("only %d of %d operations were still running, so a slot was free "+
+			"and the limit is not under test", runningCount, GlobalOpLimit)
 	}
 
 	plan, err := ctrl.PlanOpen(ctx, connIDs[GlobalOpLimit])

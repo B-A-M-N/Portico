@@ -2,10 +2,12 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -98,6 +100,9 @@ type Model struct {
 	eventsRequests subjectTracker
 	// apply holds the idempotency key for the preview currently approved.
 	apply applyState
+	// supportExportPath is where the last report was written, so the screen can
+	// say exactly what to attach.
+	supportExportPath string
 
 	snapshot          ipc.SnapshotDTO
 	plan              *ipc.PlanDTO
@@ -294,6 +299,15 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.transitionTo(ScreenHome)
 		}
 		return m, m.requestSnapshot()
+
+	case supportExportedMsg:
+		if msg.Err != nil {
+			m.status = statusLine("could not write the report", msg.Err)
+			return m, nil
+		}
+		m.supportExportPath = msg.Path
+		m.status = "Wrote " + msg.Path + " — read it before sharing."
+		return m, nil
 
 	case editPlannedMsg:
 		if m.edit == nil || !m.edit.requests.accepts(msg.Generation) {
@@ -1651,6 +1665,11 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, nil
 		case "r":
 			return m, m.readinessCmd()
+		case "E":
+			// A diagnostic report, from the screen a user reaches when
+			// something is wrong. It existed only as a CLI command, which is
+			// not where someone stuck in the interface will look.
+			return m, m.supportExportCmd()
 		case "l":
 			// Flip the gate. The mode shown is whatever the supervisor reports
 			// afterwards, so this never claims a change it did not make.
@@ -3818,5 +3837,43 @@ func routeMiddleLabel(kind, providerID string) string {
 			return providerID
 		}
 		return "provider"
+	}
+}
+
+// supportExportedMsg reports where the diagnostic report was written.
+type supportExportedMsg struct {
+	Path string
+	Err  error
+}
+
+// supportExportCmd writes a redacted diagnostic report.
+//
+// The report is written where the user can find it and the path is shown,
+// because a report nobody can locate is not one they can attach.
+func (m *Model) supportExportCmd() tea.Cmd {
+	client := m.client
+	rootCtx := m.rootCtx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(rootCtx, 30*time.Second)
+		defer cancel()
+		export, err := client.SupportExport(ctx)
+		if err != nil {
+			return supportExportedMsg{Err: err}
+		}
+		encoded, err := json.MarshalIndent(export, "", "  ")
+		if err != nil {
+			return supportExportedMsg{Err: err}
+		}
+		path := filepath.Join(os.TempDir(),
+			fmt.Sprintf("portico-support-%s.json", time.Now().UTC().Format("20060102-150405")))
+		// 0600 explicitly: the report is redacted, but it still describes this
+		// machine's services and addresses.
+		if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+			return supportExportedMsg{Err: err}
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return supportExportedMsg{Err: err}
+		}
+		return supportExportedMsg{Path: path}
 	}
 }

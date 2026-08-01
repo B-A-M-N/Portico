@@ -49,3 +49,18 @@ jobs:
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck ./...
+
+      # The acceptance matrix cites test names and commands. Nothing checked
+      # they were real: its first draft cited four tests that had been renamed
+      # and ten commands whose -run patterns matched nothing, and those rows
+      # looked authoritative while verifying nothing.
+      - name: acceptance matrix
+        run: make acceptance
+
+      - name: acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-report
+          path: acceptance-report.txt
+          if-no-files-found: warn

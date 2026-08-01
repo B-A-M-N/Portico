@@ -8,7 +8,7 @@ LDFLAGS  = -s -w \
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate clean
+.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate acceptance clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -57,5 +57,10 @@ validate: fmt-check
 	@echo
 	@echo "All release gates passed."
 
+# acceptance verifies the acceptance matrix against the tests it cites, rather
+# than trusting the names written in it.
+acceptance:
+	./scripts/verify_acceptance_matrix.sh
+
 clean:
-	rm -f portico
+	rm -f portico acceptance-report.txt

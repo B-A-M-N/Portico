@@ -79,11 +79,11 @@ Run a single row with the command in its Command column.
 | **Quitting outranks typing** | `TestQuittingOutranksTyping` | `ctrl+c` quits and clears the credential rather than being typed into it. Caught by an existing test when the routing order was wrong. | `go test ./internal/tui/ -run QuittingOutranksTyping` | `cfa8b2e` |
 | The field does not swallow navigation | `TestNavigationKeysAreNotSwallowedByTheField`, `TestAMenuQuestionDoesNotRouteToTheField` | Enter and esc belong to the screen; menus do not collect text. | `go test ./internal/tui/screens/ -run NavigationKeysAreNot && go test ./internal/tui/screens/ -run MenuQuestionDoesNot` | `cfa8b2e` |
 | Content taller than the terminal is reachable | `TestContentTallerThanTheTerminalCanBeReached` (`internal/tui/scroll_test.go`) | Clipping happens where content is rendered, so what is cut can be scrolled to. | `go test ./internal/tui/ -run ContentTallerThan` | `cfa8b2e` |
-| Hidden content is announced | `TestTheUserIsToldThereIsMore` | How much is above and below, and which keys move it. | `go test ./internal/tui/ -run UserIsToldThereIsMore` | `cfa8b2e` |
-| The viewport never overflows | `TestTheViewportNeverExceedsTheTerminalHeight` | Across heights 3…50, including the indicator line. | `go test ./internal/tui/ -run ViewportNeverExceeds` | `cfa8b2e` |
-| Scrolling stops at the end | `TestScrollingStopsAtTheEnd` | No blank space past the bottom. | `go test ./internal/tui/ -run ScrollingStopsAtTheEnd` | `cfa8b2e` |
+| Hidden content is announced | `TestContentTallerThanTheTerminalCanBeReached` | How much is above and below, and which keys move it — asserted through the real lifecycle. | `go test ./internal/tui/ -run ContentTallerThan` | `ed5450a` |
+| The viewport never overflows | `TestPagingDownRepeatedlyStopsAtTheEnd` | Over-paging cannot exceed the terminal height or run into blank space. | `go test ./internal/tui/ -run PagingDownRepeatedly` | `ed5450a` |
+| The whole content is reachable | `TestEndReachesTheBottomAndHomeReturns` | End reaches the last line and Home returns; the content is reachable, not merely some of it. | `go test ./internal/tui/ -run EndReachesTheBottom` | `ed5450a` |
 | Content that fits is untouched | `TestShortContentIsNotClipped` | No indicator, no reserved line. | `go test ./internal/tui/ -run ShortContentIsNotClipped` | `cfa8b2e` |
-| A screen opens at the top | `TestOpeningAScreenStartsAtTheTop` | Detected at render, so every navigation path is covered. | `go test ./internal/tui/ -run OpeningAScreenStarts` | `cfa8b2e` |
+| A screen opens at the top | `TestAScreenOpensAtTheTop` | One transition authority, so every navigation path is covered. | `go test ./internal/tui/ -run AScreenOpensAtTheTop` | `ed5450a` |
 | The list is not scrolled twice | `TestTheConnectionListIsNotScrolledTwice` | The selection-following viewport and the free one do not both act. | `go test ./internal/tui/ -run ConnectionListIsNot` | `cfa8b2e` |
 | Scroll keys do not fire while typing | `TestScrollKeysDoNotFireWhileTyping` | The wizard owns the keyboard. | `go test ./internal/tui/ -run ScrollKeysDoNotFire` | `cfa8b2e` |
 | A jump key does not fire during a decision | `TestAJumpKeyDoesNotFireDuringADecision` | `s` and `p` do not leave a plan preview, repair, or running operation. | `go test ./internal/tui/ -run JumpKeyDoesNot` | `4b4f5a6` |
@@ -162,7 +162,63 @@ Run a single row with the command in its Command column.
 | A fresh database is usable | `TestAFreshDatabaseIsImmediatelyUsable` | A chain that applies cleanly and leaves an unusable schema is still a broken release. | `go test ./internal/store/ -run FreshDatabaseIsImmediately` | `a8a57c7` |
 | The release gate is one command | — | `make validate` runs format, build, vet, staticcheck, tests and race tests. | `make validate` | `a8a57c7` |
 
+## 9. Second review: composition, mutation safety, and the real path
+
+An independent review of the completed remediation found defects that unit
+tests on each side could not see. These rows are the corrections.
+
+| Requirement | Test | Behaviour pinned | Command | Commit |
+|---|---|---|---|---|
+| **Scrolling works through the real lifecycle** | `TestContentTallerThanTheTerminalCanBeReached` (`internal/tui/scroll_test.go`) | Size the window, open a screen, press Page Down, read the view. The previous tests set the height by hand — setup production cannot perform — and the feature did not work at all. | `go test ./internal/tui/ -run ContentTallerThan` | `ed5450a` |
+| **Rendering does not change the program** | `TestViewIsPure` | Two identical renders produce identical output and leave the model unchanged, across five screens. Both the scroll state and the inspect model were being mutated from inside View. | `go test ./internal/tui/ -run ViewIsPure` | `ed5450a` |
+| ctrl+d is not a scroll key | `TestCtrlDIsNotAScrollKey` | In a terminal it means end of input. | `go test ./internal/tui/ -run CtrlDIsNot` | `ed5450a` |
+| A late operation refresh cannot replace the one on screen | `TestALateOperationRefreshDoesNotReplaceTheOneOnScreen` (`internal/tui/correlation_more_test.go`) | Watching one operation is not interrupted by a refresh started for another. | `go test ./internal/tui/ -run ALateOperationRefresh` | `b3146e1` |
+| Leaving progress abandons its refresh | `TestLeavingProgressAbandonsItsRefresh` | A reply in flight cannot install an operation after the screen is gone. | `go test ./internal/tui/ -run LeavingProgressAbandons` | `b3146e1` |
+| A copy cannot be submitted twice | `TestACopyCannotBeSubmittedTwice` | A second Enter does not create a second connection. | `go test ./internal/tui/ -run ACopyCannotBeSubmittedTwice` | `b3146e1` |
+| A late copy reply cannot clear another copy | `TestALateCopyReplyDoesNotClearAnotherCopy` | Submit A, leave, begin B, A replies. | `go test ./internal/tui/ -run ALateCopyReply` | `b3146e1` |
+| **An older snapshot cannot replace a newer one** | `TestAnOlderSnapshotDoesNotReplaceANewerOne` | Otherwise stale state sits beside a newer event cursor, and the corrections have already been skipped. | `go test ./internal/tui/ -run AnOlderSnapshot` | `b3146e1` |
+| A smaller history page cannot undo "show more" | `TestASmallerHistoryPageDoesNotReplaceALargerOne` | Ordered by request token. | `go test ./internal/tui/ -run ASmallerHistoryPage` | `b3146e1` |
+| Applying carries an idempotency key | `TestApplyingAPlanCarriesAnIdempotencyKey` | The machinery existed end to end and nothing used it. | `go test ./internal/tui/ -run IdempotencyKey` | `b3146e1` |
+| A retry reuses the same key | `TestRetryingAnApplyReusesTheSameKey`, `TestANewPreviewIsANewAttempt` | One key per approved preview; a different plan is a different attempt. | `go test ./internal/tui/ -run RetryingAnApply && go test ./internal/tui/ -run ANewPreviewIsANewAttempt` | `b3146e1` |
+| **A timed-out apply is not reported as failed** | `TestATimedOutApplyIsNotReportedAsFailed` | The supervisor continues after the client's context is cancelled, so the outcome is unknown, not failed. | `go test ./internal/tui/ -run ATimedOutApply` | `b3146e1` |
+| **Account removal decides and deletes together** | `TestRemovingAnAccountDecidesAndDeletesTogether` (`internal/store/migration_chain_test.go`) | One write transaction, so a connection bound in between cannot be stranded. | `go test ./internal/store/ -run RemovingAnAccountDecides` | `eff55c9` |
+| **A cleanup obligation blocks removing its account** | `TestACleanupObligationBlocksRemovingTheAccountThatCanDischargeIt` | Otherwise the only credential able to remove a created resource is taken away. | `go test ./internal/store/ -run ACleanupObligationBlocks` | `eff55c9` |
+| **A refusal reaches the screen with names, through the real transport** | `TestAccountRemovalRefusalReachesTheScreenWithNames` (`internal/tui/vertical_test.go`) | Real server, real socket, real client, real model. Both sides' unit tests passed while this path was broken. | `go test ./internal/tui/ -run AccountRemovalRefusalReaches` | `eff55c9` |
+| Turning protection on asks who can sign in | `TestTurningProtectionOnAsksWhoCanSignIn` (`internal/tui/edit_test.go`) | A policy naming nobody is refused where it is typed, not after a round trip. | `go test ./internal/tui/ -run TurningProtectionOn` | `9e50e7b` |
+| Identities are parsed by the wizard's own parser | `TestNamedIdentitiesReachTheRequest`, `TestAMalformedIdentityIsRefusedWhereItIsTyped` | One parser, so the screen and core cannot disagree about a valid identity. | `go test ./internal/tui/ -run NamedIdentitiesReach && go test ./internal/tui/ -run AMalformedIdentity` | `9e50e7b` |
+| The account is chosen, not typed | `TestTheAccountIsChosenNotTyped` | Only accounts the provider reports as usable. | `go test ./internal/tui/ -run TheAccountIsChosen` | `9e50e7b` |
+| The CLI does not require a zone the provider calls optional | `TestProviderLoginDoesNotRequireAZone` (`internal/cli/handler_test.go`) | One provider contract, declared by the provider, read by both interfaces. | `go test ./internal/cli/ -run ProviderLoginDoesNotRequireAZone` | `67bfc49` |
+| **A secret is never taken from an argument** | `TestASecretIsNeverTakenFromAnArgument` | Arguments are in shell history and the process list. | `go test ./internal/cli/ -run ASecretIsNeverTaken` | `67bfc49` |
+| Adding an account uses the selected provider | `TestAddingAnAccountUsesTheSelectedProvider` (`internal/tui/accounts_test.go`) | No Cloudflare default in a provider-neutral mechanism. | `go test ./internal/tui/ -run AddingAnAccountUsesTheSelected` | `67bfc49` |
+| The selected account is visible | `TestTheSelectedAccountIsVisible` | The screen offered "↑↓ select account" and drew no marker. | `go test ./internal/tui/ -run TheSelectedAccountIsVisible` | `67bfc49` |
+| A no-op plan says which intent it answers | `TestANoOpPlanSaysWhichIntentItAnswers` (`internal/tui/refresh_test.go`) | Every no-op said "No repair needed" and pushed the repair screen. | `go test ./internal/tui/ -run ANoOpPlanSays` | `be5f524` |
+| The route names what carries the traffic | `TestTheRouteStripNamesWhatCarriesTheTraffic` | A forward has no provider gateway. | `go test ./internal/tui/ -run TheRouteStripNames` | `be5f524` |
+| **Origin ownership says what closing stops** | `TestOriginOwnershipSaysWhatClosingDoes`, `TestAForwardSaysOnlyForwardingStops` (`internal/supervisor/describe_spec_test.go`) | Whether Portico started the local service, or connected to one already running. | `go test ./internal/supervisor/ -run OriginOwnershipSays && go test ./internal/supervisor/ -run AForwardSaysOnly` | `be5f524` |
+| The Access contract is pinned | `TestCreatingAnAppSendsTheHostnameAndAllowedIdentities`, `TestAProtectedAppIsNeverCreatedWithoutIdentities`, `TestAFailedPolicyRemovesTheApplication` (`internal/access/contract_test.go`) | The resource that decides who can reach a protected connection, previously covered only by a fake manager. | `go test ./internal/access/ -run CreatingAnAppSends && go test ./internal/access/ -run AProtectedAppIsNever && go test ./internal/access/ -run AFailedPolicyRemoves` | `959ec52` |
+| A missing Access resource is an absence | `TestAMissingApplicationIsAnAbsenceNotAFailure`, `TestAMissingPolicyIsAnAbsenceNotAFailure`, `TestARejectedTokenIsNotAMissingApplication` | Same rule as the tunnel and DNS managers, both directions. | `go test ./internal/access/ -run AMissingApplicationIs && go test ./internal/access/ -run AMissingPolicyIs && go test ./internal/access/ -run ARejectedTokenIsNotAMissingApp` | `959ec52` |
+| **Overwriting a permissive file still ends private** | `TestOverwritingAPermissiveFileStillEndsPrivate` (`internal/cli/handler_test.go`) | os.WriteFile's mode applies only on create; the code claimed 0600 and produced 0644. Verified empirically before fixing. | `go test ./internal/cli/ -run OverwritingAPermissiveFile` | `959ec52` |
+| An existing report is not silently replaced | `TestAnExistingReportIsNotSilentlyReplaced`, `TestAFailedWriteLeavesNoPartialReport` | --force required; no half-report left behind. | `go test ./internal/cli/ -run AnExistingReportIsNot && go test ./internal/cli/ -run AFailedWriteLeaves` | `959ec52` |
+| The report is reachable from the interface | `TestTheSupportReportIsReachableFromTheInterface` (`internal/tui/refresh_test.go`) | A CLI-only report is not where a stuck user looks. | `go test ./internal/tui/ -run TheSupportReportIsReachable` | pending |
+| **The matrix is verified, not trusted** | — | `make acceptance` runs every cited command and checks every cited test name exists. Its first run found four renamed tests and a wrong exit code in itself. | `make acceptance` | pending |
+
+
 ---
+
+## How this matrix is verified
+
+`make acceptance` runs every command in the tables above and checks that every
+test name they cite exists. It fails if a row points at nothing.
+
+This is not decoration. The first draft of this document cited ten commands
+whose `-run` patterns matched no test — pipes escaped for the markdown table
+became literal `\|` in Go's regexp — and later cited four tests that had been
+renamed. Those rows read as authoritative and verified nothing. The checker's
+own first version reported success while listing eighteen failures, because a
+counter was incremented in what turned out to be a subshell; it now counts from
+the report it writes.
+
+The check runs in CI and uploads its report, which records the commit and the Go
+version it ran against.
 
 ## What is not claimed
 
@@ -183,6 +239,23 @@ none.
   are reachable over the transport. The TUI deliberately routes edits through
   plans instead of the PATCH path, so `UpdateConnection` is an API affordance
   rather than a gap.
-- **The `-race` suite is run with `-count=1` locally and `-count=3` in CI.** No
-  flaky test was observed across the runs in this remediation; one apparent
-  failure was traced to a shell timeout cutting a run short, not to a test.
+- **The `-race` suite is run with `-count=1` locally and `-count=3` in CI.**
+  One flaky test was found and fixed: `TestController_ConcurrentOperationLimit`
+  asserted that exceeding the concurrency limit is refused, while its guard only
+  skipped when *no* operation was still running. A run where some had finished
+  left a free slot, so the next apply was correctly accepted and the test
+  correctly failed. It surfaced under load — two race suites competing — which
+  is the condition a developer machine does not reproduce. An earlier version of
+  this document claimed no flaky test had been observed; that claim was made
+  before anything had looked hard enough.
+- **Account removal is not yet expressed as a previewed plan.** Every other
+  mutation here is an immutable plan the user approves. Removal deletes
+  credential state directly, behind a confirmation screen that states what will
+  happen. The safety problems — stranding a connection, orphaning a cleanup
+  obligation — are fixed transactionally, so what remains is a consistency gap
+  rather than a hazard. It is tracked, not done.
+- **Vertical coverage is partial.** There is now a real-server, real-socket,
+  real-model test for account-removal refusals, and the package exposes a no-op
+  handler to make more of them cheap. Provider validation details, plan apply
+  and the event stream are still proven on each side separately. The account
+  removal defect is what that gap looks like when it bites.

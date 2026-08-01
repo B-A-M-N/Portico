@@ -14,6 +14,7 @@ type SupervisorClient interface {
 	GetConnectionDetail(ctx context.Context, id string) (*ipc.ConnectionDetailDTO, error)
 	ConnectionLogs(ctx context.Context, id string, lines int) (*ipc.ConnectionLogsDTO, error)
 	Readiness(ctx context.Context) (*ipc.ReadinessDTO, error)
+	SupportExport(ctx context.Context) (*ipc.SupportExportDTO, error)
 	SetLaunchMode(ctx context.Context, mode string) (*ipc.LaunchModeDTO, error)
 	ProviderSetupFlow(ctx context.Context, providerID string) (*ipc.SetupFlowDTO, error)
 	RecommendProvider(ctx context.Context, req ipc.ProviderRecommendationRequest) (
