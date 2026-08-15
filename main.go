@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/B-A-M-N/portico/cmd"
 	"github.com/B-A-M-N/portico/internal/cli"
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
@@ -36,9 +35,6 @@ func main() {
 
 	// Create root command with signal-aware context.
 	rootCmd := cli.NewCLI()
-
-	// Add legacy command group that wraps old Flare commands.
-	rootCmd.AddCommand(cmd.LegacyCmd())
 
 	// Execute with the signal-aware context.
 	if err := rootCmd.ExecuteContext(ctx); err != nil {

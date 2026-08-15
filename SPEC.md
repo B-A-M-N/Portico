@@ -181,21 +181,18 @@ The first commit changes only:
 - Binary name.
 - package imports affected by the module path.
 - README title.
-- legacy command namespace.
 
 Do not combine architectural changes with this rename.
 
-### 3.2 Preserve a working legacy path temporarily
+### 3.2 Legacy command path removed
 
-The existing Flare command flow remains available during migration as:
-
-```bash
-portico legacy ...
-```
-
-It is temporary and hidden from beginner documentation. It provides a known-working behavior baseline while Cloudflare code is moved behind the new controller.
-
-Delete `portico legacy` only after the new path passes equivalent characterization tests.
+The legacy Flare command subtree under `cmd/` was removed at commit `0c53e4f`
+after a capability parity inventory confirmed every legacy command — `serve`,
+`list`, `close`, `status`, `update`, `logs`, `doctor`, `init`, `auth login`,
+`auth whoami`, `auth logout`, `auth print-login-url`, `auth rotate-mtls`,
+`config get`, `config set`, and `version` — has an equivalent in the new
+`internal/cli/` path that talks to the supervisor over IPC. Tests and
+documentation no longer reference `portico legacy`.
 
 ### 3.3 Extraction order
 
@@ -240,9 +237,6 @@ Avoid architectural metaphors in user-facing copy. Portico's name affects geomet
 
 ```text
 portico/
-├── cmd/
-│   └── portico/
-│       └── main.go
 ├── internal/
 │   ├── app/
 │   │   ├── bootstrap.go

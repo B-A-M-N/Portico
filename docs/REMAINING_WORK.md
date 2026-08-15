@@ -147,23 +147,17 @@ on the lookup instead of recreating it.
 
 `core.Provider` no longer requires `Apply`, `Repair`, or `Remove`, but both the
 Cloudflare and mock adapters still contain those old asynchronous execution
-implementations. `portico legacy` also remains a second mutation architecture.
+implementations.
 
 **Implementation**
 
-1. Add characterization tests for every legacy command that is intentionally
-   retained during migration.
-2. Delete adapter `Apply`, `Repair`, and `Remove` once no callers remain, or
-   move them into a clearly isolated legacy-only adapter that cannot be reached
-   by the supervisor registry.
-3. Remove `portico legacy` only after equivalent new supervisor workflows and
-   characterization coverage exist. Until then, warn that it does not share
-   Portico lifecycle ownership and block unsafe resource mutations if needed.
+1. ~~Add characterization tests for every legacy command that is intentionally retained during migration.~~ (done — `portico legacy` removed)
+2. ~~Delete adapter `Apply`, `Repair`, and `Remove` once no callers remain, or move them into a clearly isolated legacy-only adapter that cannot be reached by the supervisor registry.~~
+3. Remove `portico legacy` only after equivalent new supervisor workflows and characterization coverage exist.
 
 **Acceptance**
 
-- A repository search finds no production call path that mutates Cloudflare
-  outside `ExecuteStep` under controller/supervisor journaling.
+- A repository search finds no production call path that mutates Cloudflare outside `ExecuteStep` under controller/supervisor journaling.
 - The documented legacy removal gate in `SPEC.md` §3.2 is satisfied.
 
 ## P1 — finish the beginner workflow

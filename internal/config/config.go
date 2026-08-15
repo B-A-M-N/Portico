@@ -340,16 +340,16 @@ func DeleteCredential() error {
 // Validate checks that required config values are present.
 func Validate() error {
 	if viper.GetString(KeyAccountID) == "" {
-		return fmt.Errorf("cloudflare.account_id is not set (run 'portico legacy init' or configure Portico Cloudflare setup)")
+		return fmt.Errorf("cloudflare.account_id is not set (run 'portico provider login cloudflare' or set CLOUDFLARE_ACCOUNT_ID)")
 	}
 	if viper.GetString(KeyZoneID) == "" {
-		return fmt.Errorf("cloudflare.zone_id is not set (run 'portico legacy init' or configure Portico Cloudflare setup)")
+		return fmt.Errorf("cloudflare.zone_id is not set (run 'portico provider login cloudflare' or set CLOUDFLARE_ZONE_ID)")
 	}
 	if viper.GetString(KeyDomain) == "" {
-		return fmt.Errorf("cloudflare.domain is not set (run 'portico legacy init' or configure Portico Cloudflare setup)")
+		return fmt.Errorf("cloudflare.domain is not set (run 'portico provider login cloudflare' or set CLOUDFLARE_DOMAIN)")
 	}
 	if APIToken() == "" {
-		return fmt.Errorf("no API token found (run 'portico legacy auth login' or set CLOUDFLARE_API_TOKEN)")
+		return fmt.Errorf("no API token found (run 'portico provider login cloudflare' or set CLOUDFLARE_API_TOKEN)")
 	}
 	return nil
 }
