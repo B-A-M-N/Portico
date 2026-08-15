@@ -189,6 +189,15 @@ func (h *verticalHandler) HandleConfigureProviderAccount(id string, req ipc.Conf
 	return h.configureResponse, h.configureErr
 }
 
+func (h *verticalHandler) HandleReverifyProviderAccount(providerID, accountID string, req ipc.ReverifyProviderAccountRequest) (
+	*ipc.ReverifyProviderAccountResponse, error) {
+	return nil, nil
+}
+
+func (h *verticalHandler) HandleTelemetry(id string) (*ipc.TelemetryDTO, error) {
+	return nil, nil
+}
+
 func TestProviderValidationDetailsReachTheScreen(t *testing.T) {
 	handler := &verticalHandler{
 		configureResponse: &ipc.ConfigureProviderAccountResponse{

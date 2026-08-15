@@ -17,6 +17,7 @@ import (
 	ngroktunnels "github.com/ngrok/ngrok-api-go/v9/tunnels"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
 )
 
 // Provider implements core.Provider for Ngrok.
@@ -215,6 +216,15 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 	profile := desired.Profile
 	if profile == nil {
 		return nil, fmt.Errorf("ngrok: profile is required")
+	}
+
+	// Defensive kind check: this provider only supports service_exposure.
+	// Without it, a non-service-exposure profile would be planned with empty
+	// source/exposure/protection (the zero values returned by the backward-
+	// compat accessors), causing silent misconfiguration or — worse — an
+	// unprotected public service.
+	if profile.Kind != "" && profile.Kind != core.ConnectionServiceExposure {
+		return nil, fmt.Errorf("ngrok: connection kind %q is not supported, only service_exposure", profile.Kind)
 	}
 
 	var intent core.OperationIntent
@@ -670,33 +680,26 @@ func (p *Provider) Observe(ctx context.Context, id core.ConnectionID) (*core.Obs
 }
 
 // TelemetrySample is the traffic the agent reports for one connection.
-type TelemetrySample struct {
-	ConnectionCount int64
-	RequestCount    int64
-	LatencyP50Ms    float64
-	LatencyP95Ms    float64
-	SampledAt       time.Time
-}
+// It is a type alias for the provider-neutral type so ngrok satisfies
+// provider.TelemetryProvider.
+type TelemetrySample = provider.TelemetrySample
 
 // Telemetry returns the traffic counters the agent reports for a connection.
-//
-// The adapter previously declared telemetry unsupported. The agent does report
-// connection and request counts with latency percentiles, so this is now a real
-// capability rather than an absent one.
-func (p *Provider) Telemetry(ctx context.Context, id core.ConnectionID) (TelemetrySample, error) {
+func (p *Provider) Telemetry(ctx context.Context, id core.ConnectionID) (provider.TelemetrySample, error) {
 	agent, err := p.agentFor(id)
 	if err != nil {
-		return TelemetrySample{}, err
+		return provider.TelemetrySample{}, err
 	}
 	tunnel, err := agent.Tunnel(ctx, tunnelName(id))
 	if err != nil {
-		return TelemetrySample{}, err
+		return provider.TelemetrySample{}, err
 	}
-	return TelemetrySample{
+	return provider.TelemetrySample{
 		ConnectionCount: tunnel.Metrics.Conns.Count,
 		RequestCount:    tunnel.Metrics.HTTP.Count,
-		LatencyP50Ms:    tunnel.Metrics.HTTP.P50,
-		LatencyP95Ms:    tunnel.Metrics.HTTP.P95,
 		SampledAt:       time.Now().UTC(),
 	}, nil
 }
+
+// Ensure ngrok satisfies the optional TelemetryProvider interface.
+var _ provider.TelemetryProvider = (*Provider)(nil)

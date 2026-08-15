@@ -33,9 +33,6 @@ type Controller struct {
 	deleteFinalizer  DeleteConnectionFinalizer
 	connectionStorer ConnectionStorer
 	profileUpdater   ProfileUpdater
-	// pendingEdits holds proposed profiles for edit plans until their
-	// apply-profile step commits.
-	pendingEdits     pendingEdits
 	resourceSaver    ResourceSaver
 	resourceRemover  ResourceRemover
 	credentialStorer CredentialStorer
@@ -264,29 +261,35 @@ func (c *Controller) CreateProfile(
 		}
 	}
 	protection := profile.GetProtection()
-	if protection.Kind != "" && protection.Kind != core.ProtectionNone && protection.SessionTTL <= 0 {
+	// Only service_exposure connections have protection. For other kinds,
+	// GetProtection returns a zero-value spec which would incorrectly trigger
+	// the session TTL defaulting below.
+	if profile.Kind == core.ConnectionServiceExposure && protection.Kind != "" && protection.Kind != core.ProtectionNone && protection.SessionTTL <= 0 {
 		// Update the session TTL in the spec
 		if profile.Spec.ServiceExposure != nil {
 			profile.Spec.ServiceExposure.Protection.SessionTTL = core.DefaultProtectedSessionTTL
 		}
 	}
 
-	// Validate before storing
+	// Validate before storing (on the caller's profile, before normalization).
 	if err := profile.Validate(); err != nil {
 		return nil, nil, core.ErrValidation(err.Error())
 	}
 
-	// Validate provider exists
-	if _, err := c.providerForProfile(profile); err != nil {
-		return nil, nil, err
-	}
-
-	// Deep copy before storing
+	// Deep copy before storing (don't mutate the caller's profile).
 	storedProfile := profile.DeepCopy()
 	now := time.Now().UTC()
+	// Apply semantic defaults (desired state, disconnect policy).
+	core.NormalizeProfile(storedProfile, now)
+	// Server-owned creation metadata is always established by CreateProfile.
+	storedProfile.Revision = 1
 	storedProfile.CreatedAt = now
 	storedProfile.UpdatedAt = now
-	storedProfile.Revision = 1
+
+	// Validate provider compatibility (after normalization, so defaults are reflected).
+	if err := c.validateProviderForProfile(ctx, storedProfile); err != nil {
+		return nil, nil, err
+	}
 
 	// Reject duplicate IDs
 	if _, exists := c.profiles[storedProfile.ID]; exists {
@@ -370,6 +373,11 @@ func (c *Controller) UpdateProfile(ctx context.Context, profile *core.Connection
 
 	// Validate provider exists
 	if _, err := c.providerForProfile(profile); err != nil {
+		return err
+	}
+
+	// Validate provider compatibility (kind support, protocols, protection, etc.).
+	if err := c.validateProviderForProfile(ctx, profile); err != nil {
 		return err
 	}
 
@@ -601,6 +609,7 @@ type RuntimeCommitter interface {
 	CommitOpenSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID, startedAt time.Time) (*core.RuntimeCommitResult, error)
 	CommitCloseSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error)
 	CommitRepairSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error)
+	CommitEditSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error)
 	CommitOperationFailure(ctx context.Context, connID core.ConnectionID, opID core.OperationID, errMsg string, provider core.ProviderID, retryable bool) error
 	CommitDeleteSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) error
 }
@@ -667,12 +676,17 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 		return nil, err
 	}
 
-	// Prepare/resolve the local origin before calling the provider. Owned
-	// origins are represented by an explicit plan step and are started only
-	// after the preview is accepted.
-	resolvedOrigin, err := c.prepareOriginForConnection(ctx, connID, openProfile.GetSource())
-	if err != nil {
-		return nil, fmt.Errorf("origin preparation: %w", err)
+	// Prepare/resolve the local origin before calling the provider. Only
+	// service-exposure connections have a local origin model. Port forwards,
+	// client tunnels, and private networks have no service origin — pass nil.
+	var resolvedOrigin *core.ResolvedOrigin
+	if openProfile.Kind == core.ConnectionServiceExposure {
+		sourceSpec := openProfile.GetSource()
+		var err error
+		resolvedOrigin, err = c.prepareOriginForConnection(ctx, connID, sourceSpec)
+		if err != nil {
+			return nil, fmt.Errorf("origin preparation: %w", err)
+		}
 	}
 
 	desired := core.DesiredConnection{
@@ -684,7 +698,8 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	if err != nil {
 		return nil, err
 	}
-	if resolvedOrigin.Owned {
+	// Only insert a StartOrigin step when a non-nil resolved origin is owned.
+	if resolvedOrigin != nil && resolvedOrigin.Owned {
 		insertStartOriginStep(plan, resolvedOrigin.URL)
 	}
 
@@ -1024,12 +1039,20 @@ func sourceOwnsOrigin(source core.SourceSpec) bool {
 var ErrNoRepairNeeded = errors.New("no repair needed")
 
 // PlanRepair creates a repair plan for a connection based on findings.
+//
+// Currently supports service-exposure connections only. Non-service kinds
+// (port_forward, client_tunnel, private_network) require kind-specific
+// repair logic that is not yet implemented.
 func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (*core.OperationPlan, error) {
 	c.mu.RLock()
 	profile, ok := c.profiles[connID]
 	c.mu.RUnlock()
 	if !ok {
 		return nil, core.ErrProfileNotFound(connID)
+	}
+
+	if profile.Kind != core.ConnectionServiceExposure {
+		return nil, fmt.Errorf("repair for connection kind %q is not yet implemented", profile.Kind)
 	}
 
 	// Repair restores runtime and provider state toward the desired
@@ -1265,7 +1288,7 @@ func planRequiresProvider(plan *core.OperationPlan) bool {
 	}
 	for _, step := range plan.Steps {
 		switch step.Kind {
-		case core.StepStartOrigin, core.StepStopOrigin, core.StepFinalizeLocalDeletion:
+		case core.StepStartOrigin, core.StepStopOrigin, core.StepFinalizeLocalDeletion, core.StepApplyProfile:
 			continue
 		default:
 			return true

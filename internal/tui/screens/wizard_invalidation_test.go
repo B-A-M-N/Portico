@@ -162,7 +162,10 @@ func TestTheEvaluationAndTheConnectionDescribeTheSameThing(t *testing.T) {
 			tc.mutate(&state)
 			m.state = state
 
-			built := m.buildRequest()
+			built, err := m.buildRequest()
+			if err != nil {
+				t.Fatal(err)
+			}
 			scored := m.recommendationRequest()
 
 			if scored.ConnectionKind != built.Kind {

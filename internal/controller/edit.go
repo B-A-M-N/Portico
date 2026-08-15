@@ -3,38 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 )
-
-// pendingEdits holds the proposed profile for an edit plan until its
-// apply-profile step commits.
-//
-// The profile is deliberately not written when the plan is built. Until the
-// commit step runs, the connection still reads as its previous self, so a
-// failure earlier in the plan leaves nothing to undo at the profile level.
-type pendingEdits struct {
-	mu       sync.Mutex
-	proposed map[core.PlanID]*core.ConnectionProfile
-}
-
-func (p *pendingEdits) put(planID core.PlanID, profile *core.ConnectionProfile) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.proposed == nil {
-		p.proposed = map[core.PlanID]*core.ConnectionProfile{}
-	}
-	p.proposed[planID] = profile
-}
-
-func (p *pendingEdits) take(planID core.PlanID) (*core.ConnectionProfile, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	profile, ok := p.proposed[planID]
-	return profile, ok
-}
 
 // ProfileDelta describes what an edit changes and what it invalidates.
 type ProfileDelta struct {
@@ -75,14 +47,17 @@ func (d *ProfileDelta) invalidate(kinds ...core.ResourceType) {
 // The classification is derived from the fields that changed rather than
 // inferred at execution time, so the plan preview can state exactly which
 // provider resources will be replaced before the user confirms.
+//
+// Currently supports service-exposure connections fully. For other kinds
+// (port_forward, private_network, client_tunnel), generic metadata changes
+// (name, lifecycle) are detected, but spec-specific changes are not yet
+// classified. This is intentional: non-service edit support is incremental.
 func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, error) {
 	var delta ProfileDelta
 	if current == nil || proposed == nil {
 		return delta, fmt.Errorf("both the current and proposed profiles are required")
 	}
 	if current.Kind != proposed.Kind {
-		// A kind change is a migration between different lifecycles, not an
-		// edit. Clone and delete expresses it without inventing a conversion.
 		return delta, core.ErrValidation(fmt.Sprintf(
 			"changing the connection kind from %q to %q is not an edit; clone the connection and delete the original instead",
 			current.Kind, proposed.Kind))
@@ -92,8 +67,6 @@ func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, erro
 		delta.Changes = append(delta.Changes, "name")
 	}
 
-	// A different provider or account invalidates everything: resources at the
-	// old provider cannot be adopted by the new one.
 	if current.Driver.ProviderID != proposed.Driver.ProviderID {
 		delta.Changes = append(delta.Changes, "provider")
 		delta.RestartConnector = true
@@ -105,33 +78,76 @@ func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, erro
 		delta.invalidate(core.ResourceTunnel, core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy)
 	}
 
-	cur, prop := current.Spec.ServiceExposure, proposed.Spec.ServiceExposure
-	if cur != nil && prop != nil {
-		if !sameSource(cur.Source, prop.Source) {
-			// The origin is local. Nothing at the provider depends on it, but
-			// the connector is pointed at it and must be restarted.
-			delta.Changes = append(delta.Changes, "source")
-			delta.RestartConnector = true
+	switch current.Kind {
+	case core.ConnectionServiceExposure:
+		cur, prop := current.Spec.ServiceExposure, proposed.Spec.ServiceExposure
+		if cur != nil && prop != nil {
+			if !sameSource(cur.Source, prop.Source) {
+				delta.Changes = append(delta.Changes, "source")
+				delta.RestartConnector = true
+			}
+			if cur.Exposure.Mode != prop.Exposure.Mode {
+				delta.Changes = append(delta.Changes, "exposure mode")
+				delta.RestartConnector = true
+				delta.invalidate(core.ResourceTunnel, core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy)
+			} else if cur.Exposure.RequestedAddress != prop.Exposure.RequestedAddress {
+				delta.Changes = append(delta.Changes, "hostname")
+				delta.RestartConnector = true
+				delta.invalidate(core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy)
+			}
+			if cur.Exposure.Protocol != prop.Exposure.Protocol {
+				delta.Changes = append(delta.Changes, "protocol")
+				delta.RestartConnector = true
+			}
+			if !sameProtection(cur.Protection, prop.Protection) {
+				delta.Changes = append(delta.Changes, "protection")
+				delta.RestartConnector = true
+				delta.invalidate(core.ResourceAccessApp, core.ResourceAccessPolicy)
+			}
 		}
-		if cur.Exposure.Mode != prop.Exposure.Mode {
-			delta.Changes = append(delta.Changes, "exposure mode")
-			delta.RestartConnector = true
-			delta.invalidate(core.ResourceTunnel, core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy)
-		} else if cur.Exposure.RequestedAddress != prop.Exposure.RequestedAddress {
-			// The tunnel survives a hostname change; its route and DNS record
-			// do not.
-			delta.Changes = append(delta.Changes, "hostname")
-			delta.RestartConnector = true
-			delta.invalidate(core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy)
+	case core.ConnectionPortForward:
+		cur, prop := current.Spec.PortForward, proposed.Spec.PortForward
+		if cur != nil && prop != nil {
+			if cur.LocalPort != prop.LocalPort {
+				delta.Changes = append(delta.Changes, "local port")
+				delta.RestartConnector = true
+			}
+			if cur.RemoteHost != prop.RemoteHost || cur.RemotePort != prop.RemotePort {
+				delta.Changes = append(delta.Changes, "remote target")
+				delta.RestartConnector = true
+			}
+			if cur.Protocol != prop.Protocol {
+				delta.Changes = append(delta.Changes, "protocol")
+				delta.RestartConnector = true
+			}
+			if cur.Direction != prop.Direction {
+				delta.Changes = append(delta.Changes, "direction")
+				delta.RestartConnector = true
+			}
 		}
-		if cur.Exposure.Protocol != prop.Exposure.Protocol {
-			delta.Changes = append(delta.Changes, "protocol")
-			delta.RestartConnector = true
+	case core.ConnectionPrivateNetwork:
+		cur, prop := current.Spec.PrivateNetwork, proposed.Spec.PrivateNetwork
+		if cur != nil && prop != nil {
+			if cur.NetworkID != prop.NetworkID {
+				delta.Changes = append(delta.Changes, "network")
+				delta.RestartConnector = true
+			}
+			if cur.Mode != prop.Mode {
+				delta.Changes = append(delta.Changes, "mode")
+				delta.RestartConnector = true
+			}
 		}
-		if !sameProtection(cur.Protection, prop.Protection) {
-			delta.Changes = append(delta.Changes, "protection")
-			delta.RestartConnector = true
-			delta.invalidate(core.ResourceAccessApp, core.ResourceAccessPolicy)
+	case core.ConnectionClientTunnel:
+		cur, prop := current.Spec.ClientTunnel, proposed.Spec.ClientTunnel
+		if cur != nil && prop != nil {
+			if cur.Client != prop.Client {
+				delta.Changes = append(delta.Changes, "client")
+				delta.RestartConnector = true
+			}
+			if cur.TunnelID != prop.TunnelID {
+				delta.Changes = append(delta.Changes, "tunnel ID")
+				delta.RestartConnector = true
+			}
 		}
 	}
 
@@ -158,7 +174,6 @@ func sameSource(a, b core.SourceSpec) bool {
 		}
 		return sameCommand(a.MCP.Command, b.MCP.Command)
 	}
-	// One side has an arm the other does not.
 	return a.Existing == nil && b.Existing == nil &&
 		a.Directory == nil && b.Directory == nil &&
 		a.Command == nil && b.Command == nil &&
@@ -249,6 +264,11 @@ func (c *Controller) PlanEdit(ctx context.Context, connID core.ConnectionID, pro
 		return nil, delta, err
 	}
 
+	// Validate provider compatibility for the proposed profile.
+	if err := c.validateProviderForProfile(ctx, candidate); err != nil {
+		return nil, delta, err
+	}
+
 	plan := &core.OperationPlan{
 		ID:              core.NewPlanID(),
 		ConnectionID:    connID,
@@ -257,6 +277,19 @@ func (c *Controller) PlanEdit(ctx context.Context, connID core.ConnectionID, pro
 		Intent:          core.IntentEdit,
 		CreatedAt:       time.Now().UTC(),
 		ExpiresAt:       time.Now().UTC().Add(10 * time.Minute),
+	}
+
+	// Reject provider/account changes as edits. The current plan model cannot
+	// safely represent mixed-provider execution. Direct users to clone+delete.
+	if current.Driver.ProviderID != candidate.Driver.ProviderID {
+		return nil, delta, core.ErrValidation(fmt.Sprintf(
+			"changing the provider from %q to %q is not an edit; clone the connection and delete the original instead",
+			current.Driver.ProviderID, candidate.Driver.ProviderID))
+	}
+	if current.Driver.AccountID != candidate.Driver.AccountID {
+		return nil, delta, core.ErrValidation(fmt.Sprintf(
+			"changing the account from %q to %q is not an edit; clone the connection and delete the original instead",
+			current.Driver.AccountID, candidate.Driver.AccountID))
 	}
 
 	// A no-op edit must not close and reopen a working connection.
@@ -308,33 +341,42 @@ func (c *Controller) PlanEdit(ctx context.Context, connID core.ConnectionID, pro
 		Technical: core.TechnicalOperation{Type: "apply_profile"},
 	})
 
+	// Expected state after the operation: preserve current runtime state
+	// for metadata-only edits, restore to open if we stopped and reopen.
 	if wasOpen {
-		openPlan, err := c.planOpenSteps(ctx, candidate)
-		if err != nil {
-			return nil, delta, fmt.Errorf("plan reopen after edit: %w", err)
-		}
-		plan.Steps = append(plan.Steps, openPlan...)
 		plan.Expected.State = core.RuntimeOpen
 	} else {
 		plan.Expected.State = core.RuntimeClosed
 	}
 
+	if wasOpen && delta.RestartConnector {
+		openPlan, err := c.planOpenSteps(ctx, candidate)
+		if err != nil {
+			return nil, delta, fmt.Errorf("plan reopen after edit: %w", err)
+		}
+		plan.Steps = append(plan.Steps, openPlan...)
+	}
+
 	if err := plan.ComputeFingerprint(); err != nil {
 		return nil, delta, err
 	}
-	c.pendingEdits.put(plan.ID, candidate)
+	// Embed the proposed profile in the plan as a durable, fingerprint-bound
+	// payload. This eliminates pendingEdits and makes edit plans survive
+	// supervisor restart.
+	editPayload, err := core.NewEditPayload(candidate)
+	if err != nil {
+		return nil, delta, fmt.Errorf("create edit payload: %w", err)
+	}
+	plan.EditPayload = editPayload
+	// Recompute fingerprint to include the edit payload hash.
+	if err := plan.ComputeFingerprint(); err != nil {
+		return nil, delta, err
+	}
 	return plan, delta, nil
 }
 
-// RebindPendingEdit moves a pending proposed profile onto the canonical plan
-// ID, which persistence may assign after the plan was built.
+// RebindPendingEdit is retained for backward compatibility as a no-op.
 func (c *Controller) RebindPendingEdit(from, to core.PlanID) {
-	if from == to {
-		return
-	}
-	if profile, ok := c.pendingEdits.take(from); ok {
-		c.pendingEdits.put(to, profile)
-	}
 }
 
 // resourcesForEdit returns the tracked provider resources for a connection.
@@ -380,6 +422,20 @@ func deleteStepForResource(providerID core.ProviderID, resource core.ProviderRes
 		},
 		Destructive: true,
 		Ownership:   core.OwnershipManaged,
+		// Compensation: recreate the resource on the old profile if a later
+		// step fails. This makes the edit all-or-nothing: either the new
+		// profile is fully applied, or the connection is left exactly as it
+		// was. The compensation step uses the old provider binding because
+		// the resource was created under the old profile.
+		Compensation: &core.CompensationStep{
+			ID:   fmt.Sprintf("edit-recreate-%s-%s", resource.Type, safeResourceID(resource.ExternalID)),
+			Kind: kind,
+			Technical: core.TechnicalOperation{
+				Provider:   providerID,
+				Type:       operation, // The provider's delete is reversible only if it tracks external IDs; otherwise this is a no-op that records the obligation.
+				ResourceID: resource.ExternalID,
+			},
+		},
 	}, true
 }
 
@@ -405,9 +461,16 @@ func (c *Controller) planOpenSteps(ctx context.Context, profile *core.Connection
 	openProfile := profile.DeepCopy()
 	openProfile.Desired = core.DesiredOpen
 
-	resolvedOrigin, err := c.prepareOriginForConnection(ctx, profile.ID, openProfile.GetSource())
-	if err != nil {
-		return nil, fmt.Errorf("origin preparation: %w", err)
+	// Only service-exposure connections have a local origin model. Port forwards,
+	// client tunnels, and private networks have no service origin — pass nil.
+	var resolvedOrigin *core.ResolvedOrigin
+	if openProfile.Kind == core.ConnectionServiceExposure {
+		sourceSpec := openProfile.GetSource()
+		var err error
+		resolvedOrigin, err = c.prepareOriginForConnection(ctx, profile.ID, sourceSpec)
+		if err != nil {
+			return nil, fmt.Errorf("origin preparation: %w", err)
+		}
 	}
 
 	plan, err := prov.Plan(ctx, core.DesiredConnection{
@@ -417,7 +480,7 @@ func (c *Controller) planOpenSteps(ctx context.Context, profile *core.Connection
 	if err != nil {
 		return nil, err
 	}
-	if resolvedOrigin.Owned {
+	if resolvedOrigin != nil && resolvedOrigin.Owned {
 		insertStartOriginStep(plan, resolvedOrigin.URL)
 	}
 	return plan.Steps, nil

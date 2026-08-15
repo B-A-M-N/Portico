@@ -929,6 +929,232 @@ func TestSavePlanRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEditPlanPersistenceRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+
+	p := testProfile()
+	if err := s.SaveProfile(context.Background(), p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	proposed := p.DeepCopy()
+	proposed.Name = "renamed"
+
+	payload, err := core.NewEditPayload(proposed)
+	if err != nil {
+		t.Fatalf("NewEditPayload: %v", err)
+	}
+
+	plan := &core.OperationPlan{
+		ID:              core.PlanID("edit-plan-1"),
+		ConnectionID:    p.ID,
+		ProfileRevision: 1,
+		Provider:        core.ProviderID("mock"),
+		Account:         core.ProviderAccountID("acct-1"),
+		Intent:          core.IntentEdit,
+		Steps: []core.PlanStep{
+			{ID: "edit-apply-profile", Kind: core.StepApplyProfile, Summary: "Apply the edited connection"},
+		},
+		EditPayload: payload,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := plan.ComputeFingerprint(); err != nil {
+		t.Fatalf("ComputeFingerprint: %v", err)
+	}
+
+	if err := s.SavePlan(context.Background(), plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+
+	loaded, err := s.LoadPlan(context.Background(), plan.ID)
+	if err != nil {
+		t.Fatalf("LoadPlan: %v", err)
+	}
+
+	if loaded.EditPayload == nil {
+		t.Fatal("EditPayload was not persisted")
+	}
+	if loaded.EditPayload.Profile == nil {
+		t.Fatal("EditPayload.Profile was not persisted")
+	}
+	if loaded.EditPayload.Profile.Name != "renamed" {
+		t.Fatalf("EditPayload.Profile.Name = %q, want renamed", loaded.EditPayload.Profile.Name)
+	}
+	if loaded.EditPayload.CanonicalHash == "" {
+		t.Fatal("EditPayload.CanonicalHash was not persisted")
+	}
+	if loaded.Account != "acct-1" {
+		t.Fatalf("Account = %q, want acct-1", loaded.Account)
+	}
+
+	// Verify fingerprint changes when account changes.
+	if err := loaded.VerifyFingerprint(); err != nil {
+		t.Fatalf("VerifyFingerprint after load: %v", err)
+	}
+}
+
+func TestEditPlanHashDetectsMutation(t *testing.T) {
+	s := newTestStore(t)
+
+	p := testProfile()
+	if err := s.SaveProfile(context.Background(), p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	proposed := p.DeepCopy()
+	proposed.Name = "renamed"
+
+	payload, err := core.NewEditPayload(proposed)
+	if err != nil {
+		t.Fatalf("NewEditPayload: %v", err)
+	}
+
+	plan := &core.OperationPlan{
+		ID:              core.PlanID("edit-plan-2"),
+		ConnectionID:    p.ID,
+		ProfileRevision: 1,
+		Provider:        core.ProviderID("mock"),
+		Account:         core.ProviderAccountID("acct-1"),
+		Intent:          core.IntentEdit,
+		Steps: []core.PlanStep{
+			{ID: "edit-apply-profile", Kind: core.StepApplyProfile, Summary: "Apply the edited connection"},
+		},
+		EditPayload: payload,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := plan.ComputeFingerprint(); err != nil {
+		t.Fatalf("ComputeFingerprint: %v", err)
+	}
+
+	// Verify fingerprint is valid initially.
+	if err := plan.VerifyFingerprint(); err != nil {
+		t.Fatalf("initial VerifyFingerprint: %v", err)
+	}
+
+	// Mutate the profile AFTER fingerprinting. This should be detected.
+	plan.EditPayload.Profile.Name = "tampered"
+
+	// VerifyFingerprint should fail because the hash no longer matches.
+	if err := plan.VerifyFingerprint(); err == nil {
+		t.Fatal("VerifyFingerprint should fail after profile mutation but succeeded")
+	}
+}
+
+func TestEditPlanDeepCopyIsolation(t *testing.T) {
+	s := newTestStore(t)
+
+	p := testProfile()
+	if err := s.SaveProfile(context.Background(), p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	proposed := p.DeepCopy()
+	proposed.Name = "renamed"
+
+	payload, err := core.NewEditPayload(proposed)
+	if err != nil {
+		t.Fatalf("NewEditPayload: %v", err)
+	}
+
+	plan := &core.OperationPlan{
+		ID:              core.PlanID("edit-plan-3"),
+		ConnectionID:    p.ID,
+		ProfileRevision: 1,
+		Provider:        core.ProviderID("mock"),
+		Account:         core.ProviderAccountID("acct-1"),
+		Intent:          core.IntentEdit,
+		Steps: []core.PlanStep{
+			{ID: "edit-apply-profile", Kind: core.StepApplyProfile, Summary: "Apply the edited connection"},
+		},
+		EditPayload: payload,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := plan.ComputeFingerprint(); err != nil {
+		t.Fatalf("ComputeFingerprint: %v", err)
+	}
+
+	if err := s.SavePlan(context.Background(), plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+
+	loaded, err := s.LoadPlan(context.Background(), plan.ID)
+	if err != nil {
+		t.Fatalf("LoadPlan: %v", err)
+	}
+
+	// Mutate the original plan's payload. The loaded plan should be isolated.
+	plan.EditPayload.Profile.Name = "tampered"
+
+	if loaded.EditPayload.Profile.Name != "renamed" {
+		t.Fatalf("loaded plan was mutated by original: Name = %q, want renamed", loaded.EditPayload.Profile.Name)
+	}
+
+	// Deep copy should also isolate.
+	copied := loaded.DeepCopy()
+	loaded.EditPayload.Profile.Name = "mutated-after-copy"
+
+	if copied.EditPayload.Profile.Name != "renamed" {
+		t.Fatalf("deep copy was mutated by original: Name = %q, want renamed", copied.EditPayload.Profile.Name)
+	}
+}
+
+func TestSaveOrGetPlanPreservesEditPayload(t *testing.T) {
+	s := newTestStore(t)
+
+	p := testProfile()
+	if err := s.SaveProfile(context.Background(), p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+
+	proposed := p.DeepCopy()
+	proposed.Name = "renamed"
+
+	payload, err := core.NewEditPayload(proposed)
+	if err != nil {
+		t.Fatalf("NewEditPayload: %v", err)
+	}
+
+	plan := &core.OperationPlan{
+		ID:              core.PlanID("edit-plan-dedup"),
+		ConnectionID:    p.ID,
+		ProfileRevision: 1,
+		Provider:        core.ProviderID("mock"),
+		Account:         core.ProviderAccountID("acct-1"),
+		Intent:          core.IntentEdit,
+		Steps: []core.PlanStep{
+			{ID: "edit-apply-profile", Kind: core.StepApplyProfile, Summary: "Apply the edited connection"},
+		},
+		EditPayload: payload,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := plan.ComputeFingerprint(); err != nil {
+		t.Fatalf("ComputeFingerprint: %v", err)
+	}
+
+	// First save.
+	saved, err := s.SaveOrGetPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("SaveOrGetPlan (first): %v", err)
+	}
+	if saved.EditPayload == nil {
+		t.Fatal("First SaveOrGetPlan lost EditPayload")
+	}
+
+	// Second save with same fingerprint should return the canonical plan with payload.
+	plan2 := plan.DeepCopy()
+	plan2.ID = core.PlanID("edit-plan-dedup-2") // Different ID, same fingerprint.
+	saved2, err := s.SaveOrGetPlan(context.Background(), plan2)
+	if err != nil {
+		t.Fatalf("SaveOrGetPlan (second): %v", err)
+	}
+	if saved2.EditPayload == nil {
+		t.Fatal("Deduplicated plan lost EditPayload")
+	}
+	if saved2.EditPayload.Profile.Name != "renamed" {
+		t.Fatalf("Deduplicated plan payload name = %q, want renamed", saved2.EditPayload.Profile.Name)
+	}
+}
+
 func TestIdempotencyKey_LookupAndRecord(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

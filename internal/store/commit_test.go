@@ -787,6 +787,82 @@ func TestCommitRepairSuccessBumpsRuntimeRevision(t *testing.T) {
 	}
 }
 
+func TestCommitEditSuccessBumpsRuntimeRevision(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	p := testProfile()
+	if err := s.SaveProfile(ctx, p); err != nil {
+		t.Fatalf("SaveProfile: %v", err)
+	}
+	rt := testRuntime()
+	if err := s.SaveRuntime(ctx, rt); err != nil {
+		t.Fatalf("SaveRuntime: %v", err)
+	}
+	// Create a running operation to be cleared by CommitEditSuccess.
+	opID := core.OperationID("op-edit")
+	// Save a plan first (foreign key constraint).
+	if err := s.SavePlan(ctx, &core.OperationPlan{
+		ID:           "plan-edit",
+		ConnectionID: p.ID,
+		Provider:     p.Driver.ProviderID,
+		Intent:       core.IntentEdit,
+	}); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+	if err := s.SaveOperation(ctx, opID, "plan-edit", p.ID, "running", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("SaveOperation: %v", err)
+	}
+	// Reset revision to a known value.
+	_, err := s.db.Exec("UPDATE connection_runtime SET runtime_revision = 0 WHERE connection_id = ?", p.ID)
+	if err != nil {
+		t.Fatalf("reset revision: %v", err)
+	}
+
+	res, err := s.CommitEditSuccess(ctx, p.ID, opID)
+	if err != nil {
+		t.Fatalf("CommitEditSuccess: %v", err)
+	}
+	// Desired state preserved.
+	if res.DesiredState != p.Desired {
+		t.Fatalf("desired state = %q, want %q", res.DesiredState, p.Desired)
+	}
+	// Runtime state preserved.
+	if res.RuntimeState != rt.State {
+		t.Fatalf("runtime state = %q, want %q", res.RuntimeState, rt.State)
+	}
+
+	// runtime_revision bumped.
+	var rev int64
+	err = s.db.QueryRow("SELECT runtime_revision FROM connection_runtime WHERE connection_id = ?", p.ID).Scan(&rev)
+	if err != nil {
+		t.Fatalf("query revision: %v", err)
+	}
+	if rev != 1 {
+		t.Fatalf("expected runtime_revision 1 after edit, got %d", rev)
+	}
+
+	// Active operation cleared.
+	var activeOpID *string
+	err = s.db.QueryRow("SELECT active_operation_id FROM connection_runtime WHERE connection_id = ?", p.ID).Scan(&activeOpID)
+	if err != nil {
+		t.Fatalf("query active op: %v", err)
+	}
+	if activeOpID != nil {
+		t.Fatalf("expected active_operation_id NULL, got %q", *activeOpID)
+	}
+
+	// Operation marked completed.
+	var opState string
+	err = s.db.QueryRow("SELECT state FROM operations WHERE id = ?", opID).Scan(&opState)
+	if err != nil {
+		t.Fatalf("query op state: %v", err)
+	}
+	if opState != "completed" {
+		t.Fatalf("expected operation state 'completed', got %q", opState)
+	}
+}
+
 func TestMigration17AddsRuntimeRevision(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_m17.db")

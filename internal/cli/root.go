@@ -42,7 +42,12 @@ for connection failures.`,
 	root.AddCommand(newDiscoverCmd())
 	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newRepairCmd())
+	root.AddCommand(newVersionCmd())
 	root.AddCommand(newLogsCmd("Show supervisor logs (alias for 'supervisor logs')"))
+
+	// Setting Version makes 'portico --version' work and keeps the version
+	// template consistent with the 'version' subcommand.
+	root.Version = Version
 
 	return root
 }

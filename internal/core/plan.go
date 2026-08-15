@@ -35,6 +35,13 @@ func (p *OperationPlan) DeepCopy() *OperationPlan {
 		cp.Expected.Resources = make([]ResourceSummary, len(p.Expected.Resources))
 		copy(cp.Expected.Resources, p.Expected.Resources)
 	}
+	// Deep copy the edit payload so the stored plan cannot be mutated through
+	// the original pointer.
+	if p.EditPayload != nil {
+		payload := *p.EditPayload
+		payload.Profile = p.EditPayload.Profile.DeepCopy()
+		cp.EditPayload = &payload
+	}
 	return &cp
 }
 
@@ -95,16 +102,33 @@ type OperationPlan struct {
 	// the plan's identity because it holds the credential: a resource created
 	// here can only be removed by the same account, and a cleanup obligation
 	// that does not record it can be orphaned by removing that account.
-	Account             ProviderAccountID
-	Intent              OperationIntent
-	Steps               []PlanStep
-	Warnings            []PlanWarning
-	Expected            ExpectedOutcome
-	Preconditions       []Precondition
+	Account       ProviderAccountID
+	Intent        OperationIntent
+	Steps         []PlanStep
+	Warnings      []PlanWarning
+	Expected      ExpectedOutcome
+	Preconditions []Precondition
+	// EditPayload is the proposed profile for an edit plan. It is canonicalized
+	// and persisted with the plan so that the plan survives supervisor restart.
+	// The canonical hash of this payload is included in the plan fingerprint.
+	EditPayload         *EditPayload `json:"edit_payload,omitempty"`
 	Fingerprint         string
 	ObservedFingerprint string
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
+}
+
+// EditPayload is the durable representation of an edit's proposed profile.
+// It contains the desired-state profile (no secrets) and a canonical hash
+// that is included in the plan fingerprint.
+type EditPayload struct {
+	// Profile is the proposed profile after the edit. It contains desired
+	// state only — no secrets.
+	Profile *ConnectionProfile `json:"profile"`
+	// CanonicalHash is the SHA-256 of the canonical JSON encoding of the
+	// profile. It is included in the plan fingerprint so that any mutation
+	// of the proposed profile after preview invalidates the plan.
+	CanonicalHash string `json:"canonical_hash"`
 }
 
 // PlanStep represents a single step in a plan
@@ -252,6 +276,7 @@ func (p *OperationPlan) computeFingerprint() (string, error) {
 		ConnectionID        ConnectionID
 		ProfileRevision     uint64
 		Provider            ProviderID
+		Account             ProviderAccountID
 		Intent              OperationIntent
 		Steps               []PlanStep
 		Warnings            []PlanWarning
@@ -259,12 +284,15 @@ func (p *OperationPlan) computeFingerprint() (string, error) {
 		Preconditions       []Precondition
 		ObservedFingerprint string
 		ExpiresAt           time.Time
+		// EditPayloadHash is the canonical hash of the proposed profile.
+		EditPayloadHash string
 	}
 
 	h := planHash{
 		ConnectionID:        p.ConnectionID,
 		ProfileRevision:     p.ProfileRevision,
 		Provider:            p.Provider,
+		Account:             p.Account,
 		Intent:              p.Intent,
 		Steps:               p.Steps,
 		Warnings:            p.Warnings,
@@ -272,6 +300,9 @@ func (p *OperationPlan) computeFingerprint() (string, error) {
 		Preconditions:       p.Preconditions,
 		ObservedFingerprint: p.ObservedFingerprint,
 		ExpiresAt:           p.ExpiresAt,
+	}
+	if p.EditPayload != nil {
+		h.EditPayloadHash = p.EditPayload.CanonicalHash
 	}
 
 	data, err := json.Marshal(h)
@@ -283,7 +314,48 @@ func (p *OperationPlan) computeFingerprint() (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
+// NewEditPayload creates a durable edit payload from a proposed profile.
+// It stores a deep copy of the profile (so the caller cannot later mutate
+// what the plan will apply) and computes its canonical hash for fingerprint binding.
+func NewEditPayload(profile *ConnectionProfile) (*EditPayload, error) {
+	if profile == nil {
+		return nil, fmt.Errorf("edit payload requires a profile")
+	}
+	// Store a defensive deep copy so the caller cannot mutate the profile
+	// that the plan will apply.
+	canonical := profile.DeepCopy()
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		return nil, fmt.Errorf("marshal profile for edit payload: %w", err)
+	}
+	hash := sha256.Sum256(data)
+	return &EditPayload{
+		Profile:       canonical,
+		CanonicalHash: fmt.Sprintf("%x", hash),
+	}, nil
+}
+
+// VerifyHash recomputes the canonical hash from the profile content and
+// compares it against the stored CanonicalHash. This detects any mutation
+// of the proposed profile after the plan was fingerprinted.
+func (p *EditPayload) VerifyHash() error {
+	if p == nil {
+		return nil
+	}
+	data, err := json.Marshal(p.Profile)
+	if err != nil {
+		return fmt.Errorf("marshal profile for hash verification: %w", err)
+	}
+	computed := fmt.Sprintf("%x", sha256.Sum256(data))
+	if computed != p.CanonicalHash {
+		return fmt.Errorf("edit payload hash mismatch: profile was modified after preview")
+	}
+	return nil
+}
+
 // VerifyFingerprint recomputes the fingerprint and compares it with the stored value.
+// For edit plans, it also verifies that the embedded proposed profile still
+// matches its canonical hash (detecting post-preview mutation).
 // This is a pure check - it does not mutate the plan's fingerprint.
 func (p *OperationPlan) VerifyFingerprint() error {
 	saved := p.Fingerprint
@@ -293,6 +365,15 @@ func (p *OperationPlan) VerifyFingerprint() error {
 	}
 	if computed != saved {
 		return fmt.Errorf("fingerprint mismatch: plan has been modified")
+	}
+	// For edit plans, additionally verify the embedded profile hasn't been
+	// mutated since the hash was computed. The plan fingerprint alone trusts
+	// the stored CanonicalHash, so without this check a caller could mutate
+	// the profile after preview and the plan would still verify.
+	if p.EditPayload != nil {
+		if err := p.EditPayload.VerifyHash(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

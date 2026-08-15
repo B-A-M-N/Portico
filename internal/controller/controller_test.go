@@ -1084,3 +1084,105 @@ func TestController_ObservedFingerprintStalePlan(t *testing.T) {
 		t.Fatal("expected error applying plan with stale observed fingerprint")
 	}
 }
+
+func TestPortForwardLifecycle(t *testing.T) {
+	// Use a mock provider that declares support for port_forward.
+	prov := &portForwardMockProvider{mock.New()}
+	reg := newTestRegistry(prov)
+	ctrl := New(reg, newTestJournal())
+
+	ctx := context.Background()
+
+	// Create a port-forward connection.
+	profile := &core.ConnectionProfile{
+		Name: "forward",
+		Kind: core.ConnectionPortForward,
+		Spec: core.ConnectionSpec{
+			PortForward: &core.PortForwardSpec{
+				LocalPort:  8080,
+				RemoteHost: "127.0.0.1",
+				RemotePort: 80,
+				Protocol:   core.ProtocolTCP,
+				Direction:  core.PortForwardLocal,
+			},
+		},
+		Driver:  core.DriverSelection{ProviderID: "mock"},
+		Desired: core.DesiredClosed,
+	}
+
+	if _, _, err := ctrl.CreateProfile(ctx, profile); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+
+	connID := profile.ID
+	if connID == "" {
+		t.Fatal("CreateProfile did not assign ID")
+	}
+
+	// Verify initial runtime state is closed.
+	rt, ok := ctrl.GetRuntime(connID)
+	if !ok {
+		t.Fatal("runtime not created")
+	}
+	if rt.State != core.RuntimeClosed {
+		t.Fatalf("expected closed, got %s", rt.State)
+	}
+
+	// Open.
+	plan, err := ctrl.PlanOpen(ctx, connID)
+	if err != nil {
+		t.Fatalf("PlanOpen: %v", err)
+	}
+	if plan.Intent != core.IntentOpen {
+		t.Fatalf("Intent = %q, want open", plan.Intent)
+	}
+
+	if err := ctrl.SavePlan(plan); err != nil {
+		t.Fatalf("SavePlan: %v", err)
+	}
+
+	op, err := ctrl.ApplyPlan(ctx, plan.ID)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	finalOp := awaitOperationTerminal(t, ctrl, op.ID)
+	if finalOp.State != OperationStateCompleted {
+		t.Fatalf("State = %q, want completed", finalOp.State)
+	}
+
+	// Close.
+	closePlan, err := ctrl.PlanClose(ctx, connID)
+	if err != nil {
+		t.Fatalf("PlanClose: %v", err)
+	}
+	if closePlan.Intent != core.IntentClose {
+		t.Fatalf("Intent = %q, want close", closePlan.Intent)
+	}
+
+	if err := ctrl.SavePlan(closePlan); err != nil {
+		t.Fatalf("SavePlan (close): %v", err)
+	}
+
+	op2, err := ctrl.ApplyPlan(ctx, closePlan.ID)
+	if err != nil {
+		t.Fatalf("ApplyPlan (close): %v", err)
+	}
+	finalOp2 := awaitOperationTerminal(t, ctrl, op2.ID)
+	if finalOp2.State != OperationStateCompleted {
+		t.Fatalf("Close State = %q, want completed", finalOp2.State)
+	}
+}
+
+// portForwardMockProvider wraps mock.Provider to declare port_forward support.
+type portForwardMockProvider struct {
+	*mock.Provider
+}
+
+func (p *portForwardMockProvider) Capabilities(ctx context.Context) (core.Capabilities, error) {
+	caps, _ := p.Provider.Capabilities(ctx)
+	caps.Kinds = []core.ConnectionKind{core.ConnectionPortForward}
+	caps.Protocols = map[core.Protocol]core.ProtocolCapability{
+		core.ProtocolTCP: {Supported: true, Private: true},
+	}
+	return caps, nil
+}

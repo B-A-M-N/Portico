@@ -37,6 +37,13 @@ type reconcileDecision struct {
 func (s *Supervisor) computeReconcileDecision(ctx context.Context, input ReconcileInput) (*reconcileDecision, error) {
 	desired := input.Profile.Desired
 
+	// Reconciliation is kind-specific. The current implementation handles
+	// service-exposure (Cloudflare) connections. Other kinds have their own
+	// reconciliation semantics that are not yet implemented.
+	if input.Profile.Kind != core.ConnectionServiceExposure {
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
 	// Reconciliation moves a connection toward its desired state without
 	// anyone asking, so it must not drive a connection toward a state that is
 	// no longer permitted. A profile stored under an older rule would

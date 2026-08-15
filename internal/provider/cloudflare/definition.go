@@ -36,8 +36,11 @@ func (d *Definition) Identity() core.ProviderIdentity {
 
 func (d *Definition) CatalogEntry() provider.CatalogEntry {
 	return provider.CatalogEntry{
-		ID: "cloudflare", Name: "cloudflare", DisplayName: "Cloudflare",
+		ID:           "cloudflare",
+		Name:         "cloudflare",
+		DisplayName:  "Cloudflare",
 		Availability: provider.AvailabilityUnconfigured,
+		Stability:    core.StabilityStable,
 		SetupActions: []string{"Add a Cloudflare account"},
 	}
 }

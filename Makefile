@@ -4,7 +4,10 @@ DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS  = -s -w \
            -X github.com/B-A-M-N/portico/cmd.Version=$(VERSION) \
            -X github.com/B-A-M-N/portico/cmd.Commit=$(COMMIT) \
-           -X github.com/B-A-M-N/portico/cmd.Date=$(DATE)
+           -X github.com/B-A-M-N/portico/cmd.Date=$(DATE) \
+           -X github.com/B-A-M-N/portico/internal/cli.Version=$(VERSION) \
+           -X github.com/B-A-M-N/portico/internal/cli.Commit=$(COMMIT) \
+           -X github.com/B-A-M-N/portico/internal/cli.Date=$(DATE)
 
 SHELL := /bin/bash
 

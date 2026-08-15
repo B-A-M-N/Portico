@@ -2098,15 +2098,73 @@ func TestCreateConnectionSupportsPortForwardAndRefusesTheRest(t *testing.T) {
 		}
 	})
 
-	t.Run("private network is refused with a reason", func(t *testing.T) {
+	t.Run("private network without arm is refused", func(t *testing.T) {
+		// With no PrivateNetwork arm, the tagged union validation rejects
+		// the request as malformed — the kind declares a spec that is missing.
 		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
 			Name: "net", Kind: string(core.ConnectionPrivateNetwork),
+		})
+		if err == nil {
+			t.Fatal("a private network connection was accepted without a spec arm")
+		}
+		if !strings.Contains(err.Error(), "none were populated") {
+			t.Fatalf("refusal should indicate missing arm: %v", err)
+		}
+	})
+
+	t.Run("private network with arm is refused as not implemented", func(t *testing.T) {
+		// With the arm present, the kind is refused as not implemented.
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name:           "net",
+			Kind:           string(core.ConnectionPrivateNetwork),
+			PrivateNetwork: &ipc.PrivateNetworkSpecDTO{NetworkID: "tailscale"},
 		})
 		if err == nil {
 			t.Fatal("a private network connection was accepted despite having no adapter")
 		}
 		if !strings.Contains(err.Error(), "not implemented") {
 			t.Fatalf("refusal does not explain itself: %v", err)
+		}
+	})
+
+	t.Run("client tunnel requires its spec arm", func(t *testing.T) {
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "mcp", Kind: string(core.ConnectionClientTunnel),
+		})
+		if err == nil {
+			t.Fatal("a client tunnel connection was accepted without a client_tunnel specification")
+		}
+		if !strings.Contains(err.Error(), "none were populated") {
+			t.Fatalf("refusal should indicate missing arm: %v", err)
+		}
+	})
+
+	t.Run("port forward requires its spec arm", func(t *testing.T) {
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "pf", Kind: string(core.ConnectionPortForward),
+		})
+		if err == nil {
+			t.Fatal("a port forward connection was accepted without a port_forward specification")
+		}
+		if !strings.Contains(err.Error(), "none were populated") {
+			t.Fatalf("refusal should indicate missing arm: %v", err)
+		}
+	})
+
+	t.Run("kind and spec arm mismatch is refused", func(t *testing.T) {
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name:           "web",
+			Kind:           string(core.ConnectionServiceExposure),
+			PrivateNetwork: &ipc.PrivateNetworkSpecDTO{NetworkID: "tailscale"},
+		})
+		if err == nil {
+			t.Fatal("a service_exposure connection with only a private_network arm was accepted")
+		}
+		// Service exposure with only private_network arm: validation sees one arm
+		// populated (private_network) but kind=service_exposure, so it rejects
+		// because the populated arm doesn't match the declared kind.
+		if !strings.Contains(err.Error(), "service_exposure") {
+			t.Fatalf("refusal should mention service_exposure: %v", err)
 		}
 	})
 

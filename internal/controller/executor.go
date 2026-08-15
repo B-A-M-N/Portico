@@ -640,6 +640,9 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				newDesired = core.DesiredOpen
 			case core.IntentClose:
 				newDesired = core.DesiredClosed
+			case core.IntentEdit:
+				// Edit preserves the current desired state.
+				newDesired = profile.Desired
 			}
 			newRuntimeState := core.RuntimeClosed
 			switch plan.Intent {
@@ -649,6 +652,13 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				newRuntimeState = core.RuntimeClosed
 			case core.IntentRepair:
 				newRuntimeState = core.RuntimeOpen
+			case core.IntentEdit:
+				// Edit preserves the current runtime state.
+				c.mu.RLock()
+				if rt, ok := c.runtimes[plan.ConnectionID]; ok {
+					newRuntimeState = rt.State
+				}
+				c.mu.RUnlock()
 			}
 
 			// Persist runtime transition first. If this fails, do not mutate memory.
@@ -662,6 +672,8 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 					commit, persistErr = c.runtimeCommitter.CommitCloseSuccess(ctx, plan.ConnectionID, rec.oper.ID)
 				case core.IntentRepair:
 					commit, persistErr = c.runtimeCommitter.CommitRepairSuccess(ctx, plan.ConnectionID, rec.oper.ID)
+				case core.IntentEdit:
+					commit, persistErr = c.runtimeCommitter.CommitEditSuccess(ctx, plan.ConnectionID, rec.oper.ID)
 				default:
 					persistErr = c.runtimeCommitter.CommitOperationFailure(ctx, plan.ConnectionID, rec.oper.ID, "unknown intent", plan.Provider, false)
 				}
@@ -715,9 +727,11 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				p.Desired = newDesired
 				if commit != nil {
 					p.Revision = commit.ProfileRevision
-				} else if plan.Intent != core.IntentRepair {
+				} else if plan.Intent != core.IntentRepair && plan.Intent != core.IntentEdit {
 					// Fallback mirrors the store behavior: revision changes
 					// only when the desired profile state changes.
+					// Edit does NOT increment revision — it was already
+					// updated in the apply-profile step.
 					p.Revision++
 				}
 				c.profiles[plan.ConnectionID] = p
@@ -808,10 +822,14 @@ func (c *Controller) executeStep(ctx context.Context, plan *core.OperationPlan, 
 		// The commit boundary of an edit. Everything before this step operated
 		// on the previous profile, which is still what a reader sees; from here
 		// on the connection is its edited self.
-		proposed, ok := c.pendingEdits.take(plan.ID)
-		if !ok || proposed == nil {
+		//
+		// The proposed profile is embedded in the plan as a durable,
+		// fingerprint-bound payload (plan.EditPayload). This eliminates
+		// pendingEdits and makes edit plans survive supervisor restart.
+		if plan.EditPayload == nil || plan.EditPayload.Profile == nil {
 			return core.StepResult{}, fmt.Errorf("edit plan %s has no proposed profile to apply", plan.ID)
 		}
+		proposed := plan.EditPayload.Profile.DeepCopy()
 		c.mu.RLock()
 		currentRevision := uint64(0)
 		if existing, found := c.profiles[plan.ConnectionID]; found {

@@ -181,8 +181,9 @@ type ProviderDTO struct {
 	// provider can also be worth showing while not being selectable — one that
 	// needs setup, for instance — and one string could not carry both facts.
 	Selectable      bool              `json:"selectable"`
-	Availability    string            `json:"availability"` // "ready", "unconfigured", "binary_missing", "degraded"
-	Readiness       string            `json:"readiness"`    // "ready", "needs_auth", "needs_config", "error"
+	Availability    string            `json:"availability"`        // "ready", "unconfigured", "binary_missing", "degraded"
+	Readiness       string            `json:"readiness"`           // "ready", "needs_auth", "needs_config", "error"
+	Stability       string            `json:"stability,omitempty"` // "stable", "beta", "experimental"
 	Capabilities    *CapabilitySetDTO `json:"capabilities,omitempty"`
 	LastError       string            `json:"last_error,omitempty"`
 	RestartRequired bool              `json:"restart_required,omitempty"`
@@ -194,12 +195,14 @@ type ProviderDTO struct {
 
 // CapabilitySetDTO describes provider capabilities in a versioned, serializable form.
 type CapabilitySetDTO struct {
+	Kinds              []string `json:"kinds"`
 	TemporaryAddresses bool     `json:"temporary_addresses"`
 	CustomHostnames    bool     `json:"custom_hostnames"`
 	PrivateExposure    bool     `json:"private_exposure"`
 	ManagedDNS         bool     `json:"managed_dns"`
 	ProtectionModes    []string `json:"protection_modes"`
 	Protocols          []string `json:"protocols"`
+	Stability          string   `json:"stability,omitempty"` // "stable", "beta", "experimental"
 	TelemetrySupported bool     `json:"telemetry_supported"`
 	MaxConnectors      int      `json:"max_connectors"`
 	ExpirationMaxSecs  int      `json:"expiration_max_secs,omitempty"`
@@ -207,9 +210,10 @@ type CapabilitySetDTO struct {
 
 // ProviderAccountDTO is a selectable, non-secret provider account summary.
 type ProviderAccountDTO struct {
-	ID     string `json:"id"`
-	Label  string `json:"label"`
-	Status string `json:"status"`
+	ID             string `json:"id"`
+	Label          string `json:"label"`
+	Status         string `json:"status"`
+	UnusableReason string `json:"unusable_reason,omitempty"`
 }
 
 // ConfigureProviderAccountRequest carries one provider credential over the
@@ -260,6 +264,23 @@ type ConfigureProviderAccountResponse struct {
 type ZoneDTO struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// ReverifyProviderAccountRequest re-verifies an existing account's credential
+// without changing it. The credential is never exposed to the caller.
+type ReverifyProviderAccountRequest struct {
+	AccountID string `json:"account_id"`
+}
+
+// ReverifyProviderAccountResponse reports the outcome of re-verification.
+type ReverifyProviderAccountResponse struct {
+	// Validated reports that the credential was confirmed against the provider
+	// before the account was saved, rather than accepted on faith.
+	Validated bool   `json:"validated,omitempty"`
+	Status    string `json:"status,omitempty"`
+	// VerificationUnavailable explains why the credential could not be checked,
+	// when it could not.
+	VerificationUnavailable string `json:"verification_unavailable,omitempty"`
 }
 
 // --------------- events ---------------
@@ -435,18 +456,32 @@ type RecoveryAction struct {
 // CreateConnectionRequest is the request body for POST /v1/connections.
 // It uses a versioned tagged union so that new source, exposure, protection,
 // provider, and lifecycle fields can be added without breaking the contract.
+//
+// Exactly one spec arm must be populated for kinds other than service_exposure.
+// The tagged union is validated server-side so a malformed request is refused
+// with a reason rather than being silently coerced into a service_exposure
+// connection.
 type CreateConnectionRequest struct {
 	Version int    `json:"version"`
 	Name    string `json:"name"`
 	// Kind selects the connection kind. It defaults to service exposure, so
 	// existing callers are unaffected.
-	Kind        string               `json:"kind,omitempty"`
+	Kind string `json:"kind,omitempty"`
+	// ServiceExposure is the only kind that carries flat source/exposure/protection
+	// fields for backward compatibility. Use the corresponding spec arm for
+	// other kinds.
 	Source      SourceDTO            `json:"source"`
 	Exposure    ExposureDTO          `json:"exposure"`
 	Protection  ProtectionDTO        `json:"protection"`
 	Provider    ProviderSelectionDTO `json:"provider"`
 	Lifecycle   LifecycleDTO         `json:"lifecycle"`
 	PortForward *PortForwardDTO      `json:"port_forward,omitempty"`
+	// PrivateNetwork carries the specification for a private network connection.
+	// It is required when Kind is "private_network" and must be empty otherwise.
+	PrivateNetwork *PrivateNetworkSpecDTO `json:"private_network,omitempty"`
+	// ClientTunnel carries the specification for a client-mediated tunnel connection.
+	// It is required when Kind is "client_tunnel" and must be empty otherwise.
+	ClientTunnel *ClientTunnelSpecDTO `json:"client_tunnel,omitempty"`
 }
 
 // PortForwardDTO describes a port forward connection.
@@ -830,6 +865,18 @@ type ConnectionLogsDTO struct {
 type LogLineDTO struct {
 	Stream string `json:"stream"`
 	Text   string `json:"text"`
+}
+
+// TelemetryDTO is a provider-neutral traffic snapshot for a connection.
+type TelemetryDTO struct {
+	ConnectionCount int64  `json:"connection_count"`
+	RequestCount    int64  `json:"request_count"`
+	BytesIn         int64  `json:"bytes_in"`
+	BytesOut        int64  `json:"bytes_out"`
+	ProviderErrors  int64  `json:"provider_errors"`
+	SampledAt       string `json:"sampled_at"`
+	Available       bool   `json:"available"`
+	Unavailable     string `json:"unavailable,omitempty"`
 }
 
 // ReadinessDTO answers "what does Portico need, and what is already satisfied?"

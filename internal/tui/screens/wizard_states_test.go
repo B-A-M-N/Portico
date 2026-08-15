@@ -157,6 +157,7 @@ func TestBackFromReviewReturnsToTheStepActuallyVisited(t *testing.T) {
 	single := fullCloudflareSnapshot()
 	single[0].Accounts = []ipc.ProviderAccountDTO{{ID: "acct-a", Status: "authenticated"}}
 	m := NewWizard(&fakeWizardClient{}, single)
+	m.state.ConnectionKind = "service_exposure"
 	m.state.SourceType = "existing_service"
 	m.state.ExposureMode = "permanent_public"
 	m.state.Protection = "none"
@@ -173,6 +174,7 @@ func TestBackFromReviewReturnsToTheStepActuallyVisited(t *testing.T) {
 		{ID: "acct-a", Status: "authenticated"}, {ID: "acct-b", Status: "authenticated"},
 	}
 	m2 := NewWizard(&fakeWizardClient{}, multi)
+	m2.state.ConnectionKind = "service_exposure"
 	m2.state.SourceType = "existing_service"
 	m2.state.ExposureMode = "permanent_public"
 	m2.state.Protection = "none"
@@ -184,7 +186,7 @@ func TestBackFromReviewReturnsToTheStepActuallyVisited(t *testing.T) {
 	}
 	m2.HandleKey("esc")
 	if m2.Step() != WizardStepAccount {
-		t.Fatalf("back landed on %d; the account question was visited", m2.Step())
+		t.Fatalf("back landed on %d; want account", m2.Step())
 	}
 }
 
@@ -221,7 +223,11 @@ func TestTheRequestStatesItsKind(t *testing.T) {
 		SourceAddress: "127.0.0.1", SourceProtocol: "http", Port: "8080",
 		ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
 	}
-	if got := m.buildRequest().Kind; got != "service_exposure" {
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Kind; got != "service_exposure" {
 		t.Fatalf("request kind = %q, want it stated explicitly", got)
 	}
 }

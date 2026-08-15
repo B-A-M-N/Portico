@@ -258,7 +258,18 @@ func (p *ConnectionProfile) ExpectsPublicAddress() bool {
 	return p.Spec.ServiceExposure.Exposure.Mode != ExposurePrivate
 }
 
-// DeepCopy returns a deep copy of the profile.
+// NormalizeProfile applies semantic defaults to a profile. It only fills
+// fields that represent user preferences (desired state, disconnect policy).
+// Server-owned creation metadata (revision, timestamps) is set separately by
+// CreateProfile.
+func NormalizeProfile(profile *ConnectionProfile, now time.Time) {
+	if profile.Desired == "" {
+		profile.Desired = DesiredClosed
+	}
+	if profile.Lifecycle.OnDisconnect == "" {
+		profile.Lifecycle.OnDisconnect = DisconnectKeepAlive
+	}
+}
 func (p *ConnectionProfile) DeepCopy() *ConnectionProfile {
 	if p == nil {
 		return nil
@@ -385,6 +396,32 @@ func (p *ConnectionProfile) Validate() error {
 	// Validate Kind is set
 	if p.Kind == "" {
 		return fmt.Errorf("connection kind is required")
+	}
+
+	// Validate desired state if set (it may be empty during intermediate
+	// validation before the controller assigns DesiredClosed).
+	if p.Desired != "" {
+		switch p.Desired {
+		case DesiredOpen, DesiredClosed:
+			// valid
+		default:
+			return fmt.Errorf("invalid desired state %q", p.Desired)
+		}
+	}
+
+	// Validate lifecycle policy if set.
+	if p.Lifecycle.OnDisconnect != "" {
+		switch p.Lifecycle.OnDisconnect {
+		case DisconnectKeepAlive, DisconnectClose:
+			// valid
+		default:
+			return fmt.Errorf("invalid disconnect policy %q", p.Lifecycle.OnDisconnect)
+		}
+	}
+
+	// Validate provider selection
+	if p.Driver.ProviderID == "" {
+		return fmt.Errorf("provider ID is required")
 	}
 
 	// Validate exactly one spec is set and matches the Kind

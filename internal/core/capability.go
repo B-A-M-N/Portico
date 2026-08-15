@@ -74,6 +74,10 @@ type CapabilityConstraint struct {
 	Supported     bool
 	Requirement   *Requirement
 	Message       string
+	// RequiresRequestedAddress scopes the constraint to only apply when the
+	// profile requests a custom hostname. This prevents false rejections of
+	// normal temporary exposures that use generated addresses.
+	RequiresRequestedAddress bool
 }
 
 // Matches evaluates whether this constraint applies to the given profile.
@@ -159,6 +163,17 @@ func (c *CapabilityConstraint) Matches(profile *ConnectionProfile) bool {
 		}
 	}
 
+	// Check if a custom hostname is requested.
+	// Constraints can be scoped to only apply when the profile requests a
+	// custom hostname, preventing false rejections of normal temporary
+	// exposures that use generated addresses.
+	if c.RequiresRequestedAddress {
+		exposure := profile.GetExposure()
+		if exposure.RequestedAddress == "" {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -225,8 +240,9 @@ type ProviderIdentity struct {
 
 // Executes reports whether a provider can run a connection kind.
 func (c Capabilities) Executes(kind ConnectionKind) bool {
+	// Normalize empty kind to service exposure for backward compatibility.
 	if kind == "" {
-		return true
+		kind = ConnectionServiceExposure
 	}
 	if len(c.Kinds) == 0 {
 		// A provider that declares nothing is a service-exposure provider,

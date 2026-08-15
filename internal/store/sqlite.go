@@ -537,6 +537,15 @@ CREATE TABLE IF NOT EXISTS provider_account_removals (
 );
 `,
 	},
+	{
+		version: 22,
+		onApply: func(tx *sql.Tx) error {
+			if err := addColumnIfNotExists(tx, "operation_plans", "edit_payload_json", "BLOB"); err != nil {
+				return err
+			}
+			return addColumnIfNotExists(tx, "operation_plans", "provider_account_id", "TEXT NOT NULL DEFAULT ''")
+		},
+	},
 }
 
 // migrateCleanupItemsRecordTheirAccount adds the account that can discharge a
@@ -2575,7 +2584,8 @@ func isConstraintError(err error) bool {
 func (s *Store) loadPlanByFingerprintLocked(ctx context.Context, connID core.ConnectionID, fingerprint string) (*core.OperationPlan, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, connection_id, profile_revision, provider_id, intent, steps_json, fingerprint,
-		       created_at, expires_at, warnings_json, expected_json, preconditions_json, observed_fingerprint
+		       created_at, expires_at, warnings_json, expected_json, preconditions_json, observed_fingerprint,
+		       edit_payload_json, provider_account_id
 		FROM operation_plans WHERE connection_id = ? AND fingerprint = ?`, connID, fingerprint)
 
 	var p core.OperationPlan
@@ -2583,11 +2593,13 @@ func (s *Store) loadPlanByFingerprintLocked(ctx context.Context, connID core.Con
 	var createdAtStr string
 	var expiresAt *string
 	var observedFP *string
+	var editPayloadJSON []byte
 
 	err := row.Scan(
 		&p.ID, &p.ConnectionID, &p.ProfileRevision, &p.Provider,
 		&p.Intent, &stepsJSON, &p.Fingerprint,
 		&createdAtStr, &expiresAt, &warningsJSON, &expectedJSON, &precondsJSON, &observedFP,
+		&editPayloadJSON, &p.Account,
 	)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("plan not found with fingerprint: %s", fingerprint)
@@ -2628,7 +2640,12 @@ func (s *Store) loadPlanByFingerprintLocked(ctx context.Context, connID core.Con
 	if observedFP != nil {
 		p.ObservedFingerprint = *observedFP
 	}
-
+	if len(editPayloadJSON) > 0 {
+		p.EditPayload = &core.EditPayload{}
+		if err := json.Unmarshal(editPayloadJSON, p.EditPayload); err != nil {
+			return nil, fmt.Errorf("unmarshal edit payload: %w", err)
+		}
+	}
 	return &p, nil
 }
 
@@ -2672,14 +2689,23 @@ func (s *Store) savePlanLocked(ctx context.Context, plan *core.OperationPlan) er
 	if plan.ObservedFingerprint != "" {
 		observedFP = &plan.ObservedFingerprint
 	}
+	var editPayloadJSON []byte
+	if plan.EditPayload != nil {
+		editPayloadJSON, err = json.Marshal(plan.EditPayload)
+		if err != nil {
+			return fmt.Errorf("marshal edit payload: %w", err)
+		}
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO operation_plans
 			(id, connection_id, profile_revision, provider_id, intent, steps_json, fingerprint,
-			 created_at, expires_at, warnings_json, expected_json, preconditions_json, observed_fingerprint)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 created_at, expires_at, warnings_json, expected_json, preconditions_json, observed_fingerprint,
+			 edit_payload_json, provider_account_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		plan.ID, plan.ConnectionID, plan.ProfileRevision, plan.Provider,
 		string(plan.Intent), stepsJSON, plan.Fingerprint,
 		createdAt, expiresAt, warningsJSON, expectedJSON, precondsJSON, observedFP,
+		editPayloadJSON, plan.Account,
 	)
 	return err
 }
@@ -2696,17 +2722,20 @@ func (s *Store) loadPlanLocked(ctx context.Context, id core.PlanID) (*core.Opera
 
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, connection_id, profile_revision, provider_id, intent, steps_json, fingerprint,
-		       created_at, expires_at, warnings_json, expected_json, preconditions_json, observed_fingerprint
+		       created_at, expires_at, warnings_json, expected_json, preconditions_json, observed_fingerprint,
+		       edit_payload_json, provider_account_id
 		FROM operation_plans WHERE id = ?`, id)
 
 	var plan core.OperationPlan
 	var stepsJSON, createdAt, expiresAt, warningsJSON, expectedJSON, precondsJSON []byte
 	var intent string
 	var observedFP sql.NullString
+	var editPayloadJSON []byte
 	if err := row.Scan(
 		&plan.ID, &plan.ConnectionID, &plan.ProfileRevision, &plan.Provider,
 		&intent, &stepsJSON, &plan.Fingerprint, &createdAt, &expiresAt,
 		&warningsJSON, &expectedJSON, &precondsJSON, &observedFP,
+		&editPayloadJSON, &plan.Account,
 	); err != nil {
 		return nil, err
 	}
@@ -2745,6 +2774,12 @@ func (s *Store) loadPlanLocked(ctx context.Context, id core.PlanID) (*core.Opera
 	}
 	if observedFP.Valid {
 		plan.ObservedFingerprint = observedFP.String
+	}
+	if len(editPayloadJSON) > 0 {
+		plan.EditPayload = &core.EditPayload{}
+		if err := json.Unmarshal(editPayloadJSON, plan.EditPayload); err != nil {
+			return nil, fmt.Errorf("unmarshal edit payload: %w", err)
+		}
 	}
 	return &plan, nil
 }
@@ -3136,6 +3171,78 @@ func (s *Store) CommitRepairSuccess(ctx context.Context, connID core.ConnectionI
 		ProfileRevision: revision,
 		DesiredState:    core.DesiredConnectionState(desired),
 		RuntimeState:    core.RuntimeOpen,
+		LastTransition:  committedAt,
+	}, nil
+}
+
+// CommitEditSuccess persists the result of a successful edit operation.
+// Unlike open/close, an edit:
+//   - preserves the current desired state (the user did not request open/close)
+//   - preserves the current runtime state (a running connector stays running
+//     unless the edit explicitly requires restart)
+//   - does NOT increment the profile revision (the profile was already updated
+//     atomically in the edit's apply-profile step)
+func (s *Store) CommitEditSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	committedAt := time.Now().UTC().Truncate(time.Second)
+	now := committedAt.Format(time.RFC3339)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Mark the operation as completed.
+	_, err = tx.ExecContext(ctx,
+		"UPDATE operations SET state = 'completed', completed_at = ? WHERE id = ?",
+		now, opID)
+	if err != nil {
+		return nil, fmt.Errorf("complete operation: %w", err)
+	}
+
+	// 2. Clear the active operation on the runtime row, preserving the current
+	//    desired state and runtime state (the edit did not request open/close).
+	//    Bump runtime_revision as required by CAS design.
+	_, err = tx.ExecContext(ctx, `
+		UPDATE connection_runtime SET
+			active_operation_id = NULL,
+			runtime_revision = runtime_revision + 1,
+			last_transition = ?,
+			error_json = NULL
+		WHERE connection_id = ?`,
+		now, connID)
+	if err != nil {
+		return nil, fmt.Errorf("clear active operation: %w", err)
+	}
+
+	// 3. Read back the committed profile values and current runtime state.
+	var revision uint64
+	var desired string
+	var runtimeState core.RuntimeState
+	if err := tx.QueryRowContext(ctx,
+		"SELECT revision, desired_state FROM connection_profiles WHERE id = ?", connID).Scan(&revision, &desired); err != nil {
+		return nil, fmt.Errorf("read committed profile: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx,
+		"SELECT runtime_state FROM connection_runtime WHERE connection_id = ?", connID).Scan(&runtimeState); err != nil {
+		return nil, fmt.Errorf("read committed runtime: %w", err)
+	}
+	if _, err := appendEventTx(ctx, tx, opID, connID, string(core.EventOperationCompleted), string(core.StageSucceeded), committedAt, core.OperationEvent{
+		OperationID: opID, ConnectionID: connID, Stage: core.StageSucceeded, Message: "Edit operation completed", Timestamp: committedAt,
+	}); err != nil {
+		return nil, fmt.Errorf("persist edit completion event: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &core.RuntimeCommitResult{
+		ProfileRevision: revision,
+		DesiredState:    core.DesiredConnectionState(desired),
+		RuntimeState:    runtimeState,
 		LastTransition:  committedAt,
 	}, nil
 }

@@ -65,6 +65,7 @@ type RequestHandler interface {
 	HandleProviderRecommendation(req ProviderRecommendationRequest) (*ProviderRecommendationResponse, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
+	HandleReverifyProviderAccount(providerID, accountID string, req ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error)
 	HandleRemoveProviderAccount(providerID, accountID string, req RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error)
 	HandleAccountRemovalPreview(providerID, accountID string) (*AccountRemovalPreviewDTO, error)
 	HandleProviderSetupFlow(id string) (*SetupFlowDTO, error)
@@ -76,6 +77,7 @@ type RequestHandler interface {
 	HandleRefreshDiscovery() (*DiscoveryDTO, error)
 	HandleDiagnostics(connID string) ([]DiagnosticDTO, error)
 	HandleConnectionLogs(id string, lines int) (*ConnectionLogsDTO, error)
+	HandleTelemetry(id string) (*TelemetryDTO, error)
 	HandleReadiness() (*ReadinessDTO, error)
 	HandleSetLaunchMode(mode string) (*LaunchModeDTO, error)
 	HandleSupportExport() (*SupportExportDTO, error)
@@ -484,8 +486,15 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var req CreateConnectionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "PTO-CONN-CREATE", "invalid request body")
+			return
+		}
+		// Enforce version compatibility: 0 (legacy) and 1 are supported.
+		if req.Version != 0 && req.Version != 1 {
+			writeError(w, http.StatusBadRequest, "PTO-CONN-CREATE", fmt.Sprintf("unsupported request version %d", req.Version))
 			return
 		}
 		conn, err := s.handler.HandleCreateConnection(req)
@@ -582,6 +591,16 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(logs)
+
+	case len(parts) == 2 && parts[1] == "telemetry" && r.Method == http.MethodGet:
+		telemetry, err := s.handler.HandleTelemetry(id)
+		if err != nil {
+			writeHandlerError(w, "PTO-CONN-TELEMETRY", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(telemetry)
 
 	case len(parts) == 2 && parts[1] == "detail" && r.Method == http.MethodGet:
 		detail, err := s.handler.HandleGetConnectionDetail(id)
@@ -691,6 +710,38 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, action := parts[0], parts[1]
+
+	// Reverify endpoint: POST /v1/providers/{id}/accounts/{accountID}/reverify
+	if len(parts) >= 4 && action == "accounts" && parts[2] != "" && parts[3] == "reverify" {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
+			return
+		}
+		// Use the path account ID as the sole identity. The body is optional
+		// and may carry additional fields, but the path ID wins.
+		var req ReverifyProviderAccountRequest
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+			defer r.Body.Close()
+			decoder := json.NewDecoder(r.Body)
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&req); err != nil && err != io.EOF {
+				writeError(w, http.StatusBadRequest, "PROV-010", "invalid request body")
+				return
+			}
+		}
+		// Use the path account ID, not the body account ID.
+		req.AccountID = parts[2]
+		response, err := s.handler.HandleReverifyProviderAccount(id, parts[2], req)
+		if err != nil {
+			writeHandlerError(w, "PROV-010", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
 
 	// DELETE /v1/providers/{id}/accounts/{accountID}
 	//

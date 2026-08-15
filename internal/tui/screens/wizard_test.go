@@ -70,7 +70,10 @@ func TestEmailOTPProtectionRulesAreValidatedAndIncludedInRequest(t *testing.T) {
 		AllowedDomains: domains,
 		Provider:       "cloudflare",
 	}
-	req := m.buildRequest()
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.Protection.Kind != "email_otp" || !reflect.DeepEqual(req.Protection.AllowedEmails, emails) || !reflect.DeepEqual(req.Protection.AllowedDomains, domains) {
 		t.Fatalf("protection request = %#v", req.Protection)
 	}
@@ -118,7 +121,11 @@ func TestWizardSelectsConfiguredCloudflareAccount(t *testing.T) {
 	if m.Step() != WizardStepReview || m.state.AccountID != "account-b" {
 		t.Fatalf("selected state = %#v", m.state)
 	}
-	if got := m.buildRequest().Provider.AccountID; got != "account-b" {
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Provider.AccountID; got != "account-b" {
 		t.Fatalf("request account ID = %q, want account-b", got)
 	}
 }
@@ -147,7 +154,10 @@ func TestCommandWizardMapsArgumentsAndWorkingDirectory(t *testing.T) {
 		Name: "Command service", SourceType: "command", SourceAddress: "npm", Port: "3000",
 		CommandArgs: args, WorkingDir: "/work/app", ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
 	}
-	req := m.buildRequest()
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.Source.Command == nil || !reflect.DeepEqual(req.Source.Command.Args, args) || req.Source.Command.WorkingDir != "/work/app" {
 		t.Fatalf("command request = %#v", req.Source.Command)
 	}
@@ -210,7 +220,10 @@ func TestDirectoryWizardMapsServingModeAndPermissions(t *testing.T) {
 		DirectoryMode: "writes", AllowUpload: true, AllowDelete: true,
 		ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
 	}
-	req := m.buildRequest()
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.Source.Directory == nil || req.Source.Directory.Mode != "writes" || !req.Source.Directory.AllowUpload || !req.Source.Directory.AllowDelete {
 		t.Fatalf("directory request = %#v", req.Source.Directory)
 	}
@@ -259,7 +272,10 @@ func TestMCPWizardMapsTransportAndConstrainsSSEExposure(t *testing.T) {
 	if got := m.exposures(); !reflect.DeepEqual(got, []string{"permanent_public"}) {
 		t.Fatalf("SSE exposures = %#v", got)
 	}
-	req := m.buildRequest()
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.Source.MCP == nil || req.Source.MCP.Transport != "sse" || req.Source.MCP.Endpoint != m.state.SourceAddress {
 		t.Fatalf("MCP request = %#v", req.Source.MCP)
 	}
@@ -272,7 +288,10 @@ func TestMCPCommandWizardMapsOwnedCommand(t *testing.T) {
 		Port: "3001", CommandArgs: []string{"--port", "3001"}, WorkingDir: "/work/mcp",
 		MCPTransport: "streamable_http", ExposureMode: "temporary_public", Protection: "none", Provider: "cloudflare",
 	}
-	req := m.buildRequest()
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if req.Source.MCP == nil || req.Source.MCP.Endpoint != "" || req.Source.MCP.Command == nil {
 		t.Fatalf("MCP request = %#v", req.Source.MCP)
 	}
@@ -304,7 +323,10 @@ func TestWizardBuildRequestSetsLifecycleDefaults(t *testing.T) {
 		Protection:     "none",
 		Provider:       "cloudflare",
 	}
-	req := m.buildRequest()
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !req.Lifecycle.AutoStart {
 		t.Fatal("wizard request should default AutoStart to true")
 	}

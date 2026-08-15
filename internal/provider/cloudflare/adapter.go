@@ -282,10 +282,11 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 					Message:       "SSE transport is not supported with Quick Tunnels (temporary exposure)",
 				},
 				{
-					Code:          "quick_tunnel_no_custom_hostname",
-					ExposureModes: []core.ExposureMode{core.ExposureTemporary},
-					Supported:     false,
-					Message:       "Quick Tunnels do not support custom hostnames",
+					Code:                     "quick_tunnel_no_custom_hostname",
+					ExposureModes:            []core.ExposureMode{core.ExposureTemporary},
+					RequiresRequestedAddress: true,
+					Supported:                false,
+					Message:                  "Quick Tunnels do not support custom hostnames",
 				},
 			},
 		}, nil
@@ -372,6 +373,16 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 	if desired.Profile == nil {
 		return nil, fmt.Errorf("cloudflare: profile required")
 	}
+
+	// Defensive kind check: this provider only supports service_exposure.
+	// Without it, a non-service-exposure profile would be planned with empty
+	// source/exposure/protection (the zero values returned by the backward-
+	// compat accessors), causing silent misconfiguration or — worse — an
+	// unprotected public service.
+	if desired.Profile.Kind != "" && desired.Profile.Kind != core.ConnectionServiceExposure {
+		return nil, fmt.Errorf("cloudflare: connection kind %q is not supported, only service_exposure", desired.Profile.Kind)
+	}
+
 	// Closing only stops a connector and must remain possible when the local
 	// source is no longer available.
 	if desired.Profile.Desired != core.DesiredClosed && desired.Origin == nil {

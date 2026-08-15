@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,6 +118,7 @@ type ProviderSnapshot struct {
 	// Registered adapters report ready or unconfigured; catalog-only entries
 	// report why no adapter exists.
 	Availability Availability
+	Stability    core.Stability
 	Reason       string
 	// SetupActions are the concrete steps a user can take to make this
 	// provider usable.
@@ -159,6 +161,7 @@ type CatalogEntry struct {
 	Name         string
 	DisplayName  string
 	Availability Availability
+	Stability    core.Stability
 	Reason       string
 	SetupActions []string
 }
@@ -316,6 +319,7 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 				Name:            entry.Name,
 				DisplayName:     entry.DisplayName,
 				Availability:    entry.Availability,
+				Stability:       entry.Stability,
 				Reason:          entry.Reason,
 				SetupActions:    append([]string(nil), entry.SetupActions...),
 				Accounts:        usable,
@@ -371,9 +375,9 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 			// Distinguishing this from "no account" is the difference between
 			// "add one" and "finish the one you started".
 			snap.Availability = AvailabilityUnconfigured
-			snap.Reason = fmt.Sprintf(
-				"%d account(s) are saved but not usable yet; their credentials were never confirmed",
-				len(pending))
+			// Generate the summary from actual pending statuses/reasons rather
+			// than a blanket "never confirmed" that may be false.
+			snap.Reason = pendingAccountsReason(pending)
 		default:
 			snap.Availability = AvailabilityUnconfigured
 		}
@@ -384,9 +388,13 @@ func (r *registry) snapshot(ctx context.Context) []ProviderSnapshot {
 			if snap.Reason == "" {
 				snap.Reason = entry.Reason
 			}
-			if entry.Availability == AvailabilityExperimental {
+			// Only demote availability to experimental if the definition explicitly
+			// reported it and we don't have a better declared availability.
+			// A provider that is declared ready (via opt-in) should stay ready.
+			if snap.Availability == AvailabilityUnconfigured && entry.Availability == AvailabilityExperimental {
 				snap.Availability = AvailabilityExperimental
 			}
+			snap.Stability = entry.Stability
 		}
 		result = append(result, snap)
 	}
@@ -509,6 +517,7 @@ func (r *registry) SetAccounts(providerID core.ProviderID, accounts []core.Provi
 
 // SetAccountInfo associates non-secret display metadata with configured
 // accounts. It also replaces the account ID projection used for validation.
+// Only usable accounts are added to the ID projection, matching Install().
 func (r *registry) SetAccountInfo(providerID core.ProviderID, accounts []AccountInfo) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -521,7 +530,12 @@ func (r *registry) SetAccountInfo(providerID core.ProviderID, accounts []Account
 		if infos[i].Status == "" {
 			infos[i].Status = "configured"
 		}
-		ids = append(ids, infos[i].ID)
+		// Only usable accounts belong in the ID projection. Including an
+		// unverified one let the controller durably bind a profile to an
+		// account the provider cannot serve.
+		if infos[i].Usable() {
+			ids = append(ids, infos[i].ID)
+		}
 	}
 	r.accounts[providerID] = ids
 	r.accountInfo[providerID] = infos
@@ -542,4 +556,42 @@ func (r *registry) GetAccounts(providerID core.ProviderID) []core.ProviderAccoun
 // caller's context to bound capability queries.
 func (r *registry) DiscoverIdentities(ctx context.Context) []ProviderSnapshot {
 	return r.snapshot(ctx)
+}
+
+// pendingAccountsReason generates a human-readable summary of why pending
+// accounts are not usable, based on their actual statuses and reasons.
+func pendingAccountsReason(pending []AccountInfo) string {
+	if len(pending) == 0 {
+		return ""
+	}
+	// Collect unique reasons.
+	reasons := make(map[string]int)
+	for _, acc := range pending {
+		if acc.UnusableReason != "" {
+			reasons[acc.UnusableReason]++
+			continue
+		}
+		switch acc.Status {
+		case "pending":
+			reasons["credential was never confirmed"]++
+		case "expired":
+			reasons["credential expired"]++
+		case "revoked":
+			reasons["credential was revoked"]++
+		case "unreadable":
+			reasons["stored credential could not be read"]++
+		default:
+			reasons["not usable (status: "+acc.Status+")"]++
+		}
+	}
+	parts := make([]string, 0, len(reasons))
+	for reason, count := range reasons {
+		if count == 1 {
+			parts = append(parts, "1 account: "+reason)
+		} else {
+			parts = append(parts, fmt.Sprintf("%d accounts: %s", count, reason))
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
 }

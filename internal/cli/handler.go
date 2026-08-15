@@ -801,14 +801,17 @@ func handleDoctor(cmd *cobra.Command) error {
 	launcher := app.NewLauncher()
 	paths := launcher.GetPaths()
 	doctorFileStatus("Database", paths.DatabasePath, 0600)
-	doctorFileStatus("Installation key", filepath.Join(filepath.Dir(paths.DatabasePath), "portico-key.bin"), 0600)
+
+	// Secret store path is versioned and managed by the SecretStore. Report the
+	// active key path through the store rather than hardcoding "portico-key.bin".
+	doctorSecretKeyStatus(filepath.Dir(paths.DatabasePath))
 
 	// Doctor is observational by default. In particular, it must not call
 	// getClient because that helper starts a supervisor when none is running.
 	client := launcher.ConnectToSupervisor()
 	if err := client.Health(cmd.Context()); err != nil {
-		fmt.Println("~ Supervisor: not running (no changes made)")
-		return nil
+		fmt.Printf("✗ Supervisor: not running (%v)\n", err)
+		return fmt.Errorf("supervisor is not running: %w", err)
 	}
 	snap, err := client.Snapshot(cmd.Context())
 	if err != nil {
@@ -816,7 +819,7 @@ func handleDoctor(cmd *cobra.Command) error {
 	}
 	fmt.Printf("✓ Supervisor reachable (seq: %d)\n", snap.LastSeq)
 	fmt.Printf("✓ Connections: %d\n", len(snap.Connections))
-	// Check providers
+	// Check providers — use Availability/Readiness rather than Authenticated.
 	providers, err := client.ListProviders(cmd.Context())
 	if err != nil {
 		fmt.Printf("⚠ Provider list: %v\n", err)
@@ -824,10 +827,30 @@ func handleDoctor(cmd *cobra.Command) error {
 		fmt.Printf("✓ Providers: %d\n", len(providers))
 		for _, p := range providers {
 			status := "✓"
-			if !p.Authenticated {
+			reason := p.Availability
+			switch p.Availability {
+			case "ready":
+				if p.Stability == "experimental" || p.Stability == "beta" {
+					status = "~"
+					reason = p.Availability + " • " + p.Stability
+				}
+			case "unconfigured":
+				status = "~"
+				reason = "setup required"
+			case "client_missing":
 				status = "✗"
+				reason = "client not installed"
+			case "degraded":
+				status = "✗"
+				reason = "degraded"
+			case "not_implemented":
+				status = "-"
+				reason = "not implemented"
+			case "experimental":
+				status = "~"
+				reason = "experimental"
 			}
-			fmt.Printf("  %s %s (%s)\n", status, p.DisplayName, p.ID)
+			fmt.Printf("  %s %s (%s: %s)\n", status, p.DisplayName, p.ID, reason)
 		}
 	}
 	// Check connections
@@ -838,13 +861,57 @@ func handleDoctor(cmd *cobra.Command) error {
 		}
 	}
 	fmt.Printf("✓ Running connections: %d/%d\n", running, len(snap.Connections))
-	// Discovery check
-	if result, err := client.Discovery(cmd.Context()); err == nil && len(result.Services) > 0 {
+	// Discovery check — separate error vs zero services.
+	result, err := client.Discovery(cmd.Context())
+	if err != nil {
+		fmt.Printf("⚠ Discovery failed: %v\n", err)
+	} else if len(result.Services) > 0 {
 		fmt.Printf("✓ Discovery: %d services available\n", len(result.Services))
 	} else {
-		fmt.Printf("~ Discovery: not available or no services\n")
+		fmt.Printf("~ Discovery: 0 services found\n")
 	}
 	return nil
+}
+
+// doctorSecretKeyStatus reports the status of the secret store installation key.
+// It lists all versioned key files rather than hardcoding "portico-key.bin".
+func doctorSecretKeyStatus(dataDir string) {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		fmt.Printf("~ Secret store: cannot read %s: %v\n", dataDir, err)
+		return
+	}
+	var keyFiles []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == "portico-key.bin" || strings.HasPrefix(name, "portico-key-v") && strings.HasSuffix(name, ".bin") {
+			keyFiles = append(keyFiles, name)
+		}
+	}
+	if len(keyFiles) == 0 {
+		fmt.Printf("~ Installation key: not created yet\n")
+		return
+	}
+	for _, name := range keyFiles {
+		path := filepath.Join(dataDir, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Printf("✗ Installation key: %s: %v\n", name, err)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			fmt.Printf("✗ Installation key: %s: not a regular file\n", name)
+			continue
+		}
+		if info.Mode().Perm() != 0600 {
+			fmt.Printf("✗ Installation key: %s: permissions %o, expected 600\n", name, info.Mode().Perm())
+			continue
+		}
+		fmt.Printf("✓ Installation key: %s\n", path)
+	}
 }
 
 func doctorFileStatus(label, path string, expectedMode os.FileMode) {

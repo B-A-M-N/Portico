@@ -258,6 +258,25 @@ func (c *Client) ConnectionLogs(ctx context.Context, id string, lines int) (*Con
 	return &logs, nil
 }
 
+// Telemetry returns the traffic snapshot for a connection.
+func (c *Client) Telemetry(ctx context.Context, id string) (*TelemetryDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/connections/"+id+"/telemetry", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	var telemetry TelemetryDTO
+	if err := json.NewDecoder(resp.Body).Decode(&telemetry); err != nil {
+		return nil, err
+	}
+	return &telemetry, nil
+}
+
 // CreateConnection creates a new connection.
 func (c *Client) CreateConnection(ctx context.Context, req CreateConnectionRequest) (*ConnectionDTO, error) {
 	body, err := json.Marshal(req)
@@ -576,6 +595,28 @@ func (c *Client) RemoveProviderAccount(ctx context.Context, providerID, accountI
 		return nil, err
 	}
 	var result RemoveProviderAccountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ReverifyProviderAccount asks the supervisor to verify an existing account's
+// credential against the provider without changing it.
+func (c *Client) ReverifyProviderAccount(ctx context.Context, providerID, accountID string) (*ReverifyProviderAccountResponse, error) {
+	body, err := json.Marshal(ReverifyProviderAccountRequest{AccountID: accountID})
+	if err != nil {
+		return nil, fmt.Errorf("marshal reverify request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/providers/"+url.PathEscape(providerID)+"/accounts/"+url.PathEscape(accountID)+"/reverify", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result ReverifyProviderAccountResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}

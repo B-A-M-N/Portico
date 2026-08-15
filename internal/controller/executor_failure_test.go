@@ -55,6 +55,10 @@ func (f *fakeRuntimeCommitter) CommitRepairSuccess(ctx context.Context, connID c
 	return nil, nil
 }
 
+func (f *fakeRuntimeCommitter) CommitEditSuccess(ctx context.Context, connID core.ConnectionID, opID core.OperationID) (*core.RuntimeCommitResult, error) {
+	return nil, nil
+}
+
 func (f *fakeRuntimeCommitter) CommitOperationFailure(ctx context.Context, connID core.ConnectionID, opID core.OperationID, errMsg string, provider core.ProviderID, retryable bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

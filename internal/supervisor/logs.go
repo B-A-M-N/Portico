@@ -2,13 +2,16 @@ package supervisor
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/provider"
 )
 
 // maxLogLines bounds a log response. Connector logs rotate on disk and can be
@@ -116,6 +119,47 @@ func (h *supervisorHandler) HandleConnectionLogs(id string, lines int) (*ipc.Con
 		result.Lines = result.Lines[len(result.Lines)-maxLogLines:]
 	}
 	result.Available = result.Unavailable == ""
+	return result, nil
+}
+
+// HandleTelemetry returns the traffic snapshot for a connection.
+func (h *supervisorHandler) HandleTelemetry(id string) (*ipc.TelemetryDTO, error) {
+	cid := core.ConnectionID(id)
+	profile, ok := h.sup.controller.GetProfile(cid)
+	if !ok {
+		return nil, core.ErrProfileNotFound(cid)
+	}
+
+	result := &ipc.TelemetryDTO{}
+
+	providerID := profile.Driver.ProviderID
+	prov := h.sup.registry.Get(providerID)
+	if prov == nil {
+		result.Unavailable = "provider is not registered"
+		return result, nil
+	}
+
+	// Check if the provider supports telemetry.
+	_, tp := provider.TelemetryCapability(prov)
+	if tp == nil {
+		result.Unavailable = "provider does not expose traffic telemetry"
+		return result, nil
+	}
+
+	// Get the telemetry sample.
+	sample, err := tp.Telemetry(context.Background(), cid)
+	if err != nil {
+		result.Unavailable = fmt.Sprintf("could not read telemetry: %v", err)
+		return result, nil
+	}
+
+	result.ConnectionCount = sample.ConnectionCount
+	result.RequestCount = sample.RequestCount
+	result.BytesIn = sample.BytesIn
+	result.BytesOut = sample.BytesOut
+	result.ProviderErrors = sample.ProviderErrors
+	result.SampledAt = sample.SampledAt.Format(time.RFC3339)
+	result.Available = true
 	return result, nil
 }
 

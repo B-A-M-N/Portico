@@ -478,6 +478,11 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 			TelemetrySupported: caps.Telemetry.Supported,
 			MaxConnectors:      caps.Redundancy.MaxConnectors,
 		}
+		// Map supported connection kinds.
+		for _, kind := range caps.Kinds {
+			dto.Capabilities.Kinds = append(dto.Capabilities.Kinds, string(kind))
+		}
+		sort.Strings(dto.Capabilities.Kinds)
 		// Map protection modes
 		for _, prot := range caps.BuiltInProtection {
 			if prot.Supported {
@@ -490,11 +495,6 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 				dto.Capabilities.Protocols = append(dto.Capabilities.Protocols, string(proto))
 			}
 		}
-		// Protocols come from a map, so their order varies between calls.
-		// Sorting makes the wire representation deterministic: a client
-		// comparing successive snapshots to detect provider changes would
-		// otherwise see the same capabilities as different and discard work
-		// that was still valid.
 		sort.Strings(dto.Capabilities.Protocols)
 		sort.Strings(dto.Capabilities.ProtectionModes)
 		if caps.Expiration.Supported && caps.Expiration.MaxDuration > 0 {
@@ -542,17 +542,24 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 		// against this provider. Clients were each deriving it from the
 		// availability string and reaching different answers.
 		dto.Selectable = p.Availability.Selectable()
+		dto.Stability = string(p.Stability)
 
 		for _, account := range p.Accounts {
 			dto.Accounts = append(dto.Accounts, ipc.ProviderAccountDTO{
-				ID: string(account.ID), Label: account.Label, Status: account.Status,
+				ID:             string(account.ID),
+				Label:          account.Label,
+				Status:         account.Status,
+				UnusableReason: account.UnusableReason,
 			})
 		}
 		// Kept separate from Accounts so nothing offers them for selection or
 		// planning, while the provider screen can still show and repair them.
 		for _, account := range p.PendingAccounts {
 			dto.PendingAccounts = append(dto.PendingAccounts, ipc.ProviderAccountDTO{
-				ID: string(account.ID), Label: account.Label, Status: account.Status,
+				ID:             string(account.ID),
+				Label:          account.Label,
+				Status:         account.Status,
+				UnusableReason: account.UnusableReason,
 			})
 		}
 		provDTOs = append(provDTOs, dto)
@@ -798,7 +805,99 @@ func (h *supervisorHandler) HandleGetConnection(id string) (*ipc.ConnectionDTO, 
 	return &dto, nil
 }
 
+// validateCreateRequest enforces exactly-one-arm for the create request tagged
+// union. Without this, a malformed request with multiple populated arms is
+// silently coerced into whichever branch is checked first. The validation:
+//
+//  1. normalizes empty Kind to service_exposure (backward compatibility)
+//  2. determines which logical spec arms are populated
+//  3. requires exactly one arm to be populated
+//  4. requires the populated arm to match the declared kind
+//  5. rejects all foreign-arm data
+func validateCreateRequest(req ipc.CreateConnectionRequest) error {
+	kind := core.ConnectionKind(req.Kind)
+	if kind == "" {
+		kind = core.ConnectionServiceExposure
+	}
+
+	// Count populated arms.
+	const (
+		armServiceExposure = 1 << iota
+		armPortForward
+		armPrivateNetwork
+		armClientTunnel
+	)
+	var populated int
+	var which int
+
+	// Service exposure: populated if any flat field is set. This preserves
+	// backward compatibility where service_exposure requests carry flat
+	// Source/Exposure/Protection rather than an explicit arm pointer.
+	if req.Source.Kind != "" || req.Exposure.Mode != "" ||
+		req.Protection.Kind != "" || req.Source.Existing != nil ||
+		req.Source.Directory != nil || req.Source.Command != nil ||
+		req.Source.MCP != nil {
+		populated++
+		which = armServiceExposure
+	}
+	if req.PortForward != nil {
+		populated++
+		which = armPortForward
+	}
+	if req.PrivateNetwork != nil {
+		populated++
+		which = armPrivateNetwork
+	}
+	if req.ClientTunnel != nil {
+		populated++
+		which = armClientTunnel
+	}
+
+	switch populated {
+	case 0:
+		return core.ErrValidation("the connection requires exactly one spec arm, but none were populated")
+	case 1:
+		// Exactly one arm populated. Verify it matches the declared kind.
+	default:
+		return core.ErrValidation("the connection requires exactly one spec arm, but multiple were populated")
+	}
+
+	switch kind {
+	case core.ConnectionServiceExposure:
+		if which != armServiceExposure {
+			return core.ErrValidation("a service_exposure connection requires service_exposure fields, not another kind")
+		}
+		// Reject foreign arms (defense in depth: already caught by count).
+		if req.PortForward != nil || req.PrivateNetwork != nil || req.ClientTunnel != nil {
+			return core.ErrValidation("a service_exposure connection cannot carry port_forward, private_network, or client_tunnel arms")
+		}
+	case core.ConnectionPortForward:
+		if which != armPortForward {
+			return core.ErrValidation("a port forward connection requires a port_forward specification")
+		}
+	case core.ConnectionPrivateNetwork:
+		if which != armPrivateNetwork {
+			return core.ErrValidation("a private network connection requires a private_network specification")
+		}
+	case core.ConnectionClientTunnel:
+		if which != armClientTunnel {
+			return core.ErrValidation("a client tunnel connection requires a client_tunnel specification")
+		}
+	default:
+		return core.ErrValidation(fmt.Sprintf("unknown connection kind %q", kind))
+	}
+
+	return nil
+}
+
 func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	// Validate the tagged union before dispatching. A malformed request must be
+	// refused with a reason rather than silently coerced into a service_exposure
+	// connection.
+	if err := validateCreateRequest(req); err != nil {
+		return nil, err
+	}
+
 	// The kind is no longer hardcoded. Kinds that cannot be executed are
 	// refused with the reason rather than accepted and left inert.
 	switch core.ConnectionKind(req.Kind) {
@@ -1539,6 +1638,17 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 // supervisor-owned secret store. Provider instances are built at supervisor
 // startup, so the caller must restart after a successful write before this
 // account becomes selectable for operations.
+// HandleReverifyProviderAccount verifies an existing account's credential
+// against the provider without changing it. The credential is never exposed.
+// TODO: implement once account resolution and credential re-fetch are available.
+func (h *supervisorHandler) HandleReverifyProviderAccount(providerID, accountID string, req ipc.ReverifyProviderAccountRequest) (*ipc.ReverifyProviderAccountResponse, error) {
+	return &ipc.ReverifyProviderAccountResponse{
+		Validated:               false,
+		Status:                  "unavailable",
+		VerificationUnavailable: "reverification is not yet implemented",
+	}, fmt.Errorf("reverification is not yet implemented")
+}
+
 // HandleProviderSetupFlow returns a provider's declarative setup requirements.
 // A provider that declares none cannot be configured, which the caller must
 // state rather than presenting an empty form.

@@ -155,6 +155,127 @@ func TestPlanCloseDoesNotRequireOrigin(t *testing.T) {
 	}
 }
 
+// TestPlanRefusesNonServiceExposureKinds verifies the security regression fix:
+// Cloudflare provider must not plan a non-service-exposure connection with empty
+// source/exposure/protection (the zero values returned by the backward-compat
+// accessors). Doing so would treat a port_forward/private_network/client_tunnel
+// as an unprotected public service.
+func TestPlanRefusesNonServiceExposureKinds(t *testing.T) {
+	p, err := NewQuickTunnel("cloudflared", t.TempDir(), fakeConnectorProcessService{})
+	if err != nil {
+		t.Fatalf("NewQuickTunnel: %v", err)
+	}
+
+	for _, kind := range []core.ConnectionKind{core.ConnectionPortForward, core.ConnectionPrivateNetwork, core.ConnectionClientTunnel} {
+		t.Run(string(kind), func(t *testing.T) {
+			_, err := p.Plan(context.Background(), core.DesiredConnection{Profile: &core.ConnectionProfile{
+				ID:       "conn-1",
+				Name:     "connection",
+				Kind:     kind,
+				Revision: 1,
+				Desired:  core.DesiredOpen,
+			}})
+			if err == nil {
+				t.Fatalf("Plan should have refused %q kind, but succeeded", kind)
+			}
+			if !strings.Contains(err.Error(), "not supported") {
+				t.Fatalf("refusal for %q should say 'not supported': %v", kind, err)
+			}
+		})
+	}
+
+	// Service exposure and empty kind should still work.
+	for _, kind := range []core.ConnectionKind{"", core.ConnectionServiceExposure} {
+		t.Run(string(kind), func(t *testing.T) {
+			_, err := p.Plan(context.Background(), core.DesiredConnection{Profile: &core.ConnectionProfile{
+				ID:       "conn-1",
+				Name:     "connection",
+				Kind:     kind,
+				Revision: 1,
+				Desired:  core.DesiredClosed,
+			}})
+			if err != nil {
+				t.Fatalf("Plan should accept %q kind: %v", kind, err)
+			}
+		})
+	}
+}
+
+func TestQuickTunnelTemporaryNoHostnameConstraint(t *testing.T) {
+	p, err := NewQuickTunnel("cloudflared", t.TempDir(), fakeConnectorProcessService{})
+	if err != nil {
+		t.Fatalf("NewQuickTunnel: %v", err)
+	}
+
+	// A normal temporary exposure WITHOUT a custom hostname must succeed.
+	plan, err := p.Plan(context.Background(), core.DesiredConnection{
+		Profile: &core.ConnectionProfile{
+			ID:       "conn-quick",
+			Name:     "quick",
+			Kind:     core.ConnectionServiceExposure,
+			Revision: 1,
+			Desired:  core.DesiredOpen,
+			Spec: core.ConnectionSpec{
+				ServiceExposure: &core.ServiceExposureSpec{
+					Source: core.SourceSpec{
+						Kind: core.SourceExisting,
+						Existing: &core.ExistingServiceSpec{
+							Address:  "127.0.0.1:3000",
+							Protocol: core.ProtocolHTTP,
+						},
+					},
+					Exposure: core.ExposureSpec{
+						Mode: core.ExposureTemporary,
+						// No RequestedAddress — must succeed.
+					},
+				},
+			},
+			Driver: core.DriverSelection{ProviderID: "cloudflare"},
+		},
+		Origin: &core.ResolvedOrigin{URL: "http://127.0.0.1:3000", Protocol: core.ProtocolHTTP, Owned: false},
+	})
+	if err != nil {
+		t.Fatalf("Plan for temporary Quick Tunnel without hostname should succeed: %v", err)
+	}
+	if plan.Intent != core.IntentOpen {
+		t.Fatalf("Intent = %q, want open", plan.Intent)
+	}
+
+	// A temporary exposure WITH a custom hostname must fail.
+	_, err = p.Plan(context.Background(), core.DesiredConnection{
+		Profile: &core.ConnectionProfile{
+			ID:       "conn-quick-host",
+			Name:     "quick-host",
+			Kind:     core.ConnectionServiceExposure,
+			Revision: 1,
+			Desired:  core.DesiredOpen,
+			Spec: core.ConnectionSpec{
+				ServiceExposure: &core.ServiceExposureSpec{
+					Source: core.SourceSpec{
+						Kind: core.SourceExisting,
+						Existing: &core.ExistingServiceSpec{
+							Address:  "127.0.0.1:3000",
+							Protocol: core.ProtocolHTTP,
+						},
+					},
+					Exposure: core.ExposureSpec{
+						Mode:             core.ExposureTemporary,
+						RequestedAddress: "custom.example.com",
+					},
+				},
+			},
+			Driver: core.DriverSelection{ProviderID: "cloudflare"},
+		},
+		Origin: &core.ResolvedOrigin{URL: "http://127.0.0.1:3000", Protocol: core.ProtocolHTTP, Owned: false},
+	})
+	if err == nil {
+		t.Fatal("Plan for temporary Quick Tunnel WITH hostname should fail")
+	}
+	if !strings.Contains(err.Error(), "custom hostname") {
+		t.Fatalf("expected 'custom hostname' in error: %v", err)
+	}
+}
+
 func TestFinalizeLocalDeletionSucceeds(t *testing.T) {
 	p, err := NewQuickTunnel("cloudflared", t.TempDir(), fakeConnectorProcessService{})
 	if err != nil {

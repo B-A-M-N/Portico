@@ -42,11 +42,22 @@ type ProviderRecommendationMsg struct {
 // with a concrete one — the evaluation and the connection describing different
 // things.
 func (m *WizardModel) recommendationRequest() ipc.ProviderRecommendationRequest {
-	return recommendationFromCreateRequest(m.buildRequest())
+	req, err := m.buildRequest()
+	if err != nil {
+		// If we can't build the request, return a minimal recommendation request.
+		return ipc.ProviderRecommendationRequest{
+			ConnectionKind: m.state.ConnectionKind,
+		}
+	}
+	return recommendationFromCreateRequest(req)
 }
 
 // recommendationFromCreateRequest reads the requirements out of a create
 // request. It is the single place that decides what a source implies.
+//
+// Requirements are kind-specific: service-exposure connections derive
+// protocol from the source, while port-forward connections derive it from
+// the port-forward spec.
 func recommendationFromCreateRequest(req ipc.CreateConnectionRequest) ipc.ProviderRecommendationRequest {
 	out := ipc.ProviderRecommendationRequest{
 		ConnectionKind:    req.Kind,
@@ -58,6 +69,19 @@ func recommendationFromCreateRequest(req ipc.CreateConnectionRequest) ipc.Provid
 		PreferredAccount:  req.Provider.AccountID,
 	}
 
+	switch req.Kind {
+	case "port_forward":
+		// Port forwards derive protocol from the port-forward spec.
+		if req.PortForward != nil {
+			out.Protocol = req.PortForward.Protocol
+		}
+		if out.Protocol == "" {
+			out.Protocol = "tcp"
+		}
+		return out
+	}
+
+	// Service-exposure: derive protocol from source kind.
 	switch req.Source.Kind {
 	case "existing_service":
 		if req.Source.Existing != nil {
@@ -68,7 +92,6 @@ func recommendationFromCreateRequest(req ipc.CreateConnectionRequest) ipc.Provid
 			out.Protocol = req.Source.Command.Protocol
 		}
 	case "directory":
-		// Portico serves a directory over HTTP.
 		out.Protocol = "http"
 	case "mcp_server":
 		if req.Source.MCP != nil {

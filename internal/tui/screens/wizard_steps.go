@@ -26,31 +26,42 @@ func always(*WizardModel) bool { return true }
 // A step whose predicate is false is skipped in both directions.
 var wizardStepOrder = []stepRule{
 	{WizardStepOutcome, always},
-	// The intent question is asked only when the chosen outcome did not
-	// already determine the source.
 	{WizardStepIntent, func(m *WizardModel) bool { return m.state.Advanced }},
 	{WizardStepName, always},
+	// Port-forward steps: asked only when the connection kind is port_forward.
+	{WizardStepPortForwardLocalPort, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
+	{WizardStepPortForwardRemoteHost, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
+	{WizardStepPortForwardRemotePort, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
+	{WizardStepPortForwardProtocol, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	{WizardStepMCPMode, func(m *WizardModel) bool { return m.state.SourceType == "mcp_server" }},
-	{WizardStepSource, always},
-	{WizardStepPort, func(m *WizardModel) bool { return m.hasPortStep() }},
-	// Protocol is asked only for a service that is already listening; a
-	// command, directory or MCP source determines it another way.
-	{WizardStepProtocol, func(m *WizardModel) bool { return m.state.SourceType == "existing_service" }},
-	{WizardStepCommandArgs, func(m *WizardModel) bool { return m.isCommandOrigin() }},
-	{WizardStepCommandWorkingDir, func(m *WizardModel) bool { return m.isCommandOrigin() }},
-	{WizardStepDirectoryMode, func(m *WizardModel) bool { return m.state.SourceType == "directory" }},
-	{WizardStepDirectorySPA, func(m *WizardModel) bool {
-		return m.state.SourceType == "directory" && m.state.DirectoryMode == "read"
+	// Service-exposure steps: only for service_exposure kind.
+	{WizardStepSource, func(m *WizardModel) bool { return m.state.ConnectionKind == "service_exposure" }},
+	{WizardStepPort, func(m *WizardModel) bool { return m.hasPortStep() && m.state.ConnectionKind == "service_exposure" }},
+	{WizardStepProtocol, func(m *WizardModel) bool {
+		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure"
 	}},
-	{WizardStepMCPTransport, func(m *WizardModel) bool { return m.state.SourceType == "mcp_server" }},
-	{WizardStepExposure, always},
-	{WizardStepHostname, func(m *WizardModel) bool { return m.state.ExposureMode == "permanent_public" }},
-	{WizardStepProtection, always},
-	{WizardStepProtectionRules, func(m *WizardModel) bool { return m.state.Protection == "email_otp" }},
-	{WizardStepProvider, always},
-	// The account question is worth asking only when there is a choice to make.
+	{WizardStepCommandArgs, func(m *WizardModel) bool { return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure" }},
+	{WizardStepCommandWorkingDir, func(m *WizardModel) bool { return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure" }},
+	{WizardStepDirectoryMode, func(m *WizardModel) bool {
+		return m.state.SourceType == "directory" && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepDirectorySPA, func(m *WizardModel) bool {
+		return m.state.SourceType == "directory" && m.state.DirectoryMode == "read" && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepMCPTransport, func(m *WizardModel) bool {
+		return m.state.SourceType == "mcp_server" && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepExposure, func(m *WizardModel) bool { return m.state.ConnectionKind == "service_exposure" }},
+	{WizardStepHostname, func(m *WizardModel) bool {
+		return m.state.ExposureMode == "permanent_public" && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepProtection, func(m *WizardModel) bool { return m.state.ConnectionKind == "service_exposure" }},
+	{WizardStepProtectionRules, func(m *WizardModel) bool {
+		return m.state.Protection == "email_otp" && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepProvider, func(m *WizardModel) bool { return m.state.ConnectionKind == "service_exposure" }},
 	{WizardStepAccount, func(m *WizardModel) bool {
-		return len(m.accountsFor(m.state.Provider)) > 1
+		return m.state.ConnectionKind == "service_exposure" && len(m.accountsFor(m.state.Provider)) > 1
 	}},
 	{WizardStepReview, always},
 }
@@ -140,6 +151,12 @@ func (m *WizardModel) restoreStepInput() {
 	switch m.state.Step {
 	case WizardStepName:
 		m.setInput(m.state.Name)
+	case WizardStepPortForwardLocalPort:
+		m.setInput(m.state.PortForwardLocalPort)
+	case WizardStepPortForwardRemoteHost:
+		m.setInput(m.state.PortForwardRemoteHost)
+	case WizardStepPortForwardRemotePort:
+		m.setInput(m.state.PortForwardRemotePort)
 	case WizardStepSource:
 		m.setInput(m.state.SourceAddress)
 	case WizardStepPort:
@@ -188,6 +205,9 @@ func (m *WizardModel) restoreStepInput() {
 				m.selected = i
 			}
 		}
+	// Port-forward protocol: default to TCP (index 0).
+	case WizardStepPortForwardProtocol:
+		m.selected = 0
 	}
 }
 

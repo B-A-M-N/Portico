@@ -36,6 +36,9 @@ func (NullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (NullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return nil, nil
 }
+func (NullHandler) HandleReverifyProviderAccount(string, string, ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error) {
+	return nil, nil
+}
 func (NullHandler) HandleAccountRemovalPreview(string, string) (*AccountRemovalPreviewDTO, error) {
 	return nil, nil
 }
@@ -51,6 +54,7 @@ func (NullHandler) HandleDiscovery() (*DiscoveryDTO, error)                     
 func (NullHandler) HandleRefreshDiscovery() (*DiscoveryDTO, error)                { return nil, nil }
 func (NullHandler) HandleDiagnostics(string) ([]DiagnosticDTO, error)             { return nil, nil }
 func (NullHandler) HandleConnectionLogs(string, int) (*ConnectionLogsDTO, error)  { return nil, nil }
+func (NullHandler) HandleTelemetry(string) (*TelemetryDTO, error)                 { return nil, nil }
 func (NullHandler) HandleReadiness() (*ReadinessDTO, error)                       { return nil, nil }
 func (NullHandler) HandleSetLaunchMode(string) (*LaunchModeDTO, error)            { return nil, nil }
 func (NullHandler) HandleSupportExport() (*SupportExportDTO, error)               { return nil, nil }

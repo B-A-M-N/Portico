@@ -23,8 +23,11 @@ func (d *Definition) Identity() core.ProviderIdentity {
 
 func (d *Definition) CatalogEntry() provider.CatalogEntry {
 	return provider.CatalogEntry{
-		ID: "portforward", Name: "portforward", DisplayName: "Local port forward",
+		ID:           "portforward",
+		Name:         "portforward",
+		DisplayName:  "Local port forward",
 		Availability: provider.AvailabilityReady,
+		Stability:    core.StabilityStable,
 	}
 }
 

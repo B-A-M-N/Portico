@@ -61,6 +61,9 @@ func (nullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return &ConfigureProviderAccountResponse{}, nil
 }
+func (nullHandler) HandleReverifyProviderAccount(string, string, ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error) {
+	return &ReverifyProviderAccountResponse{}, nil
+}
 func (nullHandler) HandleOperationHistoryLimit(int) (*OperationHistoryDTO, error) {
 	return &OperationHistoryDTO{Operations: []OperationDTO{}, Available: true}, nil
 }
@@ -86,6 +89,9 @@ func (nullHandler) HandleDiagnostics(string) ([]DiagnosticDTO, error) {
 }
 func (nullHandler) HandleConnectionLogs(string, int) (*ConnectionLogsDTO, error) {
 	return &ConnectionLogsDTO{}, nil
+}
+func (nullHandler) HandleTelemetry(string) (*TelemetryDTO, error) {
+	return &TelemetryDTO{}, nil
 }
 func (nullHandler) HandleReadiness() (*ReadinessDTO, error) {
 	return &ReadinessDTO{}, nil

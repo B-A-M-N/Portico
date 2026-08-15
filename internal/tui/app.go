@@ -1746,6 +1746,28 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		}
 	}
 
+	// Inspect screen lifecycle actions. These call the same commands as Home
+	// so there is exactly one lifecycle implementation, not a second one.
+	if m.screen == ScreenInspect && m.SelectedConnection() != nil {
+		switch key {
+		case " ", "space":
+			// Space toggles connection open/close (same as Home).
+			conn := m.SelectedConnection()
+			if conn.DesiredState == "open" {
+				return m, m.planCloseCmd(conn.ID)
+			}
+			return m, m.planOpenCmd(conn.ID)
+		case "r":
+			// r triggers diagnostics/repair (same as Home).
+			m.pushScreen(ScreenRepair)
+			m.diagnostics = nil
+			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+		case "d":
+			// d triggers delete preview (same as Home).
+			return m, m.planDeleteCmd(m.SelectedConnection().ID)
+		}
+	}
+
 	switch key {
 	case "q":
 		if m.screen == ScreenHome {
@@ -2864,9 +2886,12 @@ func (m *Model) renderOperationProgress() string {
 // and a theme style. Each state is named explicitly so a provider whose client
 // is missing is never presented the same way as one that is merely
 // unconfigured, or as one Portico does not implement at all.
-func providerStateLabel(availability string) (string, string) {
+func providerStateLabel(availability string, stability string) (string, string) {
 	switch availability {
 	case "ready":
+		if stability == "experimental" || stability == "beta" {
+			return availability + " • " + stability, "attention"
+		}
 		return "Ready", "stable"
 	case "unconfigured":
 		return "Setup required", "attention"
@@ -2896,7 +2921,7 @@ func (m *Model) renderProviders() string {
 		b.WriteString("No providers are catalogued.\n\n")
 	}
 	for _, p := range m.snapshot.Providers {
-		label, style := providerStateLabel(p.Availability)
+		label, style := providerStateLabel(p.Availability, p.Stability)
 		b.WriteString(fmt.Sprintf("  %s  ", p.DisplayName))
 		b.WriteString(m.theme.Style(style).Render(label))
 		b.WriteString("\n")
@@ -2964,8 +2989,12 @@ func (m *Model) renderProviders() string {
 				fmt.Sprintf("      %s %s — %s, not usable",
 					accountMarker(m, p.ID, account.ID), accLabel, account.Status)))
 			b.WriteString("\n")
+			reason := account.UnusableReason
+			if reason == "" {
+				reason = "Its credential was never confirmed. Set the provider up again to replace it."
+			}
 			b.WriteString(m.theme.Style("muted").Render(
-				"        Its credential was never confirmed. Set the provider up again to replace it.") + "\n")
+				"        "+reason) + "\n")
 		}
 		b.WriteString("\n")
 	}

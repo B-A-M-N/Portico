@@ -36,8 +36,11 @@ func (d *Definition) Identity() core.ProviderIdentity {
 
 func (d *Definition) CatalogEntry() provider.CatalogEntry {
 	entry := provider.CatalogEntry{
-		ID: "ngrok", Name: "ngrok", DisplayName: "ngrok",
+		ID:           "ngrok",
+		Name:         "ngrok",
+		DisplayName:  "ngrok",
 		Availability: provider.AvailabilityExperimental,
+		Stability:    core.StabilityExperimental,
 		Reason: "ngrok creates real tunnels and rebuilds state after a restart, but Portico " +
 			"applies no access protection to ngrok connections, so anyone with the URL can reach them",
 		SetupActions: []string{
@@ -86,6 +89,7 @@ func (d *Definition) Activate(_ context.Context, req provider.ActivationRequest)
 	if len(req.Accounts) == 0 {
 		if req.Services.Getenv == nil || req.Services.Getenv(AuthTokenEnvVar) == "" {
 			entry.Availability = provider.AvailabilityUnconfigured
+			entry.Stability = core.StabilityExperimental
 			entry.Reason = "no ngrok account is configured and " + AuthTokenEnvVar + " is not set"
 			return provider.Installation{Catalog: entry}, nil
 		}
@@ -93,7 +97,8 @@ func (d *Definition) Activate(_ context.Context, req provider.ActivationRequest)
 		if err != nil {
 			return provider.Installation{}, fmt.Errorf("build ngrok adapter: %w", err)
 		}
-		entry.Availability = provider.AvailabilityExperimental
+		entry.Availability = provider.AvailabilityReady
+		entry.Stability = core.StabilityExperimental
 		entry.Reason = "using the token in " + AuthTokenEnvVar + "; " + entry.Reason
 		return provider.Installation{Provider: adapter, Catalog: entry}, nil
 	}
@@ -118,8 +123,15 @@ func (d *Definition) Activate(_ context.Context, req provider.ActivationRequest)
 		})
 	}
 
-	// The adapter stays experimental once enabled. Reporting it as ready would
-	// contradict the warning that it applies no access protection.
-	entry.Availability = provider.AvailabilityExperimental
+	// The adapter is selectable when explicitly enabled. The access-protection warning
+	// remains in the catalog Reason so the UI surfaces it, but AvailabilityReady
+	// allows planning and execution.
+	if d.cfg.Enabled {
+		entry.Availability = provider.AvailabilityReady
+		entry.Stability = core.StabilityExperimental
+	} else {
+		entry.Availability = provider.AvailabilityExperimental
+		entry.Stability = core.StabilityExperimental
+	}
 	return provider.Installation{Provider: adapter, Catalog: entry, Accounts: infos}, nil
 }

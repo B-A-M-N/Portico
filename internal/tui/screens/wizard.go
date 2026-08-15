@@ -121,6 +121,14 @@ type WizardState struct {
 	// themselves rather than picking a prepared outcome, which is what decides
 	// whether the intent question belongs in the sequence.
 	Advanced bool
+	// ConnectionKind selects the kind of connection to create.
+	// Defaults to service_exposure for backward compatibility.
+	ConnectionKind string
+	// PortForward fields are used when ConnectionKind is "port_forward".
+	PortForwardLocalPort  string
+	PortForwardRemoteHost string
+	PortForwardRemotePort string
+	PortForwardProtocol   string
 }
 
 // Wizard step constants
@@ -147,6 +155,14 @@ const (
 	WizardStepProtectionRules
 	WizardStepProvider
 	WizardStepAccount
+	// WizardStepPortForwardLocalPort asks for the local listening port.
+	WizardStepPortForwardLocalPort
+	// WizardStepPortForwardRemoteHost asks for the remote host.
+	WizardStepPortForwardRemoteHost
+	// WizardStepPortForwardRemotePort asks for the remote port.
+	WizardStepPortForwardRemotePort
+	// WizardStepPortForwardProtocol asks for the protocol (TCP/UDP).
+	WizardStepPortForwardProtocol
 	WizardStepReview
 	WizardStepCreating
 	WizardStepCreated       // Profile created, ask user what to do next
@@ -185,32 +201,43 @@ type wizardRecipe struct {
 	// Portico cannot honour must say so rather than quietly producing a
 	// different one.
 	Unavailable string
+	// ConnectionKind selects the connection kind to create.
+	ConnectionKind string
 }
 
 // wizardRecipes are ordered by how commonly they are wanted.
 var wizardRecipes = []wizardRecipe{
 	{
-		Label:       "Share a web app on this computer, temporarily",
-		Explanation: "Portico creates a temporary address. Anyone with the link can reach the service while the connection is open, and the address changes each time you open it.",
-		SourceType:  "existing_service",
-		Exposure:    "temporary_public",
-		Protection:  "none",
+		Label:          "Share a web app on this computer, temporarily",
+		Explanation:    "Portico creates a temporary address. Anyone with the link can reach the service while the connection is open, and the address changes each time you open it.",
+		SourceType:     "existing_service",
+		Exposure:       "temporary_public",
+		Protection:     "none",
+		ConnectionKind: "service_exposure",
 	},
 	{
-		Label:       "Publish a web app at a stable address",
-		Explanation: "Portico creates a tunnel and a DNS record for a hostname you choose. The address stays the same. You will be asked who should be allowed to reach it.",
-		SourceType:  "existing_service",
-		Exposure:    "permanent_public",
+		Label:          "Publish a web app at a stable address",
+		Explanation:    "Portico creates a tunnel and a DNS record for a hostname you choose. The address stays the same. You will be asked who should be allowed to reach it.",
+		SourceType:     "existing_service",
+		Exposure:       "permanent_public",
+		ConnectionKind: "service_exposure",
 	},
 	{
-		Label:       "Share a folder of files",
-		Explanation: "Portico serves a directory and publishes it. You choose whether it is read-only.",
-		SourceType:  "directory",
+		Label:          "Share a folder of files",
+		Explanation:    "Portico serves a directory and publishes it. You choose whether it is read-only.",
+		SourceType:     "directory",
+		ConnectionKind: "service_exposure",
 	},
 	{
-		Label:       "Run a command and share what it serves",
-		Explanation: "Portico starts a command, waits for it to listen, and publishes it. Portico stops the command when the connection closes.",
-		SourceType:  "command",
+		Label:          "Run a command and share what it serves",
+		Explanation:    "Portico starts a command, waits for it to listen, and publishes it. Portico stops the command when the connection closes.",
+		SourceType:     "command",
+		ConnectionKind: "service_exposure",
+	},
+	{
+		Label:          "Forward a local port",
+		Explanation:    "Portico forwards a local port to a remote host and port. No public address, no DNS, no access protection — just a TCP forward.",
+		ConnectionKind: "port_forward",
 	},
 	{
 		Label:       "Connect an MCP server to ChatGPT",
@@ -220,11 +247,13 @@ var wizardRecipes = []wizardRecipe{
 			"Install tunnel-client, create a tunnel in the OpenAI platform, export CONTROL_PLANE_API_KEY, " +
 			"and set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1. " +
 			"Portico will not publish your MCP server at a public address instead: that would expose it to anyone who finds the URL.",
+		ConnectionKind: "client_tunnel",
 	},
 	{
-		Label:       "Something else (choose the source yourself)",
-		Explanation: "Pick the kind of source directly and answer every question.",
-		Advanced:    true,
+		Label:          "Something else (choose the source yourself)",
+		Explanation:    "Pick the kind of source directly and answer every question.",
+		Advanced:       true,
+		ConnectionKind: "service_exposure",
 	},
 }
 
@@ -259,6 +288,7 @@ func (m *WizardModel) WithContext(ctx context.Context) *WizardModel {
 // selected, so a user never has to retype a port discovered by Portico.
 func NewWizardForService(client ConnectionCreator, providers []ipc.ProviderDTO, address, protocol string) *WizardModel {
 	m := NewWizard(client, providers)
+	m.state.ConnectionKind = "service_exposure"
 	m.state.SourceType = "existing_service"
 	m.state.SourceAddress = address
 	m.state.SourceProtocol = protocol
@@ -344,6 +374,8 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			// question back in the sequence, so going back from the name
 			// question landed on a question that path never asked.
 			m.state.Advanced = recipe.Advanced
+			// Set the connection kind from the recipe.
+			m.state.ConnectionKind = recipe.ConnectionKind
 			if recipe.Advanced {
 				m.state.Step = WizardStepIntent
 				m.selected = 0
@@ -354,9 +386,105 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.SourceType = recipe.SourceType
 			m.state.ExposureMode = recipe.Exposure
 			m.state.Protection = recipe.Protection
-			m.state.Step = WizardStepName
+			// Route based on connection kind.
+			switch recipe.ConnectionKind {
+			case "port_forward":
+				m.state.Step = WizardStepName
+				m.selected = 0
+				m.setInput(m.state.Name)
+			default:
+				m.state.Step = WizardStepName
+				m.selected = 0
+				m.setInput(m.state.Name)
+			}
+		}
+
+	case WizardStepPortForwardLocalPort:
+		switch key {
+		case "esc":
+			m.goBack()
+		case "enter":
+			port := strings.TrimSpace(m.inputValue())
+			if port == "" {
+				m.err = fmt.Errorf("local port is required")
+				return nil
+			}
+			if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+				m.err = fmt.Errorf("port must be a number between 1 and 65535")
+				return nil
+			}
+			m.err = nil
+			m.state.PortForwardLocalPort = port
+			m.state.Step = WizardStepPortForwardRemoteHost
+			m.setInput(m.state.PortForwardRemoteHost)
+		default:
+			m.setInput(editInput(m.inputValue(), key))
+		}
+
+	case WizardStepPortForwardRemoteHost:
+		switch key {
+		case "esc":
+			m.goBack()
+		case "enter":
+			host := strings.TrimSpace(m.inputValue())
+			if host == "" {
+				m.err = fmt.Errorf("remote host is required")
+				return nil
+			}
+			m.err = nil
+			m.state.PortForwardRemoteHost = host
+			m.state.Step = WizardStepPortForwardRemotePort
+			m.setInput(m.state.PortForwardRemotePort)
+		default:
+			m.setInput(editInput(m.inputValue(), key))
+		}
+
+	case WizardStepPortForwardRemotePort:
+		switch key {
+		case "esc":
+			m.goBack()
+		case "enter":
+			port := strings.TrimSpace(m.inputValue())
+			if port == "" {
+				m.err = fmt.Errorf("remote port is required")
+				return nil
+			}
+			if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+				m.err = fmt.Errorf("port must be a number between 1 and 65535")
+				return nil
+			}
+			m.err = nil
+			m.state.PortForwardRemotePort = port
+			m.state.Step = WizardStepPortForwardProtocol
 			m.selected = 0
-			m.setInput(m.state.Name)
+		default:
+			m.setInput(editInput(m.inputValue(), key))
+		}
+
+	case WizardStepPortForwardProtocol:
+		protocols := []string{"tcp", "udp"}
+		switch key {
+		case "esc":
+			m.goBack()
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < len(protocols)-1 {
+				m.selected++
+			}
+		case "enter":
+			if m.selected == 1 {
+				// UDP not implemented
+				m.err = fmt.Errorf("UDP forwarding is not implemented; only TCP is supported")
+				return nil
+			}
+			m.err = nil
+			m.state.PortForwardProtocol = protocols[m.selected]
+			m.state.Provider = "portforward"
+			m.state.Step = WizardStepReview
+			m.selected = 0
 		}
 
 	case WizardStepIntent:
@@ -389,12 +517,23 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.Name = strings.TrimSpace(m.inputValue())
-			if m.state.SourceType == "mcp_server" {
-				m.state.Step = WizardStepMCPMode
-				m.selected = boolIndex(m.state.MCPCommand)
-			} else {
+			// Route based on connection kind.
+			switch m.state.ConnectionKind {
+			case "port_forward":
+				m.state.Step = WizardStepPortForwardLocalPort
+				m.setInput(m.state.PortForwardLocalPort)
+			case "client_tunnel":
+				// Client tunnel collects MCP endpoint/tunnel ID/profile
 				m.state.Step = WizardStepSource
 				m.setInput(m.state.SourceAddress)
+			default: // service_exposure
+				if m.state.SourceType == "mcp_server" {
+					m.state.Step = WizardStepMCPMode
+					m.selected = boolIndex(m.state.MCPCommand)
+				} else {
+					m.state.Step = WizardStepSource
+					m.setInput(m.state.SourceAddress)
+				}
 			}
 		default:
 			m.setInput(editInput(m.inputValue(), key))
@@ -791,7 +930,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			// Two outcomes: save closed (default) or open (next step)
 			m.openAfterCreate = (m.selected == 1)
 			m.state.Step = WizardStepCreating
-			return createConnectionCmd(m.client, m.ctx, m.buildRequest())
+			req, err := m.buildRequest()
+			if err != nil {
+				m.err = err
+				m.state.Step = WizardStepReview
+				return nil
+			}
+			return createConnectionCmd(m.client, m.ctx, req)
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
@@ -907,7 +1052,8 @@ func (m *WizardModel) HandleOperationLoaded(msg WizardOperationLoadedMsg) tea.Cm
 }
 
 // buildRequest assembles the create request from the wizard state.
-func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
+// Returns an error if the request cannot be built (e.g. invalid port).
+func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 	s := m.state
 
 	src := ipc.SourceDTO{Kind: s.SourceType}
@@ -959,25 +1105,16 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 		}
 	}
 
-	return ipc.CreateConnectionRequest{
+	// Build the request based on connection kind.
+	kind := s.ConnectionKind
+	if kind == "" {
+		kind = "service_exposure"
+	}
+
+	req := ipc.CreateConnectionRequest{
 		Version: 1,
-		// Stated rather than inferred. The supervisor defaulted an unset kind
-		// to service exposure, so the wizard happened to work by relying on a
-		// default it never declared — and every recommendation it asked for
-		// named the kind explicitly, so the request and the evaluation behind
-		// it described the same connection only by coincidence.
-		Kind:   "service_exposure",
-		Name:   s.Name,
-		Source: src,
-		Exposure: ipc.ExposureDTO{
-			Mode:             s.ExposureMode,
-			RequestedAddress: s.Hostname,
-		},
-		Protection: ipc.ProtectionDTO{
-			Kind:           s.Protection,
-			AllowedEmails:  append([]string(nil), s.AllowedEmails...),
-			AllowedDomains: append([]string(nil), s.AllowedDomains...),
-		},
+		Kind:    kind,
+		Name:    s.Name,
 		Provider: ipc.ProviderSelectionDTO{
 			ProviderID: s.Provider,
 			AccountID:  s.AccountID,
@@ -987,6 +1124,46 @@ func (m *WizardModel) buildRequest() ipc.CreateConnectionRequest {
 			OnDisconnect: "keep_alive",
 		},
 	}
+
+	switch kind {
+	case "port_forward":
+		localPort, err := strconv.Atoi(s.PortForwardLocalPort)
+		if err != nil || localPort < 1 || localPort > 65535 {
+			return ipc.CreateConnectionRequest{}, fmt.Errorf("invalid local port: %s", s.PortForwardLocalPort)
+		}
+		remotePort, err := strconv.Atoi(s.PortForwardRemotePort)
+		if err != nil || remotePort < 1 || remotePort > 65535 {
+			return ipc.CreateConnectionRequest{}, fmt.Errorf("invalid remote port: %s", s.PortForwardRemotePort)
+		}
+		protocol := s.PortForwardProtocol
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		req.PortForward = &ipc.PortForwardDTO{
+			LocalPort:  localPort,
+			RemoteHost: s.PortForwardRemoteHost,
+			RemotePort: remotePort,
+			Protocol:   protocol,
+			Direction:  "local",
+		}
+	case "client_tunnel":
+		// Client tunnel creation is not yet implemented. Return an explicit
+		// error rather than constructing a knowingly invalid request.
+		return ipc.CreateConnectionRequest{}, fmt.Errorf("client tunnel connections are not yet supported")
+	default: // service_exposure
+		req.Source = src
+		req.Exposure = ipc.ExposureDTO{
+			Mode:             s.ExposureMode,
+			RequestedAddress: s.Hostname,
+		}
+		req.Protection = ipc.ProtectionDTO{
+			Kind:           s.Protection,
+			AllowedEmails:  append([]string(nil), s.AllowedEmails...),
+			AllowedDomains: append([]string(nil), s.AllowedDomains...),
+		}
+	}
+
+	return req, nil
 }
 
 // existingServiceAddress adds a separately entered port without confusing an
@@ -1175,6 +1352,15 @@ func (m *WizardModel) View() string {
 		return m.renderIntent()
 	case WizardStepName:
 		return m.withError(m.renderField("Name this connection:"))
+	case WizardStepPortForwardLocalPort:
+		return m.withError(m.renderField("Local listening port:"))
+	case WizardStepPortForwardRemoteHost:
+		return m.withError(m.renderField("Remote host:"))
+	case WizardStepPortForwardRemotePort:
+		return m.withError(m.renderField("Remote port:"))
+	case WizardStepPortForwardProtocol:
+		protocols := []string{"TCP", "UDP (not implemented)"}
+		return renderMenu("Protocol:", protocols, m.selected)
 	case WizardStepMCPMode:
 		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
 	case WizardStepSource:
@@ -1361,52 +1547,69 @@ func (m *WizardModel) renderReview() string {
 		"REVIEW",
 		"",
 		fmt.Sprintf("Name:       %s", m.state.Name),
-		fmt.Sprintf("Source:     %s", m.state.SourceType),
-		fmt.Sprintf("Address:    %s", m.state.SourceAddress),
 	}
-	if m.state.Port != "" {
-		lines = append(lines, fmt.Sprintf("Port:       %s", m.state.Port))
-	}
-	if len(m.state.CommandArgs) > 0 {
-		lines = append(lines, fmt.Sprintf("Arguments:  %s", strings.Join(m.state.CommandArgs, ", ")))
-	}
-	if m.state.WorkingDir != "" {
-		lines = append(lines, fmt.Sprintf("Working dir: %s", m.state.WorkingDir))
-	}
-	if m.state.SourceType == "directory" {
-		lines = append(lines, fmt.Sprintf("Directory:   %s", directoryModeSummary(m.state)))
-		if m.state.DirectorySPA {
-			lines = append(lines, "SPA fallback: enabled")
+
+	// Branch review based on connection kind.
+	switch m.state.ConnectionKind {
+	case "port_forward":
+		lines = append(lines, "Kind:       port forward")
+		lines = append(lines, fmt.Sprintf("Forward:    127.0.0.1:%s -> %s:%s", m.state.PortForwardLocalPort, m.state.PortForwardRemoteHost, m.state.PortForwardRemotePort))
+		protocol := m.state.PortForwardProtocol
+		if protocol == "" {
+			protocol = "tcp"
 		}
-	}
-	if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
-		mode := "endpoint"
-		if m.state.MCPCommand {
-			mode = "command"
+		lines = append(lines, fmt.Sprintf("Protocol:   %s", strings.ToUpper(protocol)))
+		lines = append(lines, "Direction:  local")
+	case "client_tunnel":
+		lines = append(lines, "Kind:       client tunnel")
+		lines = append(lines, fmt.Sprintf("Provider:   %s", m.state.Provider))
+	default: // service_exposure
+		lines = append(lines, fmt.Sprintf("Source:     %s", m.state.SourceType))
+		lines = append(lines, fmt.Sprintf("Address:    %s", m.state.SourceAddress))
+		if m.state.Port != "" {
+			lines = append(lines, fmt.Sprintf("Port:       %s", m.state.Port))
 		}
-		lines = append(lines, fmt.Sprintf("MCP mode:      %s", mode))
-		lines = append(lines, fmt.Sprintf("MCP transport: %s", m.state.MCPTransport))
+		if len(m.state.CommandArgs) > 0 {
+			lines = append(lines, fmt.Sprintf("Arguments:  %s", strings.Join(m.state.CommandArgs, ", ")))
+		}
+		if m.state.WorkingDir != "" {
+			lines = append(lines, fmt.Sprintf("Working dir: %s", m.state.WorkingDir))
+		}
+		if m.state.SourceType == "directory" {
+			lines = append(lines, fmt.Sprintf("Directory:   %s", directoryModeSummary(m.state)))
+			if m.state.DirectorySPA {
+				lines = append(lines, "SPA fallback: enabled")
+			}
+		}
+		if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
+			mode := "endpoint"
+			if m.state.MCPCommand {
+				mode = "command"
+			}
+			lines = append(lines, fmt.Sprintf("MCP mode:      %s", mode))
+			lines = append(lines, fmt.Sprintf("MCP transport: %s", m.state.MCPTransport))
+		}
+		lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
+		if m.state.Hostname != "" {
+			lines = append(lines, fmt.Sprintf("Hostname:   %s", m.state.Hostname))
+		}
+		if len(m.state.AllowedEmails) > 0 {
+			lines = append(lines, fmt.Sprintf("Allowed emails:  %s", strings.Join(m.state.AllowedEmails, ", ")))
+		}
+		if len(m.state.AllowedDomains) > 0 {
+			lines = append(lines, fmt.Sprintf("Allowed domains: %s", strings.Join(m.state.AllowedDomains, ", ")))
+		}
+		lines = append(lines, fmt.Sprintf("Protection: %s", m.state.Protection))
 	}
-	lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
-	if m.state.Hostname != "" {
-		lines = append(lines, fmt.Sprintf("Hostname:   %s", m.state.Hostname))
-	}
-	if len(m.state.AllowedEmails) > 0 {
-		lines = append(lines, fmt.Sprintf("Allowed emails:  %s", strings.Join(m.state.AllowedEmails, ", ")))
-	}
-	if len(m.state.AllowedDomains) > 0 {
-		lines = append(lines, fmt.Sprintf("Allowed domains: %s", strings.Join(m.state.AllowedDomains, ", ")))
-	}
-	if m.state.AccountID != "" {
+
+	if m.state.AccountID != "" && m.state.ConnectionKind == "service_exposure" {
 		lines = append(lines, fmt.Sprintf("Account:    %s", m.accountLabel(m.state.AccountID)))
 	}
-	lines = append(lines,
-		fmt.Sprintf("Protection: %s", m.state.Protection),
-		fmt.Sprintf("Provider:   %s", m.state.Provider),
-		fmt.Sprintf("Lifecycle:  auto-start=%v, on-disconnect=%s", true, "keep_alive"),
-		"",
-		"What should Portico do?",
-	)
+	if m.state.ConnectionKind == "service_exposure" {
+		lines = append(lines, fmt.Sprintf("Provider:   %s", m.state.Provider))
+	}
+	lines = append(lines, fmt.Sprintf("Lifecycle:  auto-start=%v, on-disconnect=%s", true, "keep_alive"))
+	lines = append(lines, "", "What should Portico do?")
 
 	// Two explicit outcomes
 	options := []string{

@@ -491,13 +491,21 @@ CREATE TABLE connection_profiles (
     provider_json BLOB NOT NULL, lifecycle_json BLOB NOT NULL, desired_state TEXT NOT NULL,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
-CREATE TABLE operations (
-    id TEXT PRIMARY KEY, connection_id TEXT NOT NULL,
-    FOREIGN KEY(connection_id) REFERENCES connection_profiles(id)
+CREATE TABLE operation_plans (
+    id TEXT PRIMARY KEY, connection_id TEXT NOT NULL, profile_revision INTEGER NOT NULL,
+    provider_id TEXT NOT NULL, intent TEXT NOT NULL, steps_json BLOB NOT NULL, fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL, expires_at TEXT, UNIQUE(connection_id, fingerprint)
 );
--- A real database at version 17 has this table, created by migration 1.
--- Migration 19 rebuilds it, so the fixture must carry it or it is testing a
--- database shape that cannot exist.
+CREATE TABLE operations (
+    id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, connection_id TEXT NOT NULL,
+    state TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, error_json BLOB,
+    FOREIGN KEY(plan_id) REFERENCES operation_plans(id)
+);
+CREATE TABLE operation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL, step_id TEXT,
+    event_type TEXT NOT NULL, stage TEXT NOT NULL, message TEXT, error TEXT, event_at TEXT NOT NULL,
+    FOREIGN KEY(operation_id) REFERENCES operations(id)
+);
 CREATE TABLE provider_accounts (
     id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, label TEXT NOT NULL, credential_ref TEXT,
     metadata_json BLOB, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -512,7 +520,11 @@ CREATE TABLE provider_accounts (
 	if _, err := db.Exec(`INSERT INTO connection_profiles VALUES (?,?,?,?,?,?,?,?,?,?,?)`, profileRow...); err != nil {
 		t.Fatalf("seed legacy profile: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO operations VALUES ('op-1','conn-legacy')`); err != nil {
+	// Seed a dependent operation (migration 19 rebuilds the operations table to reference operation_plans).
+	if _, err := db.Exec(`INSERT INTO operation_plans VALUES ('plan-1','conn-legacy',3,'cloudflare','open','[]','fp-1','2026-01-01T00:00:00Z',NULL)`); err != nil {
+		t.Fatalf("seed dependent plan: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO operations VALUES ('op-1','plan-1','conn-legacy','completed','2026-01-01T00:00:00Z',NULL,NULL)`); err != nil {
 		t.Fatalf("seed dependent operation: %v", err)
 	}
 }
