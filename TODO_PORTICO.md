@@ -13,104 +13,156 @@
 - [x] Wave 1 — Foundational fixes (lanes 1-3)
 - [x] Adversarial Gate 1
 - [x] Wave 2 — User workflows (lanes A-D)
-- [ ] Adversarial Gate 2
+- [x] Adversarial Gate 2
 - [x] Wave 3 — Observability (telemetry contract: internal/provider/telemetry.go)
 - [ ] Wave 4 — Provider expansion (4A-4E)
 - [ ] Adversarial Gate 3
 - [ ] Wave 5 — TUI decomposition
 - [ ] Wave 6 — Legacy removal and release
 
+## Critical architectural correction (2026-08-15)
+
+**"OpenAI tunnel" is NOT a provider. It's a connection profile that runs over transport providers.**
+
+The current `internal/provider/openaitunnel/` is architecturally wrong. It needs to become a profile (like a service-exposure profile) layered on top of transport providers: Cloudflare, ngrok, Tailscale, SSH.
+
+Portico architecture:
+```
+                         PORTICO
+
+                  ┌──────────────────┐
+                  │ Connection Intent │
+                  └────────┬─────────┘
+                           │
+                 ┌─────────▼──────────┐
+                 │ Profiles            │
+                 │ OpenAI / HTTP / SSH │
+                 └─────────┬──────────┘
+                           │
+                 ┌─────────▼─────────┐
+                 │ Security/Gateway   │
+                 │ Auth / SSE / proxy │
+                 └─────────┬─────────┘
+                           │
+              ┌────────────▼────────────┐
+              │ Transport Provider       │
+              ├──────────────────────────┤
+              │ Cloudflare │ ngrok       │
+              │ Tailscale  │ SSH         │
+              └────────────┬─────────────┘
+                           │
+                ┌──────────▼──────────┐
+                │ Runtime Supervisor   │
+                │ process/state/health │
+                └──────────┬──────────┘
+                           │
+                   ┌───────▼───────┐
+                   │ Remote Endpoint │
+                   └───────────────┘
+```
+
+### Three-state health
+
+Portico distinguishes:
+- **PROCESS** — Is the connector alive?
+- **TRANSPORT** — Is the externally reachable tunnel alive?
+- **SERVICE** — Does the intended application actually work?
+
+Not just "PID alive."
+
+### Portico Gateway
+
+A local auth/SSE proxy between client and tunnel. Prevents accidentally exposing unauthenticated local servers. Transparent to streaming — no buffering, flush chunks immediately.
+
+### Provider order
+
+1. **Common connection/spec/capability model**
+2. **Common process supervisor**
+3. **Health/reconciliation subsystem**
+4. **Portico auth/streaming gateway**
+5. **Cloudflare named tunnels**
+6. **OpenAI-compatible profile over Cloudflare**
+7. **Full remote streaming verification**
+8. **Cloudflare Quick Tunnel as explicit dev-only mode**
+9. **ngrok**
+10. **OpenAI profile over ngrok — should require almost no OpenAI-specific new code** (key architectural test)
+11. **Tailscale Serve**
+12. **Tailscale Funnel**
+13. **OpenAI profile over Tailscale**
+14. **SSH local/remote forwarding**
+15. **SOCKS/proxy connection profiles**
+16. Later providers.
+
 ---
 
-## Recommended implementation order (REVISED per Wave 0 findings)
+## Revised development sequence
 
-### Wave 1 — Foundational fixes
+### Phase 1 — Clean up (current)
+1. Freeze + checkpoint the known-good state — **DONE** (0c53e4f)
+2. Remove known architectural lies — **DONE: cmd/ removed** (8870ab3)
 
-1. **Separate availability from stability** (`internal/provider/registry.go`, `internal/core/capability.go`)
-   - Add `Stability` to `CatalogEntry` and `ProviderSnapshot`
-   - `Selectable()` should mean "can plan/execute now" not "production-stable"
-   - Carry stability through `internal/ipc/dto.go` and `internal/supervisor/supervisor.go`
-   - Render stability in `internal/tui/app.go` ("Experimental • Ready")
-   - Tests: disabled→unavailable, enabled+missing exe→client missing, enabled+missing cred→unconfigured, enabled+exe+cred→selectable+experimental, stable unchanged
+### Phase 2 — Architectural correction
+3. **OpenAI profile refactor** — convert openaitunnel provider to a profile
+   - OpenAI profile runs over Cloudflare, ngrok, Tailscale, SSH
+   - Portico Gateway for auth/SSE streaming
+   - Profile probes: /v1/models, normal request, streaming, auth
 
-2. **Complete creation tagged unions** (`internal/ipc/dto.go`)
-   - Add `PrivateNetwork *PrivateNetworkSpecDTO`, `ClientTunnel *ClientTunnelSpecDTO` to `CreateConnectionRequest`
-   - Refuse inconsistent combinations exactly as core tagged union does
-   - Tests: kind=private_network + no PrivateNetwork arm → rejected, etc.
+### Phase 3 — Harden Cloudflare (reference provider)
+4. Cloudflare becomes the reference implementation
+5. Creation, configuration, startup, shutdown, reconnection
+6. State discovery, credentials, failure handling
+7. Orphan cleanup, URL/status reporting, logging, diagnostics
 
-3. **Propagate provider-account failure reasons** (`internal/ipc/dto.go`)
-   - Add `UnusableReason string` to `ProviderAccountDTO`
-   - Propagate from `provider.AccountInfo` → supervisor → IPC → TUI
-   - Tests: pending/unverified, missing credential, unreadable, multi-account restriction
+### Phase 4 — Finish OpenAI end-to-end
+8. OpenAI profile over Cloudflare
+9. Full streaming verification
+10. Profile discovery: /v1/models probe, capability detection
+11. Usable client output: base URL, API token, env vars
 
-### Wave 1.5 — Security regression fix (CRITICAL, from Agent E)
+### Phase 5 — Incremental TUI extraction
+12. Extract architectural boundaries one at a time, driven by provider work
+13. Application shell → state/model → routing → input → orchestration → status
 
-4. **Fix Cloudflare/ngrok Plan() accessors** — SECURITY REGRESSION
-   - `provider/cloudflare/adapter.go:Plan()` uses `GetSource()`, `GetExposure()`, `GetProtection()`, `IsProtected()` which return zero values for non-service-exposure kinds
-   - For `port_forward`/`private_network`/`client_tunnel`: empty source, empty protection → treated as **unprotected public service**
-   - Fix: Cloudflare and ngrok must switch on `profile.Kind` and access `profile.Spec.*` arms directly (like portforward/openai_tunnel already do)
-   - Also fix `controller/controller.go:PlanOpen()` which calls `GetSource()` for all kinds
-   - Tests: non-service-exposure kinds must NOT be planned with empty protection
+### Phase 6 — Experimental providers
+14. Graduate ngrok behind explicit opt-in gating
+15. Three maturity states: experimental → supported → default
 
-### Wave 2 — User workflows
-
-5. **Add port-forward TUI creation** (`internal/tui/screens/wizard.go`)
-   - Add `ConnectionKind` to `WizardState`
-   - Port-forward recipe: name → local port → remote host → remote port → TCP → review
-   - Client tunnel recipe: MCP endpoint → transport → provider → config → review
-   - Do not ask hostname/protection/provider-account for non-service kinds
-
-6. **Fix provider repair/reverification UX** (`internal/tui/screens/providers.go`)
-   - Add Reverify and Replace credential actions
-   - Reuses existing configure-account path with prefilled metadata
-
-7. **Fix Doctor/key/log state correctness** (`internal/cli/handler.go`, `internal/tui/screens/inspect.go`)
-   - Use `Availability`/`Readiness` instead of `Authenticated`
-   - Separate discovery error vs zero results
-   - Delete stale "Log capture is not implemented" fallback (inspect.go:355-368)
-   - Fix hardcoded key-file path
-   - Add `LogsLoading`/`LogsLoaded`/`LogsError` state model
-
-8. **Add inspect lifecycle actions** (`internal/tui/screens/inspect.go`)
-   - Space (toggle), r (diagnose/repair), e (edit), c (copy), d (delete preview)
-   - Must call exact same plan commands as Home
-
-### Wave 3+ — Observability, provider expansion, TUI decomposition, release
-
-9. Wire telemetry (`TelemetryProvider` interface in `internal/provider/`)
-10. Graduate ngrok behind explicit experimental opt-in
-11. Implement Tailscale/private-network support (`internal/provider/tailscale/`)
-12. Finish OpenAI client-tunnel workflow
-13. Design SSH/proxy connection types (`ConnectionProxy`, `ProxySpec`)
-14. Decompose TUI god objects (`app.go` ~3945L, `wizard.go` ~1759L)
-15. Remove legacy mutation architecture (`cmd/`)
-16. Release/install verification
-17. Update documentation
+### Phase 7 — Adversarial pass + release
+18. Adversarial remediation pass
+19. Clean-machine install/first-run testing
+20. Cut v0.1
 
 ---
 
-## Critical files
+## v0.1 release gate
 
-| File | Role |
-|---|---|
-| `internal/core/connection.go` | Central domain model |
-| `internal/core/plan.go` | OperationPlan + fingerprint |
-| `internal/core/capability.go` | Stability definitions |
-| `internal/controller/controller.go` | Orchestration |
-| `internal/provider/registry.go` | Provider registration + availability |
-| `internal/provider/cloudflare/adapter.go` | Reference provider (has security regression in Plan()) |
-| `internal/provider/ngrok/adapter.go` | Has same security regression in Plan() |
-| `internal/provider/mock/provider.go` | Mock for tests |
-| `internal/supervisor/supervisor.go` | Supervisor lifecycle |
-| `internal/ipc/server.go` + `client.go` | IPC transport |
-| `internal/ipc/dto.go` | DTOs (needs PrivateNetwork, ClientTunnel, Stability, UnusableReason) |
-| `internal/store/sqlite.go` | Persistence + migrations |
-| `internal/process/actor.go` + `logs.go` | Connector subprocess |
-| `internal/cli/handler.go` | Doctor command (4 bugs) |
-| `internal/tui/app.go` | Root TUI model (~3945 lines) |
-| `internal/tui/screens/wizard.go` | Creation wizard (~1759 lines) |
-| `internal/tui/screens/inspect.go` | Connection inspect (stale fallback + missing lifecycle) |
-| `internal/tui/edit.go` | Connection editing |
+```
+V0.1 RELEASE GATE
+[ ] Current work checkpoint committed
+[ ] Dead CLI implementation removed                    ← DONE
+[ ] CLI behavior parity verified
+[ ] Cloudflare workflow fully hardened
+[ ] OpenAI profile fully implemented (streaming, auth, verification)
+[ ] Experimental-provider gating implemented
+[ ] TUI responsibility extraction completed where needed
+[ ] clean-machine installation tested
+[ ] upgrade/reinstall tested
+[ ] configuration persistence tested
+[ ] failure/recovery scenarios tested
+[ ] orphan-process cleanup tested
+[ ] build passes
+[ ] vet passes
+[ ] static analysis passes
+[ ] unit tests pass
+[ ] integration tests pass
+[ ] race tests pass
+[ ] acceptance matrix passes
+[ ] documentation matches actual behavior
+[ ] version reporting works
+[ ] packaged binary/install method verified
+```
+
+Tailscale, SSH, SOCKS, generic proxies, etc. should **not** block v0.1.
 
 ---
 
@@ -125,6 +177,9 @@
 - **One authority per concept** — no duplicate kind/provider-selection decisions
 - **Stability != Availability** — experimental providers can be ready+selectable
 - **Unavailable != Empty** — DTOs carry Available+Unavailable reason
+- **Three-state health** — PROCESS, TRANSPORT, SERVICE (not just PID)
+- **OpenAI is a profile, not a provider** — runs over transport providers
+- **Gateway is streaming-transparent** — no buffering, immediate flush
 
 ---
 
@@ -146,3 +201,27 @@ staticcheck ./...
 make acceptance
 make validate
 ```
+
+---
+
+## Critical files
+
+| File | Role |
+|---|---|
+| `internal/core/connection.go` | Central domain model |
+| `internal/core/plan.go` | OperationPlan + fingerprint |
+| `internal/core/capability.go` | Stability definitions |
+| `internal/controller/controller.go` | Orchestration |
+| `internal/provider/registry.go` | Provider registration + availability |
+| `internal/provider/cloudflare/adapter.go` | Reference provider |
+| `internal/provider/openaitunnel/adapter.go` | **TO BE REFACTORED** — profile, not provider |
+| `internal/supervisor/supervisor.go` | Supervisor lifecycle |
+| `internal/ipc/server.go` + `client.go` | IPC transport |
+| `internal/ipc/dto.go` | DTOs |
+| `internal/store/sqlite.go` | Persistence + migrations |
+| `internal/process/actor.go` + `logs.go` | Connector subprocess |
+| `internal/cli/handler.go` | Doctor command |
+| `internal/tui/app.go` | Root TUI model |
+| `internal/tui/screens/wizard.go` | Creation wizard |
+| `internal/tui/screens/inspect.go` | Connection inspect |
+| `internal/tui/edit.go` | Connection editing |
