@@ -281,6 +281,108 @@ func (s *Supervisor) gatewayNeeded(p *core.ConnectionProfile, rt *core.Connectio
 	return p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel
 }
 
+// runHealthChecks performs three-state health checks (PROCESS, TRANSPORT, SERVICE)
+// for a connection and stores the result in the runtime.
+func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.ConnectionID) {
+	rt, ok := s.controller.GetRuntime(connID)
+	if !ok {
+		return
+	}
+
+	report := &core.HealthReport{
+		ConnectionID: connID,
+	}
+
+	// PROCESS check: Is the connector alive?
+	if rt.Connector.Status == core.ConnectorStatusRunning && rt.Connector.PID > 0 {
+		report.Process = core.HealthCheck{
+			OK:           true,
+			Detail:       fmt.Sprintf("connector running (PID %d)", rt.Connector.PID),
+			LastChecked:  time.Now().UTC(),
+		}
+	} else {
+		report.Process = core.HealthCheck{
+			OK:           false,
+			Detail:       fmt.Sprintf("connector %s", rt.Connector.Status),
+			LastChecked:  time.Now().UTC(),
+		}
+	}
+
+	// TRANSPORT check: Is the tunnel reachable?
+	if rt.Endpoint.PublicAddress != "" {
+		report.Transport = s.checkTransport(ctx, rt.Endpoint.PublicAddress)
+	} else if rt.Endpoint.PrivateAddress != "" {
+		report.Transport = s.checkTransport(ctx, rt.Endpoint.PrivateAddress)
+	} else {
+		report.Transport = core.HealthCheck{
+			OK:           rt.State == core.RuntimeClosed,
+			Detail:       "no endpoint address",
+			LastChecked:  time.Now().UTC(),
+		}
+	}
+
+	// SERVICE check: Does the application work?
+	if report.Process.OK && report.Transport.OK {
+		report.Service = s.checkService(ctx, rt)
+	} else {
+		report.Service = core.HealthCheck{
+			OK:           false,
+			Detail:       "skipped (process or transport down)",
+			LastChecked:  time.Now().UTC(),
+		}
+	}
+
+	report.Refresh()
+	rt.Health = report
+	s.controller.RestoreRuntime(rt)
+}
+
+// checkTransport verifies the endpoint is reachable.
+func (s *Supervisor) checkTransport(ctx context.Context, endpoint string) core.HealthCheck {
+	err := core.DefaultServiceCheck(ctx, endpoint)
+	return core.HealthCheck{
+		OK:          err == nil,
+		Detail:      errString(err),
+		LastChecked: time.Now().UTC(),
+	}
+}
+
+// checkService verifies the service works (for OpenAI: /v1/models).
+func (s *Supervisor) checkService(ctx context.Context, rt *core.ConnectionRuntime) core.HealthCheck {
+	endpoint := rt.Endpoint.PublicAddress
+	if endpoint == "" {
+		endpoint = rt.Endpoint.PrivateAddress
+	}
+
+	p, ok := s.controller.GetProfile(rt.ConnectionID)
+	if !ok {
+		return core.HealthCheck{OK: false, Detail: "profile not found", LastChecked: time.Now().UTC()}
+	}
+
+	var err error
+	switch p.Kind {
+	case core.ConnectionClientTunnel:
+		if p.Spec.ClientTunnel != nil && p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel {
+			err = core.OpenAIServiceCheck(ctx, endpoint)
+		}
+	default:
+		err = core.DefaultServiceCheck(ctx, endpoint)
+	}
+
+	return core.HealthCheck{
+		OK:          err == nil,
+		Detail:      errString(err),
+		LastChecked: time.Now().UTC(),
+	}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return err.Error()
+}
+
 // Start initializes the supervisor and begins serving.
 func (s *Supervisor) Start(ctx context.Context) error {
 	err := s.startup(ctx)
@@ -432,6 +534,9 @@ func (s *Supervisor) reconcileOne(ctx context.Context, connID core.ConnectionID)
 	if obs, err := s.observeConnection(ctx, p.ID); err == nil {
 		input.Observed = obs
 	}
+
+	// Run three-state health checks.
+	s.runHealthChecks(ctx, connID)
 
 	decision, err := s.computeReconcileDecision(ctx, input)
 	if err != nil {

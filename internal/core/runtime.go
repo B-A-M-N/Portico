@@ -46,6 +46,7 @@ type ConnectionRuntime struct {
 	Provider         ProviderRuntime
 	Endpoint         EndpointRuntime
 	Gateway          *GatewayRuntime
+	Health           *HealthReport
 	Diagnostics      []DiagnosticFinding
 	ActiveOperation  *OperationID
 	LastObservedAt   time.Time
@@ -91,6 +92,10 @@ func (r *ConnectionRuntime) DeepCopy() *ConnectionRuntime {
 			gwCopy.AuthTokens = append([]string(nil), r.Gateway.AuthTokens...)
 		}
 		cr.Gateway = &gwCopy
+	}
+	if r.Health != nil {
+		hcCopy := *r.Health
+		cr.Health = &hcCopy
 	}
 	return &cr
 }

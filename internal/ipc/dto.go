@@ -67,6 +67,7 @@ type ConnectionDetailDTO struct {
 	Segments      []RouteSegmentDTO    `json:"segments,omitempty"`
 	Resources     []ManagedResourceDTO `json:"resources,omitempty"`
 	Processes     []ProcessDTO         `json:"processes,omitempty"`
+	Gateway       *GatewayDTO          `json:"gateway,omitempty"`
 	Findings      []DiagnosticDTO      `json:"findings,omitempty"`
 	LastVerified  string               `json:"last_verified,omitempty"`
 	LastOperation *OperationSummaryDTO `json:"last_operation,omitempty"`
@@ -148,6 +149,17 @@ type ProcessDTO struct {
 	ConnectionID   string `json:"connection_id"`
 	ExecutablePath string `json:"executable_path,omitempty"`
 	Status         string `json:"status"`
+}
+
+// GatewayDTO describes the Portico Gateway for a connection.
+// The gateway is a local HTTP proxy that authenticates clients and forwards
+// requests through the transport tunnel. It is nil when the connection
+// does not use a gateway.
+type GatewayDTO struct {
+	Endpoint   string   `json:"endpoint"`
+	Upstream   string   `json:"upstream"`
+	AuthTokens []string `json:"auth_tokens,omitempty"`
+	StartedAt  string   `json:"started_at,omitempty"`
 }
 
 // OperationSummaryDTO is a brief operation view for connection detail.
