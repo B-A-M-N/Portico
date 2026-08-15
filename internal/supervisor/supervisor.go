@@ -59,6 +59,9 @@ type Supervisor struct {
 	diagEngine *diagnostics.Engine
 	origins    *origin.Manager
 
+	// Gateway manager owns per-connection gateway instances.
+	gatewayMgr *gatewayManager
+
 	// Event-driven reconciliation: a buffered channel of connection IDs
 	// that need re-evaluation. The reconcileLoop coalesces duplicates
 	// via reconcilePending and reconciles only affected connections.
@@ -127,6 +130,7 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 		reconcileCh:      make(chan core.ConnectionID, 64),
 		reconcilePending: make(map[core.ConnectionID]struct{}),
 		mutating:         true, // accepting mutations until shutdown begins
+		gatewayMgr:       newGatewayManager(),
 	}
 	procMgr.SetEventSink(sup.handleProcessEvent)
 	return sup, nil
@@ -153,18 +157,24 @@ func (s *Supervisor) handleProcessEvent(event process.ProcessEvent) {
 	switch event.Status {
 	case process.ProcessStatusRunning:
 		rt.Connector.Status = core.ConnectorStatusRunning
+		// Start gateway if the connection needs one.
+		s.maybeStartGateway(event.ConnectionID, rt)
 	case process.ProcessStatusStarting:
 		rt.Connector.Status = core.ConnectorStatusStarting
 	case process.ProcessStatusStopped:
 		rt.Connector.Status = core.ConnectorStatusStopped
+		// Stop gateway when connector stops.
+		s.maybeStopGateway(event.ConnectionID)
 	case process.ProcessStatusUnstable:
 		rt.Connector.Status = core.ConnectorStatusUnstable
 		rt.State = core.RuntimeDegraded
+		s.maybeStopGateway(event.ConnectionID)
 	default:
 		rt.Connector.Status = core.ConnectorStatusCrashed
 		if rt.State == core.RuntimeOpen {
 			rt.State = core.RuntimeDegraded
 		}
+		s.maybeStopGateway(event.ConnectionID)
 	}
 	rt.LastTransition = event.Timestamp
 	payload := map[string]interface{}{
@@ -197,6 +207,78 @@ func (s *Supervisor) handleProcessEvent(event process.ProcessEvent) {
 			s.TriggerReconcile(event.ConnectionID)
 		}
 	}
+}
+
+// maybeStartGateway starts the gateway for a connection if needed.
+func (s *Supervisor) maybeStartGateway(connID core.ConnectionID, rt *core.ConnectionRuntime) {
+	s.mu.RLock()
+	p, ok := s.controller.GetProfile(connID)
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if !s.gatewayNeeded(p, rt) {
+		return
+	}
+
+	// Determine the upstream URL (tunnel endpoint).
+	upstream := rt.Endpoint.PublicAddress
+	if upstream == "" {
+		upstream = rt.Endpoint.PrivateAddress
+	}
+	if upstream == "" {
+		slog.Warn("gateway: no upstream address for connection", "connection", connID)
+		return
+	}
+
+	// Get auth tokens from profile if available.
+	var authTokens []string
+	if p.Spec.ClientTunnel != nil && p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel {
+		// For OpenAI profiles, generate or retrieve tokens.
+		authTokens = []string{} // Will be populated from durable store in future.
+	}
+
+	endpoint, err := s.gatewayMgr.StartGateway(context.Background(), connID, upstream, authTokens)
+	if err != nil {
+		slog.Error("failed to start gateway", "connection", connID, "error", err)
+		return
+	}
+
+	rt.Gateway = &core.GatewayRuntime{
+		Endpoint:   endpoint,
+		Upstream:   upstream,
+		AuthTokens: authTokens,
+		StartedAt:  time.Now().UTC(),
+	}
+	s.controller.RestoreRuntime(rt)
+}
+
+// maybeStopGateway stops the gateway for a connection if running.
+func (s *Supervisor) maybeStopGateway(connID core.ConnectionID) {
+	s.mu.RLock()
+	rt, ok := s.controller.GetRuntime(connID)
+	s.mu.RUnlock()
+	if !ok || rt.Gateway == nil {
+		return
+	}
+	if err := s.gatewayMgr.StopGateway(connID); err != nil {
+		slog.Warn("failed to stop gateway", "connection", connID, "error", err)
+	}
+	rt.Gateway = nil
+	s.controller.RestoreRuntime(rt)
+}
+
+// gatewayNeeded reports whether the connection needs a gateway.
+func (s *Supervisor) gatewayNeeded(p *core.ConnectionProfile, rt *core.ConnectionRuntime) bool {
+	// Only client tunnels need the gateway for now.
+	if p.Kind != core.ConnectionClientTunnel {
+		return false
+	}
+	if p.Spec.ClientTunnel == nil {
+		return false
+	}
+	// Only OpenAI Secure MCP Tunnel uses the gateway.
+	return p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel
 }
 
 // Start initializes the supervisor and begins serving.

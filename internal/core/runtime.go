@@ -45,6 +45,7 @@ type ConnectionRuntime struct {
 	Connector        ConnectorRuntime
 	Provider         ProviderRuntime
 	Endpoint         EndpointRuntime
+	Gateway          *GatewayRuntime
 	Diagnostics      []DiagnosticFinding
 	ActiveOperation  *OperationID
 	LastObservedAt   time.Time
@@ -83,6 +84,13 @@ func (r *ConnectionRuntime) DeepCopy() *ConnectionRuntime {
 	if r.Error != nil {
 		errCopy := *r.Error
 		cr.Error = &errCopy
+	}
+	if r.Gateway != nil {
+		gwCopy := *r.Gateway
+		if r.Gateway.AuthTokens != nil {
+			gwCopy.AuthTokens = append([]string(nil), r.Gateway.AuthTokens...)
+		}
+		cr.Gateway = &gwCopy
 	}
 	return &cr
 }
@@ -201,6 +209,22 @@ type EndpointRuntime struct {
 	Port           int
 	Verified       bool
 	LastVerifiedAt time.Time
+}
+
+// GatewayRuntime represents the runtime state of the Portico Gateway.
+// The gateway is a local HTTP proxy that authenticates clients and forwards
+// requests through the transport tunnel. It is nil when the connection
+// does not use a gateway.
+type GatewayRuntime struct {
+	// Endpoint is the local URL the gateway listens on (e.g., http://127.0.0.1:PORT).
+	Endpoint string `json:"endpoint"`
+	// Upstream is the tunnel endpoint URL being proxied.
+	Upstream string `json:"upstream"`
+	// AuthTokens are the Bearer tokens accepted by the gateway.
+	// Stored for runtime use; the actual tokens are also persisted durably.
+	AuthTokens []string `json:"auth_tokens,omitempty"`
+	// StartedAt records when the gateway was started.
+	StartedAt time.Time `json:"started_at"`
 }
 
 // ProviderResource represents a provider-managed resource.
