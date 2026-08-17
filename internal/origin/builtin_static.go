@@ -133,6 +133,11 @@ func (s *BuiltinStatic) Healthy(_ context.Context) error {
 // being served.
 func noSymlink(root string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reject hidden files by default (e.g. .env, .git/config).
+		if isHiddenPath(r.URL.Path) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		target, err := safePath(root, r.URL.Path)
 		if err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -158,6 +163,11 @@ func (s *BuiltinStatic) ProcessGroupID() int {
 // The root path is pinned at construction time to prevent symlink escape.
 func spaHandler(root, index string, fileServer http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reject hidden files by default (e.g. .env, .git/config).
+		if isHiddenPath(r.URL.Path) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		// Use safePath to prevent traversal
 		target, err := safePath(root, r.URL.Path)
 		if err != nil {

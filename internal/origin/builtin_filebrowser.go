@@ -149,7 +149,10 @@ type BuiltinFileBrowser struct {
 
 // NewBuiltinFileBrowser creates a file browser origin. The configured root is
 // canonicalised (symlinks followed) once at construction and pinned via a file
-// descriptor so the served root cannot be redirected by a later symlink retarget.
+// descriptor for path validation. Note: actual filesystem operations currently
+// use pathname-based access, so there is a small validation-to-action window.
+// For TOCTOU-safe operations, the rootedDir primitives would need to be used
+// end-to-end (see P1 backlog).
 func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("--path is required for builtin:file-browser origin")
