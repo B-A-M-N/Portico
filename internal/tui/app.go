@@ -2517,34 +2517,37 @@ func (m *Model) renderHome() string {
 		availableHeight = 5
 	}
 
-	// Render connection list with viewport tracking
+	// Render connection list with viewport tracking.
+	// Use a local variable — mutating m.listOffset in View() is a no-op
+	// because View() has a value receiver.
 	conns := m.ConnectionList()
 	selectedIdx := m.selectedConnectionIndex()
+	listOffset := m.listOffset
 
-	// Adjust listOffset so the selected item is always visible.
+	// Adjust offset so the selected item is always visible.
 	if selectedIdx >= 0 {
-		if selectedIdx < m.listOffset {
-			m.listOffset = selectedIdx
-		} else if selectedIdx >= m.listOffset+availableHeight {
-			m.listOffset = selectedIdx - availableHeight + 1
+		if selectedIdx < listOffset {
+			listOffset = selectedIdx
+		} else if selectedIdx >= listOffset+availableHeight {
+			listOffset = selectedIdx - availableHeight + 1
 		}
 	}
 	// Clamp offset to valid range.
-	if m.listOffset < 0 {
-		m.listOffset = 0
+	if listOffset < 0 {
+		listOffset = 0
 	}
-	if m.listOffset > len(conns)-1 && len(conns) > 0 {
-		m.listOffset = len(conns) - 1
+	if listOffset > len(conns)-1 && len(conns) > 0 {
+		listOffset = len(conns) - 1
 	}
 
 	// Slice the visible window.
-	visibleEnd := m.listOffset + availableHeight
+	visibleEnd := listOffset + availableHeight
 	if visibleEnd > len(conns) {
 		visibleEnd = len(conns)
 	}
 	visibleConns := conns
-	if m.listOffset < len(conns) {
-		visibleConns = conns[m.listOffset:visibleEnd]
+	if listOffset < len(conns) {
+		visibleConns = conns[listOffset:visibleEnd]
 	} else {
 		visibleConns = nil
 	}
@@ -2553,8 +2556,8 @@ func (m *Model) renderHome() string {
 	lines := strings.Split(connListStr, "\n")
 
 	// Show scroll indicators when list is truncated.
-	if m.listOffset > 0 {
-		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("  ↑ %d above", m.listOffset)))
+	if listOffset > 0 {
+		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("  ↑ %d above", listOffset)))
 		b.WriteString("\n")
 	}
 
