@@ -98,33 +98,35 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 		return nil
 	}
 
+	// Hold the manager lock for the entire stop+create+start sequence to
+	// prevent concurrent Start/Stop/Start for the same connection from
+	// interleaving and replacing the map entry while the first is
+	// stopping/creating.
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if m.cleared {
-		m.mu.Unlock()
 		return fmt.Errorf("origin manager is stopped")
 	}
 
 	// If a managed origin already exists for this connection, stop it
-	// before starting a new one. We snapshot the reference under the
-	// manager lock so stopping outside the lock operates on the exact
-	// entry we found, not a newer one that may have been inserted.
+	// before starting a new one.
 	old := m.active[connectionID]
 	if old != nil {
-		m.mu.Unlock()
-		_ = old.stopUnderlying(ctx)
-		m.mu.Lock()
+		if err := old.stopUnderlying(ctx); err != nil {
+			// Log but proceed — the old origin may already be stopped.
+			slog.Warn("failed to stop old origin during restart", "connection", connectionID, "err", err)
+		}
 	}
 
-	// Create the underlying origin (outside per-origin lock).
+	// Create the underlying origin.
 	orig, err := newOwnedOrigin(connectionID, source)
 	if err != nil {
-		m.mu.Unlock()
 		return err
 	}
 
 	managed := newManagedOrigin(orig)
 	m.active[connectionID] = managed
-	m.mu.Unlock()
 
 	// Transition to starting under per-origin lock.
 	managed.SetState(originStateStarting)
@@ -133,11 +135,9 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 	if err != nil {
 		managed.SetState(originStateCrashed)
 		managed.SetLastError(err)
-		// Best-effort cleanup of failed origin to avoid resource leaks (e.g. file descriptors).
+		// Best-effort cleanup of failed origin to avoid resource leaks.
 		_ = orig.Stop(context.Background())
-		m.mu.Lock()
 		delete(m.active, connectionID)
-		m.mu.Unlock()
 		return err
 	}
 
@@ -145,13 +145,11 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 		_ = orig.Stop(context.Background())
 		managed.SetState(originStateStopped)
 		managed.SetLastError(fmt.Errorf("bounded %s, expected %s", actualURL, expectedURL))
-		m.mu.Lock()
 		delete(m.active, connectionID)
-		m.mu.Unlock()
 		return fmt.Errorf("owned origin bound %s, but plan requires %s", actualURL, expectedURL)
 	}
 
-	// Success: record URL and set running state under the per-origin lock.
+	// Success: record URL and set running state.
 	managed.SetURL(actualURL)
 	managed.SetState(originStateRunning)
 	return nil

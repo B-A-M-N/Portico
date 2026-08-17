@@ -126,19 +126,22 @@ func checkKindCapabilities(caps core.Capabilities, profile *core.ConnectionProfi
 			if !caps.PrivateExposure.Supported {
 				return core.ErrValidation(fmt.Sprintf("provider %q does not support private exposure", providerID))
 			}
-		case "":
-			// No mode specified — will be validated at plan time.
 		default:
 			return core.ErrValidation(fmt.Sprintf("unknown exposure mode %q", exposure.Mode))
 		}
-		// Check protocol support.
+
+		// Check protocol support for the required transport. The source kind
+		// determines which protocol is required; the provider must explicitly
+		// support it.
 		source := profile.GetSource()
-		if source.Existing != nil {
-			pc, ok := caps.Protocols[source.Existing.Protocol]
+		requiredProtocol := requiredTransportProtocol(source)
+		if requiredProtocol != "" {
+			pc, ok := caps.Protocols[requiredProtocol]
 			if !ok || !pc.Supported {
-				return core.ErrValidation(fmt.Sprintf("provider %q does not support protocol %q", providerID, source.Existing.Protocol))
+				return core.ErrValidation(fmt.Sprintf("provider %q does not support protocol %q required by source kind %q", providerID, requiredProtocol, source.Kind))
 			}
 		}
+
 		// Check protection support.
 		protection := profile.GetProtection()
 		if protection.Kind != "" && protection.Kind != core.ProtectionNone {
@@ -155,4 +158,31 @@ func checkKindCapabilities(caps core.Capabilities, profile *core.ConnectionProfi
 		}
 	}
 	return nil
+}
+
+// requiredTransportProtocol returns the transport protocol required by the
+// source kind. This is the single normalized derivation used in capability
+// validation so that recommendation, create, update, and edit all agree on
+// what the provider must support. An empty string means no specific protocol
+// is required (the source kind does not map to a provider transport).
+func requiredTransportProtocol(source core.SourceSpec) core.Protocol {
+	switch source.Kind {
+	case core.SourceExisting:
+		// Existing services may declare their protocol; if empty, HTTP is
+		// assumed after normalization.
+		if source.Existing != nil && source.Existing.Protocol != "" {
+			return source.Existing.Protocol
+		}
+		return core.ProtocolHTTP
+	case core.SourceCommand:
+		// Portico-managed commands terminate plain HTTP.
+		return core.ProtocolHTTP
+	case core.SourceMCP:
+		// MCP origins transport over HTTP (streamable or SSE are layered on top).
+		return core.ProtocolHTTP
+	case core.SourceDirectory:
+		// Directory origins are served as HTTP.
+		return core.ProtocolHTTP
+	}
+	return ""
 }

@@ -161,27 +161,28 @@ func (s *BuiltinStatic) ProcessGroupID() int {
 
 // spaHandler serves the index file for any path that doesn't match a real file.
 // The root path is pinned at construction time to prevent symlink escape.
+//
+// SECURITY: A path rejected by safePath (symlink escape, invalid path, etc.)
+// must NOT become a successful SPA response. Only "legitimate in-root path
+// does not exist" gets SPA fallback; path validation failures get 403/400.
 func spaHandler(root, index string, fileServer http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Reject hidden files by default (e.g. .env, .git/config).
-		if isHiddenPath(r.URL.Path) {
+		// Reject hidden files and sensitive paths by default.
+		if err := checkPublishPathStatic(r.URL.Path); err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		// Use safePath to prevent traversal
-		target, err := safePath(root, r.URL.Path)
-		if err != nil {
-			// Fall back to index for SPA
-			indexPath, err := safePath(root, index)
-			if err == nil {
-				http.ServeFile(w, r, indexPath)
-			} else {
-				http.Error(w, "not found", http.StatusNotFound)
-			}
+		// Use safePath to prevent traversal.
+		target, pathErr := safePath(root, r.URL.Path)
+		if pathErr != nil {
+			// Path validation failed (symlink escape, invalid path, etc.).
+			// Do NOT fall back to SPA index — this would let an attacker
+			// probe paths via the SPA response status.
+			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		if _, err := os.Stat(target); os.IsNotExist(err) {
-			// SPA fallback: serve index
+			// Legitimate in-root path does not exist — SPA fallback.
 			indexPath, err := safePath(root, index)
 			if err == nil {
 				http.ServeFile(w, r, indexPath)
@@ -192,6 +193,19 @@ func spaHandler(root, index string, fileServer http.Handler) http.Handler {
 		}
 		fileServer.ServeHTTP(w, r)
 	})
+}
+
+// checkPublishPathStatic applies the hidden-file policy for BuiltinStatic,
+// which doesn't have access to a BuiltinFileBrowser receiver. It rejects
+// hidden paths and sensitive segments.
+func checkPublishPathStatic(rel string) error {
+	if isSensitivePath(rel) {
+		return fmt.Errorf("sensitive path denied")
+	}
+	if isHiddenPath(rel) {
+		return fmt.Errorf("hidden path denied")
+	}
+	return nil
 }
 
 // cacheControlMiddleware adds a Cache-Control header to all responses.
