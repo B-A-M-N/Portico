@@ -644,10 +644,13 @@ func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec
 	}
 
 	// Write-enabled directories must not be exposed without protection.
-	// A publicly reachable upload endpoint is a severe security risk.
+	// A publicly reachable upload/delete endpoint is a severe security risk.
+	// Check mutation capability (upload OR delete) and use IsProtected()
+	// which correctly handles empty/None protection.
 	if spec.Source.Directory != nil && spec.Source.Directory.Mode == DirectoryModeWrites &&
-		spec.Source.Directory.AllowUpload && spec.Protection.Kind == ProtectionNone {
-		return fmt.Errorf("write-enabled directory with upload requires protection; use email_otp, identity_provider, service_token, or private_network")
+		(spec.Source.Directory.AllowUpload || spec.Source.Directory.AllowDelete) &&
+		!p.IsProtected() {
+		return fmt.Errorf("write-enabled directory with upload or delete requires protection; use email_otp, identity_provider, service_token, or private_network")
 	}
 
 	if p.Lifecycle.OnDisconnect != "" && p.Lifecycle.OnDisconnect != DisconnectKeepAlive && p.Lifecycle.OnDisconnect != DisconnectClose {

@@ -172,6 +172,38 @@ func NewBuiltinFileBrowser(cfg Config) (*BuiltinFileBrowser, error) {
 		return nil, fmt.Errorf("%s is not a directory", absPath)
 	}
 
+	return newBuiltinFileBrowserFromValidated(cfg, absPath)
+}
+
+// ValidateBuiltinFileBrowserConfig validates the configuration without opening
+// file descriptors. Use this in Plan() to avoid FD leaks for previews that
+// never become connections.
+func ValidateBuiltinFileBrowserConfig(cfg Config) error {
+	if cfg.Path == "" {
+		return fmt.Errorf("--path is required for builtin:file-browser origin")
+	}
+
+	absPath, err := filepath.Abs(cfg.Path)
+	if err != nil {
+		return fmt.Errorf("resolving path: %w", err)
+	}
+	realRoot, err := filepath.EvalSymlinks(absPath)
+	if err == nil {
+		absPath = realRoot
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("checking path: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", absPath)
+	}
+
+	return nil
+}
+
+func newBuiltinFileBrowserFromValidated(cfg Config, absPath string) (*BuiltinFileBrowser, error) {
 	// Open root directory with O_PATH to pin it. All subsequent operations
 	// will be relative to this fd, preventing symlink retarget attacks.
 	rootFd, err := unix.Open(absPath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
@@ -282,16 +314,14 @@ func (fb *BuiltinFileBrowser) CSRFToken(path string) string {
 	return base64.URLEncoding.EncodeToString(h.Sum(nil))
 }
 
-// requireCSRF checks that the request includes a valid CSRF token
-// in the X-CSRF-Token header or in the form value _csrf.
-// The token is validated against the server-side HMAC key using the
-// request path as the message, ensuring tokens are scope-bound.
+// requireCSRF checks that the request includes a valid CSRF token.
+// For mutating operations (upload/delete), the token MUST be in the
+// X-CSRF-Token header. We deliberately do NOT fall back to form values
+// because that would require parsing the request body before the upload
+// handler's MaxBytesReader limit is applied.
 func (fb *BuiltinFileBrowser) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-CSRF-Token")
-		if token == "" {
-			token = r.FormValue("_csrf")
-		}
 		if token == "" {
 			http.Error(w, "CSRF token required", http.StatusForbidden)
 			return
@@ -380,12 +410,35 @@ func (fb *BuiltinFileBrowser) handleAPI(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// isHidden reports whether any segment of the relative path is hidden (starts with .).
+func isHiddenPath(rel string) bool {
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	for _, part := range parts {
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// handleDownload serves a file for download. Hidden files are rejected by default.
 func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	relPath := strings.TrimPrefix(r.URL.Path, "/download")
+
+	// Reject hidden files by default (e.g. .env, .git/config).
+	if isHiddenPath(relPath) && !fb.cfg.ShowHidden {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	absPath, err := fb.safePath(relPath)
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -394,6 +447,8 @@ func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Requ
 
 	http.ServeFile(w, r, absPath)
 }
+
+// handleUpload processes a file upload. Hidden file targets are rejected by default.
 
 func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -429,6 +484,12 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 	dir := r.FormValue("path")
 	if dir == "" {
 		dir = "/"
+	}
+
+	// Reject hidden targets by default.
+	if isHiddenPath(dir) && !fb.cfg.ShowHidden {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
 	}
 
 	destDir, err := fb.safePath(dir)
@@ -468,14 +529,17 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "writing file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := tmpFile.Close(); err != nil {
-		http.Error(w, "closing temp file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// fsync the temp file before rename for durability.
+	// Sync BEFORE close — you cannot sync a closed file.
 	if err := tmpFile.Sync(); err != nil {
 		http.Error(w, "syncing file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tmpFile.Chmod(0644); err != nil {
+		http.Error(w, "chmod file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		http.Error(w, "closing temp file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -489,11 +553,6 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 	if fd, dirErr := os.Open(destDir); dirErr == nil {
 		_ = fd.Sync()
 		fd.Close()
-	}
-
-	if err := os.Chmod(destPath, 0644); err != nil {
-		http.Error(w, "chmod file: "+err.Error(), http.StatusInternalServerError)
-		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
@@ -512,6 +571,13 @@ func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
+	// Reject hidden targets by default.
+	if isHiddenPath(r.Form.Get("path")) && !fb.cfg.ShowHidden {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	target, err := fb.safePath(r.Form.Get("path"))
 	if err != nil || target == fb.cfg.Path {
 		http.Error(w, "forbidden", http.StatusForbidden)

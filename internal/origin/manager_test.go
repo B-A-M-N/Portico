@@ -103,10 +103,13 @@ func TestBuiltinFileBrowser_DeletesOnlyPermittedFiles(t *testing.T) {
 	defer browser.Stop(context.Background())
 	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 
-	// Delete with CSRF token (required)
+	// Delete with CSRF token in header (required)
 	token := browser.CSRFToken("/delete")
-	_, err = client.Post(endpoint+"/delete", "application/x-www-form-urlencoded",
-		strings.NewReader(url.Values{"path": {"/remove-me.txt"}, "_csrf": {token}}.Encode()))
+	req, _ := http.NewRequest(http.MethodPost, endpoint+"/delete",
+		strings.NewReader(url.Values{"path": {"/remove-me.txt"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-CSRF-Token", token)
+	_, err = client.Do(req)
 	if err != nil {
 		t.Fatalf("delete request: %v", err)
 	}
@@ -115,8 +118,11 @@ func TestBuiltinFileBrowser_DeletesOnlyPermittedFiles(t *testing.T) {
 	}
 
 	// Traversal should be rejected
-	response, err := client.Post(endpoint+"/delete", "application/x-www-form-urlencoded",
-		strings.NewReader(url.Values{"path": {"/../../etc/passwd"}, "_csrf": {token}}.Encode()))
+	travReq, _ := http.NewRequest(http.MethodPost, endpoint+"/delete",
+		strings.NewReader(url.Values{"path": {"/../../etc/passwd"}}.Encode()))
+	travReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	travReq.Header.Set("X-CSRF-Token", token)
+	response, err := client.Do(travReq)
 	if err != nil {
 		t.Fatalf("traversal request: %v", err)
 	}

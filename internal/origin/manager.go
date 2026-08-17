@@ -35,14 +35,10 @@ func (m *Manager) Plan(connectionID core.ConnectionID, source core.SourceSpec) (
 		if source.Directory == nil {
 			return nil, fmt.Errorf("directory source is missing its configuration")
 		}
-		// Constructors validate the root eagerly (without opening a listener),
-		// so a preview cannot promise an openable directory that does not exist.
+		// Validate configuration without opening file descriptors.
+		// Plan() should not leak FDs for previews that never become connections.
 		cfg := Config{Path: source.Directory.Path}
-		if source.Directory.Mode == core.DirectoryModeWrites {
-			if _, err := NewBuiltinFileBrowser(cfg); err != nil {
-				return nil, err
-			}
-		} else if _, err := NewBuiltinStatic(cfg); err != nil {
+		if err := ValidateBuiltinFileBrowserConfig(cfg); err != nil {
 			return nil, err
 		}
 		return ownedHTTPOrigin(directoryPort(connectionID)), nil
@@ -130,14 +126,15 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 	m.active[connectionID] = managed
 	m.mu.Unlock()
 
-	// Transition to starting under the per-origin lock.
+	// Transition to starting under per-origin lock.
 	managed.SetState(originStateStarting)
 
 	actualURL, err := orig.Start(ctx)
-
 	if err != nil {
 		managed.SetState(originStateCrashed)
 		managed.SetLastError(err)
+		// Best-effort cleanup of failed origin to avoid resource leaks (e.g. file descriptors).
+		_ = orig.Stop(context.Background())
 		m.mu.Lock()
 		delete(m.active, connectionID)
 		m.mu.Unlock()
@@ -212,8 +209,9 @@ func (m *Manager) StopAll(ctx context.Context) error {
 	for connID, mo := range m.active {
 		snapshot[connID] = mo
 	}
-	// Clear active so no new starts succeed; cleared is already true
-	// from where StopAll was called, but be explicit.
+	// Set cleared to prevent new starts during/after shutdown.
+	m.cleared = true
+	// Clear active so no new starts succeed.
 	for connID := range m.active {
 		delete(m.active, connID)
 	}
