@@ -70,8 +70,11 @@ func TestAccountsProviderRequiresExactAccountSelection(t *testing.T) {
 type fakeTunnelManager struct {
 	requestedAccount string
 	requestedID      string
+	requestedName    string
 	state            *tunnel.TunnelState
 	err              error
+	lookupResult     *tunnel.TunnelInfo
+	lookupErr        error
 }
 
 func (f *fakeTunnelManager) CreateTunnel(context.Context, string, string) (*tunnel.TunnelInfo, error) {
@@ -90,7 +93,12 @@ func (f *fakeTunnelManager) ConfigureIngress(context.Context, string, string, st
 func (f *fakeTunnelManager) GetToken(context.Context, string, string) (string, error) {
 	return "test-token", nil
 }
-func (f *fakeTunnelManager) Delete(context.Context, string, string) error { return nil }
+func (f *fakeTunnelManager) Delete(context.Context, string, string) error             { return nil }
+func (f *fakeTunnelManager) LookupTunnelByName(_ context.Context, accountID, name string) (*tunnel.TunnelInfo, error) {
+	f.requestedAccount = accountID
+	f.requestedName = name
+	return f.lookupResult, f.lookupErr
+}
 
 // failingTokenTunnelManager returns a valid tunnel from CreateTunnel but fails
 // on GetToken, simulating a network interruption after tunnel creation but
@@ -98,7 +106,10 @@ func (f *fakeTunnelManager) Delete(context.Context, string, string) error { retu
 type failingTokenTunnelManager struct {
 	requestedAccount string
 	requestedID      string
+	requestedName    string
 	state            *tunnel.TunnelState
+	lookupResult     *tunnel.TunnelInfo
+	lookupErr        error
 }
 
 func (f *failingTokenTunnelManager) CreateTunnel(context.Context, string, string) (*tunnel.TunnelInfo, error) {
@@ -118,6 +129,11 @@ func (f *failingTokenTunnelManager) GetToken(context.Context, string, string) (s
 	return "", fmt.Errorf("token lookup failed")
 }
 func (f *failingTokenTunnelManager) Delete(context.Context, string, string) error { return nil }
+func (f *failingTokenTunnelManager) LookupTunnelByName(_ context.Context, accountID, name string) (*tunnel.TunnelInfo, error) {
+	f.requestedAccount = accountID
+	f.requestedName = name
+	return f.lookupResult, f.lookupErr
+}
 
 type fakeDNSManager struct {
 	zoneID   string
@@ -470,6 +486,75 @@ func TestAcquireTokenFailureLeavesDurableTunnelID(t *testing.T) {
 	// The failed token step must NOT report success and must NOT hide the
 	// already-created tunnel. The durable tunnel ID from the create step
 	// is what recovery/compensation needs to delete the orphaned tunnel.
+}
+
+// TestLookupTunnelByNameRecovery verifies the unknown-outcome recovery protocol.
+// A network timeout after sending CreateTunnel can mean "not created" or
+// "created, response lost". LookupTunnelByName is used ONLY for resolving an
+// interrupted create and never used to infer ownership normally.
+func TestLookupTunnelByNameRecovery(t *testing.T) {
+	// Case 1: tunnel was created, response lost — recovery finds it by name.
+	t.Run("finds_created_tunnel", func(t *testing.T) {
+		lookupResult := &tunnel.TunnelInfo{ID: "recovered-tunnel-id", Name: "portico-test-123"}
+		tunnels := &fakeTunnelManager{lookupResult: lookupResult}
+		p := &Provider{
+			accountID:     "account-1",
+			tunnels:       tunnels,
+			connectorProc: fakeConnectorProcessService{},
+			connections:   make(map[core.ConnectionID]*cfConnection),
+		}
+
+		// Recovery queries by the deterministic name that was attempted.
+		found, err := p.tunnels.LookupTunnelByName(context.Background(), "account-1", "portico-test-123")
+		if err != nil {
+			t.Fatalf("LookupTunnelByName: %v", err)
+		}
+		if found == nil {
+			t.Fatal("expected to find the created tunnel, got nil")
+		}
+		if found.ID != "recovered-tunnel-id" {
+			t.Errorf("found.ID = %q, want %q", found.ID, "recovered-tunnel-id")
+		}
+		// Verify the query used the deterministic name, not an ID.
+		if tunnels.requestedName != "portico-test-123" {
+			t.Errorf("requestedName = %q, want %q", tunnels.requestedName, "portico-test-123")
+		}
+	})
+
+	// Case 2: tunnel was NOT created (response lost before creation) — recovery finds nothing.
+	t.Run("not_created_returns_nil", func(t *testing.T) {
+		tunnels := &fakeTunnelManager{lookupResult: nil}
+		p := &Provider{
+			accountID:     "account-1",
+			tunnels:       tunnels,
+			connectorProc: fakeConnectorProcessService{},
+			connections:   make(map[core.ConnectionID]*cfConnection),
+		}
+
+		found, err := p.tunnels.LookupTunnelByName(context.Background(), "account-1", "portico-test-456")
+		if err != nil {
+			t.Fatalf("LookupTunnelByName: %v", err)
+		}
+		if found != nil {
+			t.Errorf("expected nil for not-created tunnel, got %+v", found)
+		}
+	})
+
+	// Case 3: lookup error is propagated (transient failure).
+	t.Run("lookup_error_propagated", func(t *testing.T) {
+		tunnels := &fakeTunnelManager{lookupErr: fmt.Errorf("transient: connection refused")}
+		p := &Provider{
+			accountID:     "account-1",
+			tunnels:       tunnels,
+			connectorProc: fakeConnectorProcessService{},
+			connections:   make(map[core.ConnectionID]*cfConnection),
+		}
+
+		_, err := p.tunnels.LookupTunnelByName(context.Background(), "account-1", "portico-test-789")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
 }
 
 func TestCreateDNSRepairUsesDurableTunnelIDWithoutAdapterMemory(t *testing.T) {

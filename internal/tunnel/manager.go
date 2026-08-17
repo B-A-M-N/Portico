@@ -32,6 +32,11 @@ type Manager interface {
 	GetToken(ctx context.Context, accountID, tunnelID string) (string, error)
 	// Delete removes a Cloudflare Tunnel.
 	Delete(ctx context.Context, accountID, tunnelID string) error
+	// LookupTunnelByName is a narrowly scoped deterministic-name recovery
+	// query. It is used ONLY for resolving an interrupted create whose
+	// outcome is unknown (network timeout after the request was sent). It
+	// must never be used to infer ownership in the normal observation path.
+	LookupTunnelByName(ctx context.Context, accountID, name string) (*TunnelInfo, error)
 }
 
 // TunnelInfo is the durable identity of a tunnel after creation.
@@ -187,4 +192,28 @@ func (m *APIManager) Delete(ctx context.Context, accountID, tunnelID string) err
 		return fmt.Errorf("transient: %w", err)
 	}
 	return nil
+}
+
+// LookupTunnelByName resolves the identity of a tunnel by its deterministic
+// name. It is used ONLY for recovery after an interrupted create whose
+// outcome is unknown (network timeout after the request was sent).
+//
+// The normal observation path must never use this to infer ownership: a
+// name collision with an external tunnel would otherwise adopt a foreign
+// resource. Recovery records the attempted deterministic identity *before*
+// sending the mutation, and this query is used solely to resolve whether a
+// tunnel with that name exists (and what its ID is) so the controller can
+// decide whether to adopt or delete it.
+func (m *APIManager) LookupTunnelByName(ctx context.Context, accountID, name string) (*TunnelInfo, error) {
+	rc := cf.AccountIdentifier(accountID)
+	tunnels, _, err := m.client.ListTunnels(ctx, rc, cf.TunnelListParams{Name: name})
+	if err != nil {
+		return nil, fmt.Errorf("listing tunnels for recovery: %w", err)
+	}
+	for _, t := range tunnels {
+		if t.Name == name {
+			return &TunnelInfo{ID: t.ID, Name: t.Name}, nil
+		}
+	}
+	return nil, nil
 }
