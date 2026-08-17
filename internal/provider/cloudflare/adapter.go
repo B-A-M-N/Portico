@@ -966,14 +966,13 @@ func (p *Provider) launchConnector(ctx context.Context, connectionID core.Connec
 			func(path string) (core.ConnectorHandle, error) {
 				s := spec
 				s.Args = []string{"tunnel", "--no-autoupdate", "run", "--token-file", path}
-				// Use minimal env + explicit override. Never inherit the
-				// supervisor's full environment, which may contain unrelated
-				// provider credentials.
+				// Env contains only true overrides. The process manager
+				// already supplies the safe base environment (PATH, HOME,
+				// LANG, TZ). Adapter Env must not redundantly supply what
+				// the manager owns, and must never embed secrets — the
+				// credential path is auto-redacted by processLogRedactions
+				// via the --token-file flag-value heuristic.
 				s.Env = []string{
-					"PATH=" + os.Getenv("PATH"),
-					"HOME=" + os.Getenv("HOME"),
-					"LANG=C.UTF-8",
-					"TZ=UTC",
 					"TUNNEL_TOKEN_FILE=" + path,
 				}
 				return p.connectorProc.Start(ctx, core.ProcessConfig{ConnectionID: connectionID, Spec: s})

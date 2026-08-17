@@ -282,14 +282,74 @@ func (a *actor) launch() error {
 	return nil
 }
 
+// processLogRedactions derives the set of secret values that must be redacted
+// from a connector's logs. It starts from explicit spec.Redactions, then
+// recognizes:
+//   - Flag-value pairs whose flag name suggests a secret (--token-file, --api-key, etc.)
+//   - Environment variable values whose name suggests a secret (NGROK_AUTHTOKEN, etc.)
+//
+// The value (not the flag/name) is added to the redaction set. This handles the
+// common pattern where a secret lives in the argument following a flag, or in an
+// environment variable value.
 func processLogRedactions(spec core.ProcessSpec) []string {
-	redactions := append([]string(nil), spec.Redactions...)
-	for _, arg := range spec.Args {
-		lower := strings.ToLower(arg)
-		if (strings.Contains(lower, "credential") || strings.Contains(lower, "token")) && strings.Contains(arg, "/") {
-			redactions = append(redactions, arg)
+	seen := make(map[string]bool)
+	redactions := make([]string, 0, len(spec.Redactions)+4)
+	for _, r := range spec.Redactions {
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		redactions = append(redactions, r)
+	}
+
+	// Flag names whose argument is likely a secret.
+	secretFlags := map[string]bool{
+		"--token-file": true, "--token": true,
+		"--credential": true, "--credential-file": true,
+		"--api-key": true, "--api-token": true,
+		"--secret": true, "--secret-key": true,
+		"--client-secret": true, "--client-id": true,
+		"--access-token": true, "--refresh-token": true,
+	}
+
+	for i, arg := range spec.Args {
+		// Handle --flag=value form.
+		if name, value, found := strings.Cut(arg, "="); found {
+			if secretFlags[name] && value != "" && !seen[value] {
+				seen[value] = true
+				redactions = append(redactions, value)
+			}
+			continue
+		}
+		// Handle --flag value form.
+		if secretFlags[arg] && i+1 < len(spec.Args) {
+			value := spec.Args[i+1]
+			if value != "" && !seen[value] {
+				seen[value] = true
+				redactions = append(redactions, value)
+			}
 		}
 	}
+
+	// Environment variable names whose values are secrets.
+	secretEnvNames := map[string]bool{
+		"NGROK_AUTHTOKEN": true, "NGROK_API_KEY": true,
+		"CF_API_TOKEN": true, "CF_API_KEY": true,
+		"TUNNEL_TOKEN": true, "TUNNEL_TOKEN_FILE": true,
+		"CONTROL_PLANE_API_KEY": true,
+	}
+	for _, env := range spec.Env {
+		name, value, found := strings.Cut(env, "=")
+		if !found {
+			continue
+		}
+		upper := strings.ToUpper(name)
+		if secretEnvNames[upper] && value != "" && !seen[value] {
+			seen[value] = true
+			redactions = append(redactions, value)
+		}
+	}
+
 	return redactions
 }
 
