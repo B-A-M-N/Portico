@@ -30,8 +30,7 @@ previous version of this document came to be wrong in both directions.
 ## Structure
 
 ```
-main.go              # Entry: cli.NewCLI() + legacy command tree
-cmd/                 # Legacy flare-cli Cobra commands (hidden under "portico legacy")
+main.go              # Entry: cli.NewCLI()
 internal/
   core/              # Pure domain types — no non-stdlib imports
   controller/        # Orchestrates providers, plans, operations
