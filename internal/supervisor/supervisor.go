@@ -837,6 +837,29 @@ func (h *supervisorHandler) HandleGetConnectionDetail(id string) (*ipc.Connectio
 	}
 	detail.Segments = computeRouteSegments(p, rt, segmentResources)
 
+	// Health assessment.
+	if rt != nil && rt.Health != nil {
+		detail.Health = &ipc.HealthDTO{
+			State: string(rt.Health.State),
+			Process: ipc.HealthCheckDTO{
+				State:       string(rt.Health.Process.State),
+				Detail:      rt.Health.Process.Detail,
+				LastChecked: rt.Health.Process.LastChecked.Format(time.RFC3339),
+			},
+			Transport: ipc.HealthCheckDTO{
+				State:       string(rt.Health.Transport.State),
+				Detail:      rt.Health.Transport.Detail,
+				LastChecked: rt.Health.Transport.LastChecked.Format(time.RFC3339),
+			},
+			Service: ipc.HealthCheckDTO{
+				State:       string(rt.Health.Service.State),
+				Detail:      rt.Health.Service.Detail,
+				LastChecked: rt.Health.Service.LastChecked.Format(time.RFC3339),
+			},
+			ComputedAt: rt.Health.ComputedAt.Format(time.RFC3339),
+		}
+	}
+
 	// The runtime projection is not an authoritative record of what Portico
 	// created. Controller.RestoreResources drops restored resources when a
 	// connection has no runtime row, so a connection can hold managed provider

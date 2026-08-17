@@ -68,6 +68,7 @@ type ConnectionDetailDTO struct {
 	Resources     []ManagedResourceDTO `json:"resources,omitempty"`
 	Processes     []ProcessDTO         `json:"processes,omitempty"`
 	Gateway       *GatewayDTO          `json:"gateway,omitempty"`
+	Health        *HealthDTO           `json:"health,omitempty"`
 	Findings      []DiagnosticDTO      `json:"findings,omitempty"`
 	LastVerified  string               `json:"last_verified,omitempty"`
 	LastOperation *OperationSummaryDTO `json:"last_operation,omitempty"`
@@ -163,6 +164,23 @@ type GatewayDTO struct {
 	AuthEnabled   bool   `json:"auth_enabled"`
 	CredentialRef string `json:"credential_ref,omitempty"`
 	StartedAt     string `json:"started_at,omitempty"`
+}
+
+// HealthDTO describes the three-state health assessment for a connection.
+// Health is evaluated relative to the connection's desired state and kind.
+type HealthDTO struct {
+	State       string       `json:"state"`
+	Process     HealthCheckDTO `json:"process"`
+	Transport   HealthCheckDTO `json:"transport"`
+	Service     HealthCheckDTO `json:"service"`
+	ComputedAt  string       `json:"computed_at,omitempty"`
+}
+
+// HealthCheckDTO is a single health check result.
+type HealthCheckDTO struct {
+	State       string `json:"state"`
+	Detail      string `json:"detail,omitempty"`
+	LastChecked string `json:"last_checked,omitempty"`
 }
 
 // OperationSummaryDTO is a brief operation view for connection detail.
