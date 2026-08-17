@@ -61,8 +61,12 @@ var DefaultKeyMap = KeyMap{
 }
 
 // helpRow renders a help text row with context-sensitive bindings.
-func helpRow(km KeyMap, th Theme) string {
+func helpRow(km KeyMap, th Theme, isHome bool) string {
+	quitLabel := "q Home"
+	if isHome {
+		quitLabel = "q Quit"
+	}
 	help := "  ↑↓ Navigate  Enter Inspect  Space Open/Close  n New  e Edit  c Copy  " +
-		"a Discover  r Repair  d Delete  q Quit  ? Help"
+		"a Discover  r Repair  d Delete  " + quitLabel + "  ? Help"
 	return th.Style("help").Render(help)
 }

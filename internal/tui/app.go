@@ -2618,7 +2618,7 @@ func (m *Model) renderHome() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpRow(m.keys, m.theme))
+	b.WriteString(helpRow(m.keys, m.theme, m.screen == ScreenHome))
 	return b.String()
 }
 
@@ -2680,7 +2680,7 @@ func (m *Model) renderInspect() string {
 		b.WriteString(m.theme.Style("intervention").Render(conn.Error))
 		b.WriteString("\n")
 	}
-	b.WriteString("\n[esc] back    [q] quit\n")
+	b.WriteString("\n[esc] back    [q] home\n")
 	return b.String()
 }
 
