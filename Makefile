@@ -2,16 +2,13 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE    ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS  = -s -w \
-           -X github.com/B-A-M-N/portico/cmd.Version=$(VERSION) \
-           -X github.com/B-A-M-N/portico/cmd.Commit=$(COMMIT) \
-           -X github.com/B-A-M-N/portico/cmd.Date=$(DATE) \
            -X github.com/B-A-M-N/portico/internal/cli.Version=$(VERSION) \
            -X github.com/B-A-M-N/portico/internal/cli.Commit=$(COMMIT) \
            -X github.com/B-A-M-N/portico/internal/cli.Date=$(DATE)
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate acceptance clean
+.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate acceptance release-check clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -64,6 +61,17 @@ validate: fmt-check
 # than trusting the names written in it.
 acceptance:
 	./scripts/verify_acceptance_matrix.sh
+
+# release-check is the canonical complete release gate. It runs everything
+# that tag publishing requires: format, build, vet, staticcheck, tests,
+# race, vulnerability scan, module-tidy diff, and acceptance. CI and
+# release should call this single target so "all release gates passed"
+# means the same thing everywhere.
+release-check: validate acceptance
+	go run golang.org/x/vuln/cmd/govulncheck@pinned ./... 2>/dev/null || go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	go mod tidy -diff
+	@echo
+	@echo "All release gates + release-check passed."
 
 clean:
 	rm -f portico acceptance-report.txt
