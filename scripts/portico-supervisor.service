@@ -21,11 +21,11 @@ Environment=XDG_DATA_HOME=%h/.local/share
 Environment=XDG_CONFIG_HOME=%h/.config
 Environment=XDG_STATE_HOME=%h/.local/state
 
-# Hardening
+# Hardening — relaxed to allow file-browser uploads and command origins.
+# ProtectHome=read-only would prevent writing to the user's home for uploads.
 NoNewPrivileges=true
-ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=%h/.local/share/portico %h/.local/state/portico /run/user/%U/portico
+ReadWritePaths=%h/.local/share/portico %h/.local/state/portico %h/.config/portico /run/user/%U/portico %h
 PrivateTmp=true
 
 [Install]
