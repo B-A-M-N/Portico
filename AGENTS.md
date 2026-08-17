@@ -90,6 +90,7 @@ internal/
 13. **Profile != Runtime** — never merge desired state and observed state into one object (SPEC rule #8).
 14. **Closing TUI never closes connections** (SPEC rule #7). Connections survive TUI exit.
 15. **XDG fallback:** if `XDG_RUNTIME_DIR` unset, socket goes to `/tmp/portico-$UID/`.
+16. **Go toolchain:** 1.25.13+ required (security floor).
 
 ## Testing
 
