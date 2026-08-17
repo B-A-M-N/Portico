@@ -145,11 +145,10 @@ func allowlistedEnv(extra map[string]string) []string {
 			result[name] = kv
 		}
 	}
-	// Explicit command values override inherited values
+	// Explicit command values: include all names that pass validation.
+	// These override inherited values but are NOT filtered by the allowlist.
 	for k, v := range extra {
-		if allowed[k] {
-			result[k] = k + "=" + v
-		}
+		result[k] = k + "=" + v
 	}
 	// Emit in deterministic order
 	out := make([]string, 0, len(result))

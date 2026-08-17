@@ -522,6 +522,9 @@ func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec
 		if spec.Source.Command.Port < 1 || spec.Source.Command.Port > 65535 {
 			return fmt.Errorf("command port must be between 1 and 65535")
 		}
+		if spec.Source.Command.UseShell && len(spec.Source.Command.Args) != 0 {
+			return fmt.Errorf("shell-mode command must not also specify argv entries")
+		}
 		if err := validateCommandEnvironment(spec.Source.Command.Env); err != nil {
 			return err
 		}
@@ -555,6 +558,9 @@ func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec
 			}
 			if spec.Source.MCP.Command.Port < 1 || spec.Source.MCP.Command.Port > 65535 {
 				return fmt.Errorf("MCP command port must be between 1 and 65535")
+			}
+			if spec.Source.MCP.Command.UseShell && len(spec.Source.MCP.Command.Args) != 0 {
+				return fmt.Errorf("shell-mode MCP command must not also specify argv entries")
 			}
 			if err := validateCommandEnvironment(spec.Source.MCP.Command.Env); err != nil {
 				return err
@@ -691,17 +697,21 @@ func validatePortForwardSpec(spec *PortForwardSpec) error {
 	}
 
 	switch spec.Protocol {
-	case ProtocolTCP, ProtocolUDP, "":
-		// valid
+	case ProtocolTCP, "":
+		// valid — TCP is the only supported protocol for v0.1
+	case ProtocolUDP:
+		return fmt.Errorf("UDP forwarding is not implemented; only TCP forwards are supported")
 	default:
-		return fmt.Errorf("invalid protocol %q, must be tcp or udp", spec.Protocol)
+		return fmt.Errorf("invalid port forward protocol %q", spec.Protocol)
 	}
 
 	switch spec.Direction {
-	case PortForwardLocal, PortForwardRemote, "":
-		// valid
+	case PortForwardLocal, "":
+		// valid — local is the only supported direction for v0.1
+	case PortForwardRemote:
+		return fmt.Errorf("remote port forwarding is not supported")
 	default:
-		return fmt.Errorf("invalid direction %q, must be local or remote", spec.Direction)
+		return fmt.Errorf("invalid port forward direction %q", spec.Direction)
 	}
 
 	return nil
@@ -732,6 +742,9 @@ func validateClientTunnelSpec(p *ConnectionProfile, spec *ClientTunnelSpec) erro
 	if spec.MCP.Command != nil {
 		if spec.MCP.Command.Executable == "" {
 			return fmt.Errorf("MCP command executable is required")
+		}
+		if spec.MCP.Command.UseShell && len(spec.MCP.Command.Args) != 0 {
+			return fmt.Errorf("shell-mode MCP command must not also specify argv entries")
 		}
 		if err := validateCommandEnvironment(spec.MCP.Command.Env); err != nil {
 			return err
