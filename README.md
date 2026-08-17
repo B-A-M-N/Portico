@@ -77,8 +77,9 @@ provider exists for controller tests.
   when a zone is configured as well. The zone is optional: an account without
   one gets managed tunnels with temporary addresses.
 - **Local port forwards**, which bind a loopback port and carry traffic to a
-  remote endpoint. Creatable through the API (`POST /v1/connections` with
-  `kind: port_forward`); the wizard does not yet offer them.
+  remote endpoint. Creatable through the wizard or the API (`POST /v1/connections`
+  with `kind: port_forward`). Only TCP is supported; UDP and remote forwards
+  are refused.
 - **Temporary (Quick Tunnel)** and, when configured, **Permanent (named
   tunnel + DNS)** exposure modes.
 - **Access protection** by email passcode, naming the people or domains
@@ -239,7 +240,7 @@ portico supervisor run
 
 ## Requirements
 
-- Go 1.25.12+ (earlier 1.25 patch releases have known standard-library vulnerabilities)
+- Go 1.25.13+ (earlier 1.25 patch releases have known standard-library vulnerabilities)
 - Linux (for Unix sockets, process identity via /proc)
 - `cloudflared` in `PATH` (for Cloudflare provider)
 - `ngrok` in `PATH` (only for the experimental, disabled-by-default Ngrok provider)

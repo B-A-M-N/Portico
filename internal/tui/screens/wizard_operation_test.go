@@ -19,6 +19,7 @@ func TestACompletedOpenFinishesTheWizard(t *testing.T) {
 	m.openAfterCreate = true
 
 	m.HandleOperationLoaded(WizardOperationLoadedMsg{
+		WizardID: m.id, Generation: m.generation,
 		Operation: &ipc.OperationDTO{ID: "op-1", State: ipc.OperationCompleted},
 	})
 
@@ -38,6 +39,7 @@ func TestAFailedOpenAlsoFinishesTheWizard(t *testing.T) {
 	m.openAfterCreate = true
 
 	m.HandleOperationLoaded(WizardOperationLoadedMsg{
+		WizardID: m.id, Generation: m.generation,
 		Operation: &ipc.OperationDTO{ID: "op-1", State: ipc.OperationFailed},
 	})
 
@@ -56,6 +58,7 @@ func TestARunningOperationKeepsTheWizardWaiting(t *testing.T) {
 	m.openAfterCreate = true
 
 	m.HandleOperationLoaded(WizardOperationLoadedMsg{
+		WizardID: m.id, Generation: m.generation,
 		Operation: &ipc.OperationDTO{ID: "op-1", State: ipc.OperationRunning},
 	})
 

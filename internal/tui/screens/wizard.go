@@ -38,30 +38,45 @@ type ConnectionCreatedMsg struct {
 	Err        error
 }
 
+// WizardID uniquely identifies a wizard instance. Async operations carry this ID
+// so that late replies from an abandoned wizard can be discarded.
+type WizardID uint64
+
+// WizardGeneration tracks the generation of a wizard for request correlation.
+type WizardGeneration uint64
+
 // WizardPlanLoadedMsg is delivered when the wizard's open plan request completes.
 type WizardPlanLoadedMsg struct {
-	Plan *ipc.PlanDTO
-	Err  error
+	WizardID     WizardID
+	Generation   WizardGeneration
+	Plan         *ipc.PlanDTO
+	Err          error
 }
 
 // WizardPlanAppliedMsg is delivered when the wizard's apply command completes.
 type WizardPlanAppliedMsg struct {
-	Operation *ipc.OperationDTO
-	Err       error
+	WizardID     WizardID
+	Generation   WizardGeneration
+	Operation    *ipc.OperationDTO
+	Err          error
 }
 
 // WizardOperationLoadedMsg is delivered when the wizard polls operation status.
 type WizardOperationLoadedMsg struct {
-	Operation *ipc.OperationDTO
-	Err       error
+	WizardID     WizardID
+	Generation   WizardGeneration
+	Operation    *ipc.OperationDTO
+	Err          error
 }
 
 // WizardModel is the wizard for creating new connections.
 type WizardModel struct {
-	client   ConnectionCreator
-	ctx      context.Context // application lifetime context for IPC calls
-	state    WizardState
-	selected int
+	id         WizardID         // unique ID for this wizard instance
+	generation WizardGeneration // current generation for request correlation
+	client     ConnectionCreator
+	ctx        context.Context // application lifetime context for IPC calls
+	state      WizardState
+	selected   int
 	// field is the text entry for whichever question is currently asked. It
 	// replaced a plain string that could only append and truncate.
 	field textinput.Model
@@ -264,14 +279,20 @@ type directoryModeChoice struct {
 	allowDelete bool
 }
 
+// nextWizardID generates a unique wizard ID.
+var nextWizardID WizardID
+
 // NewWizard creates a new wizard model.
 func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO) *WizardModel {
+	nextWizardID++
 	return &WizardModel{
-		client: client,
-		ctx:    context.Background(), // default; root model should call WithContext
-		caps:   providerCapabilities{providers: providers},
-		state:  WizardState{Step: WizardStepOutcome},
-		field:  NewField(),
+		id:         nextWizardID,
+		generation: 0,
+		client:     client,
+		ctx:        context.Background(), // default; root model should call WithContext
+		caps:       providerCapabilities{providers: providers},
+		state:      WizardState{Step: WizardStepOutcome},
+		field:      NewField(),
 	}
 }
 
@@ -999,7 +1020,11 @@ func (m *WizardModel) HandleCreated(msg ConnectionCreatedMsg) tea.Cmd {
 }
 
 // HandlePlanLoaded applies the result of the plan request.
+// Discards stale replies from a previous wizard generation.
 func (m *WizardModel) HandlePlanLoaded(msg WizardPlanLoadedMsg) tea.Cmd {
+	if msg.WizardID != m.id || msg.Generation != m.generation {
+		return nil // stale reply
+	}
 	if msg.Err != nil {
 		m.err = msg.Err
 		m.state.Step = WizardStepComplete
@@ -1017,7 +1042,11 @@ func (m *WizardModel) HandlePlanLoaded(msg WizardPlanLoadedMsg) tea.Cmd {
 }
 
 // HandlePlanApplied applies the result of the apply command.
+// Discards stale replies from a previous wizard generation.
 func (m *WizardModel) HandlePlanApplied(msg WizardPlanAppliedMsg) tea.Cmd {
+	if msg.WizardID != m.id || msg.Generation != m.generation {
+		return nil // stale reply
+	}
 	if msg.Err != nil {
 		m.err = msg.Err
 		m.state.Step = WizardStepComplete
@@ -1031,7 +1060,11 @@ func (m *WizardModel) HandlePlanApplied(msg WizardPlanAppliedMsg) tea.Cmd {
 }
 
 // HandleOperationLoaded applies the result of the operation poll.
+// Discards stale replies from a previous wizard generation.
 func (m *WizardModel) HandleOperationLoaded(msg WizardOperationLoadedMsg) tea.Cmd {
+	if msg.WizardID != m.id || msg.Generation != m.generation {
+		return nil // stale reply
+	}
 	if msg.Err != nil {
 		m.err = msg.Err
 		m.state.Step = WizardStepComplete
@@ -1213,15 +1246,17 @@ func (m *WizardModel) requestPlanCmd() tea.Cmd {
 	client := m.client
 	connID := m.createdID
 	ctx := m.ctx
+	wizID := m.id
+	gen := m.generation
 	return func() tea.Msg {
 		if client == nil {
-			return WizardPlanLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			return WizardPlanLoadedMsg{WizardID: wizID, Generation: gen, Err: fmt.Errorf("no supervisor connection")}
 		}
 		plan, err := client.PlanOpen(ctx, connID)
 		if err != nil {
-			return WizardPlanLoadedMsg{Err: err}
+			return WizardPlanLoadedMsg{WizardID: wizID, Generation: gen, Err: err}
 		}
-		return WizardPlanLoadedMsg{Plan: plan}
+		return WizardPlanLoadedMsg{WizardID: wizID, Generation: gen, Plan: plan}
 	}
 }
 
@@ -1233,20 +1268,22 @@ func (m *WizardModel) applyPlanCmd() tea.Cmd {
 		planID = m.plan.ID
 	}
 	ctx := m.ctx
+	wizID := m.id
+	gen := m.generation
 	return func() tea.Msg {
 		if client == nil {
-			return WizardPlanAppliedMsg{Err: fmt.Errorf("no supervisor connection")}
+			return WizardPlanAppliedMsg{WizardID: wizID, Generation: gen, Err: fmt.Errorf("no supervisor connection")}
 		}
 		if planID == "" {
-			return WizardPlanAppliedMsg{Err: fmt.Errorf("no plan to apply")}
+			return WizardPlanAppliedMsg{WizardID: wizID, Generation: gen, Err: fmt.Errorf("no plan to apply")}
 		}
 		// The same key on every retry of this plan, so a lost response cannot
 		// turn into a second operation.
 		op, err := client.ApplyPlanWithIdempotency(ctx, planID, "apply-"+planID)
 		if err != nil {
-			return WizardPlanAppliedMsg{Err: err}
+			return WizardPlanAppliedMsg{WizardID: wizID, Generation: gen, Err: err}
 		}
-		return WizardPlanAppliedMsg{Operation: op}
+		return WizardPlanAppliedMsg{WizardID: wizID, Generation: gen, Operation: op}
 	}
 }
 
@@ -1289,30 +1326,32 @@ func (m *WizardModel) operationFetchCmd(delay time.Duration) tea.Cmd {
 		opID = m.operation.ID
 	}
 	ctx := m.ctx
+	wizID := m.id
+	gen := m.generation
 	return func() tea.Msg {
 		if delay > 0 {
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
-				return WizardOperationLoadedMsg{Err: ctx.Err()}
+				return WizardOperationLoadedMsg{WizardID: wizID, Generation: gen, Err: ctx.Err()}
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return WizardOperationLoadedMsg{Err: ctx.Err()}
+			return WizardOperationLoadedMsg{WizardID: wizID, Generation: gen, Err: ctx.Err()}
 		default:
 		}
 		if client == nil {
-			return WizardOperationLoadedMsg{Err: fmt.Errorf("no supervisor connection")}
+			return WizardOperationLoadedMsg{WizardID: wizID, Generation: gen, Err: fmt.Errorf("no supervisor connection")}
 		}
 		if opID == "" {
-			return WizardOperationLoadedMsg{Err: fmt.Errorf("no operation to poll")}
+			return WizardOperationLoadedMsg{WizardID: wizID, Generation: gen, Err: fmt.Errorf("no operation to poll")}
 		}
 		op, err := client.GetOperation(ctx, opID)
 		if err != nil {
-			return WizardOperationLoadedMsg{Err: err}
+			return WizardOperationLoadedMsg{WizardID: wizID, Generation: gen, Err: err}
 		}
-		return WizardOperationLoadedMsg{Operation: op}
+		return WizardOperationLoadedMsg{WizardID: wizID, Generation: gen, Operation: op}
 	}
 }
 

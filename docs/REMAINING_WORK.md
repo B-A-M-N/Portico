@@ -177,18 +177,17 @@ lacks environment references and shell-mode configuration.
 Since this was written, the wizard's question sequence became derived rather
 than hand-written: each step declares the condition under which it is asked, so
 going back is the inverse of going forward by construction. Text fields have a
-cursor, word motion and paste. **The wizard still cannot create a port
-forward** — those are reachable only through `POST /v1/connections` with
-`kind: port_forward`.
+cursor, word motion and paste. **The wizard now supports port-forward creation.**
 
 **Implementation**
 
 1. **Done.** Steps are derived from predicates over the answers so far
    (`internal/tui/screens/wizard_steps.go`), not a static sequence.
-2. Add safe tokenized input for command arguments and environment *references*
+2. **Done.** Port-forward creation supported in wizard.
+3. Add safe tokenized input for command arguments and environment *references*
    (not raw secrets). Validate every screen before advancing.
-3. Provide a directory mode chooser, file-browser permissions, and SPA option.
-4. Keep transport choices constrained to combinations the selected provider can
+4. Provide a directory mode chooser, file-browser permissions, and SPA option.
+5. Keep transport choices constrained to combinations the selected provider can
    carry, including when an MCP command is owned by Portico.
 5. Add a final review that states owned-process behavior, chosen account,
    public/private exposure, protection, and destructive implications.
@@ -451,8 +450,8 @@ Every item above should add proportional evidence:
 Run before each commit at minimum:
 
 ```bash
-go1.25.12 test -race ./...
-go1.25.12 vet ./...
+go1.25.13 test -race ./...
+go1.25.13 vet ./...
 staticcheck ./...
 git diff --check
 ```
