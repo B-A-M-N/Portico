@@ -28,118 +28,167 @@ type accountRow struct {
 	Label        string
 	Status       string
 	// Pending marks an account whose credential was never confirmed. These are
-	// the ones most likely to want removing, so they are selectable too.
+	// still listed but visually distinct.
 	Pending bool
-}
-
-// Name is what to call the account when asking about it.
-func (r accountRow) Name() string {
-	if r.Label != "" {
-		return r.Label
-	}
-	return r.AccountID
 }
 
 // providerRow is one provider on the providers screen, with its accounts.
 type providerRow struct {
-	ID       string
-	Name     string
-	Accounts []accountRow
+	ID           string
+	Name         string
+	DisplayName  string
+	Accounts     []accountRow
+	HasSetupFlow bool
+	// NoAccounts is true when the provider has no accounts yet.
+	NoAccounts bool
 }
 
-// providerRows lists providers and their accounts in the order drawn.
+// rowKind identifies the type of a providers screen row.
+type rowKind int
+
+const (
+	rowKindProvider rowKind = iota
+	rowKindAccount
+)
+
+// screenRow is one renderable + selectable row on the providers screen.
+type screenRow struct {
+	Kind     rowKind
+	Provider providerRow
+	Account  *accountRow
+	// FlatIndex is the position in the flattened row list.
+	FlatIndex int
+}
+
+// buildScreenRows flattens providers and accounts into a selectable row list.
+func (m *Model) buildScreenRows() []screenRow {
+	var rows []screenRow
+	flatIdx := 0
+	for _, p := range m.providerRows() {
+		rows = append(rows, screenRow{
+			Kind:      rowKindProvider,
+			Provider:  p,
+			FlatIndex: flatIdx,
+		})
+		flatIdx++
+		for i := range p.Accounts {
+			rows = append(rows, screenRow{
+				Kind:      rowKindAccount,
+				Provider:  p,
+				Account:   &p.Accounts[i],
+				FlatIndex: flatIdx,
+			})
+			flatIdx++
+		}
+	}
+	return rows
+}
+
+// selectedScreenRow returns the currently selected screen row.
+func (m *Model) selectedScreenRow() (screenRow, bool) {
+	rows := m.buildScreenRows()
+	if m.cursorIndex < 0 || m.cursorIndex >= len(rows) {
+		return screenRow{}, false
+	}
+	return rows[m.cursorIndex], true
+}
+
+// selectedProvider returns the provider the cursor is within.
+func (m *Model) selectedProvider() (providerRow, bool) {
+	row, ok := m.selectedScreenRow()
+	if !ok {
+		rows := m.providerRows()
+		if len(rows) == 0 {
+			return providerRow{}, false
+		}
+		return rows[0], true
+	}
+	return row.Provider, true
+}
+
+// selectedAccount returns the account the cursor is on (if any).
+// If the cursor is on a provider row that has accounts, returns the first account.
+func (m *Model) selectedAccount() (*accountRow, bool) {
+	row, ok := m.selectedScreenRow()
+	if !ok {
+		return nil, false
+	}
+	switch row.Kind {
+	case rowKindAccount:
+		return row.Account, true
+	case rowKindProvider:
+		if len(row.Provider.Accounts) > 0 {
+			return &row.Provider.Accounts[0], true
+		}
+	}
+	return nil, false
+}
+
+// moveCursor moves the cursor by delta, clamping to the list.
+func (m *Model) moveCursor(delta int) {
+	rows := m.buildScreenRows()
+	if len(rows) == 0 {
+		m.cursorIndex = 0
+		return
+	}
+	m.cursorIndex += delta
+	if m.cursorIndex < 0 {
+		m.cursorIndex = 0
+	}
+	if m.cursorIndex >= len(rows) {
+		m.cursorIndex = len(rows) - 1
+	}
+}
+
+// moveAccountSelection is an alias for moveCursor for backward compatibility.
+func (m *Model) moveAccountSelection(delta int) {
+	m.moveCursor(delta)
+}
+
+// providerRows returns all providers with their accounts.
 func (m *Model) providerRows() []providerRow {
 	var rows []providerRow
 	for _, p := range m.snapshot.Providers {
-		row := providerRow{ID: p.ID, Name: p.DisplayName}
+		row := providerRow{
+			ID:           p.ID,
+			Name:         p.Name,
+			DisplayName:  p.DisplayName,
+			HasSetupFlow: p.SetupActions != nil && len(p.SetupActions) > 0,
+		}
 		for _, account := range p.Accounts {
 			row.Accounts = append(row.Accounts, accountRow{
-				ProviderID: p.ID, ProviderName: p.DisplayName,
-				AccountID: account.ID, Label: account.Label, Status: account.Status,
+				ProviderID:   p.ID,
+				ProviderName: p.DisplayName,
+				AccountID:    account.ID,
+				Label:        account.Label,
+				Status:       account.Status,
 			})
 		}
 		for _, account := range p.PendingAccounts {
 			row.Accounts = append(row.Accounts, accountRow{
-				ProviderID: p.ID, ProviderName: p.DisplayName,
-				AccountID: account.ID, Label: account.Label, Status: account.Status,
-				Pending: true,
+				ProviderID:   p.ID,
+				ProviderName: p.DisplayName,
+				AccountID:    account.ID,
+				Label:        account.Label,
+				Status:       account.Status,
+				Pending:      true,
 			})
+		}
+		if len(row.Accounts) == 0 {
+			row.NoAccounts = true
 		}
 		rows = append(rows, row)
 	}
 	return rows
 }
 
-// selectedProvider names the provider the cursor is within.
-//
-// The providers screen had no provider selection at all, so adding an account
-// fell back to Cloudflare by name — in a codebase whose whole setup mechanism is
-// declarative and provider-neutral.
-func (m *Model) selectedProvider() (providerRow, bool) {
-	rows := m.providerRows()
-	if len(rows) == 0 {
-		return providerRow{}, false
-	}
-	// The cursor addresses accounts; the provider is the one owning the account
-	// under it, or the first provider when there are no accounts at all.
-	if account, ok := m.selectedAccount(); ok {
-		for _, row := range rows {
-			if row.ID == account.ProviderID {
-				return row, true
-			}
-		}
-	}
-	if m.providerSelected >= 0 && m.providerSelected < len(rows) {
-		return rows[m.providerSelected], true
-	}
-	return rows[0], true
-}
-
-// accountRows lists every stored account in the order the screen draws them, so
-// a cursor index means the same thing to the renderer and to the action.
+// accountRows returns all accounts in display order (backward compatibility).
 func (m *Model) accountRows() []accountRow {
 	var rows []accountRow
-	for _, p := range m.snapshot.Providers {
-		for _, account := range p.Accounts {
-			rows = append(rows, accountRow{
-				ProviderID: p.ID, ProviderName: p.DisplayName,
-				AccountID: account.ID, Label: account.Label, Status: account.Status,
-			})
-		}
-		for _, account := range p.PendingAccounts {
-			rows = append(rows, accountRow{
-				ProviderID: p.ID, ProviderName: p.DisplayName,
-				AccountID: account.ID, Label: account.Label, Status: account.Status,
-				Pending: true,
-			})
-		}
+	for _, p := range m.providerRows() {
+		rows = append(rows, p.Accounts...)
 	}
 	return rows
-}
-
-// selectedAccount returns the account the cursor is on.
-func (m *Model) selectedAccount() (accountRow, bool) {
-	rows := m.accountRows()
-	if m.accountSelected < 0 || m.accountSelected >= len(rows) {
-		return accountRow{}, false
-	}
-	return rows[m.accountSelected], true
-}
-
-// moveAccountSelection moves the cursor, clamping to the list.
-func (m *Model) moveAccountSelection(delta int) {
-	rows := m.accountRows()
-	if len(rows) == 0 {
-		m.accountSelected = 0
-		return
-	}
-	m.accountSelected += delta
-	if m.accountSelected < 0 {
-		m.accountSelected = 0
-	}
-	if m.accountSelected >= len(rows) {
-		m.accountSelected = len(rows) - 1
-	}
 }
 
 // accountRemovedMsg reports the outcome of a removal.
@@ -197,51 +246,79 @@ func (m *Model) removeAccountCmd(row accountRow, fingerprint string) tea.Cmd {
 		response, err := client.RemoveProviderAccount(ctx, row.ProviderID, row.AccountID, fingerprint)
 		return accountRemovedMsg{
 			Generation: generation, ProviderID: row.ProviderID, AccountID: row.AccountID,
-			Name: row.Name(), Response: response, Err: err,
+			Response: response, Err: err,
 		}
 	}
 }
 
-// renderAccountRemoval draws the confirmation for removing an account.
-//
-// Removing an account is not destructive to anything the provider holds — it
-// forgets a credential Portico stored — so the confirmation says exactly that
-// rather than implying the provider account itself is being deleted.
-func (m *Model) renderAccountRemoval() string {
-	row := m.accountRemovalTarget
-	if row == nil {
-		return ""
-	}
+// renderProvidersScreen renders the providers screen with hierarchical selection.
+func (m *Model) renderProvidersScreen() string {
 	var b strings.Builder
-	b.WriteString(m.theme.Style("header").Render(" REMOVE ACCOUNT "))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("Remove %s from %s?\n\n", row.Name(), row.ProviderName))
 
-	if m.accountRemovalPreview == nil {
-		// No preview yet, either because it is still loading or because the
-		// request failed. Either way there is nothing true to say about the
-		// removal, so nothing is claimed.
-		if m.accountRemovalError != "" {
-			b.WriteString(m.theme.Style("intervention").Render(m.accountRemovalError))
-			b.WriteString("\n")
-			// What is in the way, even without a preview: a refusal that names
-			// nothing leaves the user to go and find it.
-			for _, dep := range m.accountRemovalDependents {
-				b.WriteString(m.theme.Style("muted").Render("  • " + dep))
-				b.WriteString("\n")
-			}
-			b.WriteString("\n[esc] back\n")
-			return b.String()
-		}
-		b.WriteString("Checking what this would remove...\n")
+	b.WriteString(m.theme.Style("header").Render(" PROVIDERS "))
+	b.WriteString("\n\n")
+
+	rows := m.buildScreenRows()
+	if len(rows) == 0 {
+		b.WriteString("No providers configured.\n\n")
+		b.WriteString("[n] discover   [esc] back\n")
 		return b.String()
 	}
-	// Every factual claim here comes from the supervisor, which computed it
-	// from the same evidence the removal decides on.
-	for _, line := range m.accountRemovalPreview.Consequences {
-		b.WriteString(line + "\n")
+
+	for i, row := range rows {
+		prefix := "  "
+		if i == m.cursorIndex {
+			prefix = m.theme.Style("active").Render("▸ ")
+		}
+
+		switch row.Kind {
+		case rowKindProvider:
+			providerLabel := row.Provider.DisplayName
+			if row.Provider.NoAccounts {
+				providerLabel += m.theme.Style("muted").Render("  — no accounts")
+			}
+			b.WriteString(prefix + providerLabel + "\n")
+		case rowKindAccount:
+			account := row.Account
+			status := ""
+			if account.Pending {
+				status = m.theme.Style("warning").Render("  [pending]")
+			}
+			b.WriteString(prefix + m.theme.Style("muted").Render("  ├─ ") + account.Label + status + "\n")
+		}
 	}
+
 	b.WriteString("\n")
+	// Context-sensitive actions
+	if row, ok := m.selectedScreenRow(); ok {
+		switch row.Kind {
+		case rowKindProvider:
+			b.WriteString("[a] add account   ")
+			if !row.Provider.NoAccounts {
+				b.WriteString("[x] remove account   ")
+			}
+		case rowKindAccount:
+			b.WriteString("[x] remove account   ")
+		}
+	}
+	b.WriteString("[esc] back\n")
+
+	return b.String()
+}
+
+// renderAccountRemoval renders the account removal confirmation screen.
+func (m *Model) renderAccountRemoval() string {
+	var b strings.Builder
+
+	if m.accountRemovalTarget == nil {
+		b.WriteString("No account selected.\n\n[esc] back\n")
+		return b.String()
+	}
+
+	target := m.accountRemovalTarget
+	b.WriteString(m.theme.Style("header").Render(" REMOVE ACCOUNT "))
+	b.WriteString("\n\n")
+	b.WriteString(fmt.Sprintf("Remove %s from %s?\n\n", target.Label, target.ProviderName))
 
 	if m.accountRemovalError != "" {
 		b.WriteString(m.theme.Style("intervention").Render(m.accountRemovalError))
@@ -254,21 +331,23 @@ func (m *Model) renderAccountRemoval() string {
 		return b.String()
 	}
 
-	if !m.accountRemovalPreview.Removable {
-		b.WriteString(m.theme.Style("intervention").Render("This account cannot be removed yet:"))
-		b.WriteString("\n")
-		for _, dep := range m.accountRemovalPreview.Dependencies {
-			name := dep.Name
-			if name == "" {
-				name = dep.ID
-			}
-			b.WriteString(m.theme.Style("muted").Render("  • " + name + " — " + dep.Explanation))
+	if m.accountRemovalPreview != nil {
+		if !m.accountRemovalPreview.Removable {
+			b.WriteString(m.theme.Style("intervention").Render("This account cannot be removed yet:"))
 			b.WriteString("\n")
+			for _, dep := range m.accountRemovalPreview.Dependencies {
+				b.WriteString(m.theme.Style("muted").Render("  • " + dep.Name))
+				b.WriteString("\n")
+			}
+			b.WriteString("\n[esc] back\n")
+			return b.String()
 		}
-		b.WriteString("\n[esc] back\n")
-		return b.String()
+		for _, line := range m.accountRemovalPreview.Consequences {
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
 	}
 
-	b.WriteString("[enter] remove    [esc] cancel\n")
+	b.WriteString("[enter] confirm   [esc] cancel\n")
 	return b.String()
 }

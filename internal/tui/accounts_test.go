@@ -36,8 +36,10 @@ func TestAnAccountCanBeSelectedAndRemoved(t *testing.T) {
 	m := readyModel(client, accountSnapshot())
 	m.screen = ScreenProviders
 
-	// Move to the second account and ask to remove it.
+	// Move down past the provider header to the first account, then to the second.
 	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("down"))
 	m = next.(Model)
 	next, previewCmd := m.Update(keyMsg("x"))
 	m = next.(Model)
@@ -217,13 +219,15 @@ func TestAddingAnAccountUsesTheSelectedProvider(t *testing.T) {
 	m := readyModel(&fakeClient{}, snap)
 	m.transitionTo(ScreenProviders)
 
-	// The cursor starts on ngrok's account, so that is the provider in context.
+	// The cursor starts on ngrok's provider row.
 	if got := m.selectedProviderID(); got != "ngrok" {
 		t.Fatalf("selected provider = %q, want ngrok", got)
 	}
 
-	// Moving to Cloudflare's account changes it.
+	// Moving down past ngrok's account lands on Cloudflare's provider row.
 	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
+	next, _ = m.Update(keyMsg("down"))
 	m = next.(Model)
 	if got := m.selectedProviderID(); got != "cloudflare" {
 		t.Fatalf("after moving, selected provider = %q, want cloudflare", got)
@@ -237,14 +241,14 @@ func TestTheSelectedAccountIsVisible(t *testing.T) {
 	m := readyModel(&fakeClient{}, accountSnapshot())
 	m.transitionTo(ScreenProviders)
 
-	view := m.renderProviders()
+	view := m.renderProvidersScreen()
 	if !strings.Contains(view, "▸") {
 		t.Fatalf("no account is marked as selected:\n%s", view)
 	}
 
 	next, _ := m.Update(keyMsg("down"))
 	m = next.(Model)
-	moved := m.renderProviders()
+	moved := m.renderProvidersScreen()
 	if moved == view {
 		t.Fatal("moving the cursor did not change what is marked")
 	}

@@ -72,6 +72,7 @@ type Model struct {
 	// Account lifecycle on the providers screen.
 	accountSelected          int
 	providerSelected         int
+	cursorIndex              int // providers screen cursor (flattened row index)
 	accountRequests          requestTracker
 	accountRemovalTarget     *accountRow
 	accountRemovalError      string
@@ -1805,7 +1806,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 
 	case "up", "k":
 		if m.screen == ScreenProviders {
-			m.moveAccountSelection(-1)
+			m.moveCursor(-1)
 			return m, nil
 		}
 		if m.screen == ScreenDiscovery && m.discoverySelected > 0 {
@@ -1824,7 +1825,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 
 	case "down", "j":
 		if m.screen == ScreenProviders {
-			m.moveAccountSelection(1)
+			m.moveCursor(1)
 			return m, nil
 		}
 		if m.screen == ScreenDiscovery {
@@ -1949,12 +1950,12 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		// Removing an account is reachable only where accounts are listed.
 		if m.screen == ScreenProviders {
 			if row, ok := m.selectedAccount(); ok {
-				m.accountRemovalTarget = &row
+				m.accountRemovalTarget = row
 				m.accountRemovalError = ""
 				m.accountRemovalDependents = nil
 				m.accountRemovalPreview = nil
 				m.pushScreen(ScreenAccountRemoval)
-				return m, m.previewAccountRemovalCmd(row)
+				return m, m.previewAccountRemovalCmd(*row)
 			}
 		}
 
@@ -3001,7 +3002,7 @@ func (m *Model) renderProviders() string {
 		}
 		b.WriteString("\n")
 	}
-	if len(m.accountRows()) > 0 {
+	if len(m.buildScreenRows()) > 0 {
 		b.WriteString("[↑↓] select account    [a] add account    [x] remove account    [esc] back\n")
 	} else {
 		b.WriteString("[a] add account    [esc] back    [q] quit\n")
