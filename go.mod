@@ -2,7 +2,7 @@ module github.com/B-A-M-N/portico
 
 go 1.25.7
 
-toolchain go1.25.12
+toolchain go1.25.13
 
 require (
 	charm.land/bubbletea/v2 v2.0.8

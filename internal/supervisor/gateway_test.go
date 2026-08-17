@@ -167,10 +167,11 @@ func TestGatewayRuntimeDeepCopy(t *testing.T) {
 	original := &core.ConnectionRuntime{
 		ConnectionID: "test-conn",
 		Gateway: &core.GatewayRuntime{
-			Endpoint:   "http://127.0.0.1:8080",
-			Upstream:   "https://tunnel.example.com",
-			AuthTokens: []string{"tok-1", "tok-2"},
-			StartedAt:  time.Now().UTC(),
+			Endpoint:      "http://127.0.0.1:8080",
+			Upstream:      "https://tunnel.example.com",
+			AuthEnabled:   true,
+			CredentialRef: "ref-123",
+			StartedAt:     time.Now().UTC(),
 		},
 	}
 
@@ -181,10 +182,7 @@ func TestGatewayRuntimeDeepCopy(t *testing.T) {
 	if copied.Gateway.Endpoint != original.Gateway.Endpoint {
 		t.Fatal("deep copy should preserve endpoint")
 	}
-
-	// Mutating copy should not affect original.
-	copied.Gateway.AuthTokens[0] = "mutated"
-	if original.Gateway.AuthTokens[0] == "mutated" {
-		t.Fatal("deep copy should not share token slices")
+	if copied.Gateway.CredentialRef != original.Gateway.CredentialRef {
+		t.Fatal("deep copy should preserve credential ref")
 	}
 }

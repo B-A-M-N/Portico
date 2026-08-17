@@ -155,11 +155,14 @@ type ProcessDTO struct {
 // The gateway is a local HTTP proxy that authenticates clients and forwards
 // requests through the transport tunnel. It is nil when the connection
 // does not use a gateway.
+//
+// SECURITY: Plaintext credentials are never sent over IPC.
 type GatewayDTO struct {
-	Endpoint   string   `json:"endpoint"`
-	Upstream   string   `json:"upstream"`
-	AuthTokens []string `json:"auth_tokens,omitempty"`
-	StartedAt  string   `json:"started_at,omitempty"`
+	Endpoint      string `json:"endpoint"`
+	Upstream      string `json:"upstream"`
+	AuthEnabled   bool   `json:"auth_enabled"`
+	CredentialRef string `json:"credential_ref,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`
 }
 
 // OperationSummaryDTO is a brief operation view for connection detail.

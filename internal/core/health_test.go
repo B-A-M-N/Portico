@@ -11,45 +11,67 @@ import (
 func TestHealthReportCompute(t *testing.T) {
 	tests := []struct {
 		name     string
-		process  bool
-		transport bool
-		service  bool
+		process  CheckState
+		transport CheckState
+		service  CheckState
+		desired  DesiredConnectionState
 		want     HealthState
 	}{
 		{
-			name:     "all ok",
-			process:  true,
-			transport: true,
-			service:  true,
-			want:     HealthHealthy,
+			name:      "all ok, desired open",
+			process:   CheckPass,
+			transport: CheckPass,
+			service:   CheckPass,
+			desired:   DesiredOpen,
+			want:      HealthHealthy,
 		},
 		{
-			name:     "process down",
-			process:  false,
-			transport: true,
-			service:  true,
-			want:     HealthUnhealthy,
+			name:      "process down, desired open",
+			process:   CheckFail,
+			transport: CheckPass,
+			service:   CheckPass,
+			desired:   DesiredOpen,
+			want:      HealthUnhealthy,
 		},
 		{
-			name:     "transport down",
-			process:  true,
-			transport: false,
-			service:  true,
-			want:     HealthUnhealthy,
+			name:      "transport down, desired open",
+			process:   CheckPass,
+			transport: CheckFail,
+			service:   CheckPass,
+			desired:   DesiredOpen,
+			want:      HealthUnhealthy,
 		},
 		{
-			name:     "service down but process and transport ok",
-			process:  true,
-			transport: true,
-			service:  false,
-			want:     HealthDegraded,
+			name:      "service down but process and transport ok",
+			process:   CheckPass,
+			transport: CheckPass,
+			service:   CheckFail,
+			desired:   DesiredOpen,
+			want:      HealthDegraded,
 		},
 		{
-			name:     "all down",
-			process:  false,
-			transport: false,
-			service:  false,
-			want:     HealthUnhealthy,
+			name:      "all down, desired open",
+			process:   CheckFail,
+			transport: CheckFail,
+			service:   CheckFail,
+			desired:   DesiredOpen,
+			want:      HealthUnhealthy,
+		},
+		{
+			name:      "not applicable, desired closed",
+			process:   CheckNotApplicable,
+			transport: CheckNotApplicable,
+			service:   CheckNotApplicable,
+			desired:   DesiredClosed,
+			want:      HealthClosed,
+		},
+		{
+			name:      "not applicable, desired open",
+			process:   CheckNotApplicable,
+			transport: CheckNotApplicable,
+			service:   CheckNotApplicable,
+			desired:   DesiredOpen,
+			want:      HealthUnknown,
 		},
 	}
 
@@ -57,12 +79,12 @@ func TestHealthReportCompute(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			report := &HealthReport{
 				ConnectionID: "test-conn",
-				Process:      HealthCheck{OK: tt.process, LastChecked: time.Now()},
-				Transport:    HealthCheck{OK: tt.transport, LastChecked: time.Now()},
-				Service:      HealthCheck{OK: tt.service, LastChecked: time.Now()},
+				Process:      HealthCheck{State: tt.process, LastChecked: time.Now()},
+				Transport:    HealthCheck{State: tt.transport, LastChecked: time.Now()},
+				Service:      HealthCheck{State: tt.service, LastChecked: time.Now()},
 			}
 
-			got := report.Compute()
+			got := report.Compute(tt.desired)
 			if got != tt.want {
 				t.Errorf("Compute() = %q, want %q", got, tt.want)
 			}
@@ -73,7 +95,7 @@ func TestHealthReportCompute(t *testing.T) {
 // TestHealthReportUnknown verifies that a report with no checks returns unknown.
 func TestHealthReportUnknown(t *testing.T) {
 	report := &HealthReport{ConnectionID: "test-conn"}
-	if got := report.Compute(); got != HealthUnknown {
+	if got := report.Compute(DesiredOpen); got != HealthUnknown {
 		t.Errorf("Compute() = %q, want unknown", got)
 	}
 }
@@ -82,12 +104,12 @@ func TestHealthReportUnknown(t *testing.T) {
 func TestHealthReportRefresh(t *testing.T) {
 	report := &HealthReport{
 		ConnectionID: "test-conn",
-		Process:      HealthCheck{OK: true, LastChecked: time.Now()},
-		Transport:    HealthCheck{OK: true, LastChecked: time.Now()},
-		Service:      HealthCheck{OK: true, LastChecked: time.Now()},
+		Process:      HealthCheck{State: CheckPass, LastChecked: time.Now()},
+		Transport:    HealthCheck{State: CheckPass, LastChecked: time.Now()},
+		Service:      HealthCheck{State: CheckPass, LastChecked: time.Now()},
 	}
 
-	report.Refresh()
+	report.Refresh(DesiredOpen)
 	if report.State != HealthHealthy {
 		t.Errorf("State = %q, want healthy", report.State)
 	}
@@ -113,36 +135,22 @@ func TestOpenAIServiceCheck(t *testing.T) {
 	}
 }
 
-// TestServiceCheckDetail verifies that check failures produce a detail string.
-func TestServiceCheckDetail(t *testing.T) {
-	report := &HealthReport{
-		ConnectionID: "test-conn",
-		Process:      HealthCheck{OK: true, LastChecked: time.Now()},
-		Transport:    HealthCheck{OK: true, LastChecked: time.Now()},
-		Service:      HealthCheck{OK: false, Detail: "connection refused", LastChecked: time.Now()},
-	}
-
-	got := report.Compute()
-	if got != HealthDegraded {
-		t.Errorf("Compute() = %q, want degraded", got)
-	}
-}
-
-// TestHealthStateString verifies HealthState string values.
-func TestHealthStateString(t *testing.T) {
+// TestCheckStateString verifies CheckState string values.
+func TestCheckStateString(t *testing.T) {
 	tests := []struct {
-		state HealthState
+		state CheckState
 		want  string
 	}{
-		{HealthHealthy, "healthy"},
-		{HealthDegraded, "degraded"},
-		{HealthUnhealthy, "unhealthy"},
-		{HealthUnknown, "unknown"},
+		{CheckPass, "pass"},
+		{CheckFail, "fail"},
+		{CheckUnknown, "unknown"},
+		{CheckNotApplicable, "not_applicable"},
+		{CheckSkipped, "skipped"},
 	}
 
 	for _, tt := range tests {
 		if string(tt.state) != tt.want {
-			t.Errorf("HealthState(%q).String() = %q, want %q", tt.state, string(tt.state), tt.want)
+			t.Errorf("CheckState(%q).String() = %q, want %q", tt.state, string(tt.state), tt.want)
 		}
 	}
 }

@@ -88,9 +88,6 @@ func (r *ConnectionRuntime) DeepCopy() *ConnectionRuntime {
 	}
 	if r.Gateway != nil {
 		gwCopy := *r.Gateway
-		if r.Gateway.AuthTokens != nil {
-			gwCopy.AuthTokens = append([]string(nil), r.Gateway.AuthTokens...)
-		}
 		cr.Gateway = &gwCopy
 	}
 	if r.Health != nil {
@@ -220,14 +217,20 @@ type EndpointRuntime struct {
 // The gateway is a local HTTP proxy that authenticates clients and forwards
 // requests through the transport tunnel. It is nil when the connection
 // does not use a gateway.
+//
+// SECURITY: Plaintext credentials are NEVER stored in the runtime.
+// Only a reference to the credential (CredentialRef) is stored.
+// The actual tokens are held transiently by the gateway manager.
 type GatewayRuntime struct {
 	// Endpoint is the local URL the gateway listens on (e.g., http://127.0.0.1:PORT).
 	Endpoint string `json:"endpoint"`
 	// Upstream is the tunnel endpoint URL being proxied.
 	Upstream string `json:"upstream"`
-	// AuthTokens are the Bearer tokens accepted by the gateway.
-	// Stored for runtime use; the actual tokens are also persisted durably.
-	AuthTokens []string `json:"auth_tokens,omitempty"`
+	// AuthEnabled reports whether the gateway requires authentication.
+	AuthEnabled bool `json:"auth_enabled"`
+	// CredentialRef is an opaque reference to the credential store.
+	// The actual tokens are never serialized.
+	CredentialRef string `json:"credential_ref,omitempty"`
 	// StartedAt records when the gateway was started.
 	StartedAt time.Time `json:"started_at"`
 }

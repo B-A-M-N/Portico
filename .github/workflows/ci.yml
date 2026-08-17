@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           # Security fixes reported by govulncheck require this patch release.
-          go-version: "1.25.12"
+          go-version: "1.25.13"
 
       - name: gofmt
         run: |

@@ -28,7 +28,8 @@ func newGatewayManager() *gatewayManager {
 	}
 }
 
-// StartGateway starts a gateway for the connection and stores its endpoint in the runtime.
+// StartGateway starts a gateway for the connection and returns its endpoint.
+// The gateway is started asynchronously and the function returns once it's ready.
 func (m *gatewayManager) StartGateway(ctx context.Context, connID core.ConnectionID, upstream string, authTokens []string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -42,11 +43,10 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 
 	// Create the gateway.
 	gw, err := gateway.New(gateway.Config{
-		ListenAddr:    "127.0.0.1:0",
-		Upstream:      upstream,
-		AuthRequired:  len(authTokens) > 0,
-		ValidTokens:   authTokens,
-		FlushInterval: 0, // flush SSE chunks immediately
+		ListenAddr:   "127.0.0.1:0",
+		Upstream:     upstream,
+		AuthRequired: len(authTokens) > 0,
+		ValidTokens:  authTokens,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create gateway: %w", err)
@@ -60,17 +60,25 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 		}
 	}()
 
-	// Wait for it to start.
-	if err := waitForGateway(gw); err != nil {
-		cancel()
-		return "", fmt.Errorf("gateway start failed: %w", err)
+	// Wait for it to be ready.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if gw.State() == gateway.GatewayStateReady && gw.Addr() != "" {
+			m.gateways[connID] = &gatewayHandle{gateway: gw, cancel: cancel}
+			endpoint := gw.URL()
+			slog.Info("gateway started", "connection", connID, "endpoint", endpoint, "upstream", upstream)
+			return endpoint, nil
+		}
+		if gw.State() == gateway.GatewayStateFailed {
+			cancel()
+			return "", fmt.Errorf("gateway failed to start")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	m.gateways[connID] = &gatewayHandle{gateway: gw, cancel: cancel}
-
-	endpoint := gw.URL()
-	slog.Info("gateway started", "connection", connID, "endpoint", endpoint, "upstream", upstream)
-	return endpoint, nil
+	cancel()
+	_ = gw.Stop()
+	return "", fmt.Errorf("gateway did not start in time")
 }
 
 // StopGateway stops the gateway for the connection.
@@ -101,16 +109,4 @@ func (m *gatewayManager) StopAll() {
 		_ = h.gateway.Stop()
 		delete(m.gateways, connID)
 	}
-}
-
-// waitForGateway waits for the gateway to start listening.
-func waitForGateway(gw *gateway.Gateway) error {
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if gw.Addr() != "" {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return fmt.Errorf("gateway did not start in time")
 }

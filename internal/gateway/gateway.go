@@ -9,10 +9,13 @@
 // The gateway is streaming-transparent: SSE chunks are forwarded immediately
 // without buffering. This is critical for OpenAI-compatible APIs where both
 // Chat Completions and Responses use SSE streaming.
+//
+// Security: Gateway credentials terminate at the gateway. The Portico
+// Authorization header is stripped before forwarding. Upstream auth uses
+// a separate credential domain.
 package gateway
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -21,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -42,19 +46,39 @@ type Gateway struct {
 	// validTokens are the Bearer tokens accepted by the gateway.
 	validTokens map[string]struct{}
 
+	// proxy is the reverse proxy.
+	proxy *httputil.ReverseProxy
+
 	// server is the underlying HTTP server.
 	server *http.Server
 
 	// listener is the underlying network listener.
 	listener net.Listener
 
-	// mu protects token updates.
+	// mu protects lifecycle state.
 	mu sync.RWMutex
 
-	// flushInterval controls how often SSE chunks are flushed.
-	// 0 means flush every chunk immediately.
-	flushInterval time.Duration
+	// state is the current lifecycle state.
+	state GatewayState
+
+	// startedAt records when the gateway was started.
+	startedAt time.Time
+
+	// stopCh signals the gateway to stop.
+	stopCh chan struct{}
 }
+
+// GatewayState represents the lifecycle state of a gateway.
+type GatewayState string
+
+const (
+	GatewayStateNew       GatewayState = "new"
+	GatewayStateStarting  GatewayState = "starting"
+	GatewayStateReady     GatewayState = "ready"
+	GatewayStateStopping  GatewayState = "stopping"
+	GatewayStateStopped   GatewayState = "stopped"
+	GatewayStateFailed    GatewayState = "failed"
+)
 
 // Config configures the Portico Gateway.
 type Config struct {
@@ -71,9 +95,6 @@ type Config struct {
 	// ValidTokens are the accepted Bearer tokens.
 	// If empty and AuthRequired is true, auto-generates a token.
 	ValidTokens []string
-
-	// FlushInterval controls SSE chunk flushing. 0 = immediate.
-	FlushInterval time.Duration
 }
 
 // New creates a new Portico Gateway.
@@ -103,53 +124,100 @@ func New(cfg Config) (*Gateway, error) {
 	}
 
 	g := &Gateway{
-		listenAddr:    cfg.ListenAddr,
-		upstream:      upstream,
-		authRequired:  cfg.AuthRequired,
-		validTokens:   validTokens,
-		flushInterval: cfg.FlushInterval,
+		listenAddr:   cfg.ListenAddr,
+		upstream:     upstream,
+		authRequired: cfg.AuthRequired,
+		validTokens:  validTokens,
+		state:        GatewayStateNew,
+		stopCh:       make(chan struct{}),
+	}
+
+	// Create the reverse proxy.
+	g.proxy = &httputil.ReverseProxy{
+		Director: g.director,
+		ModifyResponse: g.modifyResponse,
+		ErrorHandler: g.errorHandler,
 	}
 
 	return g, nil
 }
 
-// Start starts the gateway listener.
+// Start starts the gateway listener and blocks until the gateway stops.
+// Use a goroutine to run Start asynchronously.
 func (g *Gateway) Start(ctx context.Context) error {
+	g.mu.Lock()
+	if g.state != GatewayStateNew {
+		g.mu.Unlock()
+		return fmt.Errorf("gateway: cannot start from state %s", g.state)
+	}
+	g.state = GatewayStateStarting
+	g.mu.Unlock()
+
 	listenAddr := g.listenAddr
 	if listenAddr == "" {
-		listenAddr = "127.0.0.1:0" // dynamic port
+		listenAddr = "127.0.0.1:0"
 	}
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		g.setState(GatewayStateFailed)
 		return fmt.Errorf("gateway: listen: %w", err)
 	}
-	g.listener = listener
 
+	g.mu.Lock()
+	g.listener = listener
 	g.server = &http.Server{
 		Handler: g.handler(),
 	}
+	g.state = GatewayStateReady
+	g.startedAt = time.Now().UTC()
+	g.mu.Unlock()
 
 	slog.Info("gateway: started", "addr", g.Addr(), "upstream", g.upstream.String())
 
+	// Serve in a goroutine so we can handle stop.
+	serverErrCh := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		_ = g.Stop()
+		serverErrCh <- g.server.Serve(listener)
 	}()
 
-	return g.server.Serve(listener)
+	select {
+	case <-ctx.Done():
+		_ = g.Stop()
+		return ctx.Err()
+	case <-g.stopCh:
+		_ = g.Stop()
+		return nil
+	case err := <-serverErrCh:
+		g.setState(GatewayStateFailed)
+		return err
+	}
 }
 
 // Stop gracefully shuts down the gateway.
 func (g *Gateway) Stop() error {
-	if g.server == nil {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.state == GatewayStateStopped || g.state == GatewayStateStopping {
 		return nil
 	}
-	return g.server.Close()
+
+	g.state = GatewayStateStopping
+	close(g.stopCh)
+
+	if g.server != nil {
+		_ = g.server.Close()
+	}
+
+	g.state = GatewayStateStopped
+	return nil
 }
 
-// Addr returns the actual listen address (useful when dynamic port was used).
+// Addr returns the actual listen address.
 func (g *Gateway) Addr() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	if g.listener == nil {
 		return ""
 	}
@@ -166,26 +234,24 @@ func (g *Gateway) BaseURL() string {
 	return g.URL()
 }
 
-// AddToken adds a valid Bearer token.
-func (g *Gateway) AddToken(token string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.validTokens[token] = struct{}{}
-}
-
-// RemoveToken removes a valid Bearer token.
-func (g *Gateway) RemoveToken(token string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	delete(g.validTokens, token)
-}
-
-// HasToken reports whether a token is valid.
-func (g *Gateway) HasToken(token string) bool {
+// State returns the current lifecycle state.
+func (g *Gateway) State() GatewayState {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	_, ok := g.validTokens[token]
-	return ok
+	return g.state
+}
+
+// StartedAt returns when the gateway was started.
+func (g *Gateway) StartedAt() time.Time {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.startedAt
+}
+
+func (g *Gateway) setState(state GatewayState) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.state = state
 }
 
 // handler returns the HTTP handler for the gateway.
@@ -199,7 +265,7 @@ func (g *Gateway) handler() http.Handler {
 		}
 
 		// Proxy the request.
-		g.proxy(w, r)
+		g.proxy.ServeHTTP(w, r)
 	})
 }
 
@@ -231,64 +297,47 @@ func (g *Gateway) unauthorized(w http.ResponseWriter, reason string) {
 	_, _ = fmt.Fprintf(w, `{"error":{"message":"%s","type":"unauthorized"}}`, reason)
 }
 
-// proxy forwards the request to the upstream.
-func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request) {
-	// Create the proxy request.
-	proxyReq := r.Clone(r.Context())
-	proxyReq.URL.Host = g.upstream.Host
-	proxyReq.URL.Scheme = g.upstream.Scheme
-	proxyReq.RequestURI = ""
+// director rewrites the request to route to the upstream.
+func (g *Gateway) director(r *http.Request) {
+	r.URL.Scheme = g.upstream.Scheme
+	r.URL.Host = g.upstream.Host
+	r.Host = g.upstream.Host
 
-	// Forward the request. No timeout for streaming responses.
-	client := &http.Client{}
-	resp, err := client.Do(proxyReq)
-	if err != nil {
-		g.proxyError(w, err)
-		return
-	}
-	defer resp.Body.Close()
+	// Strip the Portico Gateway credential — it terminates at the gateway.
+	r.Header.Del("Authorization")
 
-	// Copy response headers.
-	for k, v := range resp.Header {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
-		}
-	}
+	// Set standard forwarded headers.
+	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	r.Header.Set("X-Forwarded-Proto", "http")
+	r.Header.Set("X-Forwarded-Host", r.Host)
 
-	// Handle SSE responses specially.
-	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
-
-	w.WriteHeader(resp.StatusCode)
-
-	if isSSE {
-		g.flushSSE(w, resp.Body)
-	} else {
-		_, _ = io.Copy(w, resp.Body)
-	}
+	// Ensure hop-by-hop headers are not forwarded.
+	r.Header.Del("Connection")
+	r.Header.Del("Proxy-Connection")
+	r.Header.Del("Keep-Alive")
+	r.Header.Del("TE")
+	r.Header.Del("Trailer")
+	r.Header.Del("Transfer-Encoding")
+	r.Header.Del("Upgrade")
 }
 
-// flushSSE copies SSE chunks immediately without buffering.
-func (g *Gateway) flushSSE(w http.ResponseWriter, body io.ReadCloser) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		// Fallback: just copy.
-		_, _ = io.Copy(w, body)
-		return
+// modifyResponse handles SSE responses.
+func (g *Gateway) modifyResponse(resp *http.Response) error {
+	// Ensure SSE responses are not buffered.
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		// Disable any response buffering.
+		resp.Header.Set("X-Accel-Buffering", "no")
+		resp.Header.Set("Cache-Control", "no-cache")
 	}
-
-	scanner := bufio.NewScanner(body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		_, _ = fmt.Fprintln(w, line)
-		flusher.Flush() // immediate flush — no buffering
-	}
+	return nil
 }
 
-func (g *Gateway) proxyError(w http.ResponseWriter, err error) {
-	slog.Warn("gateway: proxy error", "error", err)
+// errorHandler returns a handler for proxy errors.
+func (g *Gateway) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	slog.Warn("gateway: proxy error", "error", err, "upstream", g.upstream.String())
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadGateway)
-	_, _ = fmt.Fprintf(w, `{"error":{"message":"%s","type":"gateway_error"}}`, err.Error())
+	_, _ = w.Write([]byte(`{"error":{"message":"Upstream connection failed","type":"gateway_error"}}`))
 }
 
 // generateToken generates a random Bearer token.

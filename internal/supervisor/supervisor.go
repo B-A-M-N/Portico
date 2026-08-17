@@ -210,47 +210,14 @@ func (s *Supervisor) handleProcessEvent(event process.ProcessEvent) {
 }
 
 // maybeStartGateway starts the gateway for a connection if needed.
+//
+// NOTE: Currently disabled. The gateway traffic path is not yet designed.
+// The OpenAI Secure MCP Tunnel provider points tunnel-client directly at the
+// local MCP server, not at a gateway. Wiring the gateway into that path
+// requires starting the gateway BEFORE the tunnel client and passing the
+// gateway endpoint as --mcp.server-url. That topology is not yet implemented.
 func (s *Supervisor) maybeStartGateway(connID core.ConnectionID, rt *core.ConnectionRuntime) {
-	s.mu.RLock()
-	p, ok := s.controller.GetProfile(connID)
-	s.mu.RUnlock()
-	if !ok {
-		return
-	}
-	if !s.gatewayNeeded(p, rt) {
-		return
-	}
-
-	// Determine the upstream URL (tunnel endpoint).
-	upstream := rt.Endpoint.PublicAddress
-	if upstream == "" {
-		upstream = rt.Endpoint.PrivateAddress
-	}
-	if upstream == "" {
-		slog.Warn("gateway: no upstream address for connection", "connection", connID)
-		return
-	}
-
-	// Get auth tokens from profile if available.
-	var authTokens []string
-	if p.Spec.ClientTunnel != nil && p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel {
-		// For OpenAI profiles, generate or retrieve tokens.
-		authTokens = []string{} // Will be populated from durable store in future.
-	}
-
-	endpoint, err := s.gatewayMgr.StartGateway(context.Background(), connID, upstream, authTokens)
-	if err != nil {
-		slog.Error("failed to start gateway", "connection", connID, "error", err)
-		return
-	}
-
-	rt.Gateway = &core.GatewayRuntime{
-		Endpoint:   endpoint,
-		Upstream:   upstream,
-		AuthTokens: authTokens,
-		StartedAt:  time.Now().UTC(),
-	}
-	s.controller.RestoreRuntime(rt)
+	// Disabled until gateway traffic path is designed.
 }
 
 // maybeStopGateway stops the gateway for a connection if running.
@@ -289,50 +256,75 @@ func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.Connection
 		return
 	}
 
+	p, ok := s.controller.GetProfile(connID)
+	if !ok {
+		return
+	}
+
 	report := &core.HealthReport{
 		ConnectionID: connID,
 	}
 
+	desired := p.Desired
+
 	// PROCESS check: Is the connector alive?
-	if rt.Connector.Status == core.ConnectorStatusRunning && rt.Connector.PID > 0 {
+	if desired == core.DesiredClosed {
 		report.Process = core.HealthCheck{
-			OK:           true,
-			Detail:       fmt.Sprintf("connector running (PID %d)", rt.Connector.PID),
-			LastChecked:  time.Now().UTC(),
+			State:       core.CheckNotApplicable,
+			Detail:      "connection is closed",
+			LastChecked: time.Now().UTC(),
+		}
+	} else if rt.Connector.Status == core.ConnectorStatusRunning && rt.Connector.PID > 0 {
+		report.Process = core.HealthCheck{
+			State:       core.CheckPass,
+			Detail:      fmt.Sprintf("connector running (PID %d)", rt.Connector.PID),
+			LastChecked: time.Now().UTC(),
 		}
 	} else {
 		report.Process = core.HealthCheck{
-			OK:           false,
-			Detail:       fmt.Sprintf("connector %s", rt.Connector.Status),
-			LastChecked:  time.Now().UTC(),
+			State:       core.CheckFail,
+			Detail:      fmt.Sprintf("connector %s", rt.Connector.Status),
+			LastChecked: time.Now().UTC(),
 		}
 	}
 
 	// TRANSPORT check: Is the tunnel reachable?
-	if rt.Endpoint.PublicAddress != "" {
+	if desired == core.DesiredClosed {
+		report.Transport = core.HealthCheck{
+			State:       core.CheckNotApplicable,
+			Detail:      "connection is closed",
+			LastChecked: time.Now().UTC(),
+		}
+	} else if rt.Endpoint.PublicAddress != "" {
 		report.Transport = s.checkTransport(ctx, rt.Endpoint.PublicAddress)
 	} else if rt.Endpoint.PrivateAddress != "" {
 		report.Transport = s.checkTransport(ctx, rt.Endpoint.PrivateAddress)
 	} else {
 		report.Transport = core.HealthCheck{
-			OK:           rt.State == core.RuntimeClosed,
-			Detail:       "no endpoint address",
-			LastChecked:  time.Now().UTC(),
+			State:       core.CheckUnknown,
+			Detail:      "no endpoint address",
+			LastChecked: time.Now().UTC(),
 		}
 	}
 
 	// SERVICE check: Does the application work?
-	if report.Process.OK && report.Transport.OK {
+	if report.Process.State == core.CheckPass && report.Transport.State == core.CheckPass {
 		report.Service = s.checkService(ctx, rt)
+	} else if desired == core.DesiredClosed {
+		report.Service = core.HealthCheck{
+			State:       core.CheckNotApplicable,
+			Detail:      "connection is closed",
+			LastChecked: time.Now().UTC(),
+		}
 	} else {
 		report.Service = core.HealthCheck{
-			OK:           false,
-			Detail:       "skipped (process or transport down)",
-			LastChecked:  time.Now().UTC(),
+			State:       core.CheckSkipped,
+			Detail:      "skipped (process or transport down)",
+			LastChecked: time.Now().UTC(),
 		}
 	}
 
-	report.Refresh()
+	report.Refresh(desired)
 	rt.Health = report
 	s.controller.RestoreRuntime(rt)
 }
@@ -341,7 +333,7 @@ func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.Connection
 func (s *Supervisor) checkTransport(ctx context.Context, endpoint string) core.HealthCheck {
 	err := core.DefaultServiceCheck(ctx, endpoint)
 	return core.HealthCheck{
-		OK:          err == nil,
+		State:       errState(err),
 		Detail:      errString(err),
 		LastChecked: time.Now().UTC(),
 	}
@@ -356,24 +348,34 @@ func (s *Supervisor) checkService(ctx context.Context, rt *core.ConnectionRuntim
 
 	p, ok := s.controller.GetProfile(rt.ConnectionID)
 	if !ok {
-		return core.HealthCheck{OK: false, Detail: "profile not found", LastChecked: time.Now().UTC()}
+		return core.HealthCheck{State: core.CheckFail, Detail: "profile not found", LastChecked: time.Now().UTC()}
 	}
 
 	var err error
 	switch p.Kind {
 	case core.ConnectionClientTunnel:
 		if p.Spec.ClientTunnel != nil && p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel {
-			err = core.OpenAIServiceCheck(ctx, endpoint)
+			// OpenAI Secure MCP Tunnel uses MCP, not OpenAI HTTP API.
+			// MCP check is not implemented yet.
+			return core.HealthCheck{State: core.CheckUnknown, Detail: "MCP health check not implemented", LastChecked: time.Now().UTC()}
 		}
+		err = core.DefaultServiceCheck(ctx, endpoint)
 	default:
 		err = core.DefaultServiceCheck(ctx, endpoint)
 	}
 
 	return core.HealthCheck{
-		OK:          err == nil,
+		State:       errState(err),
 		Detail:      errString(err),
 		LastChecked: time.Now().UTC(),
 	}
+}
+
+func errState(err error) core.CheckState {
+	if err == nil {
+		return core.CheckPass
+	}
+	return core.CheckFail
 }
 
 func errString(err error) string {
