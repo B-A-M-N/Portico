@@ -1038,11 +1038,27 @@ func sourceOwnsOrigin(source core.SourceSpec) bool {
 // and no repair action is required.
 var ErrNoRepairNeeded = errors.New("no repair needed")
 
+// CanRepair reports whether a repair plan can be produced for the given
+// profile. It should be checked before offering repair in the UI so the user
+// is never shown an action that the backend will refuse. Currently only
+// service-exposure connections are supported.
+func (c *Controller) CanRepair(profile *core.ConnectionProfile) bool {
+	if profile == nil {
+		return false
+	}
+	switch profile.Kind {
+	case core.ConnectionServiceExposure:
+		return true
+	}
+	return false
+}
+
 // PlanRepair creates a repair plan for a connection based on findings.
 //
 // Currently supports service-exposure connections only. Non-service kinds
 // (port_forward, client_tunnel, private_network) require kind-specific
-// repair logic that is not yet implemented.
+// repair logic that is not yet implemented. Use CanRepair to check before
+// offering repair in the UI.
 func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (*core.OperationPlan, error) {
 	c.mu.RLock()
 	profile, ok := c.profiles[connID]
@@ -1051,7 +1067,7 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 		return nil, core.ErrProfileNotFound(connID)
 	}
 
-	if profile.Kind != core.ConnectionServiceExposure {
+	if !c.CanRepair(profile) {
 		return nil, fmt.Errorf("repair for connection kind %q is not yet implemented", profile.Kind)
 	}
 

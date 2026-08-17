@@ -1757,10 +1757,17 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			}
 			return m, m.planOpenCmd(conn.ID)
 		case "r":
-			// r triggers diagnostics/repair (same as Home).
+			// r triggers diagnostics/repair (same as Home). Gate on kind
+			// so non-service connections don't open a repair screen that
+			// the backend will refuse.
+			conn := m.SelectedConnection()
+			if conn.Kind != "service_exposure" && conn.Kind != "" {
+				m.status = "Repair is not available for this connection kind."
+				return m, nil
+			}
 			m.pushScreen(ScreenRepair)
 			m.diagnostics = nil
-			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+			return m, m.diagnosticsCmd(conn.ID)
 		case "d":
 			// d triggers delete preview (same as Home).
 			return m, m.planDeleteCmd(m.SelectedConnection().ID)
@@ -1926,9 +1933,16 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
 		}
 		if m.screen == ScreenHome && m.SelectedConnection() != nil {
-			m.pushScreen(ScreenRepair)
-			m.diagnostics = nil
-			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
+			// Only offer repair for connection kinds the controller
+			// can actually repair. Port-forward and other non-service
+			// kinds return "not yet implemented" from PlanRepair.
+			conn := m.SelectedConnection()
+			if conn.Kind == "service_exposure" || conn.Kind == "" {
+				m.pushScreen(ScreenRepair)
+				m.diagnostics = nil
+				return m, m.diagnosticsCmd(conn.ID)
+			}
+			m.status = "Repair is not available for this connection kind."
 		}
 
 	case "e":
