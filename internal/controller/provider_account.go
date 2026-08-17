@@ -98,19 +98,45 @@ func checkKindCapabilities(caps core.Capabilities, profile *core.ConnectionProfi
 		// connection kind, an unstated protocol map means no protocols are
 		// supported — it must be explicitly listed.
 		spec := profile.Spec.PortForward
-		if spec != nil && spec.Protocol != "" {
-			pc, ok := caps.Protocols[spec.Protocol]
-			if !ok || !pc.Supported {
-				return core.ErrValidation(fmt.Sprintf("provider %q does not support protocol %q for port forwards", providerID, spec.Protocol))
+		if spec != nil {
+			if spec.Protocol != "" {
+				pc, ok := caps.Protocols[spec.Protocol]
+				if !ok || !pc.Supported {
+					return core.ErrValidation(fmt.Sprintf("provider %q does not support protocol %q for port forwards", providerID, spec.Protocol))
+				}
+			}
+			// Direction is a capability constraint: only local forwards are supported.
+			if spec.Direction == core.PortForwardRemote {
+				return core.ErrValidation("remote port forwarding is not supported")
 			}
 		}
 	case core.ConnectionServiceExposure:
 		// Service exposure: check exposure mode support.
 		exposure := profile.GetExposure()
-		if exposure.Mode != "" && !caps.PrivateExposure.Supported {
-			// Check if the mode is private-only and the provider supports it.
-			if exposure.Mode == core.ExposurePrivate && !caps.PrivateExposure.Supported {
+		switch exposure.Mode {
+		case core.ExposureTemporary:
+			if !caps.TemporaryAddresses.Supported {
+				return core.ErrValidation(fmt.Sprintf("provider %q does not support temporary addresses", providerID))
+			}
+		case core.ExposurePermanent:
+			if !caps.CustomHostnames.Supported {
+				return core.ErrValidation(fmt.Sprintf("provider %q does not support permanent hostnames", providerID))
+			}
+		case core.ExposurePrivate:
+			if !caps.PrivateExposure.Supported {
 				return core.ErrValidation(fmt.Sprintf("provider %q does not support private exposure", providerID))
+			}
+		case "":
+			// No mode specified — will be validated at plan time.
+		default:
+			return core.ErrValidation(fmt.Sprintf("unknown exposure mode %q", exposure.Mode))
+		}
+		// Check protocol support.
+		source := profile.GetSource()
+		if source.Existing != nil {
+			pc, ok := caps.Protocols[source.Existing.Protocol]
+			if !ok || !pc.Supported {
+				return core.ErrValidation(fmt.Sprintf("provider %q does not support protocol %q", providerID, source.Existing.Protocol))
 			}
 		}
 		// Check protection support.

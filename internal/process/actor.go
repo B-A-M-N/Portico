@@ -188,7 +188,7 @@ func (a *actor) launch() error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Dir = spec.Dir
 	if len(spec.Env) > 0 {
-		cmd.Env = spec.Env
+		cmd.Env = minimalEnvWithOverride(spec.Env...)
 	} else {
 		cmd.Env = minimalEnv()
 	}

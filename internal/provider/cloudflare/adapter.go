@@ -951,7 +951,16 @@ func (p *Provider) launchConnector(ctx context.Context, connectionID core.Connec
 			func(path string) (core.ConnectorHandle, error) {
 				s := spec
 				s.Args = []string{"tunnel", "--no-autoupdate", "run", "--token-file", path}
-				s.Env = append(os.Environ(), "TUNNEL_TOKEN_FILE="+path)
+				// Use minimal env + explicit override. Never inherit the
+				// supervisor's full environment, which may contain unrelated
+				// provider credentials.
+				s.Env = []string{
+					"PATH=" + os.Getenv("PATH"),
+					"HOME=" + os.Getenv("HOME"),
+					"LANG=C.UTF-8",
+					"TZ=UTC",
+					"TUNNEL_TOKEN_FILE=" + path,
+				}
 				return p.connectorProc.Start(ctx, core.ProcessConfig{ConnectionID: connectionID, Spec: s})
 			},
 			func(h core.ConnectorHandle) error {
@@ -1024,8 +1033,8 @@ func (p *Provider) discoverQuickTunnelAddress(connectionID core.ConnectionID, st
 			continue
 		}
 
-		addr := tunnel.ExtractQuickTunnelURL(string(data))
-		if addr != "" {
+		addr, err := tunnel.ExtractQuickTunnelURL(string(data))
+		if err == nil {
 			return addr, nil
 		}
 

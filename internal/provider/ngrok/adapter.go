@@ -484,15 +484,7 @@ func (p *Provider) agentProcessSpec(step core.PlanStep, configPath string) core.
 		Restart:    core.RestartAlways,
 	}
 	if token != "" {
-		// Setting Env replaces the child environment wholesale, so the entries
-		// the agent needs to find its own configuration must be carried along.
 		spec.Env = []string{AuthTokenEnvVar + "=" + token}
-		if home := os.Getenv("HOME"); home != "" {
-			spec.Env = append(spec.Env, "HOME="+home)
-		}
-		if path := os.Getenv("PATH"); path != "" {
-			spec.Env = append(spec.Env, "PATH="+path)
-		}
 	}
 	return spec
 }

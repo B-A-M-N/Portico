@@ -37,12 +37,62 @@ type reconcileDecision struct {
 func (s *Supervisor) computeReconcileDecision(ctx context.Context, input ReconcileInput) (*reconcileDecision, error) {
 	desired := input.Profile.Desired
 
-	// Reconciliation is kind-specific. The current implementation handles
-	// service-exposure (Cloudflare) connections. Other kinds have their own
-	// reconciliation semantics that are not yet implemented.
-	if input.Profile.Kind != core.ConnectionServiceExposure {
+	// Reconciliation is kind-specific.
+	switch input.Profile.Kind {
+	case core.ConnectionServiceExposure:
+		return s.reconcileServiceExposure(ctx, input, desired)
+	case core.ConnectionPortForward:
+		return s.reconcilePortForward(ctx, input, desired)
+	case core.ConnectionClientTunnel:
+		// Client tunnels have no public endpoint to reconcile.
+		return &reconcileDecision{Action: "none"}, nil
+	case core.ConnectionPrivateNetwork:
+		// Private network not yet implemented.
+		return &reconcileDecision{Action: "none"}, nil
+	default:
 		return &reconcileDecision{Action: "none"}, nil
 	}
+}
+
+// reconcilePortForward handles lifecycle recovery for local port forwards.
+// A local forward has no external provider resources — it's just a listener
+// and a relay. If the relay is missing but the profile wants it open, we
+// need to recreate it.
+func (s *Supervisor) reconcilePortForward(ctx context.Context, input ReconcileInput, desired core.DesiredConnectionState) (*reconcileDecision, error) {
+	if desired == core.DesiredClosed {
+		// Desired closed: stop any running relay.
+		if input.Runtime != nil && input.Runtime.State != core.RuntimeClosed {
+			plan, err := s.controller.PlanClose(ctx, input.Profile.ID)
+			if err != nil {
+				return nil, err
+			}
+			return &reconcileDecision{Action: "close", Plan: plan}, nil
+		}
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	// Desired open: check if the relay is running.
+	if input.Runtime != nil && input.Runtime.State == core.RuntimeOpen {
+		// Check if the provider reports a healthy relay.
+		observed, err := s.controller.Observe(ctx, input.Profile.ID)
+		if err == nil && observed != nil && observed.Connector != nil {
+			if observed.Connector.Status == "running" {
+				return &reconcileDecision{Action: "none"}, nil
+			}
+		}
+	}
+
+	// Need to (re)create the forward.
+	plan, err := s.controller.PlanOpen(ctx, input.Profile.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &reconcileDecision{Action: "open", Plan: plan}, nil
+}
+
+// reconcileServiceExposure handles lifecycle recovery for service-exposure
+// connections (Cloudflare, ngrok, etc.).
+func (s *Supervisor) reconcileServiceExposure(ctx context.Context, input ReconcileInput, desired core.DesiredConnectionState) (*reconcileDecision, error) {
 
 	// Reconciliation moves a connection toward its desired state without
 	// anyone asking, so it must not drive a connection toward a state that is

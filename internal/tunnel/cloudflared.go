@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -169,8 +170,9 @@ func (c *ProcessConnector) RunQuick(ctx context.Context, url string) (QuickTunne
 		n, _ := logs.Read(buf)
 		logs.Close()
 		if n > 0 {
-			publicAddr = ExtractQuickTunnelURL(string(buf[:n]))
-			if publicAddr != "" {
+			addr, err := ExtractQuickTunnelURL(string(buf[:n]))
+			if err == nil {
+				publicAddr = addr
 				break
 			}
 		}
@@ -254,10 +256,24 @@ func (c *ProcessConnector) LogFilePath() string {
 }
 
 // ExtractQuickTunnelURL parses the trycloudflare.com URL from cloudflared output.
-func ExtractQuickTunnelURL(output string) string {
+// Returns a validated absolute HTTPS URL, or an error if the output does not
+// contain a valid Quick Tunnel address.
+func ExtractQuickTunnelURL(output string) (string, error) {
 	matches := quickTunnelURLRe.FindStringSubmatch(output)
-	if len(matches) > 0 {
-		return matches[0]
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no Quick Tunnel URL found in output")
 	}
-	return ""
+	// The regex returns a bare hostname. Construct a validated absolute URL.
+	raw := "https://" + matches[0]
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid Quick Tunnel URL %q: %w", raw, err)
+	}
+	if parsed.Scheme != "https" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid Quick Tunnel URL %q", raw)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("Quick Tunnel URL must not contain userinfo")
+	}
+	return parsed.String(), nil
 }

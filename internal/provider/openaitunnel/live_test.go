@@ -172,7 +172,7 @@ func TestRealClientRejectsAMalformedTunnelID(t *testing.T) {
 		"--control-plane.tunnel-id", "tunnel_tooshort",
 		"--control-plane.api-key", credentialReference,
 		"--health.listen-addr", "127.0.0.1:0")
-	cmd.Env = append(os.Environ(), CredentialEnvVar+"=sk-invalid-probe-key")
+	cmd.Env = minimalEnvWithOverride(CredentialEnvVar + "=" + os.Getenv(CredentialEnvVar))
 	output, _ := cmd.CombinedOutput()
 
 	if !strings.Contains(string(output), "invalid tunnel ID") {

@@ -360,14 +360,6 @@ func (pm *Manager) Cleanup() {
 // minimalEnv returns a controlled default environment for connector children.
 // This prevents inheriting the supervisor's full environment which may
 // contain provider credentials, keyring variables, or unrelated secrets.
-// minimalEnv is the filtered environment a connector process receives.
-//
-// The full environment is deliberately not inherited: it routinely carries
-// credentials for unrelated services, and a connector has no business seeing
-// them. But HOME must be the real one. It was hardcoded to /root, so under any
-// non-root user — the normal case — a client that reads its own configuration
-// file looked in a directory it could not read and failed to start. That is how
-// the ngrok agent came to exit immediately with no usable explanation.
 func minimalEnv() []string {
 	home := os.Getenv("HOME")
 	if home == "" {
@@ -390,4 +382,9 @@ func minimalEnv() []string {
 		"LANG=C.UTF-8",
 		"TZ=UTC",
 	}
+}
+
+func minimalEnvWithOverride(env ...string) []string {
+	base := minimalEnv()
+	return append(base, env...)
 }
