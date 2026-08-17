@@ -1,0 +1,46 @@
+.git
+.github
+.gitignore
+
+# Local binaries and build output
+portico
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+logs/
+
+# Test outputs
+coverage/
+*.out
+acceptance-report.txt
+
+# Editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+tmp-*
+*.tmp
+
+# Documentation build
+docs/site/
+node_modules/
+
+# Local config
+.env
+.env.*
+*.local.yaml

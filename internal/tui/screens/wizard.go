@@ -33,6 +33,8 @@ type ConnectionCreator interface {
 
 // ConnectionCreatedMsg is delivered when the async create command finishes.
 type ConnectionCreatedMsg struct {
+	WizardID   WizardID
+	Generation WizardGeneration
 	ID         string
 	Connection *ipc.ConnectionDTO
 	Err        error
@@ -47,26 +49,26 @@ type WizardGeneration uint64
 
 // WizardPlanLoadedMsg is delivered when the wizard's open plan request completes.
 type WizardPlanLoadedMsg struct {
-	WizardID     WizardID
-	Generation   WizardGeneration
-	Plan         *ipc.PlanDTO
-	Err          error
+	WizardID   WizardID
+	Generation WizardGeneration
+	Plan       *ipc.PlanDTO
+	Err        error
 }
 
 // WizardPlanAppliedMsg is delivered when the wizard's apply command completes.
 type WizardPlanAppliedMsg struct {
-	WizardID     WizardID
-	Generation   WizardGeneration
-	Operation    *ipc.OperationDTO
-	Err          error
+	WizardID   WizardID
+	Generation WizardGeneration
+	Operation  *ipc.OperationDTO
+	Err        error
 }
 
 // WizardOperationLoadedMsg is delivered when the wizard polls operation status.
 type WizardOperationLoadedMsg struct {
-	WizardID     WizardID
-	Generation   WizardGeneration
-	Operation    *ipc.OperationDTO
-	Err          error
+	WizardID   WizardID
+	Generation WizardGeneration
+	Operation  *ipc.OperationDTO
+	Err        error
 }
 
 // WizardModel is the wizard for creating new connections.
@@ -957,7 +959,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepReview
 				return nil
 			}
-			return createConnectionCmd(m.client, m.ctx, req)
+			return createConnectionCmd(m.client, m.ctx, req, m.id, m.generation)
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
@@ -999,7 +1001,12 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 }
 
 // HandleCreated applies the result of the async create command.
+// Discards stale replies from a previous wizard generation or a different
+// wizard instance.
 func (m *WizardModel) HandleCreated(msg ConnectionCreatedMsg) tea.Cmd {
+	if msg.WizardID != m.id || msg.Generation != m.generation {
+		return nil // stale reply
+	}
 	if msg.Err != nil {
 		m.err = msg.Err
 		m.state.Step = WizardStepReview
@@ -1227,17 +1234,18 @@ func existingServiceAddress(address, port string) (string, error) {
 
 // createConnectionCmd returns a command that performs the IPC call off the
 // update loop. The request is built before the closure runs so the command
-// never reads or mutates wizard state.
-func createConnectionCmd(client ConnectionCreator, ctx context.Context, req ipc.CreateConnectionRequest) tea.Cmd {
+// never reads or mutates wizard state. The wizard's identity and generation
+// are captured so a late reply from an abandoned wizard is discarded.
+func createConnectionCmd(client ConnectionCreator, ctx context.Context, req ipc.CreateConnectionRequest, wizID WizardID, gen WizardGeneration) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
-			return ConnectionCreatedMsg{Err: fmt.Errorf("no supervisor connection")}
+			return ConnectionCreatedMsg{WizardID: wizID, Generation: gen, Err: fmt.Errorf("no supervisor connection")}
 		}
 		conn, err := client.CreateConnection(ctx, req)
 		if err != nil {
-			return ConnectionCreatedMsg{Err: err}
+			return ConnectionCreatedMsg{WizardID: wizID, Generation: gen, Err: err}
 		}
-		return ConnectionCreatedMsg{ID: conn.ID, Connection: conn}
+		return ConnectionCreatedMsg{WizardID: wizID, Generation: gen, ID: conn.ID, Connection: conn}
 	}
 }
 

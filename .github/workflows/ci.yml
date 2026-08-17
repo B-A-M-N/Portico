@@ -75,5 +75,15 @@ jobs:
 
       - name: Verify Docker image
         run: |
+          # `version` must succeed in any container — it needs no supervisor.
           docker run --rm portico:test version
-          docker run --rm portico:test doctor
+          # `doctor` without a reachable supervisor must fail with a clear
+          # exit code rather than silently succeeding. This is the contract:
+          # an isolated container with no running supervisor is not a healthy
+          # deployment. Asserting the expected failure prevents a regression
+          # where doctor starts returning 0 without actually checking anything.
+          if docker run --rm portico:test doctor; then
+            echo "FAIL: doctor succeeded without a supervisor (expected exit 8)"
+            exit 1
+          fi
+          echo "OK: doctor failed as expected without a supervisor"

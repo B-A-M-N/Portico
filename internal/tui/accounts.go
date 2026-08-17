@@ -107,19 +107,16 @@ func (m *Model) selectedProvider() (providerRow, bool) {
 }
 
 // selectedAccount returns the account the cursor is on (if any).
-// If the cursor is on a provider row that has accounts, returns the first account.
+// If the cursor is on a provider row, returns nil — account removal is too
+// destructive for implicit child selection. Callers must explicitly navigate
+// to an account row before account actions apply.
 func (m *Model) selectedAccount() (*accountRow, bool) {
 	row, ok := m.selectedScreenRow()
 	if !ok {
 		return nil, false
 	}
-	switch row.Kind {
-	case rowKindAccount:
+	if row.Kind == rowKindAccount {
 		return row.Account, true
-	case rowKindProvider:
-		if len(row.Provider.Accounts) > 0 {
-			return &row.Provider.Accounts[0], true
-		}
 	}
 	return nil, false
 }
@@ -153,7 +150,7 @@ func (m *Model) providerRows() []providerRow {
 			ID:           p.ID,
 			Name:         p.Name,
 			DisplayName:  p.DisplayName,
-			HasSetupFlow: p.SetupActions != nil && len(p.SetupActions) > 0,
+			HasSetupFlow: len(p.SetupActions) > 0,
 		}
 		for _, account := range p.Accounts {
 			row.Accounts = append(row.Accounts, accountRow{
@@ -289,14 +286,14 @@ func (m *Model) renderProvidersScreen() string {
 	}
 
 	b.WriteString("\n")
-	// Context-sensitive actions
+	// Context-sensitive actions.
+	// Provider rows: only add/setup actions. Account rows: remove.
+	// [x] is never available on a provider row — implicit removal of the
+	// first account would be too destructive.
 	if row, ok := m.selectedScreenRow(); ok {
 		switch row.Kind {
 		case rowKindProvider:
 			b.WriteString("[a] add account   ")
-			if !row.Provider.NoAccounts {
-				b.WriteString("[x] remove account   ")
-			}
 		case rowKindAccount:
 			b.WriteString("[x] remove account   ")
 		}

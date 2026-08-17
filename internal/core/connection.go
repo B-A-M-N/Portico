@@ -528,11 +528,12 @@ func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec
 		if err := validateCommandEnvironment(spec.Source.Command.Env); err != nil {
 			return err
 		}
-		switch spec.Source.Command.Protocol {
-		case ProtocolHTTP, ProtocolHTTPS, "":
-			// valid
-		default:
-			return fmt.Errorf("invalid command protocol %q", spec.Source.Command.Protocol)
+		// Portico-managed command origins currently terminate plain HTTP only.
+		// Until the origin manager actually terminates TLS, HTTPS must not
+		// validate here — a profile that passes validation but cannot be
+		// executed is worse than one that fails loudly at creation time.
+		if spec.Source.Command.Protocol != "" && spec.Source.Command.Protocol != ProtocolHTTP {
+			return fmt.Errorf("command protocol %q is not supported; Portico-managed commands currently require HTTP", spec.Source.Command.Protocol)
 		}
 	}
 	if spec.Source.MCP != nil {

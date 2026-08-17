@@ -169,11 +169,11 @@ type GatewayDTO struct {
 // HealthDTO describes the three-state health assessment for a connection.
 // Health is evaluated relative to the connection's desired state and kind.
 type HealthDTO struct {
-	State       string       `json:"state"`
-	Process     HealthCheckDTO `json:"process"`
-	Transport   HealthCheckDTO `json:"transport"`
-	Service     HealthCheckDTO `json:"service"`
-	ComputedAt  string       `json:"computed_at,omitempty"`
+	State      string         `json:"state"`
+	Process    HealthCheckDTO `json:"process"`
+	Transport  HealthCheckDTO `json:"transport"`
+	Service    HealthCheckDTO `json:"service"`
+	ComputedAt string         `json:"computed_at,omitempty"`
 }
 
 // HealthCheckDTO is a single health check result.

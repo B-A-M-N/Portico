@@ -280,18 +280,28 @@ func (fb *BuiltinFileBrowser) Start(_ context.Context) (string, error) {
 }
 
 func (fb *BuiltinFileBrowser) Stop(ctx context.Context) error {
+	// Server shutdown and root-FD close are independent and idempotent so a
+	// constructed-but-never-started browser (no server) is still closable.
+	var shutdownErr error
 	if fb.server != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		err := fb.server.Shutdown(shutdownCtx)
-		// Close the root file descriptor to release the pinned directory
-		if fb.rootFd >= 0 {
-			unix.Close(fb.rootFd)
-			fb.rootFd = -1
-		}
-		return err
+		shutdownErr = fb.server.Shutdown(shutdownCtx)
 	}
-	return nil
+	fb.closeRootFd()
+	return shutdownErr
+}
+
+// closeRootFd closes the pinned root descriptor if still open. Safe to call
+// multiple times; after the first call it is a no-op.
+func (fb *BuiltinFileBrowser) closeRootFd() {
+	if fb.rootFd >= 0 {
+		unix.Close(fb.rootFd)
+		fb.rootFd = -1
+	}
 }
 
 func (fb *BuiltinFileBrowser) Logs() io.ReadCloser {
@@ -366,7 +376,8 @@ func (fb *BuiltinFileBrowser) listDir(relPath string) ([]fileEntry, error) {
 
 	var files []fileEntry
 	for _, e := range entries {
-		if !fb.cfg.ShowHidden && strings.HasPrefix(e.Name(), ".") {
+		// Skip hidden and sensitive entries unless the user explicitly opted in.
+		if err := fb.checkPublishPath(e.Name()); err != nil {
 			continue
 		}
 		info, err := e.Info()
@@ -403,17 +414,17 @@ func (fb *BuiltinFileBrowser) handleAPI(w http.ResponseWriter, r *http.Request) 
 
 	files, err := fb.listDir(relPath)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(files); err != nil {
-		http.Error(w, "encoding response: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
 }
 
-// isHidden reports whether any segment of the relative path is hidden (starts with .).
+// isHiddenPath reports whether any segment of the relative path is hidden (starts with .).
 func isHiddenPath(rel string) bool {
 	rel = filepath.Clean(rel)
 	if rel == "." || rel == "" {
@@ -428,7 +439,70 @@ func isHiddenPath(rel string) bool {
 	return false
 }
 
-// handleDownload serves a file for download. Hidden files are rejected by default.
+// sensitivePathSegments lists directory/file segments whose exposure is
+// categorically denied unless the user has made an explicit dangerous opt-in.
+// These are version-control metadata directories and credential stores that
+// must never be served to a remote caller.
+var sensitivePathSegments = map[string]bool{
+	".git":       true,
+	".ssh":       true,
+	".gnupg":     true,
+	".env":       true,
+	"id_rsa":     true,
+	"id_ed25519": true,
+	"id_ecdsa":   true,
+	"id_dsa":     true,
+}
+
+// isSensitivePath reports whether the relative path contains any segment that
+// must be categorically denied regardless of the ShowHidden setting. This is
+// separate from hidden-file policy: a user may choose to expose dotfiles, but
+// never version-control metadata or SSH/GPG credentials.
+func isSensitivePath(rel string) bool {
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	for _, part := range parts {
+		if sensitivePathSegments[part] {
+			return true
+		}
+	}
+	// Also catch any filename that looks like an environment/credential file.
+	// This runs in addition to the segment map above to catch files like
+	// ".env.local", ".npmrc", ".pypirc", ".aws/credentials", etc.
+	base := filepath.Base(rel)
+	switch base {
+	case ".env", ".env.local", ".env.production", ".env.development",
+		".npmrc", ".pypirc", ".pip", ".aws", ".azure", ".gcloud",
+		"credentials", "credentials.json", "token", "token.json",
+		"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+		"known_hosts", "authorized_keys", "config":
+		return true
+	}
+	return false
+}
+
+// checkPublishPath is the centralized publish-path policy. It applies to
+// every operation that exposes a local path to a remote caller: list, static
+// GET, browser GET, download, upload, and delete. Hidden files are denied
+// unless ShowHidden is enabled. Sensitive paths (.git, .ssh, .gnupg, and
+// credential files) are always denied regardless of ShowHidden.
+//
+// Returns a nil error if the path may be served, or a non-nil error otherwise.
+func (fb *BuiltinFileBrowser) checkPublishPath(rel string) error {
+	if isSensitivePath(rel) {
+		return fmt.Errorf("sensitive path denied")
+	}
+	if isHiddenPath(rel) && !fb.cfg.ShowHidden {
+		return fmt.Errorf("hidden path denied")
+	}
+	return nil
+}
+
+// handleDownload serves a file for download. Hidden files and sensitive paths
+// are rejected by default.
 func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -436,8 +510,8 @@ func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Requ
 	}
 	relPath := strings.TrimPrefix(r.URL.Path, "/download")
 
-	// Reject hidden files by default (e.g. .env, .git/config).
-	if isHiddenPath(relPath) && !fb.cfg.ShowHidden {
+	// Apply the centralized publish-path policy (hidden + sensitive).
+	if err := fb.checkPublishPath(relPath); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -489,35 +563,45 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 		dir = "/"
 	}
 
-	// Reject hidden targets by default.
-	if isHiddenPath(dir) && !fb.cfg.ShowHidden {
+	// Apply the centralized publish-path policy to the directory.
+	if err := fb.checkPublishPath(dir); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
+	// Validate the upload directory (parent) separately from the final filename.
+	// The destination file does not exist yet, so it must not be validated as
+	// an existing path.
 	destDir, err := fb.safePath(dir)
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	// Sanitize filename
+	// Sanitize the filename from the upload header. Reject empty, hidden or
+	// path-traversal filenames using the centralized publish-path policy.
 	cleanName := filepath.Base(header.Filename)
-	destPath := filepath.Join(destDir, cleanName)
-
-	// Verify dest is still within root
-	_, err = fb.safePath(filepath.Join(dir, cleanName))
-	if err != nil {
+	if cleanName == "" || cleanName == "." || cleanName == ".." {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := fb.checkPublishPath(cleanName); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	// Ensure the sanitized name does not escape via a trick (e.g. "foo/../../../etc/passwd").
+	if cleanName != filepath.Clean(cleanName) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	destPath := filepath.Join(destDir, cleanName)
 
 	// Create a temporary file in the same directory, then atomically rename.
 	// This prevents a copy failure from truncating or overwriting the destination.
 	// We use RENAME_NOREPLACE to prevent silent overwrites of existing files.
 	tmpFile, err := os.CreateTemp(destDir, ".upload-*")
 	if err != nil {
-		http.Error(w, "creating temp file: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
 	tmpPath := tmpFile.Name()
@@ -529,26 +613,26 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 	}()
 
 	if _, err := io.Copy(tmpFile, file); err != nil {
-		http.Error(w, "writing file: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
 	// Sync BEFORE close — you cannot sync a closed file.
 	if err := tmpFile.Sync(); err != nil {
-		http.Error(w, "syncing file: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
 	if err := tmpFile.Chmod(0644); err != nil {
-		http.Error(w, "chmod file: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
 	if err := tmpFile.Close(); err != nil {
-		http.Error(w, "closing temp file: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
 
 	// Rename atomically with RENAME_NOREPLACE to prevent silent overwrites.
 	if err := renameNoReplace(tmpPath, destPath); err != nil {
-		http.Error(w, "renaming file: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "upload failed", http.StatusInternalServerError)
 		return
 	}
 
@@ -575,8 +659,8 @@ func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Reject hidden targets by default.
-	if isHiddenPath(r.Form.Get("path")) && !fb.cfg.ShowHidden {
+	// Apply the centralized publish-path policy to the delete target.
+	if err := fb.checkPublishPath(r.Form.Get("path")); err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -592,7 +676,7 @@ func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Reques
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, "checking path", http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if info.IsDir() {
@@ -600,7 +684,7 @@ func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := os.Remove(target); err != nil {
-		http.Error(w, "deleting file", http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -617,9 +701,15 @@ func (fb *BuiltinFileBrowser) handleBrowse(w http.ResponseWriter, r *http.Reques
 		relPath = "/"
 	}
 
+	// Apply the centralized publish-path policy to the directory being browsed.
+	if err := fb.checkPublishPath(relPath); err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	files, err := fb.listDir(relPath)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 

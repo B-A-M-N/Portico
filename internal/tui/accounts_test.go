@@ -79,6 +79,38 @@ func TestAnAccountCanBeSelectedAndRemoved(t *testing.T) {
 	}
 }
 
+// TestXOnProviderRowDoesNothing verifies the production regression: pressing
+// [x] on a provider heading must not silently remove that provider's first
+// account. Account removal is too destructive for implicit child selection.
+func TestXOnProviderRowDoesNothing(t *testing.T) {
+	client := &fakeClient{}
+	m := readyModel(client, accountSnapshot())
+	m.screen = ScreenProviders
+
+	// Cursor is on the provider row (index 0) by default.
+	row, ok := m.selectedScreenRow()
+	if !ok {
+		t.Fatal("no selected row")
+	}
+	if row.Kind != rowKindProvider {
+		t.Fatalf("expected provider row, got %v", row.Kind)
+	}
+
+	// Press [x] — must NOT open account removal or issue a removal command.
+	next, previewCmd := m.Update(keyMsg("x"))
+	m = next.(Model)
+
+	if m.screen == ScreenAccountRemoval {
+		t.Fatal("x on provider row opened account removal screen")
+	}
+	if previewCmd != nil {
+		t.Fatal("x on provider row issued a command")
+	}
+	if client.removedAccount != "" {
+		t.Fatalf("x on provider row removed account %q", client.removedAccount)
+	}
+}
+
 // TestARefusalNamesWhatMustChangeFirst pins that the connections still using an
 // account are shown, not just counted. A user told "3 connections still use
 // this" has to go and find them.
@@ -92,6 +124,11 @@ func TestARefusalNamesWhatMustChangeFirst(t *testing.T) {
 	m := readyModel(client, accountSnapshot())
 	m.screen = ScreenProviders
 
+	// Navigate to the first account row (past the provider heading).
+	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
+
+	// Now press [x] to attempt removal of the account under the cursor.
 	next, previewCmd := m.Update(keyMsg("x"))
 	m = next.(Model)
 	next, _ = m.Update(previewCmd())

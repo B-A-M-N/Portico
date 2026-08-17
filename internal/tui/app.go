@@ -70,8 +70,6 @@ type Model struct {
 	scroll scrollState
 
 	// Account lifecycle on the providers screen.
-	accountSelected          int
-	providerSelected         int
 	cursorIndex              int // providers screen cursor (flattened row index)
 	accountRequests          requestTracker
 	accountRemovalTarget     *accountRow

@@ -20,18 +20,31 @@ type Info struct {
 
 // Manager manages Cloudflare Tunnel lifecycle via the API.
 type Manager interface {
-	Create(ctx context.Context, accountID, name string) (*Info, error)
+	// CreateTunnel creates a remote tunnel and returns its durable ID.
+	// This is the mutation boundary — the tunnel ID is returned immediately
+	// so it can be journaled before any dependent credential retrieval.
+	CreateTunnel(ctx context.Context, accountID, name string) (*TunnelInfo, error)
+	// Get retrieves the current state of a tunnel.
 	Get(ctx context.Context, accountID, tunnelID string) (*TunnelState, error)
+	// ConfigureIngress configures tunnel ingress rules.
 	ConfigureIngress(ctx context.Context, accountID, tunnelID, hostname, originURL string) error
+	// GetToken retrieves the tunnel connector run token.
 	GetToken(ctx context.Context, accountID, tunnelID string) (string, error)
+	// Delete removes a Cloudflare Tunnel.
 	Delete(ctx context.Context, accountID, tunnelID string) error
+}
+
+// TunnelInfo is the durable identity of a tunnel after creation.
+type TunnelInfo struct {
+	ID   string
+	Name string
 }
 
 // TunnelState represents the observed state of a tunnel.
 type TunnelState struct {
 	ID     string
 	Name   string
-	Status string // "active", "degraded", "down", etc.
+	Status string
 }
 
 // APIManager implements Manager using the Cloudflare API.
@@ -44,8 +57,11 @@ func NewAPIManager(client *cf.API) *APIManager {
 	return &APIManager{client: client}
 }
 
-// Create creates a remotely-managed Cloudflare Tunnel.
-func (m *APIManager) Create(ctx context.Context, accountID, name string) (*Info, error) {
+// CreateTunnel creates a remote Cloudflare Tunnel and returns its durable ID.
+// On success the tunnel ID is returned immediately; callers must journal this
+// ID before proceeding to credential retrieval so partial failures are
+// recoverable.
+func (m *APIManager) CreateTunnel(ctx context.Context, accountID, name string) (*TunnelInfo, error) {
 	secret := base64.StdEncoding.EncodeToString([]byte(uuid.New().String()))
 
 	rc := cf.AccountIdentifier(accountID)
@@ -67,16 +83,22 @@ func (m *APIManager) Create(ctx context.Context, accountID, name string) (*Info,
 		return nil, fmt.Errorf("transient: %w", err)
 	}
 
-	token, err := m.client.GetTunnelToken(ctx, rc, tunnel.ID)
+	return &TunnelInfo{ID: tunnel.ID, Name: tunnel.Name}, nil
+}
+
+// Create creates a tunnel and retrieves its token atomically. It is retained
+// for backward compatibility but callers should prefer CreateTunnel + GetToken
+// so that tunnel creation is journaled before token retrieval.
+func (m *APIManager) Create(ctx context.Context, accountID, name string) (*Info, error) {
+	tunnel, err := m.CreateTunnel(ctx, accountID, name)
+	if err != nil {
+		return nil, err
+	}
+	token, err := m.GetToken(ctx, accountID, tunnel.ID)
 	if err != nil {
 		return nil, fmt.Errorf("getting tunnel token: %w", err)
 	}
-
-	return &Info{
-		TunnelID:   tunnel.ID,
-		TunnelName: tunnel.Name,
-		Token:      token,
-	}, nil
+	return &Info{TunnelID: tunnel.ID, TunnelName: tunnel.Name, Token: token}, nil
 }
 
 // Get retrieves the current state of a tunnel.

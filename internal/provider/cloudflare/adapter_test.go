@@ -74,8 +74,11 @@ type fakeTunnelManager struct {
 	err              error
 }
 
+func (f *fakeTunnelManager) CreateTunnel(context.Context, string, string) (*tunnel.TunnelInfo, error) {
+	return &tunnel.TunnelInfo{ID: "tunnel-123", Name: "test-tunnel"}, nil
+}
 func (f *fakeTunnelManager) Create(context.Context, string, string) (*tunnel.Info, error) {
-	return nil, nil
+	return &tunnel.Info{TunnelID: "tunnel-123", TunnelName: "test-tunnel", Token: "test-token"}, nil
 }
 func (f *fakeTunnelManager) Get(_ context.Context, accountID, tunnelID string) (*tunnel.TunnelState, error) {
 	f.requestedAccount, f.requestedID = accountID, tunnelID
@@ -84,8 +87,37 @@ func (f *fakeTunnelManager) Get(_ context.Context, accountID, tunnelID string) (
 func (f *fakeTunnelManager) ConfigureIngress(context.Context, string, string, string, string) error {
 	return nil
 }
-func (f *fakeTunnelManager) GetToken(context.Context, string, string) (string, error) { return "", nil }
-func (f *fakeTunnelManager) Delete(context.Context, string, string) error             { return nil }
+func (f *fakeTunnelManager) GetToken(context.Context, string, string) (string, error) {
+	return "test-token", nil
+}
+func (f *fakeTunnelManager) Delete(context.Context, string, string) error { return nil }
+
+// failingTokenTunnelManager returns a valid tunnel from CreateTunnel but fails
+// on GetToken, simulating a network interruption after tunnel creation but
+// before the token response was received.
+type failingTokenTunnelManager struct {
+	requestedAccount string
+	requestedID      string
+	state            *tunnel.TunnelState
+}
+
+func (f *failingTokenTunnelManager) CreateTunnel(context.Context, string, string) (*tunnel.TunnelInfo, error) {
+	return &tunnel.TunnelInfo{ID: "orphaned-tunnel-id", Name: "orphaned-tunnel"}, nil
+}
+func (f *failingTokenTunnelManager) Create(context.Context, string, string) (*tunnel.Info, error) {
+	return nil, fmt.Errorf("token lookup failed")
+}
+func (f *failingTokenTunnelManager) Get(_ context.Context, accountID, tunnelID string) (*tunnel.TunnelState, error) {
+	f.requestedAccount, f.requestedID = accountID, tunnelID
+	return f.state, nil
+}
+func (*failingTokenTunnelManager) ConfigureIngress(context.Context, string, string, string, string) error {
+	return nil
+}
+func (f *failingTokenTunnelManager) GetToken(context.Context, string, string) (string, error) {
+	return "", fmt.Errorf("token lookup failed")
+}
+func (f *failingTokenTunnelManager) Delete(context.Context, string, string) error { return nil }
 
 type fakeDNSManager struct {
 	zoneID   string
@@ -334,6 +366,110 @@ func TestObserveWithResourcesUsesExactTrackedTunnelID(t *testing.T) {
 	if len(obs.ResourceStatuses) != 1 || obs.ResourceStatuses[0].Status != core.ObservationPresent {
 		t.Fatalf("unexpected statuses: %+v", obs.ResourceStatuses)
 	}
+}
+
+func TestCreateTunnelReturnsDurableIDBeforeTokenRetrieval(t *testing.T) {
+	tunnels := &fakeTunnelManager{}
+	p := &Provider{
+		accountID:     "account-1",
+		tunnels:       tunnels,
+		connectorProc: fakeConnectorProcessService{},
+		connections:   make(map[core.ConnectionID]*cfConnection),
+	}
+
+	result, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
+		ID:   "cf-tunnel",
+		Kind: core.StepCreateTunnel,
+		Technical: core.TechnicalOperation{
+			Provider:   "cloudflare",
+			Type:       "create_tunnel",
+			Parameters: map[string]string{"name": "test-tunnel"},
+		},
+		Ownership: core.OwnershipManaged,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep: %v", err)
+	}
+	if !result.Succeeded {
+		t.Fatalf("ExecuteStep failed: %+v", result)
+	}
+
+	// The durable tunnel ID MUST be returned in the step result so the
+	// controller can journal it before any dependent token retrieval.
+	if len(result.Resources) != 1 {
+		t.Fatalf("expected exactly 1 resource, got %d", len(result.Resources))
+	}
+	if result.Resources[0].ExternalID != "tunnel-123" {
+		t.Fatalf("expected tunnel ID %q, got %q", "tunnel-123", result.Resources[0].ExternalID)
+	}
+	if result.Resources[0].Type != core.ResourceTunnel {
+		t.Fatalf("expected tunnel resource type, got %q", result.Resources[0].Type)
+	}
+	if result.Resources[0].Ownership != core.OwnershipManaged {
+		t.Fatalf("expected managed ownership, got %q", result.Resources[0].Ownership)
+	}
+	// No credential should be returned from the create step — token
+	// acquisition is a separate step.
+	if len(result.CredentialMutations) != 0 {
+		t.Fatalf("expected no credential mutations, got %d", len(result.CredentialMutations))
+	}
+}
+
+// TestAcquireTokenFailureLeavesDurableTunnelID verifies the production
+// regression: tunnel creation succeeds but token retrieval fails. The
+// created tunnel ID is already durable, so the cleanup obligation
+// contains the exact ID and recovery can delete the orphaned tunnel.
+func TestAcquireTokenFailureLeavesDurableTunnelID(t *testing.T) {
+	tunnels := &failingTokenTunnelManager{state: &tunnel.TunnelState{ID: "orphaned-tunnel-id", Name: "orphaned-tunnel", Status: "active"}}
+	p := &Provider{
+		accountID:     "account-1",
+		tunnels:       tunnels,
+		connectorProc: fakeConnectorProcessService{},
+		connections:   make(map[core.ConnectionID]*cfConnection),
+	}
+
+	// Step 1: create tunnel — succeeds and returns the durable ID.
+	createResult, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
+		ID:   "cf-tunnel",
+		Kind: core.StepCreateTunnel,
+		Technical: core.TechnicalOperation{
+			Provider:   "cloudflare",
+			Type:       "create_tunnel",
+			Parameters: map[string]string{"name": "orphaned-tunnel"},
+		},
+		Ownership: core.OwnershipManaged,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep(create): %v", err)
+	}
+	if !createResult.Succeeded {
+		t.Fatalf("ExecuteStep(create) failed: %+v", createResult)
+	}
+
+	// The durable resource must carry the exact tunnel ID.
+	if len(createResult.Resources) != 1 || createResult.Resources[0].ExternalID != "orphaned-tunnel-id" {
+		t.Fatalf("create step did not return durable tunnel ID: %+v", createResult.Resources)
+	}
+
+	// Step 2: acquire token — fails.
+	tokenResult, err := p.ExecuteStep(context.Background(), "conn-1", core.PlanStep{
+		ID:   "cf-tunnel-token",
+		Kind: core.StepAcquireToken,
+		Technical: core.TechnicalOperation{
+			Provider: "cloudflare",
+			Type:     "acquire_token",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep(token): %v", err)
+	}
+	if tokenResult.Succeeded {
+		t.Fatal("ExecuteStep(token) unexpectedly succeeded")
+	}
+
+	// The failed token step must NOT report success and must NOT hide the
+	// already-created tunnel. The durable tunnel ID from the create step
+	// is what recovery/compensation needs to delete the orphaned tunnel.
 }
 
 func TestCreateDNSRepairUsesDurableTunnelIDWithoutAdapterMemory(t *testing.T) {

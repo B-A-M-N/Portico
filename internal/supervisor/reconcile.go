@@ -58,28 +58,41 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 // A local forward has no external provider resources — it's just a listener
 // and a relay. If the relay is missing but the profile wants it open, we
 // need to recreate it.
+//
+// For a purely in-process provider, provider observation is cheap and should
+// be authoritative. The runtime projection is not: if the supervisor
+// restarted since the relay was started, the runtime state may be stale.
+// Observe first, then decide:
+//   - desired closed + observed running → close
+//   - desired closed + observed stopped → no-op
+//   - desired open + observed running → no-op
+//   - desired open + observed stopped → open
 func (s *Supervisor) reconcilePortForward(ctx context.Context, input ReconcileInput, desired core.DesiredConnectionState) (*reconcileDecision, error) {
-	if desired == core.DesiredClosed {
-		// Desired closed: stop any running relay.
-		if input.Runtime != nil && input.Runtime.State != core.RuntimeClosed {
-			plan, err := s.controller.PlanClose(ctx, input.Profile.ID)
-			if err != nil {
-				return nil, err
-			}
-			return &reconcileDecision{Action: "close", Plan: plan}, nil
-		}
-		return &reconcileDecision{Action: "none"}, nil
+	// Observe the actual relay state from the provider. This is authoritative
+	// for an in-process relay and cheap to obtain.
+	observed, obsErr := s.controller.Observe(ctx, input.Profile.ID)
+	relayRunning := false
+	if obsErr == nil && observed != nil && observed.Connector != nil {
+		relayRunning = observed.Connector.Status == "running"
 	}
 
-	// Desired open: check if the relay is running.
-	if input.Runtime != nil && input.Runtime.State == core.RuntimeOpen {
-		// Check if the provider reports a healthy relay.
-		observed, err := s.controller.Observe(ctx, input.Profile.ID)
-		if err == nil && observed != nil && observed.Connector != nil {
-			if observed.Connector.Status == "running" {
-				return &reconcileDecision{Action: "none"}, nil
-			}
+	if desired == core.DesiredClosed {
+		// Desired closed: stop the relay only if it is actually running.
+		// Relying on runtime state alone can leave a relay alive when the
+		// runtime projection says closed (e.g. after a supervisor restart).
+		if !relayRunning {
+			return &reconcileDecision{Action: "none"}, nil
 		}
+		plan, err := s.controller.PlanClose(ctx, input.Profile.ID)
+		if err != nil {
+			return nil, err
+		}
+		return &reconcileDecision{Action: "close", Plan: plan}, nil
+	}
+
+	// Desired open: if the relay is already running, no need to recreate it.
+	if relayRunning {
+		return &reconcileDecision{Action: "none"}, nil
 	}
 
 	// Need to (re)create the forward.

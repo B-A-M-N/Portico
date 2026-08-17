@@ -163,7 +163,13 @@ const (
 	// resource is created. Provider mutations are externally visible and
 	// outlive a failed operation, so a dead origin must stop the plan before
 	// a tunnel, DNS record or Access policy is published for it.
-	StepVerifyOrigin          StepKind = "verify_origin"
+	StepVerifyOrigin StepKind = "verify_origin"
+	// StepAcquireToken retrieves the connector run token for a previously
+	// created tunnel. It is deliberately separate from tunnel creation so
+	// that the durable tunnel ID is journaled before any dependent token
+	// retrieval; a failed token fetch is then recoverable rather than
+	// orphaning an unmanaged tunnel.
+	StepAcquireToken          StepKind = "acquire_token"
 	StepVerifyConnector       StepKind = "verify_connector"
 	StepVerifyEndpoint        StepKind = "verify_endpoint"
 	StepStopConnector         StepKind = "stop_connector"

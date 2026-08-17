@@ -496,6 +496,21 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 							Type:     "delete_tunnel",
 						},
 					}},
+				// Token acquisition is a separate step from tunnel creation so
+				// that the tunnel ID is journaled before the token is fetched.
+				// A failed token fetch is then recoverable rather than orphaning
+				// an unmanaged tunnel.
+				core.PlanStep{ID: "cf-tunnel-token", Kind: core.StepAcquireToken, Summary: "Acquire tunnel connector token",
+					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "acquire_token"},
+					Destructive: false, Irreversible: false,
+					Compensation: &core.CompensationStep{
+						ID:   "comp-cf-tunnel-token",
+						Kind: core.StepDeleteTunnel,
+						Technical: core.TechnicalOperation{
+							Provider: "cloudflare",
+							Type:     "delete_tunnel",
+						},
+					}},
 				core.PlanStep{ID: "cf-route", Kind: core.StepConfigureRoute, Summary: fmt.Sprintf("Configure tunnel route for %s", hostname),
 					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "configure_route", Parameters: map[string]string{"hostname": hostname, "origin_url": originURL}},
 					Destructive: false, Irreversible: false,
@@ -1100,12 +1115,12 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		if tunnelName == "" {
 			tunnelName = fmt.Sprintf("portico-%s", safeShortID(string(connectionID), 8))
 		}
-		info, err := p.tunnels.Create(ctx, p.accountID, tunnelName)
+		tunnelInfo, err := p.tunnels.CreateTunnel(ctx, p.accountID, tunnelName)
 		if err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
 		}
 		p.mu.Lock()
-		conn.tunnel = info
+		conn.tunnel = &tunnel.Info{TunnelID: tunnelInfo.ID, TunnelName: tunnelInfo.Name}
 		p.mu.Unlock()
 		return core.StepResult{
 			StepID:    step.ID,
@@ -1113,13 +1128,30 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			Resources: []core.ProviderResource{{
 				ConnectionID: connectionID,
 				Type:         core.ResourceTunnel,
-				ExternalID:   info.TunnelID,
+				ExternalID:   tunnelInfo.ID,
 				ProviderID:   "cloudflare",
 				Ownership:    core.OwnershipManaged,
 			}},
+		}, nil
+
+	case core.StepAcquireToken:
+		p.mu.RLock()
+		tun := conn.tunnel
+		p.mu.RUnlock()
+		if tun == nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false,
+				Error: fmt.Errorf("cannot acquire token: no tunnel created yet")}, nil
+		}
+		token, err := p.tunnels.GetToken(ctx, p.accountID, tun.TunnelID)
+		if err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
+		}
+		return core.StepResult{
+			StepID:    step.ID,
+			Succeeded: true,
 			CredentialMutations: []core.CredentialMutation{{
-				TunnelID: info.TunnelID,
-				Secret:   []byte(info.Token),
+				TunnelID: tun.TunnelID,
+				Secret:   []byte(token),
 			}},
 		}, nil
 
