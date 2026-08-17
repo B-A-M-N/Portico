@@ -10,12 +10,12 @@ import (
 // TestHealthReportCompute verifies the three-state health logic.
 func TestHealthReportCompute(t *testing.T) {
 	tests := []struct {
-		name     string
-		process  CheckState
+		name      string
+		process   CheckState
 		transport CheckState
-		service  CheckState
-		desired  DesiredConnectionState
-		want     HealthState
+		service   CheckState
+		desired   DesiredConnectionState
+		want      HealthState
 	}{
 		{
 			name:      "all ok, desired open",

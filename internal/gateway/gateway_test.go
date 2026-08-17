@@ -14,8 +14,8 @@ import (
 // TestGatewayStarts verifies the gateway starts and returns an address.
 func TestGatewayStarts(t *testing.T) {
 	g, err := New(Config{
-		Upstream:      "http://127.0.0.1:18080",
-		AuthRequired:  false,
+		Upstream:     "http://127.0.0.1:18080",
+		AuthRequired: false,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

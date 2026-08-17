@@ -28,11 +28,11 @@ const (
 type CheckState string
 
 const (
-	CheckPass        CheckState = "pass"
-	CheckFail        CheckState = "fail"
-	CheckUnknown     CheckState = "unknown"
+	CheckPass          CheckState = "pass"
+	CheckFail          CheckState = "fail"
+	CheckUnknown       CheckState = "unknown"
 	CheckNotApplicable CheckState = "not_applicable"
-	CheckSkipped     CheckState = "skipped"
+	CheckSkipped       CheckState = "skipped"
 )
 
 // HealthCheck is the result of a single health check.

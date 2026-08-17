@@ -72,12 +72,12 @@ type Gateway struct {
 type GatewayState string
 
 const (
-	GatewayStateNew       GatewayState = "new"
-	GatewayStateStarting  GatewayState = "starting"
-	GatewayStateReady     GatewayState = "ready"
-	GatewayStateStopping  GatewayState = "stopping"
-	GatewayStateStopped   GatewayState = "stopped"
-	GatewayStateFailed    GatewayState = "failed"
+	GatewayStateNew      GatewayState = "new"
+	GatewayStateStarting GatewayState = "starting"
+	GatewayStateReady    GatewayState = "ready"
+	GatewayStateStopping GatewayState = "stopping"
+	GatewayStateStopped  GatewayState = "stopped"
+	GatewayStateFailed   GatewayState = "failed"
 )
 
 // Config configures the Portico Gateway.
@@ -134,9 +134,9 @@ func New(cfg Config) (*Gateway, error) {
 
 	// Create the reverse proxy.
 	g.proxy = &httputil.ReverseProxy{
-		Director: g.director,
+		Director:       g.director,
 		ModifyResponse: g.modifyResponse,
-		ErrorHandler: g.errorHandler,
+		ErrorHandler:   g.errorHandler,
 	}
 
 	return g, nil
