@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/google/uuid"
@@ -45,20 +46,27 @@ func NewAPIManager(client *cf.API) *APIManager {
 
 // Create creates a remotely-managed Cloudflare Tunnel.
 func (m *APIManager) Create(ctx context.Context, accountID, name string) (*Info, error) {
-	// Generate a random tunnel secret.
 	secret := base64.StdEncoding.EncodeToString([]byte(uuid.New().String()))
 
 	rc := cf.AccountIdentifier(accountID)
 	tunnel, err := m.client.CreateTunnel(ctx, rc, cf.TunnelCreateParams{
 		Name:      name,
 		Secret:    secret,
-		ConfigSrc: "cloudflare", // Remotely managed.
+		ConfigSrc: "cloudflare",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("creating tunnel: %w", err)
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) {
+			switch {
+			case cfErr.StatusCode == http.StatusUnauthorized || cfErr.StatusCode == http.StatusForbidden:
+				return nil, fmt.Errorf("unauthorized: %w", err)
+			case cfErr.StatusCode == http.StatusTooManyRequests:
+				return nil, fmt.Errorf("rate limited: %w", err)
+			}
+		}
+		return nil, fmt.Errorf("transient: %w", err)
 	}
 
-	// Retrieve the run token.
 	token, err := m.client.GetTunnelToken(ctx, rc, tunnel.ID)
 	if err != nil {
 		return nil, fmt.Errorf("getting tunnel token: %w", err)
@@ -77,15 +85,20 @@ func (m *APIManager) Get(ctx context.Context, accountID, tunnelID string) (*Tunn
 	rc := cf.AccountIdentifier(accountID)
 	tunnel, err := m.client.GetTunnel(ctx, rc, tunnelID)
 	if err != nil {
-		// errors.As, not a type assertion: the client wraps its errors, so a
-		// direct assertion silently fails and a deleted tunnel is reported
-		// as a failed lookup instead of an absent one. One of the four places
-		// that made this check had already been corrected; the others had not.
 		var cfErr *cf.Error
-		if errors.As(err, &cfErr) && cfErr.StatusCode == 404 {
-			return nil, nil
+		if errors.As(err, &cfErr) {
+			switch {
+			case cfErr.StatusCode == http.StatusNotFound:
+				return nil, nil
+			case cfErr.StatusCode == http.StatusUnauthorized || cfErr.StatusCode == http.StatusForbidden:
+				return nil, fmt.Errorf("unauthorized: %w", err)
+			case cfErr.StatusCode == http.StatusTooManyRequests:
+				return nil, fmt.Errorf("rate limited: %w", err)
+			}
 		}
-		return nil, fmt.Errorf("getting tunnel: %w", err)
+		// 5xx, network failures, timeouts, cancellations, and anything
+		// unclassified are transient — never treated as missing.
+		return nil, fmt.Errorf("transient: %w", err)
 	}
 	return &TunnelState{
 		ID:     tunnel.ID,
@@ -130,14 +143,26 @@ func (m *APIManager) GetToken(ctx context.Context, accountID, tunnelID string) (
 // Delete removes a Cloudflare Tunnel.
 // It first cleans up any lingering connections so the delete doesn't fail
 // with "active connections" errors after cloudflared has been stopped.
+// Returns nil if the tunnel is already gone (404).
 func (m *APIManager) Delete(ctx context.Context, accountID, tunnelID string) error {
 	rc := cf.AccountIdentifier(accountID)
 
-	// Clean up stale connections before deletion.
 	_ = m.client.CleanupTunnelConnections(ctx, rc, tunnelID)
 
-	if err := m.client.DeleteTunnel(ctx, rc, tunnelID); err != nil {
-		return fmt.Errorf("deleting tunnel: %w", err)
+	err := m.client.DeleteTunnel(ctx, rc, tunnelID)
+	if err != nil {
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) {
+			switch {
+			case cfErr.StatusCode == http.StatusNotFound:
+				return nil // already gone
+			case cfErr.StatusCode == http.StatusUnauthorized || cfErr.StatusCode == http.StatusForbidden:
+				return fmt.Errorf("unauthorized: %w", err)
+			case cfErr.StatusCode == http.StatusTooManyRequests:
+				return fmt.Errorf("rate limited: %w", err)
+			}
+		}
+		return fmt.Errorf("transient: %w", err)
 	}
 	return nil
 }

@@ -32,11 +32,7 @@ internal/
   discovery/         # ss-based enumeration + HTTP probing
   diagnostics/       # Route-segment diagnostic engine
   credentials/       # Token resolution (env, keyring, memory)
-  session/           # Legacy Flare sessions
-  tunnel/            # cloudflared subprocess wrapper
-  app/               # XDG path resolution + bootstrap
-  testutil/          # Test helpers
-cmd/                 # Legacy flare-cli Cobra commands (hidden under "portico legacy")
+  tunnel/            # Quick Tunnel URL parser
 ```
 
 ## Architecture
