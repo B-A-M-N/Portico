@@ -258,11 +258,68 @@ func (p *ConnectionProfile) ExpectsPublicAddress() bool {
 	return p.Spec.ServiceExposure.Exposure.Mode != ExposurePrivate
 }
 
-// NormalizeProfile applies semantic defaults to a profile. It only fills
-// fields that represent user preferences (desired state, disconnect policy).
-// Server-owned creation metadata (revision, timestamps) is set separately by
-// CreateProfile.
+// NormalizeProfile applies semantic defaults to a profile. It fills fields
+// that have canonical defaults so every subsequent reader sees identical
+// values regardless of which subsystem wrote the profile. Server-owned
+// creation metadata (revision, timestamps) is set separately by CreateProfile.
+//
+// Normalization order matters: kind and source defaults are applied first,
+// then exposure/protocol/protection defaults, then desired state and
+// lifecycle. This ensures capability validation (which reads the normalized
+// fields) sees canonical values.
 func NormalizeProfile(profile *ConnectionProfile, now time.Time) {
+	if profile == nil {
+		return
+	}
+
+	// Default kind to service_exposure for backward compatibility.
+	if profile.Kind == "" {
+		profile.Kind = ConnectionServiceExposure
+	}
+
+	// Apply source kind default (must match the spec arm).
+	if profile.Spec.ServiceExposure != nil {
+		if profile.Spec.ServiceExposure.Source.Kind == "" {
+			profile.Spec.ServiceExposure.Source.Kind = SourceExisting
+		}
+
+		// Normalize exposure mode: empty means temporary_public (the creation default).
+		if profile.Spec.ServiceExposure.Exposure.Mode == "" {
+			profile.Spec.ServiceExposure.Exposure.Mode = ExposureTemporary
+		}
+
+		// Normalize exposure protocol: empty means HTTP.
+		if profile.Spec.ServiceExposure.Exposure.Protocol == "" {
+			profile.Spec.ServiceExposure.Exposure.Protocol = ProtocolHTTP
+		}
+
+		// Normalize protection: empty means none.
+		if profile.Spec.ServiceExposure.Protection.Kind == "" {
+			profile.Spec.ServiceExposure.Protection.Kind = ProtectionNone
+		}
+
+		// Normalize source protocol based on source kind.
+		switch profile.Spec.ServiceExposure.Source.Kind {
+		case SourceExisting:
+			if profile.Spec.ServiceExposure.Source.Existing != nil &&
+				profile.Spec.ServiceExposure.Source.Existing.Protocol == "" {
+				profile.Spec.ServiceExposure.Source.Existing.Protocol = ProtocolHTTP
+			}
+		case SourceCommand:
+			// Command origins are always HTTP (Portico-managed commands don't terminate TLS).
+			if profile.Spec.ServiceExposure.Source.Command != nil &&
+				profile.Spec.ServiceExposure.Source.Command.Protocol == "" {
+				profile.Spec.ServiceExposure.Source.Command.Protocol = ProtocolHTTP
+			}
+		case SourceMCP:
+			if profile.Spec.ServiceExposure.Source.MCP != nil {
+				if profile.Spec.ServiceExposure.Source.MCP.Transport == "" {
+					profile.Spec.ServiceExposure.Source.MCP.Transport = MCPTransportHTTP
+				}
+			}
+		}
+	}
+
 	if profile.Desired == "" {
 		profile.Desired = DesiredClosed
 	}
