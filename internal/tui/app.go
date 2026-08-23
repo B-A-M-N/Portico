@@ -2271,51 +2271,78 @@ func (m *Model) renderError() string {
 	return b.String()
 }
 
+// renderRecovery draws the screen shown when the supervisor cannot be reached.
+//
+// It leads with what happened in the user's terms, then what they can do about
+// it, and keeps the technical detail last. The supervisor is the part of Portico
+// that owns connections and outlives the interface, so its absence has to be
+// explained rather than reported as an error code.
 func (m *Model) renderRecovery() string {
 	var b strings.Builder
 	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
 	b.WriteString("\n\n")
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Intervention).
-		Render("Cannot connect to Portico"))
-	b.WriteString("\n")
 
-	// User-facing explanation first.
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Text).
-		Render("Portico's background process (the supervisor) is not reachable."))
+	// The structured error is used when there is one: it already carries the
+	// explanation and the recovery actions, and reducing it to one line here was
+	// the defect finding 29 describes.
+	ufe := describeError(m.err)
+	summary := ufe.Summary
+	if summary == "" {
+		summary = "Portico cannot reach its supervisor"
+	}
+	b.WriteString(m.theme.Style("intervention").Render(summary))
 	b.WriteString("\n\n")
 
-	// Concise technical detail as secondary information.
-	if m.err != nil {
-		b.WriteString(lipgloss.NewStyle().
-			Foreground(m.theme.Muted).
-			Render(fmt.Sprintf("Reason: %s\n", m.err)))
+	explanation := ufe.Explanation
+	if explanation == "" {
+		explanation = "The supervisor is the part of Portico that holds your connections and keeps " +
+			"them running after this window closes. Until it answers, nothing can be read or changed."
+	}
+	b.WriteString(explanation)
+	b.WriteString("\n\n")
+
+	b.WriteString(m.theme.Style("title").Render("What you can do"))
+	b.WriteString("\n")
+	// The supervisor's own recovery actions come first when it supplied any:
+	// they are specific to what actually failed.
+	for _, action := range ufe.NextActions {
+		b.WriteString("  • " + action + "\n")
+	}
+	b.WriteString("  • Press r to try again. Portico starts the supervisor, checks that it " +
+		"answers, and loads your connections.\n")
+	if m.bootstrapper != nil {
+		if logPath := m.bootstrapper.SupervisorLogPath(); logPath != "" {
+			b.WriteString("  • Read what the supervisor logged: " + logPath + "\n")
+		}
+		if socket := m.bootstrapper.SocketPath(); socket != "" {
+			b.WriteString("  • Check that this socket is writable by you: " + socket + "\n")
+		}
+	}
+
+	// Technical detail last, dimmed. It is what goes in a bug report and is not
+	// what the user is being asked to read.
+	if detail := recoveryTechnicalDetail(ufe, m.err); detail != "" {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render("Technical detail: " + detail))
 		b.WriteString("\n")
 	}
 
-	// Concrete next actions the user can take.
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Text).
-		Render("What you can do:"))
 	b.WriteString("\n")
-	b.WriteString("  • Press [r] to retry — Portico will try to start the supervisor again\n")
-	if m.bootstrapper != nil {
-		logPath := m.bootstrapper.SupervisorLogPath()
-		if logPath != "" {
-			b.WriteString(fmt.Sprintf("  • Check the supervisor log: %s\n", logPath))
-		}
-	}
+	b.WriteString(m.actionsFor(ScreenRecovery).footer(m.theme, m.width))
 	b.WriteString("\n")
-
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Stable).
-		Render("[r] Retry"))
-	b.WriteString("   ")
-	b.WriteString(lipgloss.NewStyle().
-		Foreground(m.theme.Muted).
-		Render("[q] Quit"))
 	return b.String()
+}
+
+// recoveryTechnicalDetail is the secondary evidence line.
+func recoveryTechnicalDetail(ufe UserFacingError, err error) string {
+	detail := ufe.Technical
+	if detail == "" && err != nil {
+		detail = err.Error()
+	}
+	if ufe.Code != "" {
+		detail = strings.TrimSpace(ufe.Code + " " + detail)
+	}
+	return detail
 }
 
 func (m *Model) renderHome() string {

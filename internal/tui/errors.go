@@ -58,6 +58,20 @@ func describeError(err error) UserFacingError {
 		return UserFacingError{}
 	}
 
+	// An error that is already a UserFacingError is already the answer. Rebuilding
+	// it from its Error() string — which is only the summary — discarded the
+	// explanation, the next actions and the technical detail, and replaced them
+	// with the generic "something unexpected happened". Every one of those fields
+	// was set by whoever raised it precisely so it would be shown.
+	var described *UserFacingError
+	if errors.As(err, &described) && described != nil {
+		return *described
+	}
+	var describedValue UserFacingError
+	if errors.As(err, &describedValue) {
+		return describedValue
+	}
+
 	// An error the supervisor described structurally is already actionable.
 	var apiErr *ipc.APIStatusError
 	if errors.As(err, &apiErr) {
