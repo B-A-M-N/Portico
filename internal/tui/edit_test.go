@@ -32,11 +32,18 @@ func exposedDetail() *ipc.ConnectionDetailDTO {
 
 func forwardDetail() *ipc.ConnectionDetailDTO {
 	return &ipc.ConnectionDetailDTO{
-		Summary:  ipc.ConnectionDTO{ID: "pf-1", Name: "database", Kind: "port_forward"},
+		Summary: ipc.ConnectionDTO{
+			ID: "pf-1", Name: "database", Kind: "port_forward",
+			DesiredState: "closed", UserState: "Closed", ProviderID: "portforward",
+		},
 		Revision: 3,
+		Driver:   ipc.DriverSelectionDTO{ProviderID: "portforward"},
 		DesiredSpec: ipc.ConnectionSpecDTO{
-			Kind:        "port_forward",
-			PortForward: &ipc.PortForwardDTO{LocalPort: 5432, RemoteHost: "db.internal", RemotePort: 5432},
+			Kind: "port_forward",
+			PortForward: &ipc.PortForwardDTO{
+				LocalPort: 15432, RemoteHost: "db.internal", RemotePort: 5432,
+				Protocol: "tcp", Direction: "local",
+			},
 		},
 		Lifecycle: ipc.LifecycleDTO{AutoStart: true, OnDisconnect: "close"},
 	}
@@ -66,9 +73,15 @@ func TestAConnectionCanBeEdited(t *testing.T) {
 		t.Fatalf("screen = %q, want the edit screen", m.screen)
 	}
 
-	// Change the hostname.
-	next, _ := m.Update(keyMsg("down"))
-	m = next.(Model)
+	// Change the hostname. The cursor is moved to it by identity rather than by a
+	// fixed number of presses: the row order is the connection kind's own, and a
+	// test that counts keystrokes breaks whenever a kind gains a property.
+	var next tea.Model
+	for i, row := range m.edit.rows() {
+		if row.field == editHostname {
+			m.edit.cursor = i
+		}
+	}
 	next, _ = m.Update(keyMsg("enter"))
 	m = next.(Model)
 	if !m.edit.typing {
@@ -659,7 +672,13 @@ func TestTurningProtectionOffClearsTheIdentities(t *testing.T) {
 // and nothing refused it at the time.
 func TestTheAccountIsChosenNotTyped(t *testing.T) {
 	m := editingModel(t, &fakeClient{}, exposedDetail())
+	// The provider's accounts are resolved from the snapshot when the detail
+	// lands, so the snapshot is installed and the context refreshed before the
+	// rows are read.
 	m.snapshot = accountSnapshot()
+	m.edit.setProviderContext(
+		m.providerCapabilities(m.edit.detail.Driver.ProviderID),
+		m.providerAccounts(m.edit.detail.Driver.ProviderID))
 
 	var accountRow editRow
 	for _, row := range m.edit.rows() {

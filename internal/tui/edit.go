@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,16 @@ const (
 	editAutoStart
 	editOnDisconnect
 	editAccount
+	// The properties below are ones the controller has always classified and the
+	// screen could not change, so a connection created with the wrong address or
+	// the wrong port could only be deleted and made again.
+	editSourceAddress
+	editSourceProtocol
+	editExposureMode
+	editLocalPort
+	editRemoteHost
+	editRemotePort
+	editForwardProtocol
 )
 
 // editState holds an edit in progress.
@@ -77,6 +88,23 @@ type editState struct {
 	autoStart      *bool
 	onDisconnect   *string
 	accountID      *string
+	// Service-exposure properties the controller classified and the screen could
+	// not change.
+	sourceAddress  *string
+	sourceProtocol *string
+	exposureMode   *string
+	// Port-forward properties, likewise.
+	localPort       *string
+	remoteHost      *string
+	remotePort      *string
+	forwardProtocol *string
+
+	// caps and usable are what the provider declares and what accounts it has,
+	// resolved by the root model from the snapshot. They decide which choices the
+	// screen offers, so a policy the provider cannot enforce is not offered and an
+	// account is named rather than identified.
+	caps   *ipc.CapabilitySetDTO
+	usable []ipc.ProviderAccountDTO
 }
 
 // editRow is one line on the edit screen.
@@ -90,6 +118,12 @@ type editRow struct {
 	// oversight.
 	editable bool
 	reason   string
+	// choices are the answers for a property with a fixed set of them, so the
+	// screen steps through what is actually available rather than a hardcoded
+	// cycle. Empty means the property is a free value, typed into a field.
+	choices []string
+	// explain says what the property means, in the words a user would use.
+	explain string
 }
 
 // changed reports whether the row carries an edit.
@@ -97,55 +131,33 @@ func (r editRow) changed() bool { return r.pending != "" && r.pending != r.curre
 
 // editRows describes what can be changed about this connection.
 //
-// Only a published service has an address or an access policy, so a port
-// forward is told that rather than offered a hostname field that its spec has
-// nowhere to put.
+// The properties are the connection kind's own: only a published service has an
+// address or an access policy, and only a forward has a local port. A kind is
+// told what it cannot carry rather than being offered a field its spec has
+// nowhere to put — and rather than the field being hidden, which makes the
+// absence look like an oversight.
 func (s *editState) rows() []editRow {
 	if s.detail == nil {
 		return nil
 	}
 	summary := s.detail.Summary
-	exposed := s.detail.DesiredSpec.ServiceExposure
 
 	rows := []editRow{{
 		field: editName, label: "Name", current: summary.Name,
 		pending: derefString(s.name), editable: true,
+		explain: "What this connection is called. Changing it affects nothing but the name.",
 	}}
 
-	if exposed != nil {
-		hostname := exposed.Exposure.RequestedAddress
-		if exposed.Exposure.Mode != "permanent_public" {
-			rows = append(rows, editRow{
-				field: editHostname, label: "Hostname", current: hostname,
-				editable: false,
-				reason:   "this connection uses a temporary address, which the provider assigns",
-			})
-		} else {
-			rows = append(rows, editRow{
-				field: editHostname, label: "Hostname", current: hostname,
-				pending: derefString(s.hostname), editable: true,
-			})
-		}
+	switch {
+	case s.detail.DesiredSpec.ServiceExposure != nil:
+		rows = append(rows, s.serviceExposureRows()...)
+	case s.detail.DesiredSpec.PortForward != nil:
+		rows = append(rows, s.portForwardRows()...)
+	default:
 		rows = append(rows, editRow{
-			field: editProtection, label: "Protection", current: exposed.Protection.Kind,
-			pending: derefString(s.protection), editable: true,
-		})
-		if s.effectiveProtection() == "email_otp" {
-			rows = append(rows, editRow{
-				field: editProtectionRules, label: "Who can sign in",
-				current: screens.ProtectionRulesInput(
-					exposed.Protection.AllowedEmails, exposed.Protection.AllowedDomains),
-				pending:  derefString(s.protectionRules),
-				editable: true,
-			})
-		}
-	} else {
-		rows = append(rows, editRow{
-			field: editHostname, label: "Hostname", editable: false,
-			reason: "a " + screens.ConnectionKindLabel(summary.Kind) + " has no public address",
-		}, editRow{
-			field: editProtection, label: "Protection", editable: false,
-			reason: "access is not controlled by a policy for this kind of connection",
+			field: editHostname, label: "Address", editable: false,
+			reason: "Portico cannot yet change the properties of a " +
+				screens.ConnectionKindLabel(summary.Kind),
 		})
 	}
 
@@ -154,18 +166,32 @@ func (s *editState) rows() []editRow {
 			field: editAutoStart, label: "Open at startup",
 			current: yesNo(s.detail.Lifecycle.AutoStart), pending: pendingYesNo(s.autoStart),
 			editable: true,
+			explain:  "Whether this connection opens by itself whenever the supervisor starts.",
 		},
 		editRow{
-			field: editOnDisconnect, label: "On disconnect",
-			current: s.detail.Lifecycle.OnDisconnect, pending: derefString(s.onDisconnect),
+			field:    editOnDisconnect,
+			label:    "When Portico closes",
+			current:  onDisconnectWord(s.detail.Lifecycle.OnDisconnect),
+			pending:  onDisconnectWord(derefString(s.onDisconnect)),
+			choices:  []string{"keep_alive", "close"},
 			editable: true,
-		},
-		editRow{
-			field: editAccount, label: "Account", current: summary.ProviderAccountID,
-			pending: derefString(s.accountID), editable: true,
+			explain:  "Whether this connection keeps running after you quit Portico.",
 		},
 	)
+	rows = append(rows, s.accountRow())
 	return rows
+}
+
+// onDisconnectWord says what the disconnect policy does rather than naming it.
+func onDisconnectWord(policy string) string {
+	switch policy {
+	case "close":
+		return "closes with Portico"
+	case "keep_alive":
+		return "keeps running"
+	default:
+		return policy
+	}
 }
 
 // currentRow returns the row under the cursor, if there is one. Callers that
@@ -218,8 +244,9 @@ func (s *editState) request() ipc.UpdateConnectionRequest {
 			Options:    s.detail.Driver.Options,
 		}
 	}
-	if (s.hostname != nil || s.protection != nil || s.protectionRules != nil) &&
-		s.detail.DesiredSpec.ServiceExposure != nil {
+	if s.detail.DesiredSpec.ServiceExposure != nil &&
+		(s.hostname != nil || s.protection != nil || s.protectionRules != nil ||
+			s.exposureMode != nil || s.sourceAddress != nil || s.sourceProtocol != nil) {
 		// The spec arm is sent whole because the supervisor merges it into the
 		// existing profile field by field; the unchanged parts must therefore
 		// carry their current values rather than zeroes.
@@ -247,16 +274,64 @@ func (s *editState) request() ipc.UpdateConnectionRequest {
 			exposed.Protection.AllowedEmails = s.allowedEmails
 			exposed.Protection.AllowedDomains = s.allowedDomains
 		}
+		if s.exposureMode != nil {
+			exposed.Exposure.Mode = *s.exposureMode
+		}
+		// The source is sent only when it is what changed. It is rebuilt from the
+		// request, so sending it back unchanged would replace a spec the DTO cannot
+		// fully describe — a health check has no wire form at all — with a lesser
+		// copy of itself, as a side effect of changing something else.
+		if s.sourceAddress != nil || s.sourceProtocol != nil {
+			current := s.detail.DesiredSpec.ServiceExposure.Source.Existing
+			if current != nil {
+				existing := *current
+				if s.sourceAddress != nil {
+					existing.Address = *s.sourceAddress
+				}
+				if s.sourceProtocol != nil {
+					existing.Protocol = *s.sourceProtocol
+				}
+				exposed.Source = ipc.SourceDTO{Kind: "existing_service", Existing: &existing}
+			}
+		}
 		req.Spec = &exposed
+	}
+	if s.detail.DesiredSpec.PortForward != nil &&
+		(s.localPort != nil || s.remoteHost != nil || s.remotePort != nil ||
+			s.forwardProtocol != nil) {
+		// The forward arm, likewise sent whole: the supervisor merges it field by
+		// field, so an unchanged field must carry its current value rather than a
+		// zero that would be read as "no change" for a port and as port zero for a
+		// value that is genuinely set.
+		forward := *s.detail.DesiredSpec.PortForward
+		if s.localPort != nil {
+			if port, err := strconv.Atoi(*s.localPort); err == nil {
+				forward.LocalPort = port
+			}
+		}
+		if s.remoteHost != nil {
+			forward.RemoteHost = *s.remoteHost
+		}
+		if s.remotePort != nil {
+			if port, err := strconv.Atoi(*s.remotePort); err == nil {
+				forward.RemotePort = port
+			}
+		}
+		if s.forwardProtocol != nil {
+			forward.Protocol = *s.forwardProtocol
+		}
+		req.PortForward = &forward
 	}
 	return req
 }
 
-// protectionCycle is the order the protection choice steps through.
-var protectionCycle = []string{"none", "email_otp"}
-
-// disconnectCycle is the order the disconnect policy steps through.
-var disconnectCycle = []string{"keep_alive", "close"}
+// The protection and disconnect cycles are gone.
+//
+// They were fixed lists: protection stepped through none and email_otp whatever
+// the provider could enforce, so a provider with no access control was offered a
+// policy that fails at apply. Each property's answers now come from its row,
+// which derives them from what the provider declares — so the choices are the
+// ones that exist.
 
 // cycleNext returns the value after the current one, wrapping.
 func cycleNext(values []string, current string) string {
@@ -435,9 +510,17 @@ func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 		switch key {
 		case "enter":
 			m.commitEditField(m.edit.field.Value())
-			m.edit.typing = false
+			// The field stays open when the value was refused. Closing it would
+			// throw away what the user typed and put them back on a list, with
+			// the reason on screen and nothing to correct — so the next Enter
+			// reopened an empty field and the refusal looked like it had been
+			// forgotten.
+			if m.edit.err == "" {
+				m.edit.typing = false
+			}
 		case "esc":
 			m.edit.typing = false
+			m.edit.err = ""
 		}
 		return m, nil
 	}
@@ -496,12 +579,20 @@ func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 
 // beginEditingField opens the right editor for a property: a text field for a
 // free value, and an immediate step for a property with a fixed set of answers.
+// beginEditingField opens the right editor for a property: a step through the
+// available answers for one with a fixed set, and a text field for a free value.
+//
+// The choices come from the row, which derives them from what the provider
+// declares. Protection was a fixed cycle through three modes — offered to
+// providers that cannot enforce any of them — and the account was a cycle through
+// opaque IDs.
 func (m Model) beginEditingField(row editRow) Model {
 	m.edit.editing = row.field
 	m.edit.err = ""
 
-	switch row.field {
-	case editAutoStart:
+	// A yes/no property is its own thing: two answers, and the row renders them
+	// as words rather than as a list to step through.
+	if row.field == editAutoStart {
 		current := m.edit.detail.Lifecycle.AutoStart
 		if m.edit.autoStart != nil {
 			current = *m.edit.autoStart
@@ -509,66 +600,107 @@ func (m Model) beginEditingField(row editRow) Model {
 		next := !current
 		m.edit.autoStart = &next
 		return m
-
-	case editProtection:
-		current := m.edit.detail.DesiredSpec.ServiceExposure.Protection.Kind
-		if m.edit.protection != nil {
-			current = *m.edit.protection
-		}
-		next := cycleNext(protectionCycle, current)
-		m.edit.protection = &next
-		if next == "none" {
-			// The identities go with the policy that needed them.
-			m.edit.protectionRules = nil
-			m.edit.allowedEmails = nil
-			m.edit.allowedDomains = nil
-		}
-		return m
-
-	case editOnDisconnect:
-		current := m.edit.detail.Lifecycle.OnDisconnect
-		if m.edit.onDisconnect != nil {
-			current = *m.edit.onDisconnect
-		}
-		next := cycleNext(disconnectCycle, current)
-		m.edit.onDisconnect = &next
-		return m
 	}
 
-	if row.field == editAccount {
-		// A selector, not free text. Typing an account ID that does not exist
-		// saved a profile that failed the next time it was opened — and for a
-		// closed connection the edit plan may never consult the provider, so
-		// nothing refused it at the time.
-		accounts := m.usableAccounts()
-		if len(accounts) == 0 {
-			m.edit.err = "this provider has no usable account to move the connection to"
+	// A property with a declared set of answers steps to the next one.
+	if len(row.choices) > 0 {
+		if len(row.choices) == 1 {
+			// One answer is not a choice. Saying so is better than a keystroke
+			// that appears to do nothing.
+			m.edit.err = "there is only one available answer for " + row.label
 			return m
 		}
-		current := m.edit.effectiveAccount()
-		next := accounts[0].ID
-		for i, account := range accounts {
-			if account.ID == current {
-				next = accounts[(i+1)%len(accounts)].ID
-				break
-			}
-		}
-		m.edit.accountID = &next
+		next := cycleNext(row.choices, m.edit.currentChoice(row.field))
+		m.edit.setChoice(row.field, next)
 		return m
 	}
 
+	// Everything else is a free value, typed into a field prefilled with what it
+	// currently is — so correcting a long address does not mean retyping it.
 	m.edit.typing = true
 	m.edit.field = screens.NewField()
-	value := row.pending
-	if value == "" {
-		value = row.current
-	}
-	m.edit.field.SetValue(value)
+	m.edit.field.SetValue(m.edit.currentText(row))
 	m.edit.field.CursorEnd()
 	return m
 }
 
-// commitEditField records a typed value.
+// currentChoice is the value a choice-based property would have after this edit.
+func (s *editState) currentChoice(field editableField) string {
+	switch field {
+	case editProtection:
+		return s.effectiveProtection()
+	case editOnDisconnect:
+		if s.onDisconnect != nil {
+			return *s.onDisconnect
+		}
+		return s.detail.Lifecycle.OnDisconnect
+	case editExposureMode:
+		return s.effectiveExposureMode()
+	case editSourceProtocol:
+		if s.sourceProtocol != nil {
+			return *s.sourceProtocol
+		}
+		if exposed := s.detail.DesiredSpec.ServiceExposure; exposed != nil && exposed.Source.Existing != nil {
+			return exposed.Source.Existing.Protocol
+		}
+		return ""
+	case editForwardProtocol:
+		if s.forwardProtocol != nil {
+			return *s.forwardProtocol
+		}
+		if forward := s.detail.DesiredSpec.PortForward; forward != nil {
+			return forward.Protocol
+		}
+		return ""
+	case editAccount:
+		return s.effectiveAccount()
+	default:
+		return ""
+	}
+}
+
+// setChoice records the new answer for a choice-based property.
+//
+// Invalidation happens here: an answer that makes another answer meaningless
+// clears it, so a combination core would refuse is never carried to apply. The
+// alternative is a plan that fails a long way from the decision that caused it.
+func (s *editState) setChoice(field editableField, value string) {
+	switch field {
+	case editProtection:
+		s.protection = &value
+		if value != "email_otp" {
+			// The identities belong to the policy that needed them.
+			s.protectionRules = nil
+			s.allowedEmails = nil
+			s.allowedDomains = nil
+		}
+	case editOnDisconnect:
+		s.onDisconnect = &value
+	case editExposureMode:
+		s.exposureMode = &value
+		if value != "permanent_public" {
+			// A hostname is only meaningful for a stable address. Keeping it
+			// would send a requested address the mode has nowhere to put.
+			s.hostname = nil
+		}
+	case editSourceProtocol:
+		s.sourceProtocol = &value
+	case editForwardProtocol:
+		s.forwardProtocol = &value
+	case editAccount:
+		s.accountID = &value
+	}
+}
+
+// currentText is the value a free-text property currently has, used to prefill
+// the field.
+func (s *editState) currentText(row editRow) string {
+	if row.pending != "" {
+		return row.pending
+	}
+	return row.current
+}
+
 func (m *Model) commitEditField(value string) {
 	value = strings.TrimSpace(value)
 	switch m.edit.editing {
@@ -595,6 +727,31 @@ func (m *Model) commitEditField(value string) {
 		m.edit.allowedDomains = domains
 	case editAccount:
 		m.edit.accountID = &value
+	case editSourceAddress:
+		if value == "" {
+			m.edit.err = "a published service needs an address to publish"
+			return
+		}
+		m.edit.sourceAddress = &value
+	case editLocalPort, editRemotePort:
+		// Validated here, where the value is still on screen and editable, rather
+		// than by the supervisor after a round trip.
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			m.edit.err = "a port is a number between 1 and 65535"
+			return
+		}
+		if m.edit.editing == editLocalPort {
+			m.edit.localPort = &value
+		} else {
+			m.edit.remotePort = &value
+		}
+	case editRemoteHost:
+		if value == "" {
+			m.edit.err = "a forward needs a host to forward to"
+			return
+		}
+		m.edit.remoteHost = &value
 	}
 	m.edit.err = ""
 }

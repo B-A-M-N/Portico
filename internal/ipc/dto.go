@@ -641,8 +641,17 @@ type UpdateConnectionRequest struct {
 	ExpectedRevision uint64                  `json:"expected_revision,omitempty"`
 	Name             *string                 `json:"name,omitempty"`
 	Spec             *ServiceExposureSpecDTO `json:"spec,omitempty"`
-	Driver           *DriverSelectionDTO     `json:"driver,omitempty"`
-	Lifecycle        *LifecycleDTO           `json:"lifecycle,omitempty"`
+	// PortForward carries a forward's own editable fields. The controller has
+	// classified changes to the local port, the remote target, the protocol and
+	// the direction since forwards existed; without a way to send them, a forward
+	// created with the wrong port could only be deleted and made again.
+	//
+	// It is a separate arm rather than a widening of Spec because the specs are a
+	// tagged union: exactly one applies to a given connection, and a request
+	// carrying the wrong one is a request to change the kind, which is refused.
+	PortForward *PortForwardDTO     `json:"port_forward,omitempty"`
+	Driver      *DriverSelectionDTO `json:"driver,omitempty"`
+	Lifecycle   *LifecycleDTO       `json:"lifecycle,omitempty"`
 }
 
 // ProviderRecommendationRequest asks the supervisor to recommend a driver.

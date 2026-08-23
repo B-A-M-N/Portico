@@ -1684,6 +1684,32 @@ func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionR
 			}
 		}
 	}
+	if req.PortForward != nil {
+		// The specs are a tagged union, so a forward request against a published
+		// service is a request to change the kind — which the delta classifier
+		// refuses for good reason, and which is refused here with the reason
+		// rather than by silently writing a spec the profile does not have.
+		if proposed.Spec.PortForward == nil {
+			return nil, core.ErrValidation(
+				"this connection is not a port forward, so it has no forwarding to change")
+		}
+		spec := proposed.Spec.PortForward
+		if req.PortForward.LocalPort != 0 {
+			spec.LocalPort = req.PortForward.LocalPort
+		}
+		if req.PortForward.RemoteHost != "" {
+			spec.RemoteHost = req.PortForward.RemoteHost
+		}
+		if req.PortForward.RemotePort != 0 {
+			spec.RemotePort = req.PortForward.RemotePort
+		}
+		if req.PortForward.Protocol != "" {
+			spec.Protocol = core.Protocol(req.PortForward.Protocol)
+		}
+		if req.PortForward.Direction != "" {
+			spec.Direction = core.PortForwardDirection(req.PortForward.Direction)
+		}
+	}
 	return proposed, nil
 }
 

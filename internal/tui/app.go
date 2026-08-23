@@ -777,6 +777,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if msg.Detail != nil {
 				m.edit.detail = msg.Detail
 				m.edit.revision = msg.Detail.Revision
+				// What the provider declares and which accounts it has decide
+				// which answers the screen offers. Resolving it here rather than
+				// during render keeps View pure, and reading it from the snapshot
+				// keeps the answer the supervisor's.
+				m.edit.setProviderContext(m.providerCapabilities(msg.Detail.Driver.ProviderID),
+					m.providerAccounts(msg.Detail.Driver.ProviderID))
 			}
 		}
 		if m.clone != nil && msg.ConnectionID == m.clone.sourceID {
@@ -3893,4 +3899,33 @@ func (m *Model) clipToWidth(s string) string {
 		return s
 	}
 	return truncateToWidth(s, m.width)
+}
+
+// providerCapabilities is what a provider declares it can do, from the snapshot.
+//
+// Nil means the provider is not in the snapshot — uninstalled, or switched off —
+// which is different from a provider that declares nothing. A caller offering
+// choices must not treat the two the same: the first cannot be reasoned about, and
+// the second genuinely has no options.
+func (m *Model) providerCapabilities(id string) *ipc.CapabilitySetDTO {
+	for _, p := range m.snapshot.Providers {
+		if p.ID == id {
+			return p.Capabilities
+		}
+	}
+	return nil
+}
+
+// providerAccounts are a provider's usable accounts, from the snapshot.
+//
+// Pending accounts are excluded: an account whose credential was never confirmed
+// cannot own a connection, and the controller refuses it — so offering it would be
+// a choice that fails at apply.
+func (m *Model) providerAccounts(id string) []ipc.ProviderAccountDTO {
+	for _, p := range m.snapshot.Providers {
+		if p.ID == id {
+			return p.Accounts
+		}
+	}
+	return nil
 }
