@@ -237,5 +237,8 @@ func (m *Model) renderSettings() string {
 		b.WriteString(m.theme.Style("intervention").Render(m.settings.err))
 		b.WriteString("\n")
 	}
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenSettings).footer(m.theme, m.width))
+	b.WriteString("\n")
 	return b.String()
 }

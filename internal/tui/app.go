@@ -221,13 +221,18 @@ type Model struct {
 	streamCancel    context.CancelFunc
 	streamConnected bool
 
-	keys     KeyMap
 	theme    Theme
 	useASCII bool
 
 	wizard  *screens.WizardModel
 	inspect *screens.InspectModel
 	setup   *screens.SetupModel
+	// readiness is what the supervisor says this machine can do. It is held on
+	// the model rather than only inside the setup screen because the empty Home
+	// needs it too: whether setup is genuinely required decides what a new user
+	// is told to do first, and two screens asking separately would be two
+	// answers.
+	readiness *ipc.ReadinessDTO
 
 	client       SupervisorClient
 	bootstrapper Bootstrapper
@@ -263,7 +268,6 @@ func newModel(client SupervisorClient, bootstrapper Bootstrapper) Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	return Model{
 		screen:       ScreenBoot, // Start in boot screen
-		keys:         DefaultKeyMap,
 		theme:        theme,
 		useASCII:     os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
 		client:       client,
@@ -548,12 +552,19 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Snapshot.LastSeq > m.lastEventSeq {
 			m.lastEventSeq = msg.Snapshot.LastSeq
 		}
+		// An empty Home has to tell a new user what to do, and whether setup is
+		// genuinely required is the supervisor's answer. It is asked for once,
+		// at the one moment it changes what the user is told — not on a timer.
+		var readinessCmd tea.Cmd
+		if m.readinessForEmptyHome() {
+			readinessCmd = m.readinessCmd()
+		}
 		// On first boot, connect the event stream now that the cursor is set.
 		if !m.streamConnected {
 			m.streamConnected = true
-			return m, tea.Batch(wizardCmd, m.connectEventStream())
+			return m, tea.Batch(wizardCmd, readinessCmd, m.connectEventStream())
 		}
-		return m, wizardCmd
+		return m, tea.Batch(wizardCmd, readinessCmd)
 
 	case planLoadedMsg:
 		// A plan the user has moved on from must not open a preview. Showing it
@@ -655,7 +666,28 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// of health.
 		m.setup.Err = msg.Err
 		m.setup.Readiness = msg.Readiness
+		// The empty Home reads the same answer, so it is kept once here rather
+		// than fetched again by whichever screen needs it.
+		m.storeReadiness(msg.Readiness)
 		return m, nil
+
+	case settingsLoadedMsg:
+		m.applySettingsLoaded(msg)
+		return m, nil
+
+	case settingsSavedMsg:
+		m.applySettingsSaved(msg)
+		return m, nil
+
+	case telemetryLoadedMsg:
+		m.applyTelemetry(msg)
+		return m, nil
+
+	case accountVerifiedMsg:
+		return m, m.applyAccountVerified(msg)
+
+	case credentialReplacedMsg:
+		return m, m.applyCredentialReplaced(msg)
 
 	case providerSetupFlowMsg:
 		if msg.ProviderID != m.providerSetupProviderID || msg.Request != m.providerSetupRequest {
@@ -1074,6 +1106,8 @@ func (m Model) renderScreen() string {
 			return m.setup.View()
 		}
 		return "Checking what Portico needs..."
+	case ScreenSettings:
+		return m.renderSettings()
 	case ScreenQuit:
 		return ""
 	default:
@@ -2288,6 +2322,11 @@ func (m *Model) renderHome() string {
 	if m.width > 0 && Breakpoint(m.width) == LayoutEmergency {
 		return m.renderEmergencyHome()
 	}
+	// A fresh installation has nothing to list. The word "No connections" and a
+	// row of single letters is not an introduction to a product.
+	if len(m.ConnectionList()) == 0 {
+		return m.renderEmptyHome()
+	}
 	var b strings.Builder
 
 	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
@@ -2403,7 +2442,9 @@ func (m *Model) renderHome() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpRow(m.keys, m.theme, m.screen == ScreenHome))
+	// The footer is the screen's own action set, so it cannot advertise a key
+	// the screen does not accept nor omit one it does.
+	b.WriteString(m.actionsFor(ScreenHome).footer(m.theme, m.width))
 	return b.String()
 }
 
