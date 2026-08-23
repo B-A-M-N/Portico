@@ -68,10 +68,17 @@ func (m *WizardModel) Actions() WizardActions {
 }
 
 // planPreviewActions is the wizard's own plan confirmation.
+//
+// The label names the outcome the plan carries rather than assuming the wizard
+// only ever previews an open.
 func (m *WizardModel) planPreviewActions() WizardActions {
+	label := "Apply"
+	if m.plan != nil {
+		label = PlanConfirmLabel(m.plan.Intent)
+	}
 	return WizardActions{
 		{
-			Keys: []string{"enter"}, Label: "Open connection", Enabled: m.plan != nil,
+			Keys: []string{"enter"}, Label: label, Enabled: m.plan != nil,
 			DisabledReason: "there is no plan to apply", Primary: true,
 			Help: "Carry out exactly the steps listed. Nothing beyond them is done.",
 		},

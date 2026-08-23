@@ -40,9 +40,9 @@ type settingsState struct {
 
 // settingRow is one line on the settings screen.
 type settingRow struct {
-	id      ActionID
-	label   string
-	value   string
+	id    ActionID
+	label string
+	value string
 	// explain says what the setting does, in the words a user would use.
 	explain string
 	// editable is false for a setting the environment is deciding.
@@ -71,7 +71,7 @@ func (m Model) settingsRows() []settingRow {
 	return []settingRow{
 		launchRow,
 		{
-			id:    ActionSettings,
+			id:    ActionDefaultAutoStart,
 			label: "New connections open",
 			value: autoStartValue(s.DefaultAutoStart),
 			explain: "What a newly created connection is set to. " +
@@ -79,7 +79,7 @@ func (m Model) settingsRows() []settingRow {
 			editable: true,
 		},
 		{
-			id:    ActionSettings,
+			id:    ActionDefaultOnDisconnect,
 			label: "When Portico closes",
 			value: onDisconnectValue(s.DefaultOnDisconnect),
 			explain: "What a new connection does when you quit Portico. " +

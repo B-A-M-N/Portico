@@ -210,23 +210,27 @@ func TestCtrlDIsNotAScrollKey(t *testing.T) {
 	}
 }
 
-// TestLeavingThePreviewWithQAbandonsThePlan pins audit finding 19 where it
-// overlaps finding 1.
+// TestLeavingThePreviewAbandonsThePlan pins audit finding 19 where it overlaps
+// finding 1.
 //
-// Abandoning the in-flight plan was written into the esc handler alone, so
-// leaving the preview with q left the request live — and the reply reopened the
-// preview behind the user, on a screen they had already dismissed.
-func TestLeavingThePreviewWithQAbandonsThePlan(t *testing.T) {
+// Abandoning the in-flight plan must happen however the screen is left, not only
+// on the one path that remembered to do it: a plan left live reopens the preview
+// behind the user, on a screen they have already dismissed.
+//
+// Esc is the key that leaves a screen. q quits Portico from here — it used to
+// navigate Home from some screens and quit from others while footers advertised
+// it identically in both cases.
+func TestLeavingThePreviewAbandonsThePlan(t *testing.T) {
 	m := readyModel(&fakeClient{}, twoConnectionSnapshot())
 	m.selectedID = "conn-a"
 	m.planOpenCmd("conn-a")
 	generation := m.planRequests.current
 	m.screen = ScreenPlanPreview
 
-	next, _ := m.Update(keyMsg("q"))
+	next, _ := m.Update(keyMsg("esc"))
 	m = next.(Model)
 	if m.screen != ScreenHome {
-		t.Fatalf("q did not leave the preview: screen = %q", m.screen)
+		t.Fatalf("esc did not leave the preview: screen = %q", m.screen)
 	}
 
 	next, _ = m.Update(planLoadedMsg{
@@ -237,6 +241,49 @@ func TestLeavingThePreviewWithQAbandonsThePlan(t *testing.T) {
 
 	if m.screen == ScreenPlanPreview {
 		t.Fatal("a dismissed plan reopened the preview behind the user")
+	}
+}
+
+// TestQQuitsRatherThanNavigating pins the normalised navigation semantics.
+//
+// q advertised itself as "quit" and navigated Home from every screen but one,
+// which meant the footer described two different behaviours with one word. Esc
+// is back; q is quit; ctrl+c is quit unconditionally.
+func TestQQuitsRatherThanNavigating(t *testing.T) {
+	for _, screen := range []ScreenID{ScreenHome, ScreenPlanPreview, ScreenOperations} {
+		m := readyModel(&fakeClient{}, twoConnectionSnapshot())
+		m.screen = screen
+
+		next, cmd := m.Update(keyMsg("q"))
+		m = next.(Model)
+		if cmd == nil {
+			t.Fatalf("q on %s produced no command, so it did not quit", screen)
+		}
+		if m.screen != screen && m.screen != ScreenQuit {
+			t.Fatalf("q on %s navigated to %s instead of quitting", screen, m.screen)
+		}
+	}
+}
+
+// TestQIsTextWhileTyping pins that a printable key stays printable.
+//
+// The screens that collect text own the keyboard, so q in a hostname is the
+// letter q. They must also not advertise q as quit, or the footer would offer a
+// key the field swallows.
+func TestQIsTextWhileTyping(t *testing.T) {
+	for _, screen := range []ScreenID{ScreenNewConnection, ScreenEdit, ScreenClone} {
+		if !screenTakesTextInput(screen) {
+			t.Fatalf("%s collects text but is not treated as a text screen", screen)
+		}
+		m := readyModel(&fakeClient{}, twoConnectionSnapshot())
+		m.screen = screen
+		for _, action := range m.actionsFor(screen).Advertised() {
+			for _, key := range action.Keys {
+				if key == "q" {
+					t.Fatalf("%s advertises q, which its text field consumes", screen)
+				}
+			}
+		}
 	}
 }
 

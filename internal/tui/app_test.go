@@ -81,6 +81,13 @@ type fakeClient struct {
 	telemetryErr error
 	telemetryIDs []string
 
+	// Credential replacement. The credential itself is never retained.
+	replaceCredentialResponse *ipc.ReplaceCredentialResponse
+	replaceCredentialErr      error
+	replacedProvider          string
+	replacedAccount           string
+	replacedCredentialLen     int
+
 	// Account re-verification.
 	reverifyResponse   *ipc.ReverifyProviderAccountResponse
 	reverifyErr        error
@@ -414,6 +421,25 @@ func (f *fakeClient) Telemetry(_ context.Context, id string) (*ipc.TelemetryDTO,
 		return nil, f.telemetryErr
 	}
 	return f.telemetryDTO, nil
+}
+
+func (f *fakeClient) ReplaceProviderAccountCredential(
+	_ context.Context, providerID, accountID, credential string) (*ipc.ReplaceCredentialResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replacedProvider, f.replacedAccount = providerID, accountID
+	// The length is recorded, never the value: a test fake that keeps a
+	// credential is a test fake that can leak one into a failure message.
+	f.replacedCredentialLen = len(credential)
+	if f.replaceCredentialErr != nil {
+		return nil, f.replaceCredentialErr
+	}
+	if f.replaceCredentialResponse != nil {
+		return f.replaceCredentialResponse, nil
+	}
+	return &ipc.ReplaceCredentialResponse{
+		AccountID: accountID, Validated: true, Status: "usable",
+	}, nil
 }
 
 func (f *fakeClient) ReverifyProviderAccount(_ context.Context, providerID, accountID string) (
@@ -1171,9 +1197,21 @@ func TestHelpNavigationReturnsToSourceScreen(t *testing.T) {
 		t.Fatalf("prevScreen = %q, want %q", m.prevScreen, ScreenProviders)
 	}
 
+	// The help describes the screen it was opened from, not a generic key
+	// encyclopedia. It is generated from that screen's action set, so it cannot
+	// name a key the screen does not accept nor omit one it does.
 	view := m.View().Content
-	if !strings.Contains(view, "Providers Screen") {
-		t.Fatalf("help should show providers-specific content, got:\n%s", view)
+	title, _ := screenHelp(ScreenProviders)
+	if !strings.Contains(view, title) {
+		t.Fatalf("help should describe the providers screen (%q), got:\n%s", title, view)
+	}
+	for _, action := range m.actionsFor(ScreenProviders).Advertised() {
+		if action.Label == "" {
+			continue
+		}
+		if !strings.Contains(view, action.Label) {
+			t.Errorf("help omits the advertised action %q:\n%s", action.Label, view)
+		}
 	}
 
 	m, _ = press(t, m, "esc")
@@ -1192,8 +1230,16 @@ func TestHelpFromHomeShowsHomeContent(t *testing.T) {
 	}
 
 	view := m.View().Content
-	if !strings.Contains(view, "Home Screen") {
-		t.Fatalf("help from home should show home content, got:\n%s", view)
+	title, body := screenHelp(ScreenHome)
+	if !strings.Contains(view, title) {
+		t.Fatalf("help from home should describe the home screen (%q), got:\n%s", title, view)
+	}
+	// The description says what the screen is for, not only which keys it takes.
+	if len(body) == 0 {
+		t.Fatal("the home screen help has no description of the task")
+	}
+	if !strings.Contains(view, body[0]) {
+		t.Fatalf("help omits the home screen description, got:\n%s", view)
 	}
 }
 

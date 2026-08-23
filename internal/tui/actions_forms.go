@@ -61,11 +61,13 @@ func (m Model) editActions() ActionSet {
 	return ActionSet{
 		{
 			ID: ActionUp, Keys: []string{"up", "k"}, Label: "Up", Enabled: len(rows) > 1,
-			Help: "Move up the list of properties.",
+			DisabledReason: "there is only one property to change",
+			Help:           "Move up the list of properties.",
 		},
 		{
 			ID: ActionDown, Keys: []string{"down", "j"}, Label: "Down", Enabled: len(rows) > 1,
-			Help: "Move down the list of properties.",
+			DisabledReason: "there is only one property to change",
+			Help:           "Move down the list of properties.",
 		},
 		{
 			ID: ActionConfirm, Keys: []string{"enter"}, Label: "Change", Enabled: changeEnabled,
@@ -193,11 +195,13 @@ func (m Model) settingsActions() ActionSet {
 	return ActionSet{
 		{
 			ID: ActionUp, Keys: []string{"up", "k"}, Label: "Up", Enabled: len(rows) > 1,
-			Help: "Move up the list of settings.",
+			DisabledReason: "the settings have not been read yet",
+			Help:           "Move up the list of settings.",
 		},
 		{
 			ID: ActionDown, Keys: []string{"down", "j"}, Label: "Down", Enabled: len(rows) > 1,
-			Help: "Move down the list of settings.",
+			DisabledReason: "the settings have not been read yet",
+			Help:           "Move down the list of settings.",
 		},
 		{
 			ID: ActionConfirm, Keys: []string{"enter", "space", " "}, Label: "Change", Enabled: changeEnabled,

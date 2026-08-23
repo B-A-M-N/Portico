@@ -115,6 +115,13 @@ func (nullHandler) HandleSettings() (*SettingsDTO, error) {
 func (nullHandler) HandleUpdateSettings(SettingsRequest) (*SettingsDTO, error) {
 	return &SettingsDTO{LaunchMode: "auto", DefaultOnDisconnect: "keep_alive"}, nil
 }
+
+// Credential replacement is routed through the handler, so the null handler
+// must satisfy it even though it stores nothing.
+func (nullHandler) HandleReplaceProviderAccountCredential(
+	string, string, ReplaceCredentialRequest) (*ReplaceCredentialResponse, error) {
+	return &ReplaceCredentialResponse{}, nil
+}
 func (nullHandler) HandleSupervisorStop(ctx context.Context) error { return nil }
 
 func newTestServer(t *testing.T, st *store.Store) *Server {

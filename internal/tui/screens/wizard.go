@@ -98,6 +98,12 @@ type WizardModel struct {
 	// preferredProvider remembers a choice made before the providers changed,
 	// so a provider that still fits is returned to rather than replaced.
 	preferredProvider string
+	// setupProviderID is a provider the user asked to configure from the
+	// provider question. The root model owns provider setup — it is the only
+	// component holding the IPC client for it — so the wizard records the
+	// request and the root model performs it, returning here afterwards with
+	// every answer intact.
+	setupProviderID string
 
 	// streamConnected reports whether the root model's event stream is live.
 	// When it is, operation progress arrives as events and polling is only a
@@ -134,6 +140,11 @@ type WizardState struct {
 	AllowedDomains []string
 	Provider       string
 	AccountID      string
+	// AutoStart and OnDisconnect are the lifecycle decisions. They were
+	// hardcoded in buildRequest, so every connection opened by itself at
+	// supervisor startup and outlived the interface without being asked.
+	AutoStart    bool
+	OnDisconnect string
 	// Advanced records that the user chose to describe the connection
 	// themselves rather than picking a prepared outcome, which is what decides
 	// whether the intent question belongs in the sequence.
@@ -315,6 +326,20 @@ func NewWizardForService(client ConnectionCreator, providers []ipc.ProviderDTO, 
 	m.state.SourceType = "existing_service"
 	m.state.SourceAddress = address
 	m.state.SourceProtocol = protocol
+	m.state.Step = WizardStepName
+	return m
+}
+
+// NewWizardForManualAddress starts the wizard for an existing local service
+// whose address the user will type.
+//
+// Discovery finding nothing was a dead end: the screen reported that nothing was
+// found and offered no way on. A service on a port the scan cannot see is still
+// a service, and this is the path to publishing it.
+func NewWizardForManualAddress(client ConnectionCreator, providers []ipc.ProviderDTO) *WizardModel {
+	m := NewWizard(client, providers)
+	m.state.ConnectionKind = "service_exposure"
+	m.state.SourceType = "existing_service"
 	m.state.Step = WizardStepName
 	return m
 }
@@ -891,6 +916,21 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 
 	case WizardStepProvider:
 		switch key {
+		case "s":
+			// A provider that needs configuring is configured from here. The
+			// user was previously required to abandon the wizard, set the
+			// provider up elsewhere, and answer every question again.
+			choice, ok := choiceAt(m.providerChoices(), m.selected)
+			if !ok || choice.Value == "" {
+				return nil
+			}
+			if choice.Available {
+				m.err = fmt.Errorf("%s is already usable", choice.Label)
+				return nil
+			}
+			m.err = nil
+			m.setupProviderID = choice.Value
+			return nil
 		case "up", "k":
 			if m.selected > 0 {
 				m.selected--
@@ -944,6 +984,11 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 
 	case WizardStepReview:
 		switch key {
+		case "L":
+			// The lifecycle decisions are editable here rather than being
+			// applied silently from a default the user was never shown.
+			m.cycleLifecycle()
+			return nil
 		case "enter":
 			// A connection with no provider cannot open, and saving it would
 			// leave a row that fails the moment anyone tries. The wizard
@@ -1163,8 +1208,8 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 			AccountID:  s.AccountID,
 		},
 		Lifecycle: ipc.LifecycleDTO{
-			AutoStart:    true,
-			OnDisconnect: "keep_alive",
+			AutoStart:    s.AutoStart,
+			OnDisconnect: onDisconnectValue(s.OnDisconnect),
 		},
 	}
 
@@ -1591,121 +1636,18 @@ func (m *WizardModel) renderAccount() string {
 	return renderMenu("Which "+name+" account should own this connection?", options, m.selected)
 }
 
-func (m *WizardModel) renderReview() string {
-	lines := []string{
-		"REVIEW",
-		"",
-		fmt.Sprintf("Name:       %s", m.state.Name),
-	}
-
-	// Branch review based on connection kind.
-	switch m.state.ConnectionKind {
-	case "port_forward":
-		lines = append(lines, "Kind:       port forward")
-		lines = append(lines, fmt.Sprintf("Forward:    127.0.0.1:%s -> %s:%s", m.state.PortForwardLocalPort, m.state.PortForwardRemoteHost, m.state.PortForwardRemotePort))
-		protocol := m.state.PortForwardProtocol
-		if protocol == "" {
-			protocol = "tcp"
-		}
-		lines = append(lines, fmt.Sprintf("Protocol:   %s", strings.ToUpper(protocol)))
-		lines = append(lines, "Direction:  local")
-	case "client_tunnel":
-		lines = append(lines, "Kind:       client tunnel")
-		lines = append(lines, fmt.Sprintf("Provider:   %s", m.state.Provider))
-	default: // service_exposure
-		lines = append(lines, fmt.Sprintf("Source:     %s", m.state.SourceType))
-		lines = append(lines, fmt.Sprintf("Address:    %s", m.state.SourceAddress))
-		if m.state.Port != "" {
-			lines = append(lines, fmt.Sprintf("Port:       %s", m.state.Port))
-		}
-		if len(m.state.CommandArgs) > 0 {
-			lines = append(lines, fmt.Sprintf("Arguments:  %s", strings.Join(m.state.CommandArgs, ", ")))
-		}
-		if m.state.WorkingDir != "" {
-			lines = append(lines, fmt.Sprintf("Working dir: %s", m.state.WorkingDir))
-		}
-		if m.state.SourceType == "directory" {
-			lines = append(lines, fmt.Sprintf("Directory:   %s", directoryModeSummary(m.state)))
-			if m.state.DirectorySPA {
-				lines = append(lines, "SPA fallback: enabled")
-			}
-		}
-		if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
-			mode := "endpoint"
-			if m.state.MCPCommand {
-				mode = "command"
-			}
-			lines = append(lines, fmt.Sprintf("MCP mode:      %s", mode))
-			lines = append(lines, fmt.Sprintf("MCP transport: %s", m.state.MCPTransport))
-		}
-		lines = append(lines, fmt.Sprintf("Exposure:   %s", m.state.ExposureMode))
-		if m.state.Hostname != "" {
-			lines = append(lines, fmt.Sprintf("Hostname:   %s", m.state.Hostname))
-		}
-		if len(m.state.AllowedEmails) > 0 {
-			lines = append(lines, fmt.Sprintf("Allowed emails:  %s", strings.Join(m.state.AllowedEmails, ", ")))
-		}
-		if len(m.state.AllowedDomains) > 0 {
-			lines = append(lines, fmt.Sprintf("Allowed domains: %s", strings.Join(m.state.AllowedDomains, ", ")))
-		}
-		lines = append(lines, fmt.Sprintf("Protection: %s", m.state.Protection))
-	}
-
-	if m.state.AccountID != "" && m.state.ConnectionKind == "service_exposure" {
-		lines = append(lines, fmt.Sprintf("Account:    %s", m.accountLabel(m.state.AccountID)))
-	}
-	if m.state.ConnectionKind == "service_exposure" {
-		lines = append(lines, fmt.Sprintf("Provider:   %s", m.state.Provider))
-	}
-	lines = append(lines, fmt.Sprintf("Lifecycle:  auto-start=%v, on-disconnect=%s", true, "keep_alive"))
-	lines = append(lines, "", "What should Portico do?")
-
-	// Two explicit outcomes
-	options := []string{
-		"Save connection (closed — you can open it later)",
-		"Save and open connection (review plan first)",
-	}
-	lines = append(lines, renderMenu("", options, m.selected))
-
-	if m.err != nil {
-		lines = append(lines, "", "Error: "+m.err.Error())
-	}
-	lines = append(lines, "", "Enter Confirm  Esc Back")
-	return strings.Join(lines, "\n")
-}
-
+// renderPlanPreview shows the plan through the shared presentation, so the
+// wizard describes a plan the same way every other surface does.
 func (m *WizardModel) renderPlanPreview() string {
-	lines := []string{"OPEN CONNECTION PLAN", ""}
-
 	if m.plan == nil {
-		lines = append(lines, "Loading plan...")
-		return strings.Join(lines, "\n")
+		return "Loading the plan..."
 	}
-
-	lines = append(lines, fmt.Sprintf("Intent: %s", m.plan.Intent))
-	lines = append(lines, fmt.Sprintf("Provider: %s", m.plan.Provider))
-	lines = append(lines, "")
-	lines = append(lines, "Steps:")
-	for i, step := range m.plan.Steps {
-		prefix := "  "
-		if step.Destructive {
-			prefix = "  [DESTRUCTIVE] "
-		}
-		lines = append(lines, fmt.Sprintf("%s%d. %s", prefix, i+1, step.Summary))
-	}
-
-	if len(m.plan.Warnings) > 0 {
-		lines = append(lines, "", "Warnings:")
-		for _, w := range m.plan.Warnings {
-			lines = append(lines, "  - "+w)
-		}
-	}
-
+	view := DescribePlan(m.plan, m.state.Name)
+	out := RenderPlan(view)
 	if m.err != nil {
-		lines = append(lines, "", "Error: "+m.err.Error())
+		out += "\nError: " + m.err.Error()
 	}
-	lines = append(lines, "", "Enter Apply plan  Esc Cancel")
-	return strings.Join(lines, "\n")
+	return out
 }
 
 func (m *WizardModel) renderOperationWait() string {

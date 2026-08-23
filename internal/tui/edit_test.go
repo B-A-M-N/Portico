@@ -437,23 +437,48 @@ func TestACopyIsCreatedClosed(t *testing.T) {
 
 // TestEditAndCopyAreDiscoverable pins that the actions are findable. An action
 // nobody can find is not reachable, which is the state edit was already in.
+// TestEditAndCopyAreDiscoverable pins that the two operations reachable from
+// nowhere are now offered where the connection is.
+//
+// The supervisor could edit and copy a connection and no screen asked. Both the
+// footer and the help are generated from the screen's action set, so this checks
+// the one description rather than two hand-written strings that could drift.
 func TestEditAndCopyAreDiscoverable(t *testing.T) {
 	m := readyModel(&fakeClient{}, twoConnectionSnapshot())
 	m.screen = ScreenHome
+	m.selectedID = "conn-a"
 
+	actions := m.actionsFor(ScreenHome)
+	for _, id := range []ActionID{ActionEdit, ActionCopy} {
+		action, ok := actions.Find(id)
+		if !ok {
+			t.Fatalf("the home screen does not offer %s at all", id)
+		}
+		if !action.Enabled {
+			t.Errorf("%s is offered but disabled with a connection selected: %s",
+				id, action.DisabledReason)
+		}
+		if action.Label == "" {
+			t.Errorf("%s is offered with no label, so nothing can advertise it", id)
+		}
+	}
+
+	// The footer advertises them.
 	home := m.View().Content
-	for _, hint := range []string{"e Edit", "c Copy"} {
+	for _, hint := range []string{"Edit", "Copy"} {
 		if !strings.Contains(home, hint) {
 			t.Errorf("the home screen does not offer %q:\n%s", hint, home)
 		}
 	}
 
+	// So does the contextual help, from the same list.
 	m.prevScreen = ScreenHome
 	m.screen = ScreenHelp
 	help := m.renderHelp()
-	for _, hint := range []string{"Edit selected connection", "Copy selected connection"} {
-		if !strings.Contains(help, hint) {
-			t.Errorf("help does not describe %q:\n%s", hint, help)
+	for _, id := range []ActionID{ActionEdit, ActionCopy} {
+		action, _ := actions.Find(id)
+		if !strings.Contains(help, action.Help) {
+			t.Errorf("help does not explain %s:\n%s", id, help)
 		}
 	}
 }

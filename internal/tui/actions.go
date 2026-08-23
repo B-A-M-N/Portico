@@ -39,18 +39,18 @@ const (
 	ActionBottom   ActionID = "bottom"
 
 	// Connection lifecycle.
-	ActionInspect     ActionID = "inspect"
-	ActionToggleOpen  ActionID = "toggle_open"
-	ActionNew         ActionID = "new"
-	ActionEdit        ActionID = "edit"
-	ActionCopy        ActionID = "copy"
-	ActionDelete      ActionID = "delete"
-	ActionRepair      ActionID = "repair"
-	ActionDiscover    ActionID = "discover"
-	ActionOperations  ActionID = "operations"
-	ActionProviders   ActionID = "providers"
-	ActionSetup       ActionID = "setup"
-	ActionSettings    ActionID = "settings"
+	ActionInspect    ActionID = "inspect"
+	ActionToggleOpen ActionID = "toggle_open"
+	ActionNew        ActionID = "new"
+	ActionEdit       ActionID = "edit"
+	ActionCopy       ActionID = "copy"
+	ActionDelete     ActionID = "delete"
+	ActionRepair     ActionID = "repair"
+	ActionDiscover   ActionID = "discover"
+	ActionOperations ActionID = "operations"
+	ActionProviders  ActionID = "providers"
+	ActionSetup      ActionID = "setup"
+	ActionSettings   ActionID = "settings"
 
 	// Provider and account management.
 	ActionConfigureProvider ActionID = "configure_provider"
@@ -63,15 +63,20 @@ const (
 	ActionApply         ActionID = "apply"
 	ActionSupportExport ActionID = "support_export"
 	ActionLaunchMode    ActionID = "launch_mode"
-	ActionShowMore      ActionID = "show_more"
-	ActionFilter        ActionID = "filter"
-	ActionFollowLogs    ActionID = "follow_logs"
-	ActionManualEntry   ActionID = "manual_entry"
-	ActionEvidence      ActionID = "evidence"
-	ActionNextField     ActionID = "next_field"
-	ActionDiscard       ActionID = "discard"
-	ActionKeepEditing   ActionID = "keep_editing"
-	ActionRetry         ActionID = "retry"
+	// The settings rows are actions in their own right, so the row under the
+	// cursor names the field to change rather than the change being decided by
+	// the cursor's index.
+	ActionDefaultAutoStart    ActionID = "default_auto_start"
+	ActionDefaultOnDisconnect ActionID = "default_on_disconnect"
+	ActionShowMore            ActionID = "show_more"
+	ActionFilter              ActionID = "filter"
+	ActionFollowLogs          ActionID = "follow_logs"
+	ActionManualEntry         ActionID = "manual_entry"
+	ActionEvidence            ActionID = "evidence"
+	ActionNextField           ActionID = "next_field"
+	ActionDiscard             ActionID = "discard"
+	ActionKeepEditing         ActionID = "keep_editing"
+	ActionRetry               ActionID = "retry"
 )
 
 // Action describes one thing the current screen can do: its identity, the keys
@@ -144,6 +149,22 @@ func (s ActionSet) Find(id ActionID) (Action, bool) {
 	for _, a := range s {
 		if a.ID == id {
 			return a, true
+		}
+	}
+	return Action{}, false
+}
+
+// FindByKey returns the action a key names whether or not it is enabled.
+//
+// Dispatch uses Lookup, which refuses a disabled action. This is how the
+// refusal is explained: a key that names a disabled action produces its reason
+// rather than nothing at all, which is what made a dimmed action look broken.
+func (s ActionSet) FindByKey(key string) (Action, bool) {
+	for _, a := range s {
+		for _, k := range a.Keys {
+			if k == key {
+				return a, true
+			}
 		}
 	}
 	return Action{}, false
@@ -232,6 +253,21 @@ func keyLabel(key string) string {
 	}
 }
 
+// screenTakesTextInput reports whether a screen may be collecting typed text.
+//
+// On such a screen a printable key is input, not a command: `q` in a hostname is
+// the letter q. These screens own their own keyboard and are delegated to before
+// the action set is consulted; this is what keeps `q` out of their advertised
+// actions, so no footer offers a quit that the field would swallow.
+func screenTakesTextInput(screen ScreenID) bool {
+	switch screen {
+	case ScreenNewConnection, ScreenEdit, ScreenClone:
+		return true
+	default:
+		return false
+	}
+}
+
 // navigationActions are the bindings every non-text screen accepts. They are
 // declared once here so no screen has to remember them and none can advertise
 // a set that differs from what it accepts.
@@ -276,6 +312,17 @@ func navigationActions(screen ScreenID, canScroll bool) ActionSet {
 			ID: ActionBack, Keys: []string{"esc"}, Label: "Back", Enabled: true, Primary: true,
 			Help: "Return to the previous screen. Anything in progress here is abandoned.",
 		})
+		// q quits, on every screen that is not collecting text. It used to
+		// navigate Home from some screens and quit from others, while footers
+		// advertised "[q] quit" in both cases — so the same key did two
+		// different things under one label. Esc is how you go back.
+		if !screenTakesTextInput(screen) {
+			set = append(set, Action{
+				ID: ActionQuit, Keys: []string{"q"}, Label: "Quit", Enabled: true,
+				Help: "Leave Portico. Connections that are open stay open, and work the " +
+					"supervisor has already started carries on.",
+			})
+		}
 	}
 	// Ctrl+C always quits and is always true, so it is described even though
 	// the footer has no room to advertise it on every screen.

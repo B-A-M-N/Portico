@@ -192,9 +192,15 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 			core.ProtocolHTTPS: {Supported: true, Public: true},
 		},
 		Telemetry: core.TelemetryCapability{
-			Supported:         true,
-			RequestCounts:     true,
-			LatencyHistograms: true,
+			Supported:     true,
+			RequestCounts: true,
+			// Latency is not declared. The provider-neutral TelemetrySample
+			// carries no latency field, this adapter returns none, and the IPC
+			// DTO has nowhere to put it — so a client that believed this
+			// declaration could never retrieve what it promised. Declaring a
+			// capability no client can read is worse than declaring none:
+			// it is a claim the interface then has to explain away.
+			LatencyHistograms: false,
 			Stability:         core.StabilityBeta,
 		},
 		Redundancy: core.RedundancyCapability{Supported: false, MaxConnectors: 1},
@@ -690,6 +696,10 @@ func (p *Provider) Telemetry(ctx context.Context, id core.ConnectionID) (provide
 		ConnectionCount: tunnel.Metrics.Conns.Count,
 		RequestCount:    tunnel.Metrics.HTTP.Count,
 		SampledAt:       time.Now().UTC(),
+		// The agent reports connection and request counts. It reports no byte
+		// totals and no error counter, so neither is claimed: a zero here would
+		// be indistinguishable from a measured zero.
+		HasCounts: true,
 	}, nil
 }
 

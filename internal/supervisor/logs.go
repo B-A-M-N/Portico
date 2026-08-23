@@ -159,7 +159,17 @@ func (h *supervisorHandler) HandleTelemetry(id string) (*ipc.TelemetryDTO, error
 	result.BytesOut = sample.BytesOut
 	result.ProviderErrors = sample.ProviderErrors
 	result.SampledAt = sample.SampledAt.Format(time.RFC3339)
+	result.HasCounts = sample.HasCounts
+	result.HasBytes = sample.HasBytes
+	result.HasErrors = sample.HasErrors
 	result.Available = true
+	// A sample carrying no measured counter at all is not a sample. Reporting it
+	// as available would put a screenful of blanks in front of the user with
+	// nothing saying why.
+	if !sample.HasCounts && !sample.HasBytes && !sample.HasErrors {
+		result.Available = false
+		result.Unavailable = "the provider returned no traffic counters"
+	}
 	return result, nil
 }
 

@@ -58,6 +58,9 @@ func (th Theme) Style(use string) lipgloss.Style {
 			Padding(0, 1)
 	case "normal":
 		return s.Foreground(lipgloss.Color("#f5e6c8"))
+	case "title":
+		// A screen's own heading, distinct from the inverse-video header bar.
+		return s.Foreground(lipgloss.Color("#f5e6c8")).Bold(true)
 	case "muted":
 		return s.Foreground(lipgloss.Color("#8a7f70"))
 	case "stable":

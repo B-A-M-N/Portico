@@ -54,7 +54,7 @@ func (m Model) inspectActions() ActionSet {
 		{
 			ID: ActionToggleOpen, Keys: []string{"space", " "}, Label: toggleLabel, Enabled: has,
 			DisabledReason: noSelection, Primary: true,
-			Help:           "Open or close this connection. The change is previewed as a plan first.",
+			Help: "Open or close this connection. The change is previewed as a plan first.",
 		},
 		{
 			ID: ActionRepair, Keys: []string{"r"}, Label: "Diagnose", Enabled: repairEnabled,
@@ -116,7 +116,7 @@ func (m Model) providerActions() ActionSet {
 		{
 			ID: ActionConfigureProvider, Keys: []string{"a"}, Label: "Add account", Enabled: configurable,
 			DisabledReason: "no provider is selected", Primary: true,
-			Help:           "Give Portico a credential for this provider. It is stored encrypted and never displayed.",
+			Help: "Give Portico a credential for this provider. It is stored encrypted and never displayed.",
 		},
 		{
 			ID: ActionVerifyAccount, Keys: []string{"v"}, Label: "Verify", Enabled: hasAccount,
@@ -162,12 +162,12 @@ func (m Model) setupActions() ActionSet {
 		{
 			ID: ActionConfigureProvider, Keys: []string{"enter"}, Label: "Set up", Enabled: selected,
 			DisabledReason: "no provider is selected", Primary: true,
-			Help:           "Configure the highlighted provider so Portico can use it.",
+			Help: "Configure the highlighted provider so Portico can use it.",
 		},
 		{
 			ID: ActionLaunchMode, Keys: []string{"l"}, Label: "Launch mode", Enabled: !pinned,
 			DisabledReason: "fixed by an environment variable", Primary: true,
-			Help:           launchHelp,
+			Help: launchHelp,
 		},
 		{
 			ID: ActionRefresh, Keys: []string{"r"}, Label: "Re-check", Enabled: true,
@@ -196,12 +196,12 @@ func (m Model) discoveryActions() ActionSet {
 		{
 			ID: ActionConfirm, Keys: []string{"enter"}, Label: "Use this service", Enabled: has,
 			DisabledReason: "nothing was found", Primary: true,
-			Help:           "Start a new connection that publishes the highlighted service.",
+			Help: "Start a new connection that publishes the highlighted service.",
 		},
 		{
 			ID: ActionEvidence, Keys: []string{"i"}, Label: "Why this?", Enabled: has,
 			DisabledReason: "nothing was found",
-			Help: "Show the evidence behind the classification: what was probed and what answered.",
+			Help:           "Show the evidence behind the classification: what was probed and what answered.",
 		},
 		{
 			ID: ActionRefresh, Keys: []string{"r"}, Label: "Scan again", Enabled: true, Primary: true,

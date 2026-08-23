@@ -310,35 +310,83 @@ func TestCommandOriginRequiresPortBeforeAdvancing(t *testing.T) {
 	}
 }
 
-func TestWizardBuildRequestSetsLifecycleDefaults(t *testing.T) {
-	m := NewWizard(nil, quickTunnelOnlySnapshot())
-	m.state = WizardState{
-		Step:           WizardStepReview,
-		SourceType:     "existing_service",
-		Name:           "test",
-		SourceAddress:  "localhost",
-		Port:           "8080",
-		SourceProtocol: "https",
-		ExposureMode:   "temporary_public",
-		Protection:     "none",
-		Provider:       "cloudflare",
+// TestWizardBuildRequestCarriesTheChosenLifecycle pins that the lifecycle in the
+// request is the one the user was shown.
+//
+// buildRequest hardcoded AutoStart: true and OnDisconnect: keep_alive, so every
+// connection anyone created was armed to open whenever the supervisor started and
+// to outlive the interface — two consequential decisions, made silently, and
+// stated nowhere. They now come from the installation's stored defaults and are
+// editable on the review step.
+func TestWizardBuildRequestCarriesTheChosenLifecycle(t *testing.T) {
+	base := func() *WizardModel {
+		m := NewWizard(nil, quickTunnelOnlySnapshot())
+		m.state = WizardState{
+			Step:           WizardStepReview,
+			SourceType:     "existing_service",
+			Name:           "test",
+			SourceAddress:  "localhost",
+			Port:           "8080",
+			SourceProtocol: "https",
+			ExposureMode:   "temporary_public",
+			Protection:     "none",
+			Provider:       "cloudflare",
+		}
+		return m
 	}
-	req, err := m.buildRequest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !req.Lifecycle.AutoStart {
-		t.Fatal("wizard request should default AutoStart to true")
-	}
-	if req.Lifecycle.OnDisconnect != "keep_alive" {
-		t.Fatalf("wizard request OnDisconnect = %q, want keep_alive", req.Lifecycle.OnDisconnect)
-	}
-	if req.Source.Existing == nil {
-		t.Fatal("existing service source should be set")
-	}
-	if req.Source.Existing.Protocol != "https" {
-		t.Fatalf("protocol = %q, want https", req.Source.Existing.Protocol)
-	}
+
+	t.Run("the installation defaults are carried", func(t *testing.T) {
+		m := base()
+		m.WithDefaults(LifecycleDefaults{AutoStart: true, OnDisconnect: "close"})
+		req, err := m.buildRequest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !req.Lifecycle.AutoStart {
+			t.Fatal("the request dropped the AutoStart default")
+		}
+		if req.Lifecycle.OnDisconnect != "close" {
+			t.Fatalf("OnDisconnect = %q, want close", req.Lifecycle.OnDisconnect)
+		}
+		if req.Source.Existing == nil {
+			t.Fatal("existing service source should be set")
+		}
+		if req.Source.Existing.Protocol != "https" {
+			t.Fatalf("protocol = %q, want https", req.Source.Existing.Protocol)
+		}
+	})
+
+	t.Run("no default means the connection is not armed", func(t *testing.T) {
+		// A wizard built without defaults must not arm the connection. The
+		// absence of a decision is not consent to opening by itself.
+		req, err := base().buildRequest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.Lifecycle.AutoStart {
+			t.Fatal("a connection was armed without anyone choosing to arm it")
+		}
+		// keep_alive remains the disconnect default: leaving a connection
+		// running is recoverable, closing one the user wanted open is not.
+		if req.Lifecycle.OnDisconnect != "keep_alive" {
+			t.Fatalf("OnDisconnect = %q, want keep_alive", req.Lifecycle.OnDisconnect)
+		}
+	})
+
+	t.Run("the review edits both", func(t *testing.T) {
+		m := base()
+		m.WithDefaults(LifecycleDefaults{AutoStart: false, OnDisconnect: "keep_alive"})
+		// L steps the lifecycle combinations, so a user can change what they
+		// were shown before anything is created.
+		m.HandleKey("L")
+		req, err := m.buildRequest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !req.Lifecycle.AutoStart {
+			t.Fatal("the review did not change the lifecycle the request carries")
+		}
+	})
 }
 
 func TestWizardProtocolSelection(t *testing.T) {

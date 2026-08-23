@@ -70,8 +70,17 @@ type Model struct {
 	scroll scrollState
 
 	// Account lifecycle on the providers screen.
-	cursorIndex              int // providers screen cursor (flattened row index)
-	accountRequests          requestTracker
+	cursorIndex     int // providers screen cursor (flattened row index)
+	accountRequests requestTracker
+	// credentialRequests correlates verification and rotation to the account
+	// they were asked about, so a verdict about one account can never be shown
+	// against another.
+	credentialRequests subjectTracker
+	// replacingAccountID is the account a credential rotation is for. When it is
+	// empty the setup form is adding an account; when it is set, the same form is
+	// collecting a replacement for that exact account, whose identity must not
+	// change.
+	replacingAccountID       string
 	accountRemovalTarget     *accountRow
 	accountRemovalError      string
 	accountRemovalDependents []string
@@ -119,6 +128,31 @@ type Model struct {
 	discovery         []ipc.DiscoveredServiceDTO
 	discoverySelected int
 	opEvents          []string
+
+	// diagnosticSelected is the finding under the cursor on the repair screen.
+	diagnosticSelected int
+	// discoveryEvidence shows why Portico classified the selected service as it
+	// did. The evidence was gathered, carried in the DTO, and never displayed.
+	discoveryEvidence bool
+
+	// Telemetry for the connection on screen. It is requested when a surface
+	// that shows it is opened, and correlated by connection so a reply for one
+	// connection is never drawn against another. There is no idle ticker.
+	telemetry            *ipc.TelemetryDTO
+	telemetryFor         string
+	telemetryRequests    subjectTracker
+	telemetryUnavailable string
+
+	// logsFollow keeps re-reading the connector's output while the Logs tab is
+	// open and the connection is active.
+	logsFollow bool
+	// logsStream filters the log by source: empty for everything, else the
+	// stream name the connector wrote to.
+	logsStream string
+
+	// operationsFilter narrows the history. A user looking for what went wrong
+	// should not have to read every successful open to find it.
+	operationsFilter operationFilter
 
 	// Connection detail for inspect screen
 	connectionDetail *ipc.ConnectionDetailDTO
@@ -177,6 +211,10 @@ type Model struct {
 	// providerSetupRequest increments per flow load, so a late reply to a
 	// cancelled load cannot reset a form already being filled in.
 	providerSetupRequest int
+	// resumeWizardAfterSetup names the provider the wizard asked to configure.
+	// When it is set, finishing setup returns to the wizard rather than to the
+	// providers screen, with every answer the user had given still in place.
+	resumeWizardAfterSetup string
 
 	lastEventSeq    int64
 	stream          *ipc.EventStream
@@ -224,14 +262,14 @@ func newModel(client SupervisorClient, bootstrapper Bootstrapper) Model {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return Model{
-		screen:      ScreenBoot, // Start in boot screen
-		keys:        DefaultKeyMap,
-		theme:       theme,
-		useASCII:    os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
-		client:      client,
+		screen:       ScreenBoot, // Start in boot screen
+		keys:         DefaultKeyMap,
+		theme:        theme,
+		useASCII:     os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
+		client:       client,
 		bootstrapper: bootstrapper,
-		rootCtx:     ctx,
-		rootCancel:  cancel,
+		rootCtx:      ctx,
+		rootCancel:   cancel,
 	}
 }
 
@@ -269,8 +307,6 @@ func (m *Model) bootstrapCmd() tea.Cmd {
 		return bootstrapDoneMsg{}
 	}
 }
-
-
 
 // Update handles messages (SPEC §17.7).
 // Update advances the model, then measures what the next render will produce.
@@ -1744,372 +1780,26 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleProviderSetupKey(key)
 	}
 
-	// While the setup screen is active, it owns navigation.
-	if m.screen == ScreenSetup && m.setup != nil {
-		switch key {
-		case "up", "k", "down", "j":
-			m.setup.HandleKey(key)
-			return m, nil
-		case "r":
-			return m, m.readinessCmd()
-		case "E":
-			// A diagnostic report, from the screen a user reaches when
-			// something is wrong. It existed only as a CLI command, which is
-			// not where someone stuck in the interface will look.
-			return m, m.supportExportCmd()
-		case "l":
-			// Flip the gate. The mode shown is whatever the supervisor reports
-			// afterwards, so this never claims a change it did not make.
-			return m, m.setLaunchModeCmd(oppositeLaunchMode(m.currentLaunchMode()))
-		case "enter":
-			// Any provider that declares a setup flow can be configured. What
-			// it needs is the provider's own declaration, fetched here rather
-			// than assumed, so this no longer works for Cloudflare alone.
-			if selected := m.setup.Selected(); selected != nil {
-				next, cmd := m.beginProviderSetup(selected.ID)
-				m = next
-				m.pushScreen(ScreenProviders)
-				return m, cmd
-			}
-			return m, nil
+	// Everything else is the current screen's action set: the same description
+	// the footer draws and Help explains. Dispatch through it means an action
+	// that is advertised is an action that runs, and one that is disabled cannot
+	// be executed by pressing its key.
+	actions := m.actionsFor(m.screen)
+	if action, ok := actions.Lookup(key); ok {
+		next, cmd, handled := m.handleAction(action.ID, action)
+		if handled {
+			return next, cmd
 		}
 	}
-
-	// Scrolling works on every freely-scrolled screen, and is checked before
-	// per-screen keys so no screen has to implement it. It is checked after
-	// the wizard and setup forms above, which own the keyboard while typing.
-	if scrollsFreely(m.screen) {
-		// ctrl+d is not bound. In a terminal it means end-of-input, and a user
-		// who presses it expecting that should not get a half-page scroll.
-		switch key {
-		case "pgdown":
-			m.scroll.scrollBy(m.scroll.page())
-			return m, nil
-		case "pgup":
-			m.scroll.scrollBy(-m.scroll.page())
-			return m, nil
-		case "home":
-			m.scroll.toTop()
-			return m, nil
-		case "end":
-			m.scroll.toBottom()
-			return m, nil
-		}
-	}
-
-	// While the inspect screen is active, delegate tab navigation to the InspectModel.
-	if m.screen == ScreenInspect && m.inspect != nil {
-		switch key {
-		case "left", "h", "right", "l":
-			m.inspect.HandleKey(key)
-			return m, nil
-		}
-	}
-
-	// Inspect screen lifecycle actions. These call the same commands as Home
-	// so there is exactly one lifecycle implementation, not a second one.
-	if m.screen == ScreenInspect && m.SelectedConnection() != nil {
-		switch key {
-		case " ", "space":
-			// Space toggles connection open/close (same as Home).
-			conn := m.SelectedConnection()
-			if conn.DesiredState == "open" {
-				return m, m.planCloseCmd(conn.ID)
-			}
-			return m, m.planOpenCmd(conn.ID)
-		case "r":
-			// r triggers diagnostics/repair (same as Home). Gate on kind
-			// so non-service connections don't open a repair screen that
-			// the backend will refuse.
-			conn := m.SelectedConnection()
-			if conn.Kind != "service_exposure" && conn.Kind != "" {
-				m.status = "Repair is not available for this connection kind."
-				return m, nil
-			}
-			m.pushScreen(ScreenRepair)
-			m.diagnostics = nil
-			return m, m.diagnosticsCmd(conn.ID)
-		case "d":
-			// d triggers delete preview (same as Home).
-			return m, m.planDeleteCmd(m.SelectedConnection().ID)
-		}
-	}
-
-	switch key {
-	case "q":
-		if m.screen == ScreenHome {
-			if m.rootCancel != nil {
-				m.rootCancel()
-			}
-			m.clearProviderSetupSecret()
-			return m, tea.Quit
-		}
-		// q leaves the screen exactly as esc does. It did not abandon the
-		// screen's in-flight work, so quitting the plan preview left the plan
-		// request live and a late reply reopened the preview behind the user.
-		m.abandonScreenWork()
-		m.transitionTo(ScreenHome)
-		return m, nil
-
-	case "esc":
-		if m.screen == ScreenHelp {
-			// Return to the screen that opened help.
-			m.screen = m.prevScreen
-			m.prevScreen = ""
-			return m, nil
-		}
-		if m.screen == ScreenHome {
-			// Can't go back from home
-			return m, nil
-		}
-		m.abandonScreenWork()
-		// Try to pop the navigation stack
-		if !m.popScreen() {
-			// Stack empty, go to home
-			m.transitionTo(ScreenHome)
+	// A key naming an action that is currently unavailable says why. Doing
+	// nothing at all is what made a dimmed action look broken rather than
+	// blocked.
+	if action, ok := actions.FindByKey(key); ok && !action.Enabled {
+		if action.DisabledReason != "" {
+			m.status = action.Label + " is not available: " + action.DisabledReason
 		}
 		return m, nil
-
-	case "up", "k":
-		if m.screen == ScreenProviders {
-			m.moveCursor(-1)
-			return m, nil
-		}
-		if m.screen == ScreenDiscovery && m.discoverySelected > 0 {
-			m.discoverySelected--
-		} else if m.screen == ScreenOperations && m.opsSelectedIdx > 0 {
-			m.opsSelectedIdx--
-			return m, m.operationEventsForSelection()
-		} else if m.screen == ScreenHome {
-			// Move selection up by finding the current index and decrementing.
-			conns := m.ConnectionList()
-			idx := m.selectedConnectionIndex()
-			if idx > 0 {
-				m.selectedID = conns[idx-1].ID
-			}
-		}
-
-	case "down", "j":
-		if m.screen == ScreenProviders {
-			m.moveCursor(1)
-			return m, nil
-		}
-		if m.screen == ScreenDiscovery {
-			if m.discoverySelected < len(m.discovery)-1 {
-				m.discoverySelected++
-			}
-		} else if m.screen == ScreenOperations {
-			if m.opsSelectedIdx < len(m.operations)-1 {
-				m.opsSelectedIdx++
-				return m, m.operationEventsForSelection()
-			}
-		} else if m.screen == ScreenHome {
-			// Move selection down by finding the current index and incrementing.
-			conns := m.ConnectionList()
-			idx := m.selectedConnectionIndex()
-			if idx >= 0 && idx < len(conns)-1 {
-				m.selectedID = conns[idx+1].ID
-			} else if idx < 0 && len(conns) > 0 {
-				m.selectedID = conns[0].ID
-			}
-		}
-
-	case "enter":
-		if m.screen == ScreenAccountRemoval {
-			// A refusal already shown is not re-sent by pressing enter again;
-			// the only way on is back.
-			if m.accountRemovalTarget == nil || m.accountRemovalError != "" {
-				return m, nil
-			}
-			// Nothing is removed that was not previewed, and nothing the
-			// preview says cannot be removed.
-			if m.accountRemovalPreview == nil || !m.accountRemovalPreview.Removable {
-				return m, nil
-			}
-			return m, m.removeAccountCmd(*m.accountRemovalTarget, m.accountRemovalPreview.Fingerprint)
-		}
-		if m.screen == ScreenHome && m.SelectedConnection() != nil {
-			conn := m.SelectedConnection()
-			m.inspect = screens.NewInspect(conn)
-			m.syncInspectModel()
-			// Detail from the previous connection must not be shown against
-			// this one while the fetch is in flight.
-			m.connectionDetail = nil
-			m.connectionLogs = nil
-			m.pushScreen(ScreenInspect)
-			return m, tea.Batch(m.connectionDetailCmd(conn.ID), m.connectionLogsCmd(conn.ID))
-		} else if m.screen == ScreenPlanPreview && m.plan != nil {
-			if m.applying {
-				return m, nil
-			}
-			// What is applied must be what was previewed. This must fail
-			// closed: the earlier version refused only when both identities
-			// were present and disagreed, so a plan carrying no connection ID
-			// was applied without ever being checked. An identity that cannot
-			// be verified is not an identity that matches.
-			if !m.planMatchesPreview() {
-				m.status = "The plan identity could not be verified. Press esc and request a new preview."
-				return m, nil
-			}
-			// Apply the previewed plan asynchronously.
-			m.applying = true
-			m.status = "Applying plan..."
-			// Track if this is a repair for post-repair verification
-			if m.plan.Intent == "repair" {
-				m.awaitingRepairVerification = true
-			}
-			return m, m.applyPlanCmd(m.plan.ID)
-		} else if m.screen == ScreenRepair && m.SelectedConnection() != nil && len(m.diagnostics) > 0 {
-			// Store pre-repair diagnostics for verification
-			m.preRepairDiagnostics = make([]ipc.DiagnosticDTO, len(m.diagnostics))
-			copy(m.preRepairDiagnostics, m.diagnostics)
-			m.repairConnectionID = m.SelectedConnection().ID
-			return m, m.planRepairCmd(m.SelectedConnection().ID)
-		} else if m.screen == ScreenDiscovery && len(m.discovery) > 0 {
-			svc := m.discovery[m.discoverySelected]
-			m.wizard = screens.NewWizardForService(m.client, m.providerSnapshot(), svc.Address, svc.Protocol).WithContext(m.rootCtx)
-			m.status = ""
-			m.pushScreen(ScreenNewConnection)
-		}
-
-	case "n":
-		if m.screen == ScreenHome {
-			m.wizard = screens.NewWizard(m.client, m.providerSnapshot()).WithContext(m.rootCtx)
-			m.status = ""
-			m.pushScreen(ScreenNewConnection)
-		}
-
-	case "r":
-		if m.screen == ScreenRecovery {
-			// Retry the full bring-up sequence: ensure/start supervisor
-			// -> health check -> snapshot. A bare snapshot retry against
-			// an unchanged dead supervisor would loop without progress.
-			m.err = nil
-			m.status = ""
-			m.transitionTo(ScreenBoot)
-			return m, m.bootstrapCmd()
-		}
-		if m.screen == ScreenRepair && m.SelectedConnection() != nil {
-			// Clear pre-repair diagnostics when manually re-running
-			m.preRepairDiagnostics = nil
-			m.repairConnectionID = ""
-			m.diagnostics = nil
-			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
-		}
-		if m.screen == ScreenHome && m.SelectedConnection() != nil {
-			// Only offer repair for connection kinds the controller
-			// can actually repair. Port-forward and other non-service
-			// kinds return "not yet implemented" from PlanRepair.
-			conn := m.SelectedConnection()
-			if conn.Kind == "service_exposure" || conn.Kind == "" {
-				m.pushScreen(ScreenRepair)
-				m.diagnostics = nil
-				return m, m.diagnosticsCmd(conn.ID)
-			}
-			m.status = "Repair is not available for this connection kind."
-		}
-
-	case "e":
-		// Editing was reachable from nowhere: the supervisor could do it, and
-		// no screen asked.
-		if (m.screen == ScreenHome || m.screen == ScreenInspect) && m.SelectedConnection() != nil {
-			return m.beginEdit(m.SelectedConnection().ID)
-		}
-
-	case "c":
-		if (m.screen == ScreenHome || m.screen == ScreenInspect) && m.SelectedConnection() != nil {
-			conn := m.SelectedConnection()
-			return m.beginClone(conn.ID, conn.Name)
-		}
-
-	case "x":
-		// Removing an account is reachable only where accounts are listed.
-		if m.screen == ScreenProviders {
-			if row, ok := m.selectedAccount(); ok {
-				m.accountRemovalTarget = row
-				m.accountRemovalError = ""
-				m.accountRemovalDependents = nil
-				m.accountRemovalPreview = nil
-				m.pushScreen(ScreenAccountRemoval)
-				return m, m.previewAccountRemovalCmd(*row)
-			}
-		}
-
-	case "a":
-		if m.screen == ScreenHome {
-			m.status = "Discovering local services..."
-			return m, m.discoveryCmd()
-		}
-		if m.screen == ScreenProviders {
-			return m.beginProviderSetup(m.selectedProviderID())
-		}
-
-	case "d":
-		if m.screen == ScreenHome && m.SelectedConnection() != nil {
-			return m, m.planDeleteCmd(m.SelectedConnection().ID)
-		}
-		if m.screen == ScreenRepair && m.SelectedConnection() != nil {
-			// Re-run diagnostics.
-			m.diagnostics = nil
-			return m, m.diagnosticsCmd(m.SelectedConnection().ID)
-		}
-
-	case "m":
-		// Older operations, on the screen that said there were some.
-		if m.screen == ScreenOperations && m.operationsTruncated {
-			next := m.operationsLimit * 2
-			if next <= 0 {
-				next = 100
-			}
-			return m, m.loadOperationsLimitCmd(next)
-		}
-
-	case "o":
-		if m.screen == ScreenHome {
-			m.pushScreen(ScreenOperations)
-			m.operationEvents = nil
-			m.operationEventsFor = ""
-			m.operationEventsFailed = ""
-			return m, m.loadOperationsCmd()
-		}
-
-	case "s":
-		if !acceptsGlobalNavigation(m.screen) {
-			return m, nil
-		}
-		if m.setup == nil {
-			m.setup = screens.NewSetup()
-		}
-		m.pushScreen(ScreenSetup)
-		return m, m.readinessCmd()
-
-	case "p":
-		if !acceptsGlobalNavigation(m.screen) {
-			return m, nil
-		}
-		m.pushScreen(ScreenProviders)
-
-	case "?":
-		// Help is reachable from anywhere, but pressing ? on the help screen
-		// recorded help as the screen to return to, which stranded the user
-		// there.
-		if m.screen == ScreenHelp {
-			return m, nil
-		}
-		m.prevScreen = m.screen
-		m.transitionTo(ScreenHelp)
-
-	case "space", " ":
-		if m.screen == ScreenHome && m.SelectedConnection() != nil {
-			conn := m.SelectedConnection()
-			// Plan asynchronously; planLoadedMsg moves to the preview screen.
-			if conn.DesiredState == "open" {
-				return m, m.planCloseCmd(conn.ID)
-			}
-			return m, m.planOpenCmd(conn.ID)
-		}
 	}
-
 	return m, nil
 }
 
@@ -2781,126 +2471,67 @@ func (m *Model) renderInspect() string {
 
 func (m *Model) renderPlanPreview() string {
 	if m.plan == nil {
-		return "No plan"
+		return "Loading the plan..."
 	}
 	var b strings.Builder
 
-	// Title with explicit action
-	intent := m.plan.Intent
-	if intent == "" {
-		intent = "unknown"
-	}
-	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" [%s] ", strings.ToUpper(intent))))
-	b.WriteString("\n\n")
-
 	// The identity comes from the plan, never from the cursor. Reading the
 	// selection meant a plan prepared for one connection could be previewed
-	// under another's name if the user moved while it was being prepared —
-	// and the next keypress applies what the plan says, not what the screen
-	// said.
+	// under another's name if the user moved while it was being prepared — and
+	// the next keypress applies what the plan says, not what the screen said.
+	name := ""
 	conn := m.connectionByID(m.plan.ConnectionID)
 	if conn != nil {
-		b.WriteString(fmt.Sprintf("Connection: %s\n", conn.Name))
+		name = conn.Name
 	} else if m.plan.ConnectionID != "" {
-		b.WriteString(fmt.Sprintf("Connection: %s\n", m.plan.ConnectionID))
+		name = m.plan.ConnectionID
 	}
-	b.WriteString(fmt.Sprintf("Provider:   %s\n", m.plan.Provider))
+
+	view := screens.DescribePlan(m.plan, name)
+
+	b.WriteString(m.theme.Style("header").Render(" " + view.Title + " "))
+	b.WriteString("\n\n")
+	b.WriteString(view.Sentence)
+	b.WriteString("\n")
+
+	// The provider and account are named in display terms. The account row
+	// previously showed the opaque account ID.
+	b.WriteString("\nThrough:    " + m.providerDisplayName(m.plan.Provider) + "\n")
 	if conn != nil && conn.ProviderAccountID != "" {
-		b.WriteString(fmt.Sprintf("Account:    %s\n", conn.ProviderAccountID))
+		b.WriteString("Account:    " + m.accountDisplayLabel(m.plan.Provider, conn.ProviderAccountID) + "\n")
 	}
 
-	// Consequences before implementation terminology: what this achieves, who
-	// can reach it, what changes locally and at the provider, and what can be
-	// undone. The step list follows as the exact technical plan.
-	if m.plan.Outcome != "" {
+	for _, section := range view.Sections {
 		b.WriteString("\n")
-		b.WriteString(m.theme.Style("header").Render(" OUTCOME "))
-		b.WriteString("\n")
-		b.WriteString(m.theme.Style("stable").Render("  " + m.plan.Outcome))
-		b.WriteString("\n")
-	}
-	if m.plan.Access != "" {
-		b.WriteString("\n")
-		b.WriteString(m.theme.Style("header").Render(" ACCESS "))
-		b.WriteString("\n  ")
-		b.WriteString(m.plan.Access)
-		b.WriteString("\n")
-	}
-	writeSection := func(title string, items []string) {
-		if len(items) == 0 {
-			return
+		style := "header"
+		if section.Attention {
+			style = "attention"
 		}
+		b.WriteString(m.theme.Style(style).Render(" " + strings.ToUpper(section.Title) + " "))
 		b.WriteString("\n")
-		b.WriteString(m.theme.Style("header").Render(" " + title + " "))
-		b.WriteString("\n")
-		for _, item := range items {
-			b.WriteString("  " + item + "\n")
-		}
-	}
-	writeSection("LOCAL CHANGES", m.plan.LocalChanges)
-	writeSection("PROVIDER CHANGES", m.plan.ProviderChanges)
-	writeSection("REVERSIBILITY", m.plan.Reversibility)
-
-	// Warnings
-	if len(m.plan.Warnings) > 0 {
-		b.WriteString("\n")
-		b.WriteString(m.theme.Style("attention").Render("Warnings:"))
-		b.WriteString("\n")
-		for _, warning := range m.plan.Warnings {
-			b.WriteString(fmt.Sprintf("  ! %s\n", warning))
+		for _, line := range section.Lines {
+			b.WriteString("  " + line + "\n")
 		}
 	}
 
-	// Exact technical plan.
-	b.WriteString("\nTechnical plan:\n")
-	hasIrreversible := false
-	for i, step := range m.plan.Steps {
-		mark := " "
-		if step.Destructive {
-			mark = "!"
-		}
-		if step.Irreversible {
-			mark = "X"
-			hasIrreversible = true
-		}
-		b.WriteString(fmt.Sprintf("  [%s] %d. %s", mark, i+1, step.Summary))
-		if step.Destructive {
-			b.WriteString(" [destructive]")
-		}
-		if step.Irreversible {
-			b.WriteString(" [irreversible]")
-		}
+	if view.Irreversible {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("attention").Render(
+			"  A step marked X cannot be undone."))
 		b.WriteString("\n")
 	}
 
-	// Plan fingerprint (for debugging/staleness detection)
-	if m.plan.Fingerprint != "" {
-		b.WriteString("\n")
-		fp := m.plan.Fingerprint
-		if len(fp) > 8 {
-			fp = fp[:8]
-		}
-		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("Fingerprint: %s", fp)))
-		b.WriteString("\n")
-	}
-
-	if m.status != "" {
-		b.WriteString("\n")
-		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
-		b.WriteString("\n")
-	}
 	if m.applying {
-		b.WriteString("\nApplying...\n")
-	} else {
-		b.WriteString("\n")
-		if hasIrreversible || intent == "delete" {
-			b.WriteString(m.theme.Style("intervention").Render("This operation cannot be undone."))
-			b.WriteString("\n")
-			b.WriteString("[esc] cancel    [enter] confirm    [q] quit\n")
-		} else {
-			b.WriteString("[esc] cancel    [enter] apply    [q] quit\n")
-		}
+		b.WriteString("\n" + m.theme.Style("muted").Render("Applying...") + "\n")
 	}
+	if m.status != "" {
+		b.WriteString("\n" + m.status + "\n")
+	}
+	if m.err != nil {
+		b.WriteString("\n" + m.renderUserFacingError() + "\n")
+	}
+
+	b.WriteString("\n" + m.actionsFor(ScreenPlanPreview).footer(m.theme, m.width) + "\n")
 	return b.String()
 }
 
@@ -3533,85 +3164,6 @@ func (m *Model) renderOperations() string {
 		b.WriteString("\n")
 		b.WriteString("\n[esc] back    [q] quit\n")
 	}
-	return b.String()
-}
-
-func (m *Model) renderHelp() string {
-	var b strings.Builder
-	b.WriteString(m.theme.Style("header").Render(" HELP "))
-	b.WriteString("\n\n")
-
-	// Use prevScreen for contextual help since m.screen is ScreenHelp.
-	sourceScreen := m.prevScreen
-	if sourceScreen == "" {
-		sourceScreen = ScreenHome
-	}
-
-	switch sourceScreen {
-	case ScreenHome:
-		b.WriteString("Home Screen:\n")
-		b.WriteString("  n        New connection wizard\n")
-		b.WriteString("  enter    Inspect selected connection\n")
-		b.WriteString("  space    Open/close selected connection\n")
-		b.WriteString("  r        Repair selected connection\n")
-		b.WriteString("  a        Discover local services\n")
-		b.WriteString("  e        Edit selected connection\n")
-		b.WriteString("  c        Copy selected connection\n")
-		b.WriteString("  d        Preview deletion of selected connection\n")
-		b.WriteString("  o        View operations\n")
-		b.WriteString("  p        Providers\n")
-		b.WriteString("  s        Setup — what Portico needs and what is already configured\n")
-		b.WriteString("  up/k     Select previous\n")
-		b.WriteString("  down/j   Select next\n")
-	case ScreenInspect:
-		b.WriteString("Inspect Screen:\n")
-		b.WriteString("  ←/h      Previous tab\n")
-		b.WriteString("  →/l      Next tab\n")
-		b.WriteString("  e        Edit this connection\n")
-		b.WriteString("  c        Copy this connection\n")
-		b.WriteString("  esc      Back to home\n")
-	case ScreenPlanPreview:
-		b.WriteString("Plan Preview:\n")
-		b.WriteString("  enter    Apply plan\n")
-		b.WriteString("  esc      Cancel\n")
-	case ScreenOperationProgress:
-		b.WriteString("Operation Progress:\n")
-		b.WriteString("  esc      Back to home\n")
-	case ScreenRepair:
-		b.WriteString("Repair Screen:\n")
-		b.WriteString("  enter    Preview repair plan\n")
-		b.WriteString("  r        Re-run diagnostics\n")
-		b.WriteString("  esc      Back to home\n")
-	case ScreenDiscovery:
-		b.WriteString("Discovery Screen:\n")
-		b.WriteString("  up/k     Select previous service\n")
-		b.WriteString("  down/j   Select next service\n")
-		b.WriteString("  enter    Create connection from selected service\n")
-		b.WriteString("  esc      Back to home\n")
-	case ScreenOperations:
-		b.WriteString("Operations Screen:\n")
-		b.WriteString("  up/k     Select previous operation\n")
-		b.WriteString("  down/j   Select next operation\n")
-		b.WriteString("  esc      Back to home\n")
-	case ScreenProviders:
-		b.WriteString("Providers Screen:\n")
-		b.WriteString("  a        Add account\n")
-		b.WriteString("  esc      Back to home\n")
-	case ScreenRecovery:
-		b.WriteString("Recovery Screen:\n")
-		b.WriteString("  r        Retry connection to supervisor\n")
-		b.WriteString("  q        Quit\n")
-	default:
-		b.WriteString("General:\n")
-	}
-
-	b.WriteString("\nGlobal:\n")
-	b.WriteString("  esc      Back to home (from most screens)\n")
-	b.WriteString("  q        Quit (from home screen)\n")
-	b.WriteString("  ctrl+c   Force quit\n")
-	b.WriteString("  ?        This help screen\n")
-
-	b.WriteString("\n[esc] back\n")
 	return b.String()
 }
 

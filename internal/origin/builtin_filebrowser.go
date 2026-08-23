@@ -141,7 +141,7 @@ type BuiltinFileBrowser struct {
 	canonicalRoot string // pinned canonical root at construction time
 	rootFd        int    // file descriptor for root directory (O_PATH)
 	serveDone     chan struct{}
-	csrfKey       [32]byte // random key for HMAC-based CSRF tokens
+	csrfKey       [32]byte   // random key for HMAC-based CSRF tokens
 	rooted        *rootedDir // P0 #2: fd-relative operations
 }
 

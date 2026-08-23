@@ -8,10 +8,10 @@ import (
 type UnknownStepObservation string
 
 const (
-	StepAbsent      UnknownStepObservation = "absent"
-	StepExactMatch  UnknownStepObservation = "exact_match"
-	StepAmbiguous   UnknownStepObservation = "ambiguous"
-	StepTransient   UnknownStepObservation = "transient"
+	StepAbsent     UnknownStepObservation = "absent"
+	StepExactMatch UnknownStepObservation = "exact_match"
+	StepAmbiguous  UnknownStepObservation = "ambiguous"
+	StepTransient  UnknownStepObservation = "transient"
 )
 
 // UnknownOutcomeResolver resolves the outcome of an interrupted provider

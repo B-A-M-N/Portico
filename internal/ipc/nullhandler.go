@@ -39,6 +39,9 @@ func (NullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccou
 func (NullHandler) HandleReverifyProviderAccount(string, string, ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error) {
 	return nil, nil
 }
+func (NullHandler) HandleReplaceProviderAccountCredential(string, string, ReplaceCredentialRequest) (*ReplaceCredentialResponse, error) {
+	return nil, nil
+}
 func (NullHandler) HandleAccountRemovalPreview(string, string) (*AccountRemovalPreviewDTO, error) {
 	return nil, nil
 }

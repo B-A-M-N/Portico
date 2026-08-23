@@ -155,12 +155,14 @@ type rootedFileInfo struct {
 	name string
 }
 
-func (fi *rootedFileInfo) Name() string       { return fi.name }
-func (fi *rootedFileInfo) Size() int64        { return fi.st.Size }
-func (fi *rootedFileInfo) Mode() os.FileMode  { return os.FileMode(fi.st.Mode) }
-func (fi *rootedFileInfo) ModTime() time.Time { return time.Unix(int64(fi.st.Mtim.Sec), int64(fi.st.Mtim.Nsec)) }
-func (fi *rootedFileInfo) IsDir() bool        { return fi.st.Mode&syscall.S_IFDIR != 0 }
-func (fi *rootedFileInfo) Sys() interface{}   { return fi.st }
+func (fi *rootedFileInfo) Name() string      { return fi.name }
+func (fi *rootedFileInfo) Size() int64       { return fi.st.Size }
+func (fi *rootedFileInfo) Mode() os.FileMode { return os.FileMode(fi.st.Mode) }
+func (fi *rootedFileInfo) ModTime() time.Time {
+	return time.Unix(int64(fi.st.Mtim.Sec), int64(fi.st.Mtim.Nsec))
+}
+func (fi *rootedFileInfo) IsDir() bool      { return fi.st.Mode&syscall.S_IFDIR != 0 }
+func (fi *rootedFileInfo) Sys() interface{} { return fi.st }
 
 // serveFile serves a file from an open fd using http.ServeContent.
 // This avoids the TOCTOU window of path-based serving.

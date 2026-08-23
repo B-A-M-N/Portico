@@ -50,8 +50,12 @@ func (m Model) actionsFor(screen ScreenID) ActionSet {
 	case ScreenRecovery:
 		set = m.recoveryActions()
 	case ScreenHelp:
+		// Esc closes help; ? is deliberately absorbed here rather than
+		// reopening it, which used to record help as the screen to return to
+		// and stranded the user. It is not advertised as a second binding for
+		// closing, because it does not close: it does nothing.
 		set = ActionSet{{
-			ID: ActionBack, Keys: []string{"esc", "?"}, Label: "Close help", Enabled: true,
+			ID: ActionBack, Keys: []string{"esc"}, Label: "Close help", Enabled: true,
 			Primary: true, Help: "Return to the screen you came from.",
 		}}
 	}

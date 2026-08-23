@@ -623,6 +623,40 @@ func (c *Client) ReverifyProviderAccount(ctx context.Context, providerID, accoun
 	return &result, nil
 }
 
+// ReplaceProviderAccountCredential rotates the secret behind an existing
+// account without changing its identity.
+//
+// The credential is sent in the body over the authenticated local Unix socket,
+// never as a path or query parameter: those are logged by anything that logs a
+// request line. The response carries no credential.
+func (c *Client) ReplaceProviderAccountCredential(ctx context.Context, providerID, accountID, credential string) (
+	*ReplaceCredentialResponse, error,
+) {
+	body, err := json.Marshal(ReplaceCredentialRequest{Credential: credential})
+	if err != nil {
+		return nil, fmt.Errorf("marshal credential replacement request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "PUT",
+		"/v1/providers/"+url.PathEscape(providerID)+"/accounts/"+url.PathEscape(accountID)+"/credential", body)
+	// The marshalled body held the secret. Clearing it limits how long the
+	// plaintext stays reachable in this process.
+	for i := range body {
+		body[i] = 0
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result ReplaceCredentialResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // RecommendProvider asks which provider suits a set of stated requirements.
 //
 // The answer names a provider and an account, and carries the reasons and

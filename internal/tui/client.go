@@ -29,6 +29,10 @@ type SupervisorClient interface {
 	// without exposing or changing it.
 	ReverifyProviderAccount(ctx context.Context, providerID, accountID string) (
 		*ipc.ReverifyProviderAccountResponse, error)
+	// ReplaceProviderAccountCredential rotates the secret behind an existing
+	// account, keeping its identity so connections using it keep working.
+	ReplaceProviderAccountCredential(ctx context.Context, providerID, accountID, credential string) (
+		*ipc.ReplaceCredentialResponse, error)
 	ProviderSetupFlow(ctx context.Context, providerID string) (*ipc.SetupFlowDTO, error)
 	RecommendProvider(ctx context.Context, req ipc.ProviderRecommendationRequest) (
 		*ipc.ProviderRecommendationResponse, error)

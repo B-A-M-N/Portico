@@ -316,6 +316,38 @@ type ReverifyProviderAccountResponse struct {
 	VerificationUnavailable string `json:"verification_unavailable,omitempty"`
 }
 
+// ReplaceCredentialRequest rotates the secret behind an existing account.
+//
+// The account identity (provider_id, account_id) is not part of the body: it is
+// in the path, and it is deliberately not changeable here. Every connection
+// stores that identity, so replacing a credential must keep it — otherwise the
+// connections would still point at the account whose credential was replaced.
+type ReplaceCredentialRequest struct {
+	// Credential is the new secret. Like every other credential field it must
+	// come from stdin, an environment reference, or a protected descriptor —
+	// never a command argument — and it is never echoed back.
+	Credential string `json:"credential"`
+}
+
+// ReplaceCredentialResponse reports the outcome of a rotation.
+//
+// It carries no credential and no derivative of one: only whether the new
+// secret was validated, what the account's status is now, and whether the
+// provider could be reloaded in place.
+type ReplaceCredentialResponse struct {
+	AccountID string `json:"account_id,omitempty"`
+	// Validated reports that the new credential was confirmed against the
+	// provider before it replaced the old one.
+	Validated bool   `json:"validated,omitempty"`
+	Status    string `json:"status,omitempty"`
+	// VerificationUnavailable explains why the new credential could not be
+	// checked, when Portico has no way to check it for this provider.
+	VerificationUnavailable string `json:"verification_unavailable,omitempty"`
+	// RestartRequired reports that the credential is stored but the running
+	// provider could not be reloaded, so it is not yet in force.
+	RestartRequired bool `json:"restart_required,omitempty"`
+}
+
 // --------------- events ---------------
 
 // EventDTO is an event delivered via SSE.
@@ -910,6 +942,15 @@ type TelemetryDTO struct {
 	SampledAt       string `json:"sampled_at"`
 	Available       bool   `json:"available"`
 	Unavailable     string `json:"unavailable,omitempty"`
+
+	// HasCounts, HasBytes and HasErrors report which counters the provider
+	// actually measured. A provider that does not report byte totals must not
+	// have "0 bytes" displayed against it: an unmeasured counter and a measured
+	// zero are different facts, and a client cannot tell them apart from the
+	// value alone.
+	HasCounts bool `json:"has_counts,omitempty"`
+	HasBytes  bool `json:"has_bytes,omitempty"`
+	HasErrors bool `json:"has_errors,omitempty"`
 }
 
 // ReadinessDTO answers "what does Portico need, and what is already satisfied?"

@@ -1915,17 +1915,6 @@ func (h *supervisorHandler) HandleUpdateSettings(req ipc.SettingsRequest) (*ipc.
 	return h.HandleSettings()
 }
 
-// HandleReverifyProviderAccount verifies an existing account's credential
-// against the provider without changing it. The credential is never exposed.
-// TODO: implement once account resolution and credential re-fetch are available.
-func (h *supervisorHandler) HandleReverifyProviderAccount(providerID, accountID string, req ipc.ReverifyProviderAccountRequest) (*ipc.ReverifyProviderAccountResponse, error) {
-	return &ipc.ReverifyProviderAccountResponse{
-		Validated:               false,
-		Status:                  "unavailable",
-		VerificationUnavailable: "reverification is not yet implemented",
-	}, fmt.Errorf("reverification is not yet implemented")
-}
-
 // HandleProviderSetupFlow returns a provider's declarative setup requirements.
 // A provider that declares none cannot be configured, which the caller must
 // state rather than presenting an empty form.

@@ -1,0 +1,176 @@
+package screens
+
+import (
+	"fmt"
+	"strings"
+)
+
+// The review, around what the user asked for.
+//
+// The review listed the request's fields in the request's own words: a "Source"
+// of "existing_service", an "Exposure" of "temporary_public", a "Protection" of
+// "email_otp", a "Lifecycle" of "auto-start=true, on-disconnect=keep_alive" —
+// the last two of which were printed as literals rather than read from the
+// state, so they said the same thing whatever the user had chosen.
+//
+// The five questions a person needs answered before agreeing to this are what
+// will be reachable, how it will be reached, who can reach it, what Portico is
+// about to create, and what happens when it is closed. That is what this says.
+
+// renderReview draws the last question before anything is created.
+func (m *WizardModel) renderReview() string {
+	var b strings.Builder
+	b.WriteString("REVIEW\n\n")
+	b.WriteString(m.state.Name + " — " + strings.ToLower(ConnectionKindLabel(m.state.ConnectionKind)) + "\n\n")
+
+	for _, section := range m.reviewSections() {
+		b.WriteString(section.title + "\n")
+		for _, line := range section.lines {
+			b.WriteString("  " + line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("What should Portico do?\n")
+	b.WriteString(renderMenu("", []string{
+		"Save it, closed — you can open it whenever you want",
+		"Save it and open it now — you will see the plan first",
+	}, m.selected))
+
+	if m.err != nil {
+		b.WriteString("\n\nError: " + m.err.Error())
+	}
+	return b.String()
+}
+
+// reviewSection is one labelled group of statements about the connection.
+type reviewSection struct {
+	title string
+	lines []string
+}
+
+// reviewSections is the review's content, per connection kind.
+func (m *WizardModel) reviewSections() []reviewSection {
+	switch m.state.ConnectionKind {
+	case "port_forward":
+		return m.portForwardReview()
+	case "client_tunnel":
+		return m.clientTunnelReview()
+	default:
+		return m.serviceExposureReview()
+	}
+}
+
+// serviceExposureReview describes a published service.
+func (m *WizardModel) serviceExposureReview() []reviewSection {
+	sections := []reviewSection{
+		{title: "What will be reachable", lines: []string{SourceSentence(m.state)}},
+		{title: "How it will be reached", lines: []string{AddressSentence(m.state)}},
+		{title: "Who can reach it", lines: []string{AccessSentence(m.state)}},
+		{title: "Through", lines: m.providerLines()},
+		{title: "What Portico will create and manage", lines: ManagedSentence(m.state)},
+		{title: "When you close it", lines: []string{ClosingSentence(m.state)}},
+		{title: "Startup and quitting", lines: m.lifecycleLines()},
+	}
+	if extra := m.sourceDetailLines(); len(extra) > 0 {
+		sections = append(sections, reviewSection{title: "Details", lines: extra})
+	}
+	return sections
+}
+
+// portForwardReview describes a local forward, which has no public address, no
+// DNS and no access policy — so it must not be described as though it had them.
+func (m *WizardModel) portForwardReview() []reviewSection {
+	protocol := strings.ToUpper(m.state.PortForwardProtocol)
+	if protocol == "" {
+		protocol = "TCP"
+	}
+	return []reviewSection{
+		{title: "What will be reachable", lines: []string{
+			m.state.PortForwardRemoteHost + " port " + m.state.PortForwardRemotePort +
+				", as if it were on this machine",
+		}},
+		{title: "How it will be reached", lines: []string{
+			"At 127.0.0.1:" + m.state.PortForwardLocalPort + " over " + protocol + ".",
+			"There is no public address and no DNS record.",
+		}},
+		{title: "Who can reach it", lines: []string{
+			"Anything running on this machine. The listener is local only.",
+		}},
+		{title: "What Portico will create and manage", lines: ManagedSentence(m.state)},
+		{title: "When you close it", lines: []string{
+			"The listener stops. Nothing at the remote end is affected.",
+		}},
+		{title: "Startup and quitting", lines: m.lifecycleLines()},
+	}
+}
+
+// clientTunnelReview describes a client-mediated tunnel Portico manages rather
+// than one it created.
+func (m *WizardModel) clientTunnelReview() []reviewSection {
+	return []reviewSection{
+		{title: "What will be reachable", lines: []string{SourceSentence(m.state)}},
+		{title: "How it will be reached", lines: []string{
+			"Through a tunnel the client opens outward. There is no public address, " +
+				"and nothing on this machine is listening for the internet.",
+		}},
+		{title: "Who can reach it", lines: []string{
+			"Only the client the tunnel belongs to.",
+		}},
+		{title: "What Portico will create and manage", lines: ManagedSentence(m.state)},
+		{title: "When you close it", lines: []string{
+			"The tunnel client stops. The tunnel itself continues to exist at the provider.",
+		}},
+		{title: "Startup and quitting", lines: m.lifecycleLines()},
+	}
+}
+
+// providerLines names the provider and account in display terms.
+func (m *WizardModel) providerLines() []string {
+	name := m.state.Provider
+	for _, p := range m.caps.providers {
+		if p.ID == m.state.Provider && p.DisplayName != "" {
+			name = p.DisplayName
+		}
+	}
+	if name == "" {
+		return []string{"No provider chosen. This connection could not be opened."}
+	}
+	lines := []string{name}
+	if m.state.AccountID != "" {
+		lines = append(lines, "Account: "+m.accountLabel(m.state.AccountID))
+	}
+	return lines
+}
+
+// lifecycleLines states both lifecycle decisions and how to change them.
+func (m *WizardModel) lifecycleLines() []string {
+	return []string{
+		autoStartSentence(m.state.AutoStart) + ".",
+		onDisconnectSentence(m.state.OnDisconnect) + ".",
+		"Press L to change either of these.",
+	}
+}
+
+// sourceDetailLines carries the specifics that matter but do not belong in the
+// five headline answers.
+func (m *WizardModel) sourceDetailLines() []string {
+	var out []string
+	if m.state.WorkingDir != "" {
+		out = append(out, "The command runs in "+m.state.WorkingDir+".")
+	}
+	if m.state.SourceType == "directory" {
+		out = append(out, directoryModeSummary(m.state)+".")
+		if m.state.DirectorySPA {
+			out = append(out, "A request for a path that does not exist is answered with the "+
+				"index page, which is what a single-page app needs.")
+		}
+	}
+	if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
+		out = append(out, "The MCP server is reached over "+m.state.MCPTransport+".")
+	}
+	if m.state.SourceProtocol != "" && m.state.SourceType == "existing_service" {
+		out = append(out, fmt.Sprintf("Portico connects to it over %s.", m.state.SourceProtocol))
+	}
+	return out
+}

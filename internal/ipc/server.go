@@ -67,6 +67,10 @@ type RequestHandler interface {
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
 	HandleReverifyProviderAccount(providerID, accountID string, req ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error)
+	// HandleReplaceProviderAccountCredential rotates the secret behind an
+	// existing account, keeping its identity so every connection using it keeps
+	// working. The new credential is validated before it replaces the old one.
+	HandleReplaceProviderAccountCredential(providerID, accountID string, req ReplaceCredentialRequest) (*ReplaceCredentialResponse, error)
 	HandleRemoveProviderAccount(providerID, accountID string, req RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error)
 	HandleAccountRemovalPreview(providerID, accountID string) (*AccountRemovalPreviewDTO, error)
 	HandleProviderSetupFlow(id string) (*SetupFlowDTO, error)
@@ -823,6 +827,42 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 		response, err := s.handler.HandleReverifyProviderAccount(id, parts[2], req)
 		if err != nil {
 			writeHandlerError(w, "PROV-010", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Credential replacement: PUT /v1/providers/{id}/accounts/{accountID}/credential
+	//
+	// A rotation, not a new account. The identity comes from the path and is not
+	// changeable, because every connection stores it.
+	if len(parts) >= 4 && action == "accounts" && parts[2] != "" && parts[3] == "credential" {
+		if r.Method != http.MethodPut {
+			writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
+			return
+		}
+		if r.Body == nil {
+			writeError(w, http.StatusBadRequest, "PROV-011", "a new credential is required")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		defer r.Body.Close()
+		var req ReplaceCredentialRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "PROV-011", "invalid request body")
+			return
+		}
+		response, err := s.handler.HandleReplaceProviderAccountCredential(id, parts[2], req)
+		// The request carried a secret. Clearing the field stops it living on in
+		// the decoded struct for the rest of the handler's stack frame.
+		req.Credential = ""
+		if err != nil {
+			writeHandlerError(w, "PROV-011", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
