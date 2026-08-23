@@ -2353,8 +2353,15 @@ func recoveryTechnicalDetail(ufe UserFacingError, err error) string {
 	return detail
 }
 
+// renderHome draws the connection list and the selected connection.
+//
+// The layout decides what fits: two columns when there is room for both the set
+// and one member of it, stacked when there is not, and a one-line route when the
+// terminal is narrow. Home previously drew the same full-width list at every
+// size, so a route strip at sixty-one columns was drawn wider than the terminal.
 func (m *Model) renderHome() string {
-	if m.width > 0 && Breakpoint(m.width) == LayoutEmergency {
+	layout := NewLayout(m.width, m.height)
+	if m.width > 0 && layout.Breakpoint == LayoutEmergency {
 		return m.renderEmergencyHome()
 	}
 	// A fresh installation has nothing to list. The word "No connections" and a
@@ -2362,112 +2369,25 @@ func (m *Model) renderHome() string {
 	if len(m.ConnectionList()) == 0 {
 		return m.renderEmptyHome()
 	}
-	var b strings.Builder
 
+	var b strings.Builder
 	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
 	b.WriteString("\n\n")
-	b.WriteString(m.theme.Style("header").Render(" CONNECTIONS "))
-	b.WriteString("\n")
 
-	// Calculate available height for connection list
-	// Reserve space for: header (1) + title (1) + route (3-5) + status (2) + help (2) = ~10 lines
-	availableHeight := m.height - 10
-	if availableHeight < 5 {
-		availableHeight = 5
-	}
-
-	// Render connection list with viewport tracking.
-	// Use a local variable — mutating m.listOffset in View() is a no-op
-	// because View() has a value receiver.
-	conns := m.ConnectionList()
-	selectedIdx := m.selectedConnectionIndex()
-	listOffset := m.listOffset
-
-	// Adjust offset so the selected item is always visible.
-	if selectedIdx >= 0 {
-		if selectedIdx < listOffset {
-			listOffset = selectedIdx
-		} else if selectedIdx >= listOffset+availableHeight {
-			listOffset = selectedIdx - availableHeight + 1
-		}
-	}
-	// Clamp offset to valid range.
-	if listOffset < 0 {
-		listOffset = 0
-	}
-	if listOffset > len(conns)-1 && len(conns) > 0 {
-		listOffset = len(conns) - 1
-	}
-
-	// Slice the visible window.
-	visibleEnd := listOffset + availableHeight
-	if visibleEnd > len(conns) {
-		visibleEnd = len(conns)
-	}
-	visibleConns := conns
-	if listOffset < len(conns) {
-		visibleConns = conns[listOffset:visibleEnd]
+	list := m.renderHomeList(layout)
+	if layout.SideBySide {
+		// The list and the selected connection side by side. lipgloss joins them,
+		// so both columns are measured in terminal cells rather than runes.
+		detail := m.renderHomeDetail(layout)
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
+			lipgloss.NewStyle().Width(layout.ListWidth).Render(list),
+			lipgloss.NewStyle().Width(gutter).Render(""),
+			lipgloss.NewStyle().Width(maxInt(layout.DetailWidth, 1)).Render(detail),
+		))
+		b.WriteString("\n")
 	} else {
-		visibleConns = nil
-	}
-
-	connListStr := renderConnectionList(visibleConns, m.selectedID, m.width, m.theme, m.useASCII)
-	lines := strings.Split(connListStr, "\n")
-
-	// Show scroll indicators when list is truncated.
-	if listOffset > 0 {
-		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("  ↑ %d above", listOffset)))
-		b.WriteString("\n")
-	}
-
-	for _, line := range lines {
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-
-	if visibleEnd < len(conns) {
-		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("  ↓ %d more", len(conns)-visibleEnd)))
-		b.WriteString("\n")
-	}
-
-	if selected := m.SelectedConnection(); selected != nil {
-		state := route.RouteOpen
-		switch selected.UserState {
-		case "Open":
-			state = route.RouteOpen
-		case "Closed":
-			state = route.RouteClosed
-		case "Unstable":
-			state = route.RouteDegraded
-		default:
-			state = route.RouteUnknown
-		}
-		// The strip draws where the connection ends. Reading only the public
-		// address drew a blank endpoint for every port forward and client
-		// tunnel, which have no public address by construction.
-		endpoint := selected.PublicAddress
-		if endpoint == "" {
-			endpoint = selected.PrivateAddress
-		}
-		if endpoint == "" {
-			endpoint = screens.ConnectionKindLabel(selected.Kind)
-		}
-		vm := route.RouteVM{
-			LocalLabel: selected.Name,
-			// The middle of the route is labelled by what it actually is. The
-			// strip drew one provider-gateway shape for every kind, so a port
-			// forward's forwarding process and a client tunnel's outbound
-			// client were both presented as a provider gateway that does not
-			// exist for either.
-			ProviderLabel: routeMiddleLabel(selected.Kind, selected.ProviderID),
-			EndpointLabel: endpoint,
-			State:         state,
-		}
-		routeStr := route.RenderRoute(vm, m.width, m.useASCII)
-		if routeStr != "" {
-			b.WriteString("\n")
-			b.WriteString(routeStr)
-		}
+		b.WriteString(list)
+		b.WriteString(m.renderHomeDetail(layout))
 	}
 
 	if m.status != "" {
@@ -2475,12 +2395,115 @@ func (m *Model) renderHome() string {
 		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
 		b.WriteString("\n")
 	}
+	if m.err != nil {
+		b.WriteString("\n")
+		b.WriteString(m.renderUserFacingError())
+	}
 
 	b.WriteString("\n")
 	// The footer is the screen's own action set, so it cannot advertise a key
 	// the screen does not accept nor omit one it does.
 	b.WriteString(m.actionsFor(ScreenHome).footer(m.theme, m.width))
 	return b.String()
+}
+
+// renderHomeList draws the connection list, scrolled so the selection is visible.
+func (m *Model) renderHomeList(layout Layout) string {
+	var b strings.Builder
+	b.WriteString(m.theme.Style("header").Render(" CONNECTIONS "))
+	b.WriteString("\n")
+
+	// The offset is a local: View has a value receiver, so writing m.listOffset
+	// here writes to a copy that is thrown away.
+	conns := m.ConnectionList()
+	selectedIdx := m.selectedConnectionIndex()
+	rows := layout.ListRows
+	listOffset := m.listOffset
+
+	if selectedIdx >= 0 {
+		if selectedIdx < listOffset {
+			listOffset = selectedIdx
+		} else if selectedIdx >= listOffset+rows {
+			listOffset = selectedIdx - rows + 1
+		}
+	}
+	if listOffset < 0 {
+		listOffset = 0
+	}
+	if listOffset > len(conns)-1 && len(conns) > 0 {
+		listOffset = len(conns) - 1
+	}
+
+	visibleEnd := minInt(listOffset+rows, len(conns))
+	var visible []ipc.ConnectionDTO
+	if listOffset < len(conns) {
+		visible = conns[listOffset:visibleEnd]
+	}
+
+	if listOffset > 0 {
+		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf("  ↑ %d above", listOffset)))
+		b.WriteString("\n")
+	}
+	b.WriteString(renderConnectionList(visible, m.selectedID, layout.ListWidth, m.theme, m.useASCII))
+	b.WriteString("\n")
+	if visibleEnd < len(conns) {
+		b.WriteString(m.theme.Style("muted").Render(
+			fmt.Sprintf("  ↓ %d more", len(conns)-visibleEnd)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderHomeDetail draws what is known about the selected connection: its route,
+// and its traffic when there is room and the provider reports any.
+func (m *Model) renderHomeDetail(layout Layout) string {
+	selected := m.SelectedConnection()
+	if selected == nil || !layout.ShowRoute {
+		return ""
+	}
+
+	var b strings.Builder
+	width := layout.Width
+	if layout.SideBySide {
+		width = layout.DetailWidth
+		b.WriteString(m.theme.Style("header").Render(" SELECTED "))
+		b.WriteString("\n")
+		b.WriteString("  " + truncateToWidth(selected.Name, maxInt(width-2, 1)) + "\n")
+		b.WriteString("  " + m.theme.Style("muted").Render(
+			truncateToWidth(screens.ConnectionKindLabel(selected.Kind)+" — "+selected.UserState,
+				maxInt(width-2, 1))) + "\n")
+	}
+
+	if routeStr := m.renderSelectedRoute(selected, width, layout.CompactRoute); routeStr != "" {
+		b.WriteString("\n")
+		b.WriteString(routeStr)
+		b.WriteString("\n")
+	}
+
+	// Traffic figures only where there is room for them, and only when the
+	// provider actually supplied some.
+	if layout.ShowMeasurements {
+		if sample, unavailable := m.telemetryForSelection(); sample != nil || unavailable != "" {
+			b.WriteString("\n")
+			b.WriteString(m.theme.Style("header").Render(" ACTIVITY "))
+			b.WriteString("\n")
+			b.WriteString(m.renderTelemetry())
+		}
+	}
+	return b.String()
+}
+
+// renderSelectedRoute draws the route for one connection.
+//
+// The route is built from the authoritative segments when the detail has been
+// loaded, and from the connection summary otherwise — never from a shape assumed
+// per provider.
+func (m *Model) renderSelectedRoute(conn *ipc.ConnectionDTO, width int, compact bool) string {
+	vm := m.routeViewModel(conn)
+	if compact {
+		return route.RenderCompactRoute(vm, width, m.useASCII)
+	}
+	return route.RenderRoute(vm, width, m.useASCII)
 }
 
 // renderNewConnection renders the new-connection wizard screen.
@@ -3259,10 +3282,14 @@ func (m *Model) renderEmergencyHome() string {
 func renderHeader(width int, th Theme, useASCII bool) string {
 	header := " PORTICO "
 	if width > 40 {
-		// Account for the prefix (2 chars) and suffix (2 chars) in the padding.
+		// The header style itself pads by one cell on each side, so the frame
+		// occupies two cells more than the string it is given. Leaving those out
+		// of the arithmetic made every header exactly two cells wider than the
+		// terminal, which wrapped the first line of every screen.
+		const stylePadding = 2
 		prefixLen := 2 // "┌─" or "+-"
 		suffixLen := 2 // "─┐" or "-+"
-		padding := width - len(header) - prefixLen - suffixLen
+		padding := width - displayWidth(header) - prefixLen - suffixLen - stylePadding
 		if padding < 0 {
 			padding = 0
 		}

@@ -201,6 +201,15 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 	if width < 20 {
 		return renderCompactRoute(vm, useASCII)
 	}
+	// When the supervisor has described the route, that description is what is
+	// drawn: each segment owns a span, a failure breaks the line where it failed,
+	// and the topology follows the connection's actual shape. The fixed
+	// local → gateway → endpoint drawing below is the fallback for a connection
+	// whose detail has not been loaded, where inventing segments would be worse
+	// than drawing a summary.
+	if segmented := RenderSegmentedRoute(vm, width, useASCII); segmented != "" {
+		return segmented
+	}
 
 	canvas := NewCanvas(width, 4)
 

@@ -183,48 +183,125 @@ func (s ActionSet) Advertised() []Action {
 	return out
 }
 
+// footerIndent is the leading space before the action bar. It is part of the
+// width budget: leaving it out made every footer two cells wider than the
+// terminal, which wrapped the bar onto a second line and pushed the screen up.
+const footerIndent = "  "
+
 // footer renders the action bar: the keys and labels of everything on offer,
 // with unavailable actions dimmed.
+//
+// The bar must fit. A footer wider than the terminal wraps, and a wrapped action
+// bar is both unreadable and the wrong height, so whatever is drawn is what fits:
+// the primary actions first, then as many of the rest as there is room for. An
+// action dropped for space is still in the contextual Help, which is not
+// width-constrained — so nothing becomes undiscoverable, it just stops competing
+// for a narrow line.
 func (s ActionSet) footer(th Theme, width int) string {
-	var enabled, disabled []string
+	entries := s.footerEntries()
+	if len(entries) == 0 {
+		return ""
+	}
+
+	// No width has been reported yet: show everything rather than guessing.
+	if width <= 0 {
+		return th.Style("help").Render(footerIndent + joinFooter(th, entries))
+	}
+
+	budget := width - displayWidth(footerIndent)
+	if budget <= 0 {
+		return ""
+	}
+
+	// Primary actions come first and are kept in preference to the rest, because
+	// they are the screen's actual tasks. Within each group the declared order is
+	// preserved, so the bar does not reshuffle as state changes.
+	ordered := make([]footerEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.primary {
+			ordered = append(ordered, e)
+		}
+	}
+	for _, e := range entries {
+		if !e.primary {
+			ordered = append(ordered, e)
+		}
+	}
+
+	var kept []footerEntry
+	used := 0
+	for _, e := range ordered {
+		cost := displayWidth(e.text)
+		if len(kept) > 0 {
+			cost += displayWidth(footerSeparator)
+		}
+		if used+cost > budget {
+			continue
+		}
+		kept = append(kept, e)
+		used += cost
+	}
+	if len(kept) == 0 {
+		// Not even one action fits whole. The first is clipped rather than the
+		// bar disappearing, so the screen still shows something to press.
+		return th.Style("help").Render(footerIndent + truncateToWidth(ordered[0].text, budget))
+	}
+
+	// Redrawn in declared order, so a narrow bar is a subset of the wide one
+	// rather than a differently-ordered list.
+	final := make([]footerEntry, 0, len(kept))
+	for _, e := range entries {
+		for _, k := range kept {
+			if k.text == e.text {
+				final = append(final, e)
+				break
+			}
+		}
+	}
+	return th.Style("help").Render(footerIndent + joinFooter(th, final))
+}
+
+// footerSeparator is the gap between entries on the action bar.
+const footerSeparator = "   "
+
+// footerEntry is one advertised action as it appears on the bar.
+type footerEntry struct {
+	text    string
+	enabled bool
+	primary bool
+}
+
+// footerEntries is every advertised action that has a key to press.
+func (s ActionSet) footerEntries() []footerEntry {
+	out := make([]footerEntry, 0, len(s))
 	for _, a := range s.Advertised() {
 		key := a.primaryKey()
 		if key == "" {
 			continue
 		}
-		entry := "[" + keyLabel(key) + "] " + a.Label
-		if a.Enabled {
-			enabled = append(enabled, entry)
+		out = append(out, footerEntry{
+			text:    "[" + keyLabel(key) + "] " + a.Label,
+			enabled: a.Enabled,
+			primary: a.Primary,
+		})
+	}
+	return out
+}
+
+// joinFooter renders the entries, dimming the unavailable ones.
+//
+// The styling is applied per entry rather than to a joined run of them, so an
+// available action next to an unavailable one is not swept into the same colour.
+func joinFooter(th Theme, entries []footerEntry) string {
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.enabled {
+			parts = append(parts, e.text)
 		} else {
-			disabled = append(disabled, entry)
+			parts = append(parts, th.Style("muted").Render(e.text))
 		}
 	}
-	line := strings.Join(enabled, "   ")
-	if len(disabled) > 0 {
-		dim := th.Style("muted").Render(strings.Join(disabled, "   "))
-		if line != "" {
-			line += "   " + dim
-		} else {
-			line = dim
-		}
-	}
-	// A narrow terminal gets the primary actions only, rather than a wrapped
-	// wall of keys.
-	if width > 0 && displayWidth(line) > width {
-		var primary []string
-		for _, a := range s.Advertised() {
-			if !a.Primary || !a.Enabled {
-				continue
-			}
-			if key := a.primaryKey(); key != "" {
-				primary = append(primary, "["+keyLabel(key)+"] "+a.Label)
-			}
-		}
-		if len(primary) > 0 {
-			line = strings.Join(primary, "  ")
-		}
-	}
-	return th.Style("help").Render("  " + line)
+	return strings.Join(parts, footerSeparator)
 }
 
 // keyLabel names a key the way a keyboard does.
