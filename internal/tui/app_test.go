@@ -1588,11 +1588,11 @@ func TestOperationsScreenDistinguishesEmptyFromUnavailable(t *testing.T) {
 		m.screen = ScreenOperations
 
 		view := m.View().Content
-		if !strings.Contains(view, "No operations have run yet") {
+		if !strings.Contains(view, "has not done anything yet") {
 			t.Fatalf("empty history not reported as authoritative:\n%s", view)
 		}
-		if strings.Contains(view, "unavailable") {
-			t.Fatalf("readable empty history was reported as unavailable:\n%s", view)
+		if strings.Contains(view, "could not read") {
+			t.Fatalf("readable empty history was reported as unreadable:\n%s", view)
 		}
 	})
 
@@ -1608,13 +1608,13 @@ func TestOperationsScreenDistinguishesEmptyFromUnavailable(t *testing.T) {
 		m.screen = ScreenOperations
 
 		view := m.View().Content
-		if !strings.Contains(view, "unavailable") {
-			t.Fatalf("unreadable history was not reported as unavailable:\n%s", view)
+		if !strings.Contains(view, "could not read its history") {
+			t.Fatalf("unreadable history was not reported as unreadable:\n%s", view)
 		}
 		if !strings.Contains(view, "database is locked") {
 			t.Fatalf("unavailability reason was not shown:\n%s", view)
 		}
-		if strings.Contains(view, "No operations have run yet") {
+		if strings.Contains(view, "has not done anything yet") {
 			t.Fatalf("unreadable history claimed no operations have run:\n%s", view)
 		}
 	})
@@ -1637,9 +1637,19 @@ func TestOperationsScreenShowsIntentNotPlanID(t *testing.T) {
 	m.screen = ScreenOperations
 
 	view := m.View().Content
-	if !strings.Contains(view, "open") {
-		t.Fatalf("operation intent not shown:\n%s", view)
+	// The intent is stated as the action taken, in the words a user would use,
+	// rather than as the wire value or the plan's opaque ID.
+	if !strings.Contains(view, "Opened") {
+		t.Fatalf("operation intent not shown as an action:\n%s", view)
 	}
+	if strings.Contains(view, "plan-7f3a9c") && !strings.Contains(view, "TECHNICAL DETAIL") {
+		t.Fatalf("the plan ID leads the row instead of being technical detail:\n%s", view)
+	}
+	// The connection is named, not identified.
+	if !strings.Contains(view, "web") {
+		t.Fatalf("the connection name is not shown:\n%s", view)
+	}
+	// The provider remains available, under technical detail.
 	if !strings.Contains(view, "cloudflare") {
 		t.Fatalf("operation provider not shown:\n%s", view)
 	}

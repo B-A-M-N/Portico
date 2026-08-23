@@ -72,12 +72,19 @@ func TestACappedHistorySaysItIsCapped(t *testing.T) {
 	m.operationsTruncated = true
 	m.operationsLimit = 50
 
+	m.width = 120
 	view := m.renderOperations()
-	if !strings.Contains(view, "There are older ones") {
+	if !strings.Contains(view, "Older operations exist") {
 		t.Fatalf("a capped history does not say so:\n%s", view)
 	}
-	if !strings.Contains(view, "[m] show more") {
-		t.Fatalf("a capped history offers no way to see more:\n%s", view)
+	// And the way to see them is advertised, from the screen's action set rather
+	// than a hardcoded string that could name a key the screen does not accept.
+	action, ok := m.actionsFor(ScreenOperations).Find(ActionShowMore)
+	if !ok || !action.Enabled {
+		t.Fatal("a capped history does not offer a way to see more")
+	}
+	if !strings.Contains(view, action.Label) {
+		t.Fatalf("the way to see older operations is not advertised:\n%s", view)
 	}
 }
 

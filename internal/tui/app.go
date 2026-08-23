@@ -3156,176 +3156,207 @@ func operationDuration(op ipc.OperationDTO) (time.Duration, bool) {
 	return d, true
 }
 
+// renderOperations draws the history: what Portico did, to what, and how it ended.
+//
+// The list led with operation IDs and plan fingerprints — the two things a user
+// has least use for — and left the connection's name, the action attempted and
+// the reason for a failure to be inferred from them. Nothing could be filtered,
+// so finding the failure that brought you here meant reading every successful
+// open above it.
+//
+// The identifiers are not removed. They move to the technical detail of the
+// selected operation, which is where they are useful: attaching to a bug report.
 func (m *Model) renderOperations() string {
 	var b strings.Builder
-	b.WriteString(m.theme.Style("header").Render(" OPERATIONS "))
+	b.WriteString(m.theme.Style("header").Render(" HISTORY "))
 	b.WriteString("\n\n")
 
 	if len(m.operations) == 0 {
-		// "No operations found" is an authoritative claim that no work has
-		// happened. Only make it when history was actually read.
+		// "No operations" is an authoritative claim that no work has happened.
+		// Only make it when history was actually read.
 		if !m.operationsAvailable {
-			b.WriteString(m.theme.Style("intervention").Render("Operation history is unavailable.\n"))
+			b.WriteString(m.theme.Style("intervention").Render(
+				"Portico could not read its history."))
+			b.WriteString("\n")
 			if m.operationsUnavailable != "" {
-				b.WriteString(fmt.Sprintf("\nReason: %s\n", m.operationsUnavailable))
+				b.WriteString("\nReason: " + m.operationsUnavailable + "\n")
 			}
-			b.WriteString("\nThis does not mean no operations have run.\n")
+			b.WriteString("\nThis does not mean nothing has run — it means the history " +
+				"could not be read.\n")
 		} else {
-			b.WriteString("No operations have run yet.\n")
+			b.WriteString("Portico has not done anything yet.\n")
 		}
-		b.WriteString("\n[esc] back    [q] quit\n")
+		b.WriteString("\n" + m.actionsFor(ScreenOperations).footer(m.theme, m.width) + "\n")
 		return b.String()
 	}
 
-	// Show operations list
-	for i, op := range m.operations {
+	visible := m.visibleOperations()
+	b.WriteString(m.theme.Style("muted").Render(
+		"Showing "+m.operationsFilter.label()+".") + "\n\n")
+
+	if len(visible) == 0 {
+		// The filter, not the history, is empty. Saying so distinguishes "nothing
+		// failed" from "nothing has run".
+		b.WriteString("Nothing here is " + m.operationsFilter.label() + ".\n")
+		b.WriteString("\n" + m.actionsFor(ScreenOperations).footer(m.theme, m.width) + "\n")
+		return b.String()
+	}
+
+	now := time.Now()
+	for i, op := range visible {
 		prefix := "  "
 		if i == m.opsSelectedIdx {
 			prefix = "> "
 		}
 
-		// Format operation status.
-		//
-		// Operations and steps use different vocabularies: an operation reaches
-		// "completed" (controller.OperationStateCompleted) while a step reaches
-		// "succeeded" (store.StepSucceeded). This switch previously tested for
-		// "succeeded", which an operation is never set to, so a successful
-		// operation was never styled as one.
-		status := op.State
-		statusStyle := "muted"
-		switch op.State {
-		case "running", "pending":
-			statusStyle = "attention"
-		case "completed":
-			statusStyle = "stable"
-		case "failed":
-			statusStyle = "intervention"
+		// What was done, to what, and how it ended — in that order, because that
+		// is the order a person reads it in.
+		line := prefix + m.operationHeadline(op) + " — " + operationOutcome(op)
+		if age := operationAge(op, now); age != "" {
+			line += " (" + age + ")"
 		}
-
-		// The operation's intent comes from the plan it executed. This used to
-		// display the plan ID, which is an opaque identifier, not an intent.
-		intent := op.Intent
-		if intent == "" {
-			intent = "unknown"
-		}
-
-		// Format connection ID (truncate if too long)
-		connID := op.ConnectionID
-		if len(connID) > 20 {
-			connID = connID[:17] + "..."
-		}
-
-		line := fmt.Sprintf("%s[%s] %s - %s", prefix, status, intent, connID)
-		b.WriteString(m.theme.Style(statusStyle).Render(line))
+		b.WriteString(m.theme.Style(operationStyle(op)).Render(m.clipToWidth(line)))
 		b.WriteString("\n")
 
-		// Show selected operation details
-		if i == m.opsSelectedIdx {
+		// A failure carries its reason on the row: it is the thing the user came
+		// here to find, and making them select the row to see it hides it behind
+		// a keystroke.
+		if operationFailed(op) && op.Error != "" {
+			b.WriteString(m.theme.Style("intervention").Render(
+				m.clipToWidth("      " + op.Error)))
 			b.WriteString("\n")
-			b.WriteString(m.theme.Style("header").Render(" Operation Details "))
-			b.WriteString("\n")
-			b.WriteString(fmt.Sprintf("  ID:         %s\n", op.ID))
-			b.WriteString(fmt.Sprintf("  Connection: %s\n", op.ConnectionID))
-			b.WriteString(fmt.Sprintf("  Intent:     %s\n", intent))
-			if op.ProviderID != "" {
-				b.WriteString(fmt.Sprintf("  Provider:   %s\n", op.ProviderID))
-			}
-			b.WriteString(fmt.Sprintf("  Plan:       %s\n", op.PlanID))
-			b.WriteString(fmt.Sprintf("  State:      %s\n", op.State))
-			if op.StartedAt != "" {
-				b.WriteString(fmt.Sprintf("  Started:    %s\n", op.StartedAt))
-			}
-			if op.CompletedAt != "" {
-				b.WriteString(fmt.Sprintf("  Completed:  %s\n", op.CompletedAt))
-			}
-			if d, ok := operationDuration(op); ok {
-				b.WriteString(fmt.Sprintf("  Duration:   %s\n", d))
-			}
-			if op.Fingerprint != "" {
-				b.WriteString(fmt.Sprintf("  Plan hash:  %s\n", op.Fingerprint))
-			}
-			if op.Error != "" {
-				b.WriteString(m.theme.Style("intervention").Render(fmt.Sprintf("  Error:      %s\n", op.Error)))
-			}
-
-			// What actually happened, from the operation's own journal. The
-			// steps say what was planned and how each ended; the journal says
-			// what the connector and provider reported while it ran, which is
-			// the difference between "the tunnel step failed" and knowing why.
-			if m.operationEventsFailed != "" {
-				b.WriteString("\n  ")
-				b.WriteString(m.theme.Style("muted").Render(
-					"The record of what happened could not be read: " + m.operationEventsFailed))
-				b.WriteString("\n")
-			} else if m.operationEventsFor == op.ID && len(m.operationEvents) > 0 {
-				b.WriteString("\n  What happened:\n")
-				for _, evt := range m.operationEvents {
-					line := evt.Type
-					if evt.Stage != "" {
-						line = evt.Stage + " — " + line
-					}
-					if summary := eventSummary(evt); summary != "" {
-						line = line + ": " + summary
-					}
-					b.WriteString(m.theme.Style("muted").Render("    " + line))
-					b.WriteString("\n")
-				}
-			} else if m.operationEventsFor == op.ID {
-				b.WriteString("\n  ")
-				b.WriteString(m.theme.Style("muted").Render("No further detail was recorded."))
-				b.WriteString("\n")
-			}
-
-			// Show steps if any
-			if len(op.Steps) > 0 {
-				b.WriteString("\n  Steps:\n")
-				for _, step := range op.Steps {
-					stepStatus := "○"
-					stepStyle := "muted"
-					switch step.State {
-					case "running":
-						stepStatus = "◐"
-						stepStyle = "attention"
-					case "succeeded":
-						stepStatus = "●"
-						stepStyle = "stable"
-					case "failed":
-						stepStatus = "✗"
-						stepStyle = "intervention"
-					case "compensation_failed":
-						stepStatus = "⚠"
-						stepStyle = "intervention"
-					case "skipped":
-						stepStatus = "⊘"
-					}
-					stepLine := fmt.Sprintf("    %s %s", stepStatus, step.Summary)
-					b.WriteString(m.theme.Style(stepStyle).Render(stepLine))
-					b.WriteString("\n")
-					if step.Error != "" {
-						b.WriteString(m.theme.Style("intervention").Render(fmt.Sprintf("      Error: %s", step.Error)))
-						b.WriteString("\n")
-					}
-				}
-			}
 		}
 	}
 
-	// A capped list with no way to tell it was capped reads as the whole
-	// history, which is the one thing a history must not be wrong about.
+	// The technical detail of the selected operation: identifiers, the plan it
+	// executed, the revision it was built against, and its journal.
+	if selected := m.selectedOperation(); selected != nil {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("header").Render(" TECHNICAL DETAIL "))
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render(
+			"  Operation "+selected.ID) + "\n")
+		b.WriteString(m.theme.Style("muted").Render(
+			"  State "+selected.State) + "\n")
+		if selected.PlanID != "" {
+			b.WriteString(m.theme.Style("muted").Render("  Plan "+selected.PlanID) + "\n")
+		}
+		if selected.ConnectionID != "" {
+			b.WriteString(m.theme.Style("muted").Render(
+				"  Connection "+selected.ConnectionID) + "\n")
+		}
+		if selected.ProviderID != "" {
+			b.WriteString(m.theme.Style("muted").Render(
+				"  Through "+m.providerDisplayName(selected.ProviderID)+
+					" ("+selected.ProviderID+")") + "\n")
+		}
+		if selected.Fingerprint != "" {
+			b.WriteString(m.theme.Style("muted").Render(
+				"  Plan fingerprint "+selected.Fingerprint) + "\n")
+		}
+		if selected.ProfileRevision > 0 {
+			b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf(
+				"  Built against revision %d", selected.ProfileRevision)) + "\n")
+		}
+		b.WriteString(m.renderOperationJournal(selected))
+	}
+
+	// Whether this is all of it is stated either way. A silently limited list
+	// looks identical to a complete one, so a user looking for last week's
+	// operation concludes it never happened.
 	if m.operationsTruncated {
-		b.WriteString("\n")
-		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf(
-			"  Showing the %d most recent operations. There are older ones.", len(m.operations))))
-		b.WriteString("\n")
-		b.WriteString("\n[m] show more    [esc] back    [q] quit\n")
+		b.WriteString("\n" + m.theme.Style("muted").Render(
+			"Older operations exist beyond these.") + "\n")
 	} else {
+		b.WriteString("\n" + m.theme.Style("muted").Render(
+			"This is the complete history.") + "\n")
+	}
+
+	// Said plainly, because it is not obvious and it matters: the supervisor owns
+	// the work, so walking away does not stop it.
+	b.WriteString("\n" + m.theme.Style("muted").Render(
+		"Leaving this screen, or quitting Portico, does not cancel anything. The "+
+			"supervisor finishes what it started.") + "\n")
+
+	if m.status != "" {
+		b.WriteString("\n" + m.status + "\n")
+	}
+	b.WriteString("\n" + m.actionsFor(ScreenOperations).footer(m.theme, m.width) + "\n")
+	return b.String()
+}
+
+// renderOperationJournal shows what actually happened during one operation.
+func (m *Model) renderOperationJournal(op *ipc.OperationDTO) string {
+	var b strings.Builder
+	switch {
+	case m.operationEventsFailed != "" && m.operationEventsFor == op.ID:
+		b.WriteString(m.theme.Style("muted").Render(
+			"  The journal for this operation could not be read: "+m.operationEventsFailed) + "\n")
+	case m.operationEventsFor != op.ID:
+		// The journal held is for a different operation. Showing it here would
+		// attribute one operation's events to another.
+		return b.String()
+	case len(m.operationEvents) == 0:
+		b.WriteString(m.theme.Style("muted").Render("  No events were recorded.") + "\n")
+	default:
 		b.WriteString("\n")
-		b.WriteString(m.theme.Style("muted").Render(fmt.Sprintf(
-			"  %d operations — this is the complete history.", len(m.operations))))
-		b.WriteString("\n")
-		b.WriteString("\n[esc] back    [q] quit\n")
+		for _, event := range m.operationEvents {
+			// What happened, in the words the step used, rather than the event's
+			// type name. The summary and the error are the content; the type is
+			// how the event is classified, which is not what the user is reading
+			// the journal to find out.
+			line := eventLine(event)
+			b.WriteString(m.theme.Style(eventStyle(event)).Render("  "+line) + "\n")
+		}
 	}
 	return b.String()
+}
+
+// eventLine says what one journal entry records.
+func eventLine(event ipc.EventDTO) string {
+	if op := event.Operation; op != nil {
+		switch {
+		case op.Error != "":
+			if op.StepSummary != "" {
+				return op.StepSummary + " — " + op.Error
+			}
+			return op.Error
+		case op.StepSummary != "":
+			return op.StepSummary
+		case op.State != "":
+			return "the operation became " + op.State
+		}
+	}
+	if event.Diagnostic != nil && event.Diagnostic.Summary != "" {
+		return event.Diagnostic.Summary
+	}
+	label := event.Type
+	if event.Stage != "" {
+		label += " / " + event.Stage
+	}
+	return label
+}
+
+// eventStyle draws a failure differently from a step that worked.
+func eventStyle(event ipc.EventDTO) string {
+	if event.Operation != nil && event.Operation.Error != "" {
+		return "intervention"
+	}
+	return "muted"
+}
+
+// operationStyle is how a row is drawn, from how the operation ended.
+func operationStyle(op ipc.OperationDTO) string {
+	switch {
+	case operationFailed(op):
+		return "intervention"
+	case !operationFinished(op.State):
+		return "attention"
+	case op.State == "succeeded" || op.State == "completed":
+		return "stable"
+	default:
+		return "muted"
+	}
 }
 
 func (m *Model) renderEmergencyHome() string {
@@ -3795,4 +3826,17 @@ func freshRemovalPreview(err error, response *ipc.RemoveProviderAccountResponse)
 		return response.Preview
 	}
 	return nil
+}
+
+// clipToWidth trims a line to the terminal width, and leaves it alone when no
+// width has been reported.
+//
+// A zero width is not a narrow terminal: it means no size message has arrived
+// yet. Clipping to it discards the line entirely, which is how a freshly
+// constructed model came to render blank rows.
+func (m *Model) clipToWidth(s string) string {
+	if m.width <= 0 {
+		return s
+	}
+	return truncateToWidth(s, m.width)
 }

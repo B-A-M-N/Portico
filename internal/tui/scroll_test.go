@@ -22,16 +22,26 @@ import (
 // operationsModel returns a ready model showing more operations than fit.
 func operationsModel(t *testing.T, height int) Model {
 	t.Helper()
+	// Each operation names a distinct connection, so a row is identifiable in the
+	// rendered output. The connection is looked up in the snapshot and named, so
+	// the snapshot carries one per operation: rows lead with the connection's
+	// name now, not its ID.
 	ops := make([]ipc.OperationDTO, 40)
+	snap := testSnapshot()
+	snap.Connections = nil
 	for i := range ops {
+		id := fmt.Sprintf("marker-%02d", i)
 		ops[i] = ipc.OperationDTO{
 			ID:           fmt.Sprintf("op-%02d", i),
-			ConnectionID: fmt.Sprintf("marker-%02d", i),
+			ConnectionID: id,
 			State:        ipc.OperationCompleted,
 			Intent:       "open",
 		}
+		snap.Connections = append(snap.Connections, ipc.ConnectionDTO{
+			ID: id, Name: id, DesiredState: "closed", UserState: "Closed",
+		})
 	}
-	m := readyModel(&fakeClient{}, testSnapshot())
+	m := readyModel(&fakeClient{}, snap)
 	m.operations = ops
 	m.operationsAvailable = true
 

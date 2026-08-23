@@ -127,9 +127,14 @@ func (m *Model) selectedOperation() *ipc.OperationDTO {
 }
 
 // operationFinished reports whether the supervisor is done with an operation.
+//
+// Operations and steps use different vocabularies: an operation reaches
+// "completed" while a step reaches "succeeded". Testing only for one of them is
+// how a finished operation came to be reported as still in progress — the same
+// defect the styling had, in a second place.
 func operationFinished(state string) bool {
 	switch state {
-	case "succeeded", "failed", "compensated", "recovery_required", "cancelled":
+	case "completed", "succeeded", "failed", "compensated", "recovery_required", "cancelled":
 		return true
 	default:
 		return false
@@ -180,7 +185,7 @@ func operationActionLabel(intent string) string {
 // operationOutcome states how an operation ended, in one clause.
 func operationOutcome(op ipc.OperationDTO) string {
 	switch op.State {
-	case "succeeded":
+	case "completed", "succeeded":
 		return "done"
 	case "failed":
 		return "failed"
