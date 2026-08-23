@@ -105,6 +105,13 @@ type WizardModel struct {
 	// every answer intact.
 	setupProviderID string
 
+	// Discovery, for the question that asks which running service to publish.
+	// discovered is nil until a scan has been attempted, which is what
+	// distinguishes "not asked yet" from "asked and found nothing".
+	discovered      []ipc.DiscoveredServiceDTO
+	discoverPending bool
+	discoverErr     error
+
 	// streamConnected reports whether the root model's event stream is live.
 	// When it is, operation progress arrives as events and polling is only a
 	// slow safety net; when it is not, polling is the sole source of progress.
@@ -169,6 +176,10 @@ const (
 	WizardStepIntent
 	WizardStepName
 	WizardStepMCPMode
+	// WizardStepDiscovery asks which already-running service to publish, from a
+	// scan, rather than requiring the user to have found an address elsewhere
+	// first.
+	WizardStepDiscovery
 	WizardStepSource
 	WizardStepPort
 	WizardStepProtocol
@@ -578,10 +589,19 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepSource
 				m.setInput(m.state.SourceAddress)
 			default: // service_exposure
-				if m.state.SourceType == "mcp_server" {
+				switch {
+				case m.state.SourceType == "mcp_server":
 					m.state.Step = WizardStepMCPMode
 					m.selected = boolIndex(m.state.MCPCommand)
-				} else {
+				case m.state.SourceType == "existing_service" && m.state.SourceAddress == "":
+					// Publishing something already running: Portico looks for it
+					// rather than asking the user to go and find its address.
+					// An address already known — from the Home discovery screen —
+					// skips the question.
+					m.state.Step = WizardStepDiscovery
+					m.selected = 0
+					return m.ensureDiscoveryStarted()
+				default:
 					m.state.Step = WizardStepSource
 					m.setInput(m.state.SourceAddress)
 				}
@@ -608,6 +628,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.goBack()
 		}
 
+	case WizardStepDiscovery:
+		return m.handleDiscoveryKey(key)
+
 	case WizardStepSource:
 		switch key {
 		case "esc":
@@ -619,19 +642,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.SourceAddress = strings.TrimSpace(m.inputValue())
-			if m.hasPortStep() {
-				m.state.Step = WizardStepPort
-				m.setInput(m.state.Port)
-			} else if m.state.SourceType == "directory" {
-				m.state.Step = WizardStepDirectoryMode
-				m.selected = m.directoryModeIndex()
-			} else if m.state.SourceType == "mcp_server" {
-				m.state.Step = WizardStepMCPTransport
-				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
-			} else {
-				m.state.Step = WizardStepExposure
-				m.selected = firstAvailable(m.exposureChoices())
-			}
+			m.advanceFromSource()
 		default:
 			m.setInput(editInput(m.inputValue(), key))
 		}
@@ -1457,6 +1468,8 @@ func (m *WizardModel) View() string {
 		return m.withError(renderChoices("Protocol:", portForwardProtocolChoices(), m.selected))
 	case WizardStepMCPMode:
 		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
+	case WizardStepDiscovery:
+		return m.withError(m.renderDiscovery())
 	case WizardStepSource:
 		return m.withError(m.renderField(m.sourcePrompt()))
 	case WizardStepPort:
@@ -1511,6 +1524,29 @@ func (m *WizardModel) withError(view string) string {
 		return view
 	}
 	return view + "\n\nError: " + m.err.Error()
+}
+
+// advanceFromSource moves to whatever question follows the source, given the
+// kind of source this is.
+//
+// It is one function because two questions now arrive here: the typed address and
+// the discovered service. A second copy of this branch is exactly the drift that
+// made the exposure step's back-navigation disagree with its forward navigation.
+func (m *WizardModel) advanceFromSource() {
+	switch {
+	case m.hasPortStep():
+		m.state.Step = WizardStepPort
+		m.setInput(m.state.Port)
+	case m.state.SourceType == "directory":
+		m.state.Step = WizardStepDirectoryMode
+		m.selected = m.directoryModeIndex()
+	case m.state.SourceType == "mcp_server":
+		m.state.Step = WizardStepMCPTransport
+		m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
+	default:
+		m.state.Step = WizardStepExposure
+		m.selected = firstAvailable(m.exposureChoices())
+	}
 }
 
 func (m *WizardModel) sourcePrompt() string {

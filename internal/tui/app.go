@@ -939,6 +939,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case screens.WizardDiscoveryMsg:
+		// The wizard scans for a service to publish, so the user does not have to
+		// know that Home has a separate discovery shortcut and use it first.
+		if m.wizard != nil {
+			m.wizard.HandleDiscovery(msg)
+		}
+		return m, nil
+
 	case screens.ConnectionCreatedMsg:
 		if m.wizard != nil {
 			cmd := m.wizard.HandleCreated(msg)

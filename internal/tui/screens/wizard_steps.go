@@ -34,6 +34,12 @@ var wizardStepOrder = []stepRule{
 	{WizardStepPortForwardRemotePort, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	{WizardStepPortForwardProtocol, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	{WizardStepMCPMode, func(m *WizardModel) bool { return m.state.SourceType == "mcp_server" }},
+	// The discovery question belongs to an existing service only: a directory, a
+	// command and an MCP endpoint are all things the user names rather than
+	// things Portico can find listening.
+	{WizardStepDiscovery, func(m *WizardModel) bool {
+		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure"
+	}},
 	// Service-exposure steps: only for service_exposure kind.
 	{WizardStepSource, func(m *WizardModel) bool { return m.state.ConnectionKind == "service_exposure" }},
 	{WizardStepPort, func(m *WizardModel) bool { return m.hasPortStep() && m.state.ConnectionKind == "service_exposure" }},
@@ -180,6 +186,15 @@ func (m *WizardModel) restoreStepInput() {
 		m.selected = 0
 		if m.state.MCPCommand {
 			m.selected = 1
+		}
+	case WizardStepDiscovery:
+		// Returning to the question positions the cursor on the service already
+		// chosen, so going back does not silently move the user's answer.
+		m.selected = 0
+		for i, svc := range m.discovered {
+			if svc.Address == m.state.SourceAddress {
+				m.selected = i
+			}
 		}
 	case WizardStepProtocol:
 		m.selected = indexOfString([]string{"http", "https"}, m.state.SourceProtocol)

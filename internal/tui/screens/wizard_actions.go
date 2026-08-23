@@ -63,6 +63,8 @@ func (m *WizardModel) Actions() WizardActions {
 		return m.completeActions()
 	case WizardStepReview:
 		return m.reviewActions()
+	case WizardStepDiscovery:
+		return m.discoveryActions()
 	}
 	return m.questionActions()
 }

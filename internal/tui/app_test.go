@@ -796,10 +796,16 @@ func TestWizardCreateFlowIsAsync(t *testing.T) {
 
 	m, _ = press(t, m, "n")
 
-	// Walk the wizard: intent (existing service), name, address, port,
-	// protocol (http), exposure (temporary), protection (none), provider (cloudflare).
-	steps := []string{"enter"}                         // intent: existing service
+	// Walk the wizard: outcome, name, which service, address, port, protocol,
+	// exposure, protection, provider.
+	//
+	// The service question comes before the address: publishing something already
+	// running should not require having found its address elsewhere first. With no
+	// scan result, the manual-entry option is the only choice, and taking it opens
+	// the address field — which is the path this test then follows.
+	steps := []string{"enter"}                         // outcome: share a web app temporarily
 	steps = append(steps, "d", "e", "m", "o", "enter") // name: "demo"
+	steps = append(steps, "enter")                     // which service: enter an address manually
 	steps = append(steps, "enter")                     // address: empty (port next)
 	steps = append(steps, "8", "0", "8", "0", "enter") // port: 8080
 	steps = append(steps, "enter")                     // protocol: http (default)
