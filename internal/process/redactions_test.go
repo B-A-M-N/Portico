@@ -8,9 +8,9 @@ import (
 
 func TestProcessLogRedactions_RedactsFlagValuePairs(t *testing.T) {
 	cases := []struct {
-		name   string
-		spec   core.ProcessSpec
-		want   []string
+		name string
+		spec core.ProcessSpec
+		want []string
 	}{
 		{
 			name: "token-file value form",

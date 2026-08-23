@@ -209,23 +209,21 @@ func (l *Launcher) waitForReady(ctx context.Context) error {
 
 // RunTUI launches the Bubble Tea TUI connected to the supervisor.
 // Returns the actual Bubble Tea error — does not swallow terminal errors.
+//
+// Unlike the previous implementation, RunTUI does not fail when the
+// supervisor cannot be started. The TUI has a recovery screen with
+// structured error handling and a retry action, so a startup failure is
+// surfaced there rather than dropping the user back to a shell with a raw
+// error. The bootstrapper is passed to the TUI, which drives the
+// full bring-up sequence (ensure -> health -> snapshot) from its init
+// command and retries it from the recovery screen.
 func (l *Launcher) RunTUI(ctx context.Context) error {
 	if !isInteractive() {
 		return fmt.Errorf("TUI requires an interactive terminal")
 	}
 
-	if err := l.EnsureSupervisor(ctx); err != nil {
-		return fmt.Errorf("ensure supervisor: %w", err)
-	}
-
 	client := ipc.NewClient(l.Paths.SocketPath)
-
-	if err := client.Health(ctx); err != nil {
-		return fmt.Errorf("supervisor health check failed: %w (log path: %s)",
-			err, filepath.Join(l.Paths.LogDir, "supervisor.log"))
-	}
-
-	rootModel := tui.New(client)
+	rootModel := tui.New(client, l)
 
 	program := tea.NewProgram(
 		rootModel,
@@ -239,6 +237,32 @@ func (l *Launcher) RunTUI(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// TryBootstrap performs the complete bring-up sequence: ensure the
+// supervisor is running, then verify it responds to health checks.
+// A nil error means the socket is reachable and a GetSnapshot would
+// succeed. It is idempotent: a running supervisor is not restarted.
+func (l *Launcher) TryBootstrap(ctx context.Context) error {
+	if err := l.EnsureSupervisor(ctx); err != nil {
+		return fmt.Errorf("could not start the supervisor: %w", err)
+	}
+	client := ipc.NewClient(l.Paths.SocketPath)
+	if err := client.Health(ctx); err != nil {
+		return fmt.Errorf("supervisor started but is not responding: %w", err)
+	}
+	return nil
+}
+
+// SupervisorLogPath returns the path the supervisor writes its
+// structured log to. Shown on the recovery screen.
+func (l *Launcher) SupervisorLogPath() string {
+	return filepath.Join(l.Paths.LogDir, "supervisor.log")
+}
+
+// SocketPath returns the Unix socket path. Shown on the recovery screen.
+func (l *Launcher) SocketPath() string {
+	return l.Paths.SocketPath
 }
 
 // RunSupervisor returns an error — use the supervisor package directly.

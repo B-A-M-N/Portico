@@ -98,46 +98,49 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 		return nil
 	}
 
-	// Hold the manager lock for the entire stop+create+start sequence to
-	// prevent concurrent Start/Stop/Start for the same connection from
-	// interleaving and replacing the map entry while the first is
-	// stopping/creating.
+	// Phase 1: Under global lock, snapshot the old entry and install a new
+	// placeholder. We do NOT hold the global lock during stop/start because
+	// those operations can block (e.g. command origin readiness ~60s).
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.cleared {
+		m.mu.Unlock()
 		return fmt.Errorf("origin manager is stopped")
 	}
-
-	// If a managed origin already exists for this connection, stop it
-	// before starting a new one.
 	old := m.active[connectionID]
+	orig, err := newOwnedOrigin(connectionID, source)
+	if err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	managed := newManagedOrigin(orig)
+	m.active[connectionID] = managed
+	managed.SetState(originStateStarting)
+	m.mu.Unlock()
+
+	// Phase 2: Stop the old origin (under its own per-origin lock). This is
+	// safe because Stop() on the same ID will serialize via the old entry's
+	// own lock, and the global lock is not held.
 	if old != nil {
 		if err := old.stopUnderlying(ctx); err != nil {
-			// Log but proceed — the old origin may already be stopped.
 			slog.Warn("failed to stop old origin during restart", "connection", connectionID, "err", err)
 		}
 	}
 
-	// Create the underlying origin.
-	orig, err := newOwnedOrigin(connectionID, source)
-	if err != nil {
-		return err
-	}
-
-	managed := newManagedOrigin(orig)
-	m.active[connectionID] = managed
-
-	// Transition to starting under per-origin lock.
-	managed.SetState(originStateStarting)
-
+	// Phase 3: Start the new origin WITHOUT holding the global lock. This
+	// allows other connections to Start/Stop/Observe concurrently.
 	actualURL, err := orig.Start(ctx)
 	if err != nil {
 		managed.SetState(originStateCrashed)
 		managed.SetLastError(err)
 		// Best-effort cleanup of failed origin to avoid resource leaks.
 		_ = orig.Stop(context.Background())
-		delete(m.active, connectionID)
+		m.mu.Lock()
+		// Only delete if our entry is still the active one (not replaced by
+		// a concurrent Start).
+		if m.active[connectionID] == managed {
+			delete(m.active, connectionID)
+		}
+		m.mu.Unlock()
 		return err
 	}
 
@@ -145,7 +148,11 @@ func (m *Manager) Start(ctx context.Context, connectionID core.ConnectionID, sou
 		_ = orig.Stop(context.Background())
 		managed.SetState(originStateStopped)
 		managed.SetLastError(fmt.Errorf("bounded %s, expected %s", actualURL, expectedURL))
-		delete(m.active, connectionID)
+		m.mu.Lock()
+		if m.active[connectionID] == managed {
+			delete(m.active, connectionID)
+		}
+		m.mu.Unlock()
 		return fmt.Errorf("owned origin bound %s, but plan requires %s", actualURL, expectedURL)
 	}
 
@@ -177,7 +184,10 @@ func (m *Manager) Stop(ctx context.Context, connectionID core.ConnectionID) erro
 	if orig == nil {
 		managed.SetState(originStateStopped)
 		m.mu.Lock()
-		delete(m.active, connectionID)
+		// Only delete if our entry is still the active one.
+		if m.active[connectionID] == managed {
+			delete(m.active, connectionID)
+		}
 		m.mu.Unlock()
 		return nil
 	}
@@ -192,7 +202,11 @@ func (m *Manager) Stop(ctx context.Context, connectionID core.ConnectionID) erro
 
 	managed.SetState(originStateStopped)
 	m.mu.Lock()
-	delete(m.active, connectionID)
+	// Only delete if our entry is still the active one (not replaced by a
+	// concurrent Start).
+	if m.active[connectionID] == managed {
+		delete(m.active, connectionID)
+	}
 	m.mu.Unlock()
 	return nil
 }

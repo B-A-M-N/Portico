@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/app"
+	"github.com/B-A-M-N/portico/internal/config"
 	"github.com/B-A-M-N/portico/internal/controller"
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/diagnostics"
@@ -131,6 +132,11 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 		reconcilePending: make(map[core.ConnectionID]struct{}),
 		mutating:         true, // accepting mutations until shutdown begins
 		gatewayMgr:       newGatewayManager(),
+		// The stored launch mode is loaded here rather than defaulted, so a
+		// user's explicit choice is in force from the first startup after they
+		// made it. It was previously runtime-only state that began every
+		// process as auto whatever had been selected.
+		launch: config.LoadOperationalSettings().LaunchMode,
 	}
 	procMgr.SetEventSink(sup.handleProcessEvent)
 	return sup, nil
@@ -1812,7 +1818,7 @@ func (h *supervisorHandler) HandlePlanDelete(id string) (*ipc.PlanDTO, error) {
 	return dto, nil
 }
 
-// HandleSetLaunchMode changes the startup gate at runtime.
+// HandleSetLaunchMode changes the startup gate and persists it.
 //
 // It reports the mode actually in effect rather than echoing the request. An
 // environment override wins over the stored value, so a caller that assumed
@@ -1822,17 +1828,22 @@ func (h *supervisorHandler) HandleSetLaunchMode(mode string) (*ipc.LaunchModeDTO
 		return nil, core.ErrValidation(fmt.Sprintf(
 			"launch mode must be %q or %q, not %q", LaunchManual, LaunchAuto, mode))
 	}
-	h.sup.SetLaunchMode(mode)
+	// A failure to persist is reported rather than swallowed: the mode is in
+	// force for this process either way, and a user told their choice was saved
+	// when it was not would find it reverted at the next restart.
+	if err := h.sup.SetLaunchMode(mode); err != nil {
+		return nil, fmt.Errorf("launch mode changed for this session but could not be saved: %w", err)
+	}
 
 	dto := &ipc.LaunchModeDTO{Mode: h.sup.launchMode()}
 	if _, pinned := launchModeOverride(); pinned {
 		dto.Pinned = true
 		dto.PinnedBy = launchModeEnv
 	}
-	// The mode lives in the supervisor process only; Portico has no settings
-	// store to write it to. Saying so is the difference between a user
-	// deliberately leaving it manual and being surprised on the next restart.
-	dto.Persistent = false
+	// The mode is written to the config file the supervisor owns, so it
+	// survives a restart. A pinned mode is not stored, because it is the
+	// environment's choice rather than the user's.
+	dto.Persistent = LaunchModePersistent()
 	return dto, nil
 }
 
@@ -1850,6 +1861,60 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 // supervisor-owned secret store. Provider instances are built at supervisor
 // startup, so the caller must restart after a successful write before this
 // account becomes selectable for operations.
+// HandleSettings reports the operational settings currently in effect.
+//
+// Launch mode is reported from the supervisor rather than straight from the
+// config file, so an environment override is visible as the mode actually in
+// force together with the fact that it is pinned.
+func (h *supervisorHandler) HandleSettings() (*ipc.SettingsDTO, error) {
+	stored := config.LoadOperationalSettings()
+	dto := &ipc.SettingsDTO{
+		LaunchMode:          h.sup.launchMode(),
+		DefaultAutoStart:    stored.DefaultAutoStart,
+		DefaultOnDisconnect: stored.DefaultOnDisconnect,
+	}
+	if _, pinned := launchModeOverride(); pinned {
+		dto.LaunchModePinned = true
+		dto.LaunchModePinnedBy = launchModeEnv
+	}
+	return dto, nil
+}
+
+// HandleUpdateSettings changes operational settings and reports what is in
+// effect afterwards.
+//
+// Each field is validated before it is written, and an absent field is left
+// alone. The reply is recomputed from the supervisor and the store rather than
+// assembled from the request, so a value the environment overrides is reported
+// as the override's, not the caller's.
+func (h *supervisorHandler) HandleUpdateSettings(req ipc.SettingsRequest) (*ipc.SettingsDTO, error) {
+	if req.LaunchMode != nil {
+		if !ValidLaunchMode(*req.LaunchMode) {
+			return nil, core.ErrValidation(fmt.Sprintf(
+				"launch mode must be %q or %q, not %q", LaunchManual, LaunchAuto, *req.LaunchMode))
+		}
+		if err := h.sup.SetLaunchMode(*req.LaunchMode); err != nil {
+			return nil, fmt.Errorf("could not save the launch mode: %w", err)
+		}
+	}
+	if req.DefaultAutoStart != nil {
+		if err := config.SaveDefaultAutoStart(*req.DefaultAutoStart); err != nil {
+			return nil, fmt.Errorf("could not save the startup default: %w", err)
+		}
+	}
+	if req.DefaultOnDisconnect != nil {
+		policy := *req.DefaultOnDisconnect
+		if policy != "keep_alive" && policy != "close" {
+			return nil, core.ErrValidation(fmt.Sprintf(
+				"disconnect behaviour must be \"keep_alive\" or \"close\", not %q", policy))
+		}
+		if err := config.SaveDefaultOnDisconnect(policy); err != nil {
+			return nil, fmt.Errorf("could not save the disconnect default: %w", err)
+		}
+	}
+	return h.HandleSettings()
+}
+
 // HandleReverifyProviderAccount verifies an existing account's credential
 // against the provider without changing it. The credential is never exposed.
 // TODO: implement once account resolution and credential re-fetch are available.

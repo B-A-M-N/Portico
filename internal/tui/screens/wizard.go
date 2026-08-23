@@ -485,7 +485,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		}
 
 	case WizardStepPortForwardProtocol:
-		protocols := []string{"tcp", "udp"}
+		choices := portForwardProtocolChoices()
 		switch key {
 		case "esc":
 			m.goBack()
@@ -494,17 +494,20 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected--
 			}
 		case "down", "j":
-			if m.selected < len(protocols)-1 {
+			if m.selected < len(choices)-1 {
 				m.selected++
 			}
 		case "enter":
-			if m.selected == 1 {
-				// UDP not implemented
-				m.err = fmt.Errorf("UDP forwarding is not implemented; only TCP is supported")
+			choice, ok := choiceAt(choices, m.selected)
+			if !ok {
+				return nil
+			}
+			if !choice.Available {
+				m.err = fmt.Errorf("%s: %s", choice.Label, choice.Reason)
 				return nil
 			}
 			m.err = nil
-			m.state.PortForwardProtocol = protocols[m.selected]
+			m.state.PortForwardProtocol = choice.Value
 			m.state.Provider = "portforward"
 			m.state.Step = WizardStepReview
 			m.selected = 0
@@ -1406,8 +1409,7 @@ func (m *WizardModel) View() string {
 	case WizardStepPortForwardRemotePort:
 		return m.withError(m.renderField("Remote port:"))
 	case WizardStepPortForwardProtocol:
-		protocols := []string{"TCP", "UDP (not implemented)"}
-		return renderMenu("Protocol:", protocols, m.selected)
+		return m.withError(renderChoices("Protocol:", portForwardProtocolChoices(), m.selected))
 	case WizardStepMCPMode:
 		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
 	case WizardStepSource:

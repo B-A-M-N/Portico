@@ -16,6 +16,19 @@ type SupervisorClient interface {
 	Readiness(ctx context.Context) (*ipc.ReadinessDTO, error)
 	SupportExport(ctx context.Context) (*ipc.SupportExportDTO, error)
 	SetLaunchMode(ctx context.Context, mode string) (*ipc.LaunchModeDTO, error)
+	// Settings and UpdateSettings reach the durable operational settings the
+	// supervisor owns. The TUI reads and writes them here rather than touching
+	// the config file, which only the supervisor opens.
+	Settings(ctx context.Context) (*ipc.SettingsDTO, error)
+	UpdateSettings(ctx context.Context, req ipc.SettingsRequest) (*ipc.SettingsDTO, error)
+	// Telemetry is the traffic sample a provider supplies for a connection,
+	// when it supplies one. The IPC route, the DTO and the ngrok
+	// implementation all existed while no client asked for them.
+	Telemetry(ctx context.Context, id string) (*ipc.TelemetryDTO, error)
+	// ReverifyProviderAccount checks a stored credential against the provider
+	// without exposing or changing it.
+	ReverifyProviderAccount(ctx context.Context, providerID, accountID string) (
+		*ipc.ReverifyProviderAccountResponse, error)
 	ProviderSetupFlow(ctx context.Context, providerID string) (*ipc.SetupFlowDTO, error)
 	RecommendProvider(ctx context.Context, req ipc.ProviderRecommendationRequest) (
 		*ipc.ProviderRecommendationResponse, error)

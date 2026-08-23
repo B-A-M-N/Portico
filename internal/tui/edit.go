@@ -58,6 +58,11 @@ type editState struct {
 	field    textinput.Model
 	requests requestTracker
 	err      string
+	// confirmingDiscard is set when the user has asked to leave an edit that
+	// has unsaved changes. Escape used to discard them silently, which throws
+	// away work for one keystroke on a screen whose whole purpose is to
+	// accumulate it.
+	confirmingDiscard bool
 
 	// Pending values. A nil pointer means "unchanged", which is what the
 	// update request itself means by an absent field.
@@ -161,6 +166,17 @@ func (s *editState) rows() []editRow {
 		},
 	)
 	return rows
+}
+
+// currentRow returns the row under the cursor, if there is one. Callers that
+// need to know whether the highlighted property can be changed read this rather
+// than indexing rows() themselves and risking an out-of-range cursor.
+func (s *editState) currentRow() (editRow, bool) {
+	rows := s.rows()
+	if s.cursor < 0 || s.cursor >= len(rows) {
+		return editRow{}, false
+	}
+	return rows[s.cursor], true
 }
 
 // dirty reports whether anything would change.

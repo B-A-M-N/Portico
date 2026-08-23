@@ -129,12 +129,9 @@ func safePath(root, rel string) (string, error) {
 	return current, nil
 }
 
-// renameNoReplace renames src to dst. On Linux it uses RENAME_NOREPLACE
-// to prevent silent overwrites; on other platforms it falls back to the
-// standard syscall.
-func renameNoReplace(src, dst string) error {
-	return renameNoReplaceImpl(src, dst)
-}
+// P0 #2: Use fd-relative operations for filesystem access.
+// The rootedDir provides the secure primitives; renameNoReplace is now
+// in the platform-specific files (builtin_filebrowser_linux.go / _other.go).
 
 // BuiltinFileBrowser serves a web-based file browser.
 type BuiltinFileBrowser struct {
@@ -145,6 +142,7 @@ type BuiltinFileBrowser struct {
 	rootFd        int    // file descriptor for root directory (O_PATH)
 	serveDone     chan struct{}
 	csrfKey       [32]byte // random key for HMAC-based CSRF tokens
+	rooted        *rootedDir // P0 #2: fd-relative operations
 }
 
 // NewBuiltinFileBrowser creates a file browser origin. The configured root is
@@ -221,7 +219,7 @@ func newBuiltinFileBrowserFromValidated(cfg Config, absPath string) (*BuiltinFil
 		return nil, fmt.Errorf("generating CSRF token key: %w", err)
 	}
 
-	return &BuiltinFileBrowser{cfg: cfg, canonicalRoot: absPath, rootFd: rootFd, csrfKey: csrfKey}, nil
+	return &BuiltinFileBrowser{cfg: cfg, canonicalRoot: absPath, rootFd: rootFd, csrfKey: csrfKey, rooted: newRootedDir(rootFd, absPath)}, nil
 }
 
 // Root returns the pinned canonical root path.
@@ -251,10 +249,23 @@ func (fb *BuiltinFileBrowser) Start(_ context.Context) (string, error) {
 		mux.HandleFunc("/download/", fb.handleDownload)
 	}
 	if fb.cfg.AllowUpload && !fb.cfg.ReadOnly {
-		mux.HandleFunc("/upload", fb.requireCSRF(fb.handleUpload))
+		// P0 #1: Apply body limit BEFORE CSRF check. The CSRF middleware
+		// falls back to reading _csrf from the form body, so the body must
+		// already be limited when that happens.
+		mux.HandleFunc("/upload", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			const maxUploadSize = 64 << 20
+			const multipartOverhead = 2 << 10
+			r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+multipartOverhead)
+			fb.requireCSRF(fb.handleUpload).ServeHTTP(w, r)
+		}))
 	}
 	if fb.cfg.AllowDelete && !fb.cfg.ReadOnly {
-		mux.HandleFunc("/delete", fb.requireCSRF(fb.handleDelete))
+		// P0 #1: Apply body limit BEFORE CSRF check for the same reason.
+		mux.HandleFunc("/delete", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			const maxDeleteBody = 64 << 10
+			r.Body = http.MaxBytesReader(w, r.Body, maxDeleteBody)
+			fb.requireCSRF(fb.handleDelete).ServeHTTP(w, r)
+		}))
 	}
 
 	// Apply security headers globally. Mutation endpoints enforce their
@@ -328,13 +339,21 @@ func (fb *BuiltinFileBrowser) CSRFToken(path string) string {
 }
 
 // requireCSRF checks that the request includes a valid CSRF token.
-// For mutating operations (upload/delete), the token MUST be in the
-// X-CSRF-Token header. We deliberately do NOT fall back to form values
-// because that would require parsing the request body before the upload
-// handler's MaxBytesReader limit is applied.
+// It accepts the token from either:
+//   - the X-CSRF-Token header (for API/programmatic callers)
+//   - the _csrf form value (for ordinary HTML form submissions)
+//
+// A per-route request-body limiter MUST be installed before calling
+// this handler for multipart uploads (MaxBytesReader in handleUpload);
+// ParseMultipartForm consumes the body, so the limiter must wrap it.
 func (fb *BuiltinFileBrowser) requireCSRF(next http.HandlerFunc) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-CSRF-Token")
+		if token == "" {
+			// Fall back to form value for ordinary HTML form submissions.
+			// This requires the body to have already been parsed or limited.
+			token = r.FormValue("_csrf")
+		}
 		if token == "" {
 			http.Error(w, "CSRF token required", http.StatusForbidden)
 			return
@@ -526,6 +545,8 @@ func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Requ
 }
 
 // handleUpload processes a file upload. Hidden file targets are rejected by default.
+// NOTE: r.Body must already be wrapped with http.MaxBytesReader by the caller
+// (the /upload route handler in Start) — do NOT re-wrap here.
 
 func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -538,13 +559,6 @@ func (fb *BuiltinFileBrowser) handleUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Enforce a generous upload size limit (64 MiB).
-	// The multipart form parser adds overhead for headers, boundaries,
-	// and field data; 2 KiB covers that to avoid the complete body
-	// being capped at exactly the nominal file-size limit.
-	const maxUploadSize = 64 << 20
-	const multipartOverhead = 2 << 10
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+multipartOverhead)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		http.Error(w, "file too large", http.StatusBadRequest)
 		return
@@ -654,6 +668,11 @@ func (fb *BuiltinFileBrowser) handleDelete(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "read-only mode", http.StatusForbidden)
 		return
 	}
+
+	// Apply a small body limit BEFORE parsing form (prevents unbounded read).
+	const maxDeleteBody = 64 << 10 // 64 KiB is generous for a single path field
+	r.Body = http.MaxBytesReader(w, r.Body, maxDeleteBody)
+
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return

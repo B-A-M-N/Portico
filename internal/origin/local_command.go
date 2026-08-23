@@ -137,6 +137,18 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 	l.processGroupID = pidFromCmd(cmd)
 	l.done = make(chan struct{})
 
+	// P0 #12: Capture identity IMMEDIATELY after start, not after
+	// readiness. This ensures we have a complete identity for signaling
+	// even if the readiness poll is cancelled/timed out.
+	id, err := l.recordIdentity()
+	if err != nil {
+		// Identity is required for downstream signaling.
+		_ = l.stopProcessGroupUnsafe()
+		pw.Close()
+		return "", fmt.Errorf("record identity: %w", err)
+	}
+	l.identity = id
+
 	// Close write end when process exits.
 	go func() {
 		_ = cmd.Wait()
@@ -167,13 +179,6 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode < 500 {
-				id, err := l.recordIdentity()
-				if err != nil {
-					// Identity is required for downstream signaling.
-					_ = l.stopProcessGroupUnsafe()
-					return "", fmt.Errorf("record identity: %w", err)
-				}
-				l.identity = id
 				return originURL, nil
 			}
 		}

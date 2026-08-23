@@ -93,7 +93,7 @@ func (f *fakeTunnelManager) ConfigureIngress(context.Context, string, string, st
 func (f *fakeTunnelManager) GetToken(context.Context, string, string) (string, error) {
 	return "test-token", nil
 }
-func (f *fakeTunnelManager) Delete(context.Context, string, string) error             { return nil }
+func (f *fakeTunnelManager) Delete(context.Context, string, string) error { return nil }
 func (f *fakeTunnelManager) LookupTunnelByName(_ context.Context, accountID, name string) (*tunnel.TunnelInfo, error) {
 	f.requestedAccount = accountID
 	f.requestedName = name
@@ -163,8 +163,8 @@ type fakeAccessManager struct {
 	policy    access.Policy
 }
 
-func (*fakeAccessManager) CreateApp(context.Context, string, string, access.Policy) (*access.AppInfo, error) {
-	return nil, nil
+func (*fakeAccessManager) CreateAppOnly(_ context.Context, _ string, _ string) (string, error) {
+	return "fake-app-id", nil
 }
 func (*fakeAccessManager) GetApp(context.Context, string, string) (*access.AppState, error) {
 	return nil, nil

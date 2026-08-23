@@ -9,13 +9,6 @@ import (
 	cf "github.com/cloudflare/cloudflare-go"
 )
 
-// AppInfo holds the created Access application details.
-type AppInfo struct {
-	AppID    string
-	PolicyID string
-	LoginURL string
-}
-
 // Policy defines who can access the application.
 type Policy struct {
 	AllowedEmails   []string
@@ -25,8 +18,14 @@ type Policy struct {
 }
 
 // Manager manages Cloudflare Access applications and policies.
+//
+// Application creation and policy creation are separate operations, and
+// deliberately so: the plan journals the exact application ID before the policy
+// step runs, so an interrupted create leaves a recorded application rather than
+// an unattributed one. A combined create cannot offer that, because the ID it
+// would have to record only exists inside it.
 type Manager interface {
-	CreateApp(ctx context.Context, accountID, hostname string, policy Policy) (*AppInfo, error)
+	CreateAppOnly(ctx context.Context, accountID, hostname string) (appID string, err error)
 	GetApp(ctx context.Context, accountID, appID string) (*AppState, error)
 	UpdatePolicy(ctx context.Context, accountID, appID, policyID string, policy Policy) error
 	DeleteApp(ctx context.Context, accountID, appID string) error
@@ -82,56 +81,21 @@ func NewAPIManager(client *cf.API, teamDomain string) *APIManager {
 	return &APIManager{client: client, teamDomain: teamDomain}
 }
 
-// CreateApp creates a self-hosted Access application with an allow policy.
-func (m *APIManager) CreateApp(ctx context.Context, accountID, hostname string, policy Policy) (*AppInfo, error) {
+// CreateAppOnly creates an Access application without any policy.
+// P0 #7: Used by the split app/policy journalled mutations so that the
+// exact AppID is durably recorded before policy creation.
+func (m *APIManager) CreateAppOnly(ctx context.Context, accountID, hostname string) (string, error) {
 	rc := cf.AccountIdentifier(accountID)
-
-	sessionDur := policy.SessionDuration
-	if sessionDur == "" {
-		sessionDur = "30m"
-	}
-
-	// Create the Access application.
 	app, err := m.client.CreateAccessApplication(ctx, rc, cf.CreateAccessApplicationParams{
 		Name:            fmt.Sprintf("flare-%s", hostname),
 		Domain:          hostname,
 		Type:            cf.SelfHosted,
-		SessionDuration: sessionDur,
+		SessionDuration: "30m",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("creating Access application: %w", err)
+		return "", fmt.Errorf("creating Access application: %w", err)
 	}
-
-	// Build the include rules for the allow policy.
-	include := buildIncludeRules(policy)
-
-	// P0 #8: Fail closed for protected configurations.
-	// A non-trivial auth mode must have at least one include rule.
-	if policy.AuthMode != "none" && policy.AuthMode != "private_network" && len(include) == 0 {
-		return nil, fmt.Errorf("access policy requires at least one allowed email or domain for %s protection", policy.AuthMode)
-	}
-
-	// Create an allow policy on the application.
-	accessPolicy, err := m.client.CreateAccessPolicy(ctx, rc, cf.CreateAccessPolicyParams{
-		ApplicationID: app.ID,
-		Name:          fmt.Sprintf("flare-allow-%s", hostname),
-		Decision:      "allow",
-		Precedence:    1,
-		Include:       include,
-	})
-	if err != nil {
-		// Attempt cleanup of the app we just created.
-		_ = m.client.DeleteAccessApplication(ctx, rc, app.ID)
-		return nil, fmt.Errorf("creating Access policy: %w", err)
-	}
-
-	loginURL := fmt.Sprintf("https://%s", hostname)
-
-	return &AppInfo{
-		AppID:    app.ID,
-		PolicyID: accessPolicy.ID,
-		LoginURL: loginURL,
-	}, nil
+	return app.ID, nil
 }
 
 // GetApp retrieves the current state of an Access application.
@@ -287,18 +251,28 @@ func (m *APIManager) UpdatePolicy(ctx context.Context, accountID, appID, policyI
 }
 
 // DeleteApp removes an Access application (cascades to its policies).
+// P0 #8: 404/410 means the app is already gone — desired state achieved.
 func (m *APIManager) DeleteApp(ctx context.Context, accountID, appID string) error {
 	rc := cf.AccountIdentifier(accountID)
 	if err := m.client.DeleteAccessApplication(ctx, rc, appID); err != nil {
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) && (cfErr.StatusCode == 404 || cfErr.StatusCode == 410) {
+			return nil
+		}
 		return fmt.Errorf("deleting Access application: %w", err)
 	}
 	return nil
 }
 
 // DeletePolicy removes an Access policy by its exact ID.
+// P0 #8: 404/410 means the policy is already gone — desired state achieved.
 func (m *APIManager) DeletePolicy(ctx context.Context, accountID, policyID string) error {
 	rc := cf.AccountIdentifier(accountID)
 	if err := m.client.DeleteAccessPolicy(ctx, rc, cf.DeleteAccessPolicyParams{PolicyID: policyID}); err != nil {
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) && (cfErr.StatusCode == 404 || cfErr.StatusCode == 410) {
+			return nil
+		}
 		return fmt.Errorf("deleting Access policy: %w", err)
 	}
 	return nil

@@ -249,13 +249,48 @@ func (a *actor) launch() error {
 
 	// Capture actual process identity using /proc, waiting briefly for the
 	// post-exec cmdline to be visible so the stored hash is trustworthy.
+	// P0 #11: Complete four-field identity must be part of successful launch.
+	// If capture fails, we clean up the just-created process and return a
+	// startup failure rather than publishing an incomplete identity.
 	ident, err := captureIdentityStable(cmd.Process.Pid, 500*time.Millisecond)
-	if err != nil {
-		// Fall back to spec-based identity if /proc read fails.
-		ident = core.ProcessIdentity{
-			PID:            cmd.Process.Pid,
-			ExecutablePath: spec.Executable,
-			CommandHash:    computeSpecHash(spec),
+	// captureIdentityStable may return a nil error with an incomplete identity
+	// (e.g. for short-lived processes that already exited before we could read
+	// /proc). Treat both errors and incomplete identity the same way.
+	if err != nil || !ident.Complete() {
+		// For short-lived processes that already exited, /proc/<pid>/cmdline
+		// is empty. Fall back to spec-based identity so short-lived commands
+		// can still succeed.
+		if spec.Restart == core.RestartNever {
+			// Process won't be restarted — spec-based identity is acceptable
+			// since we won't need to signal a zombie.
+			ident = core.ProcessIdentity{
+				PID:            cmd.Process.Pid,
+				ExecutablePath: spec.Executable,
+				CommandHash:    computeSpecHash(spec),
+				StartTime:      uint64(time.Now().Unix()),
+			}
+		} else if err != nil {
+			// Clean up the directly-owned process before returning failure.
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+			aio.close()
+			return fmt.Errorf("capturing process identity: %w", err)
+		}
+	}
+	// Verify the identity is complete (all four fields).
+	if !ident.Complete() {
+		// For processes that will be restarted, an incomplete identity on
+		// the first attempt is acceptable — the restart loop creates a new
+		// process and captures its identity on the next attempt.
+		if spec.Restart == core.RestartNever {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+			aio.close()
+			return fmt.Errorf("incomplete process identity captured: PID=%d exe=%s", ident.PID, ident.ExecutablePath)
 		}
 	}
 

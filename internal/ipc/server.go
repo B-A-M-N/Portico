@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
@@ -80,6 +81,11 @@ type RequestHandler interface {
 	HandleTelemetry(id string) (*TelemetryDTO, error)
 	HandleReadiness() (*ReadinessDTO, error)
 	HandleSetLaunchMode(mode string) (*LaunchModeDTO, error)
+	// HandleSettings reads the operational settings the supervisor owns, and
+	// HandleUpdateSettings changes them. The TUI reaches settings only through
+	// these: the config file is opened by the supervisor alone.
+	HandleSettings() (*SettingsDTO, error)
+	HandleUpdateSettings(req SettingsRequest) (*SettingsDTO, error)
 	HandleSupportExport() (*SupportExportDTO, error)
 	HandleSupervisorStop(ctx context.Context) error
 }
@@ -89,20 +95,18 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	if st == nil {
 		return nil, fmt.Errorf("ipc server requires durable event store")
 	}
-	// Ensure parent directory exists.
+	// P0 #10: Harden runtime-directory and stale-socket handling against
+	// hostile filesystem state.
 	dir := filepath.Dir(socketPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("ipc mkdir: %w", err)
+	if err := ensureSafeRuntimeDir(dir); err != nil {
+		return nil, err
 	}
 
-	// Check if socket exists and is owned by current user before removing
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		// If remove failed because it's owned by different user, that's an error
-		if !os.IsPermission(err) {
-			return nil, fmt.Errorf("ipc remove socket: %w", err)
-		}
-		// Socket owned by different user - can't proceed
-		return nil, fmt.Errorf("socket %s owned by different user", socketPath)
+	// P0 #10: Check existing socket before removing. Only unlink if it's a
+	// socket owned by the current user. Do NOT unlink regular files, FIFOs,
+	// or directories merely because they occupy the expected socket path.
+	if err := safeUnlinkSocket(socketPath); err != nil {
+		return nil, err
 	}
 
 	s := &Server{
@@ -135,9 +139,93 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/providers/recommend", s.handleProviderRecommendation)
 	mux.HandleFunc("/v1/readiness", s.handleReadiness)
 	mux.HandleFunc("/v1/launch-mode", s.handleLaunchMode)
+	mux.HandleFunc("/v1/settings", s.handleSettings)
 	s.mux = mux
 
 	return s, nil
+}
+
+// ensureSafeRuntimeDir verifies that the runtime directory is safe to use:
+// it must exist (or be creatable), not be a symlink, be a directory, be owned
+// by the current user, and have restrictive permissions.
+func ensureSafeRuntimeDir(dir string) error {
+	// Try to create if it doesn't exist.
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("ipc mkdir %s: %w", dir, err)
+	}
+
+	// Lstat to detect symlinks.
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("ipc stat %s: %w", dir, err)
+	}
+
+	// Reject symlinks.
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("ipc runtime dir %s is a symlink (rejected)", dir)
+	}
+
+	// Require directory.
+	if !info.IsDir() {
+		return fmt.Errorf("ipc runtime dir %s is not a directory", dir)
+	}
+
+	// Check ownership.
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("ipc runtime dir %s: cannot get ownership info", dir)
+	}
+	if stat.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("ipc runtime dir %s: owned by uid %d, expected %d", dir, stat.Uid, os.Geteuid())
+	}
+
+	// Require that the directory is not world-writable — this is the actual
+	// security boundary that would allow other users to tamper with our
+	// runtime dir. os.MkdirAll creates with 0755, t.TempDir with 0775,
+	// neither is world-writable.
+	if info.Mode()&0002 != 0 {
+		return fmt.Errorf("ipc runtime dir %s: world-writable permissions (%o)", dir, info.Mode())
+	}
+
+	return nil
+}
+
+// safeUnlinkSocket removes an existing socket file only if it is a socket
+// owned by the current user. It does NOT unlink regular files, FIFOs, or
+// directories.
+func safeUnlinkSocket(socketPath string) error {
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to do
+		}
+		return fmt.Errorf("ipc stat socket %s: %w", socketPath, err)
+	}
+
+	// Reject symlinks.
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("ipc socket %s is a symlink (rejected)", socketPath)
+	}
+
+	// Require socket type.
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("ipc socket %s is not a socket (type %o, rejected)", socketPath, info.Mode())
+	}
+
+	// Check ownership.
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("ipc socket %s: cannot get ownership info", socketPath)
+	}
+	if stat.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("ipc socket %s: owned by uid %d, expected %d", socketPath, stat.Uid, os.Geteuid())
+	}
+
+	// Safe to unlink.
+	if err := os.Remove(socketPath); err != nil {
+		return fmt.Errorf("ipc remove socket %s: %w", socketPath, err)
+	}
+	return nil
 }
 
 // Start begins listening on the Unix socket with peer credential validation.
@@ -1129,6 +1217,45 @@ func (s *Server) handleLaunchMode(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(result)
+}
+
+// handleSettings reads and writes the operational settings.
+//
+// GET returns what the supervisor currently holds. PATCH changes only the
+// fields present in the body, so two clients changing different settings do not
+// clobber each other, and returns the settings actually in effect afterwards
+// rather than echoing the request — a launch mode pinned by the environment
+// cannot be changed, and saying otherwise would be untrue.
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		settings, err := s.handler.HandleSettings()
+		if err != nil {
+			writeHandlerError(w, "PTO-SETTINGS", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(settings)
+
+	case http.MethodPatch:
+		var req SettingsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "PTO-SETTINGS-BODY", "invalid request body")
+			return
+		}
+		settings, err := s.handler.HandleUpdateSettings(req)
+		if err != nil {
+			writeHandlerError(w, "PTO-SETTINGS-WRITE", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(settings)
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "PTO-SETTINGS-METHOD", "method not allowed")
+	}
 }
 
 // handleReadiness serves the aggregated setup view.

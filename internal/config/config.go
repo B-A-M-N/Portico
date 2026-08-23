@@ -27,6 +27,18 @@ const (
 	KeyLogLevel            = "log_level"
 	KeyConfigVersion       = "config_version"
 
+	// Operational settings the supervisor owns. These are what the Settings
+	// screen writes through IPC; the TUI never touches this file itself.
+	//
+	// KeyLaunchMode is the startup gate. It was previously runtime-only, so a
+	// user's explicit choice was reported as lasting "until the supervisor
+	// restarts" — which is not a setting, it is a session preference.
+	KeyLaunchMode = "operations.launch_mode"
+	// KeyDefaultAutoStart and KeyDefaultOnDisconnect are what a new connection
+	// is created with. The wizard hardcoded true and keep_alive respectively.
+	KeyDefaultAutoStart    = "operations.default_auto_start"
+	KeyDefaultOnDisconnect = "operations.default_on_disconnect"
+
 	// Ngrok config keys
 	KeyNgrokAPITokenEnv = "ngrok.api_token_env"
 	KeyNgrokAccountID   = "ngrok.account_id"
@@ -35,7 +47,13 @@ const (
 
 // CurrentConfigVersion is the latest config schema version.
 // Increment this when adding new required fields or changing semantics.
-const CurrentConfigVersion = 1
+//
+// v2 adds the operations section: launch mode, and the defaults a new
+// connection is created with. Those choices existed before it — launch mode as
+// runtime-only state, the connection defaults as literals in the wizard — so
+// the migration writes the behaviour that was already in force rather than
+// changing anything.
+const CurrentConfigVersion = 2
 
 // Init initializes viper with defaults, config file, and env bindings.
 func Init() error {
@@ -91,6 +109,14 @@ func setDefaults(stateDir string) {
 	viper.SetDefault(KeyLogLevel, "info")
 	viper.SetDefault(KeyConfigVersion, CurrentConfigVersion)
 
+	// Operational settings. The defaults are what Portico did before they were
+	// configurable, so an existing installation behaves exactly as it did:
+	// auto honours each connection's own AutoStart flag, and a new connection
+	// is created armed and surviving client disconnection.
+	viper.SetDefault(KeyLaunchMode, "auto")
+	viper.SetDefault(KeyDefaultAutoStart, true)
+	viper.SetDefault(KeyDefaultOnDisconnect, "keep_alive")
+
 	// Ngrok defaults
 	viper.SetDefault(KeyNgrokAPITokenEnv, "NGROK_AUTHTOKEN")
 	viper.SetDefault(KeyNgrokBin, "ngrok")
@@ -129,12 +155,33 @@ func migrateConfig() error {
 // applyMigration applies a single version migration.
 // Add new migration cases here when incrementing CurrentConfigVersion.
 func applyMigration(from, to int) error {
-	// Migration v1 -> v2 (example template for future migrations)
-	// switch from {
-	// case 1:
-	//     // Migrate v1 config to v2
-	//     return migrateV1toV2()
-	// }
+	switch from {
+	case 1:
+		return migrateV1toV2()
+	}
+	return nil
+}
+
+// migrateV1toV2 writes the operations section explicitly.
+//
+// A v1 config has no operations keys, so reading them falls through to the
+// defaults — which are exactly what Portico did before they were configurable.
+// Writing them makes the behaviour visible in the file rather than implicit in
+// the binary, so a user can see what their installation will do and change it.
+//
+// It is idempotent and never overwrites a value that is already set, so running
+// it twice — or on a config that has since been edited by hand — changes
+// nothing.
+func migrateV1toV2() error {
+	if !viper.IsSet(KeyLaunchMode) {
+		viper.Set(KeyLaunchMode, "auto")
+	}
+	if !viper.IsSet(KeyDefaultAutoStart) {
+		viper.Set(KeyDefaultAutoStart, true)
+	}
+	if !viper.IsSet(KeyDefaultOnDisconnect) {
+		viper.Set(KeyDefaultOnDisconnect, "keep_alive")
+	}
 	return nil
 }
 

@@ -78,36 +78,28 @@ func ok(body string) func() (int, string) {
 	return func() (int, string) { return http.StatusOK, body }
 }
 
-// TestCreatingAnAppSendsTheHostnameAndAllowedIdentities pins the request that
-// decides who can reach a protected connection.
-func TestCreatingAnAppSendsTheHostnameAndAllowedIdentities(t *testing.T) {
-	var created int
+// TestCreatingAnAppSendsTheHostname pins the request that publishes a
+// protected application.
+//
+// Application creation and policy creation are separate calls, because the plan
+// records the exact application ID before the policy step runs. This covers the
+// first half of that pair: the request Portico actually sends.
+func TestCreatingAnAppSendsTheHostname(t *testing.T) {
 	api, fake := newFakeAPI(t, map[string]func() (int, string){
-		"POST /client/v4/accounts": func() (int, string) {
-			created++
-			if created == 1 {
-				return http.StatusOK, `{"success":true,"errors":[],"messages":[],
-					"result":{"id":"app-1","name":"flare-app.example.com","domain":"app.example.com"}}`
-			}
-			return http.StatusOK, `{"success":true,"errors":[],"messages":[],
-				"result":{"id":"pol-1","name":"flare-allow-app.example.com","decision":"allow"}}`
-		},
+		"POST /client/v4/accounts": ok(`{"success":true,"errors":[],"messages":[],
+			"result":{"id":"app-1","name":"flare-app.example.com","domain":"app.example.com"}}`),
 	})
 
-	info, err := NewAPIManager(api, "acct-1").CreateApp(context.Background(), "acct-1", "app.example.com", Policy{
-		AuthMode:       "email_otp",
-		AllowedEmails:  []string{"alice@example.com"},
-		AllowedDomains: []string{"example.org"},
-	})
+	appID, err := NewAPIManager(api, "acct-1").CreateAppOnly(
+		context.Background(), "acct-1", "app.example.com")
 	if err != nil {
-		t.Fatalf("CreateApp: %v", err)
+		t.Fatalf("CreateAppOnly: %v", err)
 	}
-	if info.AppID != "app-1" || info.PolicyID != "pol-1" {
-		t.Fatalf("CreateApp returned %#v", info)
+	if appID != "app-1" {
+		t.Fatalf("CreateAppOnly returned %q, want app-1", appID)
 	}
-
-	if len(fake.requests) < 2 {
-		t.Fatalf("expected an application and a policy, got %d requests", len(fake.requests))
+	if len(fake.requests) != 1 {
+		t.Fatalf("expected exactly one request, got %d", len(fake.requests))
 	}
 	app := fake.requests[0]
 	if got := app.Body["domain"]; got != "app.example.com" {
@@ -116,81 +108,71 @@ func TestCreatingAnAppSendsTheHostnameAndAllowedIdentities(t *testing.T) {
 	if got := app.Body["type"]; got != "self_hosted" {
 		t.Errorf("application type = %v", got)
 	}
+	// No policy is created here. The application exists with nothing allowed
+	// through it until the policy step runs, which is why the plan records the
+	// application before attempting the policy.
+	if _, ok := app.Body["decision"]; ok {
+		t.Error("the application request carries a policy decision")
+	}
+}
 
-	policy, err := json.Marshal(fake.requests[1].Body)
+// TestThePolicyCarriesTheAllowedIdentities pins the second half: who is
+// actually allowed through the application.
+func TestThePolicyCarriesTheAllowedIdentities(t *testing.T) {
+	api, fake := newFakeAPI(t, map[string]func() (int, string){
+		"POST /client/v4/accounts": ok(`{"success":true,"errors":[],"messages":[],
+			"result":{"id":"pol-1","name":"flare-allow-app.example.com","decision":"allow"}}`),
+	})
+
+	policyID, err := NewAPIManager(api, "acct-1").CreatePolicy(
+		context.Background(), "acct-1", "app-1", Policy{
+			AuthMode:       "email_otp",
+			AllowedEmails:  []string{"alice@example.com"},
+			AllowedDomains: []string{"example.org"},
+		})
+	if err != nil {
+		t.Fatalf("CreatePolicy: %v", err)
+	}
+	if policyID != "pol-1" {
+		t.Fatalf("CreatePolicy returned %q, want pol-1", policyID)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("expected exactly one request, got %d", len(fake.requests))
+	}
+	body, err := json.Marshal(fake.requests[0].Body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"alice@example.com", "example.org", "allow"} {
-		if !strings.Contains(string(policy), want) {
-			t.Errorf("the policy does not carry %q: %s", want, policy)
+		if !strings.Contains(string(body), want) {
+			t.Errorf("the policy does not carry %q: %s", want, body)
 		}
 	}
 }
 
-// TestAProtectedAppIsNeverCreatedWithoutIdentities pins the fail-closed rule.
+// TestAProtectedPolicyIsNeverCreatedWithoutIdentities pins the fail-closed rule.
 //
-// An Access application with an allow policy naming nobody is an application
-// nobody can pass — or, depending on how the provider interprets an empty
-// include list, one anybody can. Neither is what was asked for, so it is
-// refused before anything is created.
-func TestAProtectedAppIsNeverCreatedWithoutIdentities(t *testing.T) {
-	var deleted bool
+// An allow policy naming nobody is a policy nobody can pass — or, depending on
+// how the provider interprets an empty include list, one anybody can. Neither is
+// what was asked for, so it is refused before the request is sent.
+func TestAProtectedPolicyIsNeverCreatedWithoutIdentities(t *testing.T) {
 	api, fake := newFakeAPI(t, map[string]func() (int, string){
 		"POST /client/v4/accounts": ok(`{"success":true,"errors":[],"messages":[],
-			"result":{"id":"app-1","domain":"app.example.com"}}`),
-		"DELETE /client/v4/accounts": func() (int, string) {
-			deleted = true
-			return http.StatusOK, `{"success":true,"errors":[],"messages":[],"result":{"id":"app-1"}}`
-		},
+			"result":{"id":"pol-1","decision":"allow"}}`),
 	})
 
-	_, err := NewAPIManager(api, "acct-1").CreateApp(context.Background(), "acct-1", "app.example.com", Policy{
-		AuthMode: "email_otp",
-	})
+	_, err := NewAPIManager(api, "acct-1").CreatePolicy(
+		context.Background(), "acct-1", "app-1", Policy{AuthMode: "email_otp"})
 	if err == nil {
-		t.Fatal("a protected application was created with no allowed identities")
+		t.Fatal("a protected policy was created with no allowed identities")
 	}
 	if !strings.Contains(err.Error(), "at least one allowed email or domain") {
 		t.Fatalf("the refusal does not say what is missing: %v", err)
 	}
-	_ = fake
-	_ = deleted
-}
-
-// TestAFailedPolicyRemovesTheApplication pins that a half-created protection is
-// not left behind.
-//
-// An application with no policy is a protected connection with no rule, and
-// leaving one means the next repair finds an application it did not expect.
-func TestAFailedPolicyRemovesTheApplication(t *testing.T) {
-	var created int
-	var deletedApp bool
-	api, _ := newFakeAPI(t, map[string]func() (int, string){
-		"POST /client/v4/accounts": func() (int, string) {
-			created++
-			if created == 1 {
-				return http.StatusOK, `{"success":true,"errors":[],"messages":[],
-					"result":{"id":"app-1","domain":"app.example.com"}}`
-			}
-			return http.StatusForbidden,
-				`{"success":false,"errors":[{"code":10000,"message":"Authentication error"}],"result":null}`
-		},
-		"DELETE /client/v4/accounts": func() (int, string) {
-			deletedApp = true
-			return http.StatusOK, `{"success":true,"errors":[],"messages":[],"result":{"id":"app-1"}}`
-		},
-	})
-
-	_, err := NewAPIManager(api, "acct-1").CreateApp(context.Background(), "acct-1", "app.example.com", Policy{
-		AuthMode:      "email_otp",
-		AllowedEmails: []string{"alice@example.com"},
-	})
-	if err == nil {
-		t.Fatal("a failed policy was reported as success")
-	}
-	if !deletedApp {
-		t.Fatal("the application was left behind with no policy protecting it")
+	// Refused before anything was sent: an application left with a rejected
+	// policy request against it is a protected hostname with no rule.
+	if len(fake.requests) != 0 {
+		t.Fatalf("the refusal still sent %d request(s)", len(fake.requests))
 	}
 }
 

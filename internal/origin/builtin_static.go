@@ -133,8 +133,9 @@ func (s *BuiltinStatic) Healthy(_ context.Context) error {
 // being served.
 func noSymlink(root string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Reject hidden files by default (e.g. .env, .git/config).
-		if isHiddenPath(r.URL.Path) {
+		// Apply the centralized publish-path policy: reject hidden files
+		// and sensitive paths (.git, .ssh, .gnupg, credential files, etc.).
+		if err := checkPublishPathStatic(r.URL.Path); err != nil {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

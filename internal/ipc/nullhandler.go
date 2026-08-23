@@ -57,5 +57,7 @@ func (NullHandler) HandleConnectionLogs(string, int) (*ConnectionLogsDTO, error)
 func (NullHandler) HandleTelemetry(string) (*TelemetryDTO, error)                 { return nil, nil }
 func (NullHandler) HandleReadiness() (*ReadinessDTO, error)                       { return nil, nil }
 func (NullHandler) HandleSetLaunchMode(string) (*LaunchModeDTO, error)            { return nil, nil }
+func (NullHandler) HandleSettings() (*SettingsDTO, error)                         { return nil, nil }
+func (NullHandler) HandleUpdateSettings(SettingsRequest) (*SettingsDTO, error)    { return nil, nil }
 func (NullHandler) HandleSupportExport() (*SupportExportDTO, error)               { return nil, nil }
 func (NullHandler) HandleSupervisorStop(context.Context) error                    { return nil }

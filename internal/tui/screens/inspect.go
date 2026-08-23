@@ -6,6 +6,22 @@ import (
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
+// InspectTab identifies one tab of the inspect screen. Named constants replace
+// the bare indices the screen switched on, so a caller asking "is the Logs tab
+// open?" does not have to know that Logs is 4.
+type InspectTab int
+
+const (
+	InspectTabOverview InspectTab = iota
+	InspectTabRoute
+	InspectTabActivity
+	InspectTabTechnical
+	InspectTabLogs
+)
+
+// inspectTabCount is how many tabs exist, used to clamp navigation.
+const inspectTabCount = int(InspectTabLogs) + 1
+
 // InspectModel is the model for the inspect screen.
 //
 // Connection is the list summary the screen opens with. Detail is the
@@ -31,6 +47,10 @@ func NewInspect(conn *ipc.ConnectionDTO) *InspectModel {
 	}
 }
 
+// SelectedTab reports which tab is open, so the root model can enable the
+// actions that apply to it rather than accepting their keys everywhere.
+func (m *InspectModel) SelectedTab() InspectTab { return InspectTab(m.selectedTab) }
+
 // HandleKey processes key input for the inspect screen.
 func (m *InspectModel) HandleKey(key string) {
 	switch key {
@@ -39,7 +59,7 @@ func (m *InspectModel) HandleKey(key string) {
 			m.selectedTab--
 		}
 	case "right", "l":
-		if m.selectedTab < 4 {
+		if m.selectedTab < inspectTabCount-1 {
 			m.selectedTab++
 		}
 	}

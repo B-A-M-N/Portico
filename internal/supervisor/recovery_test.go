@@ -2319,10 +2319,11 @@ func TestSetLaunchModeReportsTheModeInEffect(t *testing.T) {
 	if result.Pinned {
 		t.Fatal("mode reported as pinned with no override set")
 	}
-	// Portico has no settings store, so the mode lasts only as long as the
-	// process. The response must not imply the choice is remembered.
-	if result.Persistent {
-		t.Fatal("mode reported as persistent; nothing writes it to durable state")
+	// The mode is written to the config file the supervisor owns, so an
+	// explicit choice survives a restart. Reporting it as temporary would tell
+	// the user their selection was about to be forgotten.
+	if !result.Persistent {
+		t.Fatal("mode reported as temporary; the supervisor stores it")
 	}
 
 	t.Run("an unrecognised mode is rejected, not coerced", func(t *testing.T) {

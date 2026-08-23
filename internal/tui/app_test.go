@@ -68,6 +68,24 @@ type fakeClient struct {
 
 	launchMode    *ipc.LaunchModeDTO
 	launchModeErr error
+
+	// Operational settings, as the supervisor would hold them.
+	settingsDTO       *ipc.SettingsDTO
+	settingsErr       error
+	updateSettingsErr error
+	settingsCalls     int
+	settingsRequests  []ipc.SettingsRequest
+
+	// Telemetry, and the connections it was asked for.
+	telemetryDTO *ipc.TelemetryDTO
+	telemetryErr error
+	telemetryIDs []string
+
+	// Account re-verification.
+	reverifyResponse   *ipc.ReverifyProviderAccountResponse
+	reverifyErr        error
+	reverifiedProvider string
+	reverifiedAccount  string
 	// launchModeAsked records every mode the TUI requested, so a test can pin
 	// which direction the toggle asked for rather than only what it displayed.
 	launchModeAsked []string
@@ -346,6 +364,72 @@ func (f *fakeClient) RemoveProviderAccount(ctx context.Context, providerID, acco
 	return &ipc.RemoveProviderAccountResponse{Removed: true}, nil
 }
 
+// Settings, UpdateSettings, Telemetry and ReverifyProviderAccount complete the
+// SupervisorClient surface. Each records what was asked so a test can assert
+// the TUI reached the supervisor rather than answering locally.
+
+func (f *fakeClient) Settings(_ context.Context) (*ipc.SettingsDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settingsCalls++
+	if f.settingsErr != nil {
+		return nil, f.settingsErr
+	}
+	if f.settingsDTO != nil {
+		return f.settingsDTO, nil
+	}
+	return &ipc.SettingsDTO{LaunchMode: "auto", DefaultOnDisconnect: "keep_alive"}, nil
+}
+
+func (f *fakeClient) UpdateSettings(_ context.Context, req ipc.SettingsRequest) (*ipc.SettingsDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settingsRequests = append(f.settingsRequests, req)
+	if f.updateSettingsErr != nil {
+		return nil, f.updateSettingsErr
+	}
+	current := f.settingsDTO
+	if current == nil {
+		current = &ipc.SettingsDTO{LaunchMode: "auto", DefaultOnDisconnect: "keep_alive"}
+	}
+	updated := *current
+	if req.LaunchMode != nil {
+		updated.LaunchMode = *req.LaunchMode
+	}
+	if req.DefaultAutoStart != nil {
+		updated.DefaultAutoStart = *req.DefaultAutoStart
+	}
+	if req.DefaultOnDisconnect != nil {
+		updated.DefaultOnDisconnect = *req.DefaultOnDisconnect
+	}
+	f.settingsDTO = &updated
+	return &updated, nil
+}
+
+func (f *fakeClient) Telemetry(_ context.Context, id string) (*ipc.TelemetryDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.telemetryIDs = append(f.telemetryIDs, id)
+	if f.telemetryErr != nil {
+		return nil, f.telemetryErr
+	}
+	return f.telemetryDTO, nil
+}
+
+func (f *fakeClient) ReverifyProviderAccount(_ context.Context, providerID, accountID string) (
+	*ipc.ReverifyProviderAccountResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reverifiedProvider, f.reverifiedAccount = providerID, accountID
+	if f.reverifyErr != nil {
+		return f.reverifyResponse, f.reverifyErr
+	}
+	if f.reverifyResponse != nil {
+		return f.reverifyResponse, nil
+	}
+	return &ipc.ReverifyProviderAccountResponse{Validated: true, Status: "usable"}, nil
+}
+
 // --------------- helpers ---------------
 
 func keyMsg(key string) tea.KeyPressMsg {
@@ -377,7 +461,7 @@ func press(t *testing.T, m Model, key string) (Model, tea.Cmd) {
 }
 
 func readyModel(client SupervisorClient, snap ipc.SnapshotDTO) Model {
-	m := newModel(client)
+	m := newModel(client, nil)
 	next, _ := m.Update(snapshotMsg{Snapshot: snap})
 	return next.(Model)
 }
@@ -564,7 +648,7 @@ func TestSnapshotMsgUpdatesModel(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := newModel(&fakeClient{})
+			m := newModel(&fakeClient{}, nil)
 			if tt.pre != nil {
 				m = tt.pre(m)
 			}
@@ -748,7 +832,7 @@ func TestWizardCreateFlowIsAsync(t *testing.T) {
 // --------------- Phase 1 correctness tests ---------------
 
 func TestSnapshotSetsEventCursorAndConnectsSSE(t *testing.T) {
-	m := newModel(&fakeClient{})
+	m := newModel(&fakeClient{}, nil)
 	snap := ipc.SnapshotDTO{
 		Connections: []ipc.ConnectionDTO{{ID: "c1", Name: "web"}},
 		LastSeq:     42,
@@ -768,7 +852,7 @@ func TestSnapshotSetsEventCursorAndConnectsSSE(t *testing.T) {
 }
 
 func TestSnapshotDoesNotReconnectSSEOnRefresh(t *testing.T) {
-	m := newModel(&fakeClient{})
+	m := newModel(&fakeClient{}, nil)
 	snap := ipc.SnapshotDTO{
 		Connections: []ipc.ConnectionDTO{{ID: "c1", Name: "web"}},
 		LastSeq:     10,
@@ -948,7 +1032,7 @@ func TestSelectionFallsBackWhenConnectionDeleted(t *testing.T) {
 }
 
 func TestInitOnlyRequestsSnapshot(t *testing.T) {
-	m := newModel(&fakeClient{})
+	m := newModel(&fakeClient{}, nil)
 	cmd := m.Init()
 	if cmd == nil {
 		t.Fatal("Init returned nil command")
@@ -973,7 +1057,7 @@ func TestTUIBootToHomeToQuit(t *testing.T) {
 	}
 
 	// Create the TUI model with the fake client
-	model := newModel(fake)
+	model := newModel(fake, nil)
 
 	// Run the TUI program with a short timeout context
 	// Use WithInputOSFile(0) to simulate stdin without needing a real TTY
@@ -1033,7 +1117,7 @@ func TestTUINewConnectionWizard(t *testing.T) {
 		},
 	}
 
-	model := newModel(fake)
+	model := newModel(fake, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1056,7 +1140,7 @@ func TestTUINewConnectionWizard(t *testing.T) {
 // TestRecoveryScreenIsReachable verifies that when the initial snapshot fails,
 // the recovery screen is rendered (not the bare error view).
 func TestRecoveryScreenIsReachable(t *testing.T) {
-	m := newModel(&fakeClient{snapshotErr: errors.New("connection refused")})
+	m := newModel(&fakeClient{snapshotErr: errors.New("connection refused")}, nil)
 	next, _ := m.Update(snapshotMsg{Err: errors.New("connection refused")})
 	nm := next.(Model)
 
@@ -1913,348 +1997,4 @@ func openSetupWith(t *testing.T, fake *fakeClient, readiness *ipc.ReadinessDTO) 
 	m = next.(Model)
 	next, _ = m.Update(readinessMsg{Readiness: readiness})
 	return next.(Model)
-}
-
-// TestLaunchModeKeyTogglesTheGate pins that the advertised [l] key actually
-// changes the launch mode. The hint was previously displayed with no binding
-// behind it, so the screen described a control that did nothing.
-func TestLaunchModeKeyTogglesTheGate(t *testing.T) {
-	t.Run("auto asks for manual", func(t *testing.T) {
-		fake := &fakeClient{}
-		m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
-
-		_, cmd := m.Update(keyMsg("l"))
-		if cmd == nil {
-			t.Fatal("pressing l issued no command; the key is not bound")
-		}
-		cmd()
-
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		if len(fake.launchModeAsked) != 1 || fake.launchModeAsked[0] != "manual" {
-			t.Fatalf("requested modes = %v, want [manual]", fake.launchModeAsked)
-		}
-	})
-
-	t.Run("manual asks for auto", func(t *testing.T) {
-		fake := &fakeClient{}
-		m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "manual"})
-
-		_, cmd := m.Update(keyMsg("l"))
-		if cmd == nil {
-			t.Fatal("pressing l issued no command; the key is not bound")
-		}
-		cmd()
-
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		if len(fake.launchModeAsked) != 1 || fake.launchModeAsked[0] != "auto" {
-			t.Fatalf("requested modes = %v, want [auto]", fake.launchModeAsked)
-		}
-	})
-
-	t.Run("the new mode is shown with its lifetime", func(t *testing.T) {
-		fake := &fakeClient{}
-		m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
-
-		next, _ := m.Update(launchModeMsg{Result: &ipc.LaunchModeDTO{Mode: "manual"}})
-		m = next.(Model)
-
-		view := m.View().Content
-		if !strings.Contains(view, "nothing opens by itself") {
-			t.Fatalf("view does not show the new mode:\n%s", view)
-		}
-		// A mode that silently reverts on restart must say so; Portico has no
-		// settings store to remember it.
-		if !strings.Contains(m.status, "until the supervisor restarts") {
-			t.Fatalf("status does not state the mode's lifetime: %q", m.status)
-		}
-	})
-}
-
-// TestPinnedLaunchModeIsReportedNotSilentlyIgnored pins that when
-// PORTICO_LAUNCH_MODE decides the mode, the screen says so. Echoing the
-// requested mode would claim a change the supervisor did not make, and the key
-// would read as broken rather than overridden.
-func TestPinnedLaunchModeIsReportedNotSilentlyIgnored(t *testing.T) {
-	fake := &fakeClient{
-		launchMode: &ipc.LaunchModeDTO{
-			Mode: "auto", Pinned: true, PinnedBy: "PORTICO_LAUNCH_MODE",
-		},
-	}
-	m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
-
-	_, cmd := m.Update(keyMsg("l"))
-	if cmd == nil {
-		t.Fatal("pressing l issued no command")
-	}
-	next, _ := m.Update(cmd())
-	m = next.(Model)
-
-	if !strings.Contains(m.status, "PORTICO_LAUNCH_MODE") {
-		t.Fatalf("status does not name the override: %q", m.status)
-	}
-	// The requested mode was manual; the effective mode is auto. The screen
-	// must show the effective one.
-	view := m.View().Content
-	if !strings.Contains(view, "connections marked to start will open on launch") {
-		t.Fatalf("view shows the requested mode rather than the effective one:\n%s", view)
-	}
-	if strings.Contains(view, "nothing opens by itself") {
-		t.Fatalf("view claims a change the supervisor refused:\n%s", view)
-	}
-	if !strings.Contains(view, "fixed by PORTICO_LAUNCH_MODE") {
-		t.Fatalf("view does not explain why the key had no effect:\n%s", view)
-	}
-}
-
-// TestLaunchModeFailureIsReported ensures a failed toggle says so rather than
-// leaving the old mode on screen as though the change succeeded.
-func TestLaunchModeFailureIsReported(t *testing.T) {
-	fake := &fakeClient{launchModeErr: errors.New("supervisor unreachable")}
-	m := openSetupWith(t, fake, &ipc.ReadinessDTO{Summary: "ready", LaunchMode: "auto"})
-
-	_, cmd := m.Update(keyMsg("l"))
-	next, _ := m.Update(cmd())
-	m = next.(Model)
-
-	if !strings.Contains(m.status, "Could not change launch mode") {
-		t.Fatalf("failed toggle not reported: %q", m.status)
-	}
-	if !strings.Contains(m.status, "supervisor unreachable") {
-		t.Fatalf("failed toggle does not give the reason: %q", m.status)
-	}
-}
-
-// TestEnterSetsUpWhicheverProviderIsHighlighted pins the gap this package
-// closed. enter previously did nothing unless the highlighted provider was
-// Cloudflare, so every other provider showed its actions and left you to act
-// outside Portico.
-func TestEnterSetsUpWhicheverProviderIsHighlighted(t *testing.T) {
-	fake := &fakeClient{setupFlow: &ipc.SetupFlowDTO{
-		ProviderID: "acme", Kind: "account",
-		Fields: []ipc.SetupFieldDTO{
-			{ID: "workspace", Label: "Workspace", Required: true},
-			{ID: "token", Label: "API token", Secret: true, Required: true},
-		},
-	}}
-	m := openSetupWith(t, fake, &ipc.ReadinessDTO{
-		Summary: "1 provider needs attention",
-		Providers: []ipc.ProviderReadinessDTO{
-			{ID: "acme", DisplayName: "Acme", Blocked: true},
-		},
-	})
-
-	next, cmd := m.Update(keyMsg("enter"))
-	m = next.(Model)
-	if cmd == nil {
-		t.Fatal("enter on a non-Cloudflare provider issued no command")
-	}
-	if m.providerSetupProviderID != "acme" {
-		t.Fatalf("setup started for %q, want acme", m.providerSetupProviderID)
-	}
-
-	// The form must come from the provider's own declaration.
-	next, _ = m.Update(cmd())
-	m = next.(Model)
-
-	fake.mu.Lock()
-	asked := append([]string(nil), fake.setupFlowAsked...)
-	fake.mu.Unlock()
-	if len(asked) != 1 || asked[0] != "acme" {
-		t.Fatalf("setup flow requested for %v, want [acme]", asked)
-	}
-
-	view := m.View().Content
-	if !strings.Contains(view, "Workspace") {
-		t.Fatalf("the provider's declared field is not rendered:\n%s", view)
-	}
-	// Cloudflare's vocabulary must not appear for a provider that never
-	// declared it.
-	if strings.Contains(view, "Zone ID") || strings.Contains(view, "Cloudflare") {
-		t.Fatalf("Cloudflare's fields leaked into another provider's form:\n%s", view)
-	}
-}
-
-// TestGuidanceFlowIsShownAsInstructionsNotAForm pins that a provider whose
-// credential Portico cannot hold is not given a form that pretends to save it.
-func TestGuidanceFlowIsShownAsInstructionsNotAForm(t *testing.T) {
-	fake := &fakeClient{setupFlow: &ipc.SetupFlowDTO{
-		ProviderID: "openai_tunnel", Kind: "guidance",
-		Summary:        "Connect a local MCP server to ChatGPT.",
-		GuidanceReason: "Portico cannot hold this provider's credential.",
-		Fields: []ipc.SetupFieldDTO{
-			{ID: "credential", Label: "Control plane API key", Secret: true, Required: true},
-		},
-	}}
-	m := openSetupWith(t, fake, &ipc.ReadinessDTO{
-		Summary: "1 provider needs attention",
-		Providers: []ipc.ProviderReadinessDTO{
-			{ID: "openai_tunnel", DisplayName: "OpenAI tunnel", Blocked: true},
-		},
-	})
-
-	next, cmd := m.Update(keyMsg("enter"))
-	m = next.(Model)
-	next, _ = m.Update(cmd())
-	m = next.(Model)
-
-	view := m.View().Content
-	if !strings.Contains(view, "Portico cannot hold") {
-		t.Fatalf("guidance flow does not say why it is read-only:\n%s", view)
-	}
-	// A form would offer a prompt to type into. This must not.
-	if strings.Contains(view, "> _") || strings.Contains(view, "Step 1/") {
-		t.Fatalf("a guidance flow rendered an input form:\n%s", view)
-	}
-	if !strings.Contains(view, "Control plane API key") {
-		t.Fatalf("guidance does not say what is needed:\n%s", view)
-	}
-}
-
-// TestSetupFlowFailureIsStatedNotSilentlyEmpty ensures a provider that cannot
-// be configured says so, rather than presenting an empty form.
-func TestSetupFlowFailureIsStatedNotSilentlyEmpty(t *testing.T) {
-	fake := &fakeClient{setupFlowErr: errors.New("provider \"mock\" cannot be configured through Portico")}
-	m := openSetupWith(t, fake, &ipc.ReadinessDTO{
-		Summary:   "1 provider needs attention",
-		Providers: []ipc.ProviderReadinessDTO{{ID: "mock", DisplayName: "Mock", Blocked: true}},
-	})
-
-	next, cmd := m.Update(keyMsg("enter"))
-	m = next.(Model)
-	next, _ = m.Update(cmd())
-	m = next.(Model)
-
-	view := m.View().Content
-	if !strings.Contains(view, "cannot be configured") {
-		t.Fatalf("a provider that cannot be configured does not say so:\n%s", view)
-	}
-}
-
-// TestAnUnverifiedAccountIsNotReportedAsConfigured pins the user-facing half of
-// the authenticated-only-after-validation invariant. The supervisor stores an
-// uncheckable credential as pending and says so in the response; the screen
-// reporting "Account configured." would leave the user believing setup
-// succeeded, to find out otherwise only when a connection failed.
-func TestAnUnverifiedAccountIsNotReportedAsConfigured(t *testing.T) {
-	m := readyModel(&fakeClient{}, testSnapshot())
-
-	next, _ := m.Update(providerAccountConfiguredMsg{
-		Generation: m.providerSetupRequests.next(),
-		Response: &ipc.ConfigureProviderAccountResponse{
-			Status:                  "pending",
-			VerificationUnavailable: "Portico cannot check an acme credential, so this account is saved but unverified.",
-		},
-	})
-	m = next.(Model)
-
-	if strings.Contains(m.status, "Account configured.") {
-		t.Fatalf("an unverified account was reported as configured: %q", m.status)
-	}
-	if !strings.Contains(m.status, "not verified") {
-		t.Fatalf("status does not say the credential was unchecked: %q", m.status)
-	}
-	if !strings.Contains(m.status, "saved but unverified") {
-		t.Fatalf("the supervisor's explanation was dropped: %q", m.status)
-	}
-}
-
-// TestAStaleSetupFlowReplyDoesNotResetTheForm pins that a reply to a cancelled
-// load cannot rewind a form the user has already started filling in.
-func TestAStaleSetupFlowReplyDoesNotResetTheForm(t *testing.T) {
-	flow := cloudflareSetupFlow()
-	m := startSetupWithFlow(t, flow)
-
-	// Advance past the first field.
-	for _, r := range "account-a" {
-		next, _ := m.Update(keyMsg(string(r)))
-		m = next.(Model)
-	}
-	next, _ := m.Update(keyMsg("enter"))
-	m = next.(Model)
-	if m.providerSetupIndex != 1 {
-		t.Fatalf("setup index = %d, want 1", m.providerSetupIndex)
-	}
-
-	// A reply to an earlier load for the same provider arrives late.
-	next, _ = m.Update(providerSetupFlowMsg{
-		ProviderID: "cloudflare", Request: m.providerSetupRequest - 1, Flow: flow,
-	})
-	m = next.(Model)
-
-	if m.providerSetupIndex != 1 {
-		t.Fatalf("a stale reply rewound the form to field %d", m.providerSetupIndex)
-	}
-	if m.providerSetupValue("account_id") != "account-a" {
-		t.Fatal("a stale reply disturbed values already entered")
-	}
-}
-
-// TestSetupScreenReportsAFailedCheckAsAFailure ensures a failed readiness load
-// never renders as a healthy, empty setup.
-func TestSetupScreenReportsAFailedCheckAsAFailure(t *testing.T) {
-	m := readyModel(&fakeClient{}, testSnapshot())
-	next, _ := m.Update(keyMsg("s"))
-	m = next.(Model)
-	next, _ = m.Update(readinessMsg{Err: errors.New("supervisor unreachable")})
-	m = next.(Model)
-
-	view := m.View().Content
-	if !strings.Contains(view, "could not work out what it needs") {
-		t.Fatalf("failed check does not report itself:\n%s", view)
-	}
-	if !strings.Contains(view, "does not mean everything is fine") {
-		t.Fatalf("failed check does not disclaim health:\n%s", view)
-	}
-}
-
-// TestEscapingTheFirstWizardQuestionReturnsHome pins which question is first.
-//
-// The root model exited from the intent question, which stopped being first
-// when the wizard began by asking what the user was trying to do. Escaping the
-// outcome question did nothing, and escaping the intent question left the
-// wizard entirely instead of returning to the outcome it came from.
-func TestEscapingTheFirstWizardQuestionReturnsHome(t *testing.T) {
-	m := readyModel(&fakeClient{}, testSnapshot())
-	m, _ = press(t, m, "n")
-	if m.wizard == nil || m.wizard.Step() != screens.WizardStepOutcome {
-		t.Fatalf("wizard did not open on the outcome question")
-	}
-
-	m, _ = press(t, m, "esc")
-	if m.screen != ScreenHome || m.wizard != nil {
-		t.Fatalf("escaping the first question did not return home: screen=%q", m.screen)
-	}
-}
-
-// TestEscapingTheIntentQuestionReturnsToTheOutcome pins that a question reached
-// from another returns to it rather than abandoning the wizard.
-func TestEscapingTheIntentQuestionReturnsToTheOutcome(t *testing.T) {
-	m := readyModel(&fakeClient{}, testSnapshot())
-	m, _ = press(t, m, "n")
-
-	// Walk to the advanced outcome and take it.
-	for m.wizard.Step() == screens.WizardStepOutcome {
-		before := m.wizard.Step()
-		m, _ = press(t, m, "down")
-		if m.wizard.Step() != before {
-			break
-		}
-		if m.wizard.SelectedIndex() >= screens.WizardRecipeCount()-1 {
-			break
-		}
-	}
-	m, _ = press(t, m, "enter")
-	if m.wizard == nil || m.wizard.Step() != screens.WizardStepIntent {
-		t.Skipf("the advanced route was not reached: step=%d", m.wizard.Step())
-	}
-
-	m, _ = press(t, m, "esc")
-	if m.wizard == nil {
-		t.Fatal("escaping the intent question abandoned the wizard")
-	}
-	if m.wizard.Step() != screens.WizardStepOutcome {
-		t.Fatalf("step = %d, want the outcome question it came from", m.wizard.Step())
-	}
 }

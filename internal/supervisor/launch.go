@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/B-A-M-N/portico/internal/config"
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/store"
 )
@@ -160,14 +161,40 @@ func ValidLaunchMode(mode string) bool {
 	return false
 }
 
-// SetLaunchMode changes the gate at runtime, so it can be toggled from the UI
-// rather than requiring a config file to be edited.
-func (s *Supervisor) SetLaunchMode(mode string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if strings.EqualFold(mode, LaunchManual) {
-		s.launch = LaunchManual
-		return
+// SetLaunchMode changes the gate and persists it.
+//
+// The choice now survives a supervisor restart, which is what a user selecting
+// it expects. It was previously runtime-only, so the interface had to report
+// Persistent=false and tell the user their explicit selection would be
+// forgotten — a setting that does not persist is a session preference wearing a
+// setting's label.
+//
+// An environment override is not written: it is not the user's stored
+// preference, and persisting it would leave the override's value behind after it
+// was unset.
+func (s *Supervisor) SetLaunchMode(mode string) error {
+	normalized := LaunchAuto
+	if strings.EqualFold(strings.TrimSpace(mode), LaunchManual) {
+		normalized = LaunchManual
 	}
-	s.launch = LaunchAuto
+
+	s.mu.Lock()
+	s.launch = normalized
+	s.mu.Unlock()
+
+	if _, pinned := launchModeOverride(); pinned {
+		// The environment decides. The stored value is left alone so unsetting
+		// the override restores whatever the user had chosen.
+		return nil
+	}
+	return config.SaveLaunchMode(normalized)
+}
+
+// LaunchModePersistent reports whether the mode in effect is stored.
+//
+// A pinned mode is not stored, so it does not survive unsetting the override;
+// everything else is written to the config file and does survive a restart.
+func LaunchModePersistent() bool {
+	_, pinned := launchModeOverride()
+	return !pinned
 }

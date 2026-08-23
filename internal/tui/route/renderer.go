@@ -3,7 +3,6 @@ package route
 import (
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/B-A-M-N/portico/internal/core"
 )
@@ -78,9 +77,16 @@ const (
 )
 
 // Cell represents one terminal cell.
+//
+// Wide is set on the trailing cell of a two-cell grapheme. That cell holds no
+// rune of its own — the glyph is emitted by its leading cell — so serialization
+// must skip it rather than emit a space. Emitting a space made every wide
+// character one cell wider on output than it was on the grid, so a canvas of
+// exactly the terminal width overflowed and wrapped.
 type Cell struct {
 	Rune  rune
 	Style StyleID
+	Wide  bool
 }
 
 // Canvas is a small terminal cell grid for route rendering.
@@ -104,6 +110,10 @@ func (c *Canvas) idx(x, y int) int {
 }
 
 // Set places a rune at (x, y).
+//
+// It clears any Wide continuation flag: overwriting the trailing half of a wide
+// grapheme replaces that cell with a real one, and leaving the flag set would
+// make serialization skip the rune just written.
 func (c *Canvas) Set(x, y int, r rune, style StyleID) {
 	if x < 0 || x >= c.Width || y < 0 || y >= c.Height {
 		return
@@ -112,15 +122,41 @@ func (c *Canvas) Set(x, y int, r rune, style StyleID) {
 }
 
 // Text places a string at (x, y), clipping to canvas width.
-// Uses display-width-aware positioning to handle multi-byte runes correctly.
+//
+// It advances by display width per grapheme cluster, not by rune. Iterating
+// runes and incrementing by one treated a CJK ideograph as one cell when it
+// occupies two, a combining accent as one when it occupies none, and an emoji
+// ZWJ sequence as several when it is one cluster of two cells. Every one of
+// those mis-positioned whatever was drawn after it on the same row.
+//
+// A wide cluster occupies its leading cell and leaves the trailing cell blank,
+// which is how a terminal renders it: the pair is one glyph. A zero-width
+// cluster is folded onto the previous cell rather than consuming one of its
+// own.
 func (c *Canvas) Text(x, y int, s string, style StyleID) {
 	col := x
-	for _, r := range s {
-		if col < 0 || col >= c.Width {
+	for _, g := range graphemes(s) {
+		if col >= c.Width {
 			break
 		}
-		c.Set(col, y, r, style)
-		col++
+		w := g.width
+		if w == 0 {
+			// A combining mark belongs to the cell before it.
+			continue
+		}
+		if col >= 0 {
+			c.Set(col, y, g.lead, style)
+			if w > 1 {
+				// Mark the trailing half so serialization does not emit a
+				// space where the glyph's second cell already is.
+				for k := 1; k < w; k++ {
+					if col+k < c.Width {
+						c.Cells[c.idx(col+k, y)] = Cell{Style: style, Wide: true}
+					}
+				}
+			}
+		}
+		col += w
 	}
 }
 
@@ -231,27 +267,30 @@ func RenderRoute(vm RouteVM, width int, useASCII bool) string {
 		}
 	}
 
-	// Render labels below route
+	// Render labels below route.
+	//
+	// Each label is clipped to the space actually available to it before it is
+	// drawn. The canvas discards overflow, but three labels sharing one row can
+	// still collide, and a long endpoint would previously overwrite the
+	// provider label rather than being shortened.
 	labelY := 3
-	label := fmt.Sprintf(" %s ", vm.LocalLabel)
-	canvas.Text(0, labelY, label, StyleNormal)
+	local := truncateToWidth(fmt.Sprintf(" %s ", vm.LocalLabel), gw)
+	canvas.Text(0, labelY, local, StyleNormal)
 
 	if vm.ProviderLabel != "" {
 		provLabel := fmt.Sprintf(" %s ", vm.ProviderLabel)
-		provX := gw - utf8.RuneCountInString(provLabel)/2
-		if provX < 0 {
-			provX = 0
-		}
-		canvas.Text(provX, labelY, provLabel, StyleMuted)
+		// Centred by display width, not by rune count: a label containing a
+		// wide character was previously drawn off-centre by half its width.
+		provLabel = truncateToWidth(provLabel, width)
+		canvas.Text(centreOffset(gw, provLabel), labelY, provLabel, StyleMuted)
 	}
 
 	if vm.EndpointLabel != "" {
 		endLabel := fmt.Sprintf(" %s ", vm.EndpointLabel)
-		endX2 := endX - utf8.RuneCountInString(endLabel)
-		if endX2 < 0 {
-			endX2 = 0
-		}
-		canvas.Text(endX2, labelY, endLabel, StyleNormal)
+		// The endpoint gets the space between the gateway label and the right
+		// edge, so it cannot run back over the provider name.
+		endLabel = truncateToWidth(endLabel, max(0, endX-gw))
+		canvas.Text(rightAlignOffset(endX, endLabel), labelY, endLabel, StyleNormal)
 	}
 
 	return canvasToString(canvas)
@@ -272,10 +311,13 @@ func renderCompactRoute(vm RouteVM, useASCII bool) string {
 		}
 		route := fmt.Sprintf("%s %s %s", localStr, breakMark, endStr)
 		seg := vm.ActiveFinding.Summary
-		if len(vm.LocalLabel) > 0 {
+		if vm.LocalLabel != "" {
 			route = fmt.Sprintf("%s %s", vm.LocalLabel, route)
 		}
-		if len(route)+len(seg)+1 < 60 {
+		// Measured in cells. len() counts bytes, so a label with any
+		// multi-byte character was treated as far wider than it is and the
+		// finding summary was dropped for no reason.
+		if DisplayWidth(route)+DisplayWidth(seg)+1 < 60 {
 			route = route + " " + seg
 		}
 		return route
@@ -287,13 +329,10 @@ func renderCompactRoute(vm RouteVM, useASCII bool) string {
 	}
 	route := fmt.Sprintf("%s%s%s%s%s", localStr, line, gateway, line, endStr)
 	if vm.EndpointLabel != "" {
-		// Truncate by rune count to avoid splitting multi-byte characters.
-		runes := []rune(vm.EndpointLabel)
-		parts := len(runes)
-		if parts > 10 {
-			parts = 10
-		}
-		route += " " + string(runes[:parts])
+		// Clipped by display width on a grapheme boundary. Slicing a rune
+		// count kept ten runes, which is up to twenty cells of CJK — and could
+		// separate a combining mark from the character it modifies.
+		route += " " + truncateToWidth(vm.EndpointLabel, 10)
 	}
 	return route
 }
@@ -341,9 +380,16 @@ func canvasToString(c *Canvas) string {
 	for y := 0; y < c.Height; y++ {
 		for x := 0; x < c.Width; x++ {
 			cell := c.Cells[c.idx(x, y)]
-			if cell.Rune == 0 {
+			switch {
+			case cell.Wide:
+				// The trailing half of a wide grapheme. Its leading cell
+				// already emitted the whole glyph, which occupies this column
+				// on the terminal, so emitting anything here would add a
+				// column the grid did not allocate.
+				continue
+			case cell.Rune == 0:
 				b.WriteRune(' ')
-			} else {
+			default:
 				b.WriteRune(cell.Rune)
 			}
 		}

@@ -952,10 +952,46 @@ type LaunchModeDTO struct {
 	// PinnedBy names the override, so the caller can say what to unset.
 	PinnedBy string `json:"pinned_by,omitempty"`
 	// Persistent reports whether the mode survives a supervisor restart.
-	// Portico has no settings store yet, so a mode set at runtime lasts only
-	// as long as the process. Callers must say so rather than implying the
-	// choice is remembered.
+	// A stored mode does; a mode pinned by the environment is not stored at
+	// all, and reporting either as merely temporary would understate what the
+	// user's choice did.
 	Persistent bool `json:"persistent"`
+}
+
+// SettingsDTO is the operational configuration the supervisor owns.
+//
+// These are the choices that outlive a session and are not properties of any
+// one connection: whether marked connections open at startup, and what a newly
+// created connection defaults to. The TUI reads and writes them over IPC — it
+// never touches the config file, which only the supervisor opens.
+type SettingsDTO struct {
+	// LaunchMode is "manual" or "auto".
+	LaunchMode string `json:"launch_mode"`
+	// LaunchModePinned reports that an environment override decides the mode,
+	// so the stored value is not consulted.
+	LaunchModePinned bool `json:"launch_mode_pinned,omitempty"`
+	// LaunchModePinnedBy names the override to unset.
+	LaunchModePinnedBy string `json:"launch_mode_pinned_by,omitempty"`
+
+	// DefaultAutoStart is what a new connection's AutoStart is set to when the
+	// user does not choose otherwise. The wizard hardcoded true, which armed
+	// every connection ever created without asking.
+	DefaultAutoStart bool `json:"default_auto_start"`
+	// DefaultOnDisconnect is "keep_alive" or "close": what happens to a
+	// connection when the client that created it goes away. The wizard
+	// hardcoded keep_alive.
+	DefaultOnDisconnect string `json:"default_on_disconnect"`
+}
+
+// SettingsRequest changes operational settings.
+//
+// Every field is a pointer so an absent one means "leave this alone". Sending
+// a whole settings object back would make every write a full overwrite, and two
+// clients changing different settings would clobber each other.
+type SettingsRequest struct {
+	LaunchMode          *string `json:"launch_mode,omitempty"`
+	DefaultAutoStart    *bool   `json:"default_auto_start,omitempty"`
+	DefaultOnDisconnect *string `json:"default_on_disconnect,omitempty"`
 }
 
 // ProviderReadinessDTO is one provider's position, with the credential sources

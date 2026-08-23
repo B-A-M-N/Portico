@@ -500,29 +500,21 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 				// that the tunnel ID is journaled before the token is fetched.
 				// A failed token fetch is then recoverable rather than orphaning
 				// an unmanaged tunnel.
+				// P0 #6: No compensation. StepAcquireToken returns no Resources,
+				// so controller compensation cannot derive a resource ID from it.
+				// Tunnel destruction belongs to resource-producing StepCreateTunnel.
 				core.PlanStep{ID: "cf-tunnel-token", Kind: core.StepAcquireToken, Summary: "Acquire tunnel connector token",
 					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "acquire_token"},
 					Destructive: false, Irreversible: false,
-					Compensation: &core.CompensationStep{
-						ID:   "comp-cf-tunnel-token",
-						Kind: core.StepDeleteTunnel,
-						Technical: core.TechnicalOperation{
-							Provider: "cloudflare",
-							Type:     "delete_tunnel",
-						},
-					}},
+				},
 				core.PlanStep{ID: "cf-route", Kind: core.StepConfigureRoute, Summary: fmt.Sprintf("Configure tunnel route for %s", hostname),
 					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "configure_route", Parameters: map[string]string{"hostname": hostname, "origin_url": originURL}},
 					Destructive: false, Irreversible: false,
 					Ownership: core.OwnershipManaged,
-					Compensation: &core.CompensationStep{
-						ID:   "comp-cf-route-delete",
-						Kind: core.StepDeleteDNSRecord,
-						Technical: core.TechnicalOperation{
-							Provider: "cloudflare",
-							Type:     "delete_dns",
-						},
-					}},
+					// P0 #6: No compensation. StepConfigureRoute returns no DNS resource,
+					// so controller compensation cannot derive a resource ID from it.
+					// DNS destruction belongs to StepCreateDNSRecord.
+				},
 				core.PlanStep{ID: "cf-dns", Kind: core.StepCreateDNSRecord, Summary: fmt.Sprintf("Create DNS CNAME for %s", hostname),
 					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "create_dns", Parameters: map[string]string{"hostname": hostname}},
 					Destructive: false, Irreversible: false,
@@ -540,8 +532,11 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			// Add Access steps based on protection kind
 			if profile.GetProtection().Kind != core.ProtectionNone {
 				authMode := protectionToAuthMode(profile.GetProtection().Kind)
+				// P0 #7: Split app and policy creation into separately journalled
+				// mutations so that if policy creation fails, the exact AppID is
+				// durably recorded and can be cleaned up.
 				plan.Steps = append(plan.Steps,
-					core.PlanStep{ID: "cf-access-app", Kind: core.StepCreateAccessApp, Summary: "Create Access application and policy",
+					core.PlanStep{ID: "cf-access-app", Kind: core.StepCreateAccessApp, Summary: "Create Access application",
 						Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "create_access_app", Parameters: map[string]string{
 							"hostname":         hostname,
 							"auth_mode":        authMode,
@@ -552,11 +547,29 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 						Destructive: false, Irreversible: false,
 						Ownership: core.OwnershipManaged,
 						Compensation: &core.CompensationStep{
-							ID:   "comp-cf-access-cleanup",
+							ID:   "comp-cf-access-app-cleanup",
 							Kind: core.StepDeleteAccessApp,
 							Technical: core.TechnicalOperation{
 								Provider: "cloudflare",
 								Type:     "delete_access",
+							},
+						}},
+					core.PlanStep{ID: "cf-access-policy", Kind: core.StepCreateAccessPolicy, Summary: "Create Access policy",
+						Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "create_access_policy", Parameters: map[string]string{
+							"hostname":         hostname,
+							"auth_mode":        authMode,
+							"allowed_emails":   strings.Join(profile.GetProtection().AllowedEmails, ","),
+							"allowed_domains":  strings.Join(profile.GetProtection().AllowedDomains, ","),
+							"session_duration": profile.GetProtection().SessionTTL.String(),
+						}},
+						Destructive: false, Irreversible: false,
+						Ownership: core.OwnershipManaged,
+						Compensation: &core.CompensationStep{
+							ID:   "comp-cf-access-policy-cleanup",
+							Kind: core.StepDeleteAccessPolicy,
+							Technical: core.TechnicalOperation{
+								Provider: "cloudflare",
+								Type:     "delete_access_policy",
 							},
 						}},
 				)
@@ -1227,30 +1240,14 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		if hn == "" {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access application requires a hostname")}, nil
 		}
-		authMode := accessAuthMode(step.Technical.Parameters)
-		if authMode != "none" && authMode != "private_network" {
-			emails := step.Technical.Parameters["allowed_emails"]
-			domains := step.Technical.Parameters["allowed_domains"]
-			if emails == "" && domains == "" {
-				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("access policy requires at least one allowed email or domain for %s protection", authMode)}, nil
-			}
-		}
-		sessionDuration := ""
-		if rawDur, ok := step.Technical.Parameters["session_duration"]; ok && rawDur != "" {
-			sessionDuration = rawDur
-		}
-		appInfo, err := p.access.CreateApp(ctx, p.accountID, hn, access.Policy{
-			AuthMode:        authMode,
-			AllowedEmails:   strings.Split(step.Technical.Parameters["allowed_emails"], ","),
-			AllowedDomains:  strings.Split(step.Technical.Parameters["allowed_domains"], ","),
-			SessionDuration: sessionDuration,
-		})
+		// P0 #7: Create application only. Policy creation is a separate
+		// step so that the exact AppID is journalled before policy creation.
+		appID, err := p.access.CreateAppOnly(ctx, p.accountID, hn)
 		if err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
 		}
 		p.mu.Lock()
-		conn.accessID = appInfo.AppID
-		conn.policyID = appInfo.PolicyID
+		conn.accessID = appID
 		if conn.hostname == "" {
 			conn.hostname = hn
 		}
@@ -1259,8 +1256,7 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			StepID:    step.ID,
 			Succeeded: true,
 			Resources: []core.ProviderResource{
-				{ConnectionID: connectionID, Type: core.ResourceAccessApp, ExternalID: appInfo.AppID, ProviderID: "cloudflare", Ownership: core.OwnershipManaged},
-				{ConnectionID: connectionID, Type: core.ResourceAccessPolicy, ExternalID: appInfo.PolicyID, ProviderID: "cloudflare", Ownership: core.OwnershipManaged, Metadata: map[string]string{"app_id": appInfo.AppID}},
+				{ConnectionID: connectionID, Type: core.ResourceAccessApp, ExternalID: appID, ProviderID: "cloudflare", Ownership: core.OwnershipManaged},
 			},
 		}, nil
 

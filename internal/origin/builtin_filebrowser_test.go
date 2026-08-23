@@ -264,3 +264,160 @@ func TestBuiltinFileBrowser_FailedStartStop(t *testing.T) {
 		t.Errorf("rootFd = %d, want -1 after Stop", fb.rootFd)
 	}
 }
+
+// TestBuiltinFileBrowser_CSRFFromForm verifies that ordinary HTML form
+// submissions using a hidden _csrf field (without X-CSRF-Token header)
+// succeed — the actual rendered upload/delete forms rely on this.
+func TestBuiltinFileBrowser_CSRFFromForm(t *testing.T) {
+	root := t.TempDir()
+
+	fb, err := NewBuiltinFileBrowser(Config{
+		Type:        TypeBuiltinFileBrowser,
+		Path:        root,
+		AllowUpload: true,
+		AllowDelete: true,
+		Download:    true,
+	})
+	if err != nil {
+		t.Fatalf("NewBuiltinFileBrowser: %v", err)
+	}
+
+	addr, err := fb.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer fb.Stop(context.Background())
+
+	// Get CSRF tokens for the upload and delete paths.
+	uploadToken := fb.CSRFToken("/upload")
+	deleteToken := fb.CSRFToken("/delete")
+
+	// Helper: wrap handler the same way Start() does — body limit THEN csrf.
+	uploadRoute := func(w http.ResponseWriter, r *http.Request) {
+		const maxUploadSize = 64 << 20
+		const multipartOverhead = 2 << 10
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize+multipartOverhead)
+		fb.requireCSRF(fb.handleUpload).ServeHTTP(w, r)
+	}
+	deleteRoute := func(w http.ResponseWriter, r *http.Request) {
+		const maxDeleteBody = 64 << 10
+		r.Body = http.MaxBytesReader(w, r.Body, maxDeleteBody)
+		fb.requireCSRF(fb.handleDelete).ServeHTTP(w, r)
+	}
+
+	// --- UPLOAD via ordinary form submission (no X-CSRF-Token header) --- {
+	var uploadBody bytes.Buffer
+	mpw := multipart.NewWriter(&uploadBody)
+	// Include _csrf as a form field (like the HTML form does).
+	if err := mpw.WriteField("_csrf", uploadToken); err != nil {
+		t.Fatalf("WriteField _csrf: %v", err)
+	}
+	filePart, err := mpw.CreateFormFile("file", "form-upload.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := io.Copy(filePart, strings.NewReader("form upload contents")); err != nil {
+		t.Fatalf("write file part: %v", err)
+	}
+	mpw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, addr+"/upload", &uploadBody)
+	req.Header.Set("Content-Type", mpw.FormDataContentType())
+	// Deliberately NO X-CSRF-Token header — ordinary forms can't set it.
+
+	rec := httptest.NewRecorder()
+	uploadRoute(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload: got status %d, want 201; body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Verify the file was written.
+	dest := filepath.Join(root, "form-upload.txt")
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "form upload contents" {
+		t.Errorf("file contents = %q, want %q", string(data), "form upload contents")
+	}
+	// }
+
+	// --- DELETE via ordinary form submission (no X-CSRF-Token header) --- {
+	var deleteBody bytes.Buffer
+	dpw := multipart.NewWriter(&deleteBody)
+	if err := dpw.WriteField("_csrf", deleteToken); err != nil {
+		t.Fatalf("WriteField _csrf: %v", err)
+	}
+	if err := dpw.WriteField("path", "form-upload.txt"); err != nil {
+		t.Fatalf("WriteField path: %v", err)
+	}
+	dpw.Close()
+
+	req = httptest.NewRequest(http.MethodPost, addr+"/delete", &deleteBody)
+	req.Header.Set("Content-Type", dpw.FormDataContentType())
+	// Deliberately NO X-CSRF-Token header.
+
+	rec = httptest.NewRecorder()
+	deleteRoute(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("delete: got status %d, want 303; body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Verify the file was removed.
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Errorf("file still exists after delete: %v", err)
+	}
+	// }
+}
+
+// TestBuiltinFileBrowser_CSRFInvalidFormToken verifies that an invalid
+// _csrf form value is rejected.
+func TestBuiltinFileBrowser_CSRFInvalidFormToken(t *testing.T) {
+	root := t.TempDir()
+
+	fb, err := NewBuiltinFileBrowser(Config{
+		Type:        TypeBuiltinFileBrowser,
+		Path:        root,
+		AllowUpload: true,
+	})
+	if err != nil {
+		t.Fatalf("NewBuiltinFileBrowser: %v", err)
+	}
+
+	addr, err := fb.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer fb.Stop(context.Background())
+
+	var uploadBody bytes.Buffer
+	mpw := multipart.NewWriter(&uploadBody)
+	if err := mpw.WriteField("_csrf", "invalid-token-value"); err != nil {
+		t.Fatalf("WriteField _csrf: %v", err)
+	}
+	filePart, err := mpw.CreateFormFile("file", "should-not-exist.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	io.Copy(filePart, strings.NewReader("should not be written"))
+	mpw.Close()
+
+	req := httptest.NewRequest(http.MethodPost, addr+"/upload", &uploadBody)
+	req.Header.Set("Content-Type", mpw.FormDataContentType())
+
+	rec := httptest.NewRecorder()
+	// Body limit MUST be applied BEFORE csrf check (same as Start() wiring).
+	req.Body = io.NopCloser(io.LimitReader(req.Body, 64<<20+2<<10))
+	fb.requireCSRF(fb.handleUpload).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("upload with bad _csrf: got status %d, want 403; body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Verify no file was written.
+	if _, err := os.Stat(filepath.Join(root, "should-not-exist.txt")); !os.IsNotExist(err) {
+		t.Errorf("file was written despite invalid CSRF token")
+	}
+}

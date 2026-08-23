@@ -1,0 +1,287 @@
+package tui
+
+import "strings"
+
+// One authoritative action model.
+//
+// Key handling, the footer, and Help were three separate descriptions of what a
+// screen can do, and they had drifted in every direction the audit found:
+// Inspect executed Space, Repair and Delete without advertising any of them;
+// Setup implemented `E` and never said so; the scroll keys worked everywhere
+// and were documented nowhere; the Providers help omitted removal; Edit, Clone
+// and the wizard had no contextual help at all; and helpRow() hardcoded a list
+// of actions that KeyMap did not contain.
+//
+// An Action is the single description. Dispatch reads it, the footer renders it,
+// and Help explains it, so an action that is advertised is an action that runs,
+// and an action that runs is one the user was told about.
+
+// ActionID identifies one thing a screen can do. It is the identity dispatch
+// switches on, so a rebinding changes one Keys field rather than a switch case
+// in one file and a help string in another.
+type ActionID string
+
+const (
+	// Global navigation and lifecycle.
+	ActionQuit     ActionID = "quit"
+	ActionBack     ActionID = "back"
+	ActionHelp     ActionID = "help"
+	ActionHome     ActionID = "home"
+	ActionRefresh  ActionID = "refresh"
+	ActionConfirm  ActionID = "confirm"
+	ActionUp       ActionID = "up"
+	ActionDown     ActionID = "down"
+	ActionLeft     ActionID = "left"
+	ActionRight    ActionID = "right"
+	ActionPageUp   ActionID = "page_up"
+	ActionPageDown ActionID = "page_down"
+	ActionTop      ActionID = "top"
+	ActionBottom   ActionID = "bottom"
+
+	// Connection lifecycle.
+	ActionInspect     ActionID = "inspect"
+	ActionToggleOpen  ActionID = "toggle_open"
+	ActionNew         ActionID = "new"
+	ActionEdit        ActionID = "edit"
+	ActionCopy        ActionID = "copy"
+	ActionDelete      ActionID = "delete"
+	ActionRepair      ActionID = "repair"
+	ActionDiscover    ActionID = "discover"
+	ActionOperations  ActionID = "operations"
+	ActionProviders   ActionID = "providers"
+	ActionSetup       ActionID = "setup"
+	ActionSettings    ActionID = "settings"
+
+	// Provider and account management.
+	ActionConfigureProvider ActionID = "configure_provider"
+	ActionRemoveAccount     ActionID = "remove_account"
+	ActionVerifyAccount     ActionID = "verify_account"
+	ActionReplaceCredential ActionID = "replace_credential"
+
+	// Screen-specific.
+	ActionPreview       ActionID = "preview"
+	ActionApply         ActionID = "apply"
+	ActionSupportExport ActionID = "support_export"
+	ActionLaunchMode    ActionID = "launch_mode"
+	ActionShowMore      ActionID = "show_more"
+	ActionFilter        ActionID = "filter"
+	ActionFollowLogs    ActionID = "follow_logs"
+	ActionManualEntry   ActionID = "manual_entry"
+	ActionEvidence      ActionID = "evidence"
+	ActionNextField     ActionID = "next_field"
+	ActionDiscard       ActionID = "discard"
+	ActionKeepEditing   ActionID = "keep_editing"
+	ActionRetry         ActionID = "retry"
+)
+
+// Action describes one thing the current screen can do: its identity, the keys
+// that invoke it, how to name it to a user, whether it is available now, and
+// why not when it is not.
+type Action struct {
+	ID ActionID
+	// Keys are every binding that invokes this action. The first is the one
+	// advertised in the footer; the rest are accepted aliases (j/k for
+	// down/up, for example).
+	Keys []string
+	// Label names the action in the words a user would use.
+	Label string
+	// Enabled is false when the action cannot be taken right now. A disabled
+	// action is still advertised — drawn dimmed with its reason — because
+	// hiding it makes the interface change shape as state changes.
+	Enabled bool
+	// DisabledReason says why, in one clause, so a dimmed action is not a
+	// mystery.
+	DisabledReason string
+	// Help is the longer explanation shown on the contextual Help screen.
+	// Empty means Label is sufficient.
+	Help string
+	// Primary marks an action as one of the screen's main tasks, so the
+	// footer can show those first when space is short.
+	Primary bool
+}
+
+// primaryKey is the binding the footer advertises.
+func (a Action) primaryKey() string {
+	if len(a.Keys) == 0 {
+		return ""
+	}
+	return a.Keys[0]
+}
+
+// accepts reports whether a key invokes this action. A disabled action accepts
+// nothing: that is the whole point of the enabled flag, and it is checked here
+// rather than at each dispatch site so no site can forget.
+func (a Action) accepts(key string) bool {
+	if !a.Enabled {
+		return false
+	}
+	for _, k := range a.Keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// ActionSet is every action a screen offers, in the order it advertises them.
+type ActionSet []Action
+
+// Lookup returns the action a key invokes, and whether one exists and is
+// enabled. Dispatch uses this so a disabled action cannot be executed by
+// pressing its key.
+func (s ActionSet) Lookup(key string) (Action, bool) {
+	for _, a := range s {
+		if a.accepts(key) {
+			return a, true
+		}
+	}
+	return Action{}, false
+}
+
+// Find returns the action with the given ID whether or not it is enabled, so a
+// caller that needs to explain a refusal can read the reason.
+func (s ActionSet) Find(id ActionID) (Action, bool) {
+	for _, a := range s {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return Action{}, false
+}
+
+// Advertised is every action the footer and Help should mention. Both read the
+// same list, which is what stops one of them drifting from the other.
+func (s ActionSet) Advertised() []Action {
+	out := make([]Action, 0, len(s))
+	for _, a := range s {
+		if a.Label == "" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// footer renders the action bar: the keys and labels of everything on offer,
+// with unavailable actions dimmed.
+func (s ActionSet) footer(th Theme, width int) string {
+	var enabled, disabled []string
+	for _, a := range s.Advertised() {
+		key := a.primaryKey()
+		if key == "" {
+			continue
+		}
+		entry := "[" + keyLabel(key) + "] " + a.Label
+		if a.Enabled {
+			enabled = append(enabled, entry)
+		} else {
+			disabled = append(disabled, entry)
+		}
+	}
+	line := strings.Join(enabled, "   ")
+	if len(disabled) > 0 {
+		dim := th.Style("muted").Render(strings.Join(disabled, "   "))
+		if line != "" {
+			line += "   " + dim
+		} else {
+			line = dim
+		}
+	}
+	// A narrow terminal gets the primary actions only, rather than a wrapped
+	// wall of keys.
+	if width > 0 && displayWidth(line) > width {
+		var primary []string
+		for _, a := range s.Advertised() {
+			if !a.Primary || !a.Enabled {
+				continue
+			}
+			if key := a.primaryKey(); key != "" {
+				primary = append(primary, "["+keyLabel(key)+"] "+a.Label)
+			}
+		}
+		if len(primary) > 0 {
+			line = strings.Join(primary, "  ")
+		}
+	}
+	return th.Style("help").Render("  " + line)
+}
+
+// keyLabel names a key the way a keyboard does.
+func keyLabel(key string) string {
+	switch key {
+	case " ", "space":
+		return "space"
+	case "esc":
+		return "esc"
+	case "enter":
+		return "enter"
+	case "up":
+		return "↑"
+	case "down":
+		return "↓"
+	case "left":
+		return "←"
+	case "right":
+		return "→"
+	case "pgup":
+		return "pgup"
+	case "pgdown":
+		return "pgdn"
+	default:
+		return key
+	}
+}
+
+// navigationActions are the bindings every non-text screen accepts. They are
+// declared once here so no screen has to remember them and none can advertise
+// a set that differs from what it accepts.
+//
+// The scroll keys are included: they worked on every freely-scrolled screen and
+// were documented nowhere, which is exactly the drift this model exists to
+// remove.
+func navigationActions(screen ScreenID, canScroll bool) ActionSet {
+	set := ActionSet{
+		{
+			ID: ActionHelp, Keys: []string{"?"}, Label: "Help", Enabled: true,
+			Help: "Explain this screen and everything it can do.",
+		},
+	}
+	if canScroll {
+		set = append(set,
+			Action{
+				ID: ActionPageDown, Keys: []string{"pgdown"}, Label: "Page down", Enabled: true,
+				Help: "Scroll down a screenful.",
+			},
+			Action{
+				ID: ActionPageUp, Keys: []string{"pgup"}, Label: "Page up", Enabled: true,
+				Help: "Scroll up a screenful.",
+			},
+			Action{
+				ID: ActionTop, Keys: []string{"home"}, Label: "Top", Enabled: true,
+				Help: "Jump to the start of the content.",
+			},
+			Action{
+				ID: ActionBottom, Keys: []string{"end"}, Label: "Bottom", Enabled: true,
+				Help: "Jump to the end of the content.",
+			},
+		)
+	}
+	if screen == ScreenHome {
+		set = append(set, Action{
+			ID: ActionQuit, Keys: []string{"q"}, Label: "Quit", Enabled: true, Primary: true,
+			Help: "Leave Portico. Connections that are open stay open — the supervisor keeps running.",
+		})
+	} else {
+		set = append(set, Action{
+			ID: ActionBack, Keys: []string{"esc"}, Label: "Back", Enabled: true, Primary: true,
+			Help: "Return to the previous screen. Anything in progress here is abandoned.",
+		})
+	}
+	// Ctrl+C always quits and is always true, so it is described even though
+	// the footer has no room to advertise it on every screen.
+	set = append(set, Action{
+		ID: ActionQuit, Keys: []string{"ctrl+c"}, Enabled: true,
+		Help: "Quit Portico immediately from anywhere.",
+	})
+	return set
+}

@@ -695,6 +695,49 @@ func (c *Client) SetLaunchMode(ctx context.Context, mode string) (*LaunchModeDTO
 	return &result, nil
 }
 
+// Settings reads the operational settings the supervisor holds.
+func (c *Client) Settings(ctx context.Context) (*SettingsDTO, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/settings", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result SettingsDTO
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// UpdateSettings changes operational settings and returns those in effect
+// afterwards.
+//
+// Only the fields set in the request are changed. The response is the
+// supervisor's answer rather than an echo, so a launch mode the environment
+// pins is reported as it actually is.
+func (c *Client) UpdateSettings(ctx context.Context, req SettingsRequest) (*SettingsDTO, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal settings: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "PATCH", "/v1/settings", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result SettingsDTO
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // --------------- Event stream ---------------
 
 // EventStream connects to the SSE event stream.

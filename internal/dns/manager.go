@@ -102,6 +102,11 @@ func (m *APIManager) GetRecord(ctx context.Context, zoneID, recordID string) (*R
 func (m *APIManager) DeleteRecord(ctx context.Context, zoneID, recordID string) error {
 	rc := cf.ZoneIdentifier(zoneID)
 	if err := m.client.DeleteDNSRecord(ctx, rc, recordID); err != nil {
+		// P0 #8: 404/410 means the record is already gone — desired state achieved.
+		var cfErr *cf.Error
+		if errors.As(err, &cfErr) && (cfErr.StatusCode == 404 || cfErr.StatusCode == 410) {
+			return nil
+		}
 		return fmt.Errorf("deleting DNS record: %w", err)
 	}
 	return nil

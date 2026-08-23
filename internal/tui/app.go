@@ -84,6 +84,10 @@ type Model struct {
 	edit *editState
 	// clone is the connection copy in progress, if any.
 	clone *cloneState
+	// settings is the operational settings screen's state. It is nil until the
+	// screen is opened, and its contents are whatever the supervisor reports:
+	// the TUI never writes the config file.
+	settings *settingsState
 
 	// operationsLimit is how many operations the history screen asked for, and
 	// operationsTruncated reports that older ones exist beyond them.
@@ -187,7 +191,8 @@ type Model struct {
 	inspect *screens.InspectModel
 	setup   *screens.SetupModel
 
-	client SupervisorClient
+	client       SupervisorClient
+	bootstrapper Bootstrapper
 	// rootCtx is the application lifetime context. It is cancelled when
 	// the Bubble Tea program exits, ensuring in-flight RPCs do not outlive
 	// the TUI.
@@ -197,40 +202,75 @@ type Model struct {
 	status     string
 }
 
-// New creates a new TUI model backed by the real IPC client.
-func New(client *ipc.Client) Model {
+// New creates a new TUI model backed by the real IPC client and a
+// bootstrapper for bring-up and recovery. The bootstrapper lets the TUI
+// start even when the supervisor is unavailable — startup failures are
+// surfaced on the recovery screen rather than dropped to the shell.
+func New(client *ipc.Client, bootstrapper Bootstrapper) Model {
 	var c SupervisorClient
 	if client != nil {
 		c = client
 	}
-	return newModel(c)
+	return newModel(c, bootstrapper)
 }
 
-// newModel creates a model against the SupervisorClient interface.
-func newModel(client SupervisorClient) Model {
+// newModel creates a model against the SupervisorClient interface and
+// the Bootstrapper. The bootstrapper drives the full bring-up sequence
+// and is used by the recovery screen.
+func newModel(client SupervisorClient, bootstrapper Bootstrapper) Model {
 	theme := DefaultTheme
 	if os.Getenv("NO_COLOR") != "" || os.Getenv("PORTICO_MONOCHROME") != "" {
 		theme = MonochromeTheme
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return Model{
-		screen:     ScreenBoot, // Start in boot screen
-		keys:       DefaultKeyMap,
-		theme:      theme,
-		useASCII:   os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
-		client:     client,
-		rootCtx:    ctx,
-		rootCancel: cancel,
+		screen:      ScreenBoot, // Start in boot screen
+		keys:        DefaultKeyMap,
+		theme:       theme,
+		useASCII:    os.Getenv("PORTICO_ASCII") != "" || os.Getenv("TERM") == "dumb",
+		client:      client,
+		bootstrapper: bootstrapper,
+		rootCtx:     ctx,
+		rootCancel:  cancel,
 	}
 }
 
 // --------------- Bubble Tea integration ---------------
 
 // Init returns the startup command (SPEC §17.4).
-// Sequenced: load snapshot first, then connect SSE after cursor is set.
+//
+// The TUI starts in ScreenBoot and attempts the full bring-up sequence
+// through the bootstrapper (ensure supervisor -> health check). Only a
+// successful bootstrap transitions to snapshot loading and then Home. A
+// bootstrap failure transitions to the recovery screen, which can retry
+// the whole sequence rather than retrying a snapshot fetch against an
+// unchanged dead supervisor.
 func (m Model) Init() tea.Cmd {
+	if m.bootstrapper != nil {
+		return m.bootstrapCmd()
+	}
+	// No bootstrapper (some tests): fall back to snapshot directly.
 	return m.requestSnapshot()
 }
+
+// bootstrapCmd runs the full bring-up sequence off the update loop.
+// On success it proceeds to snapshot loading; on failure it transitions
+// to the recovery screen with a structured error.
+func (m *Model) bootstrapCmd() tea.Cmd {
+	b := m.bootstrapper
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if b == nil {
+			return bootstrapDoneMsg{}
+		}
+		if err := b.TryBootstrap(ctx); err != nil {
+			return bootstrapFailedMsg{Err: err}
+		}
+		return bootstrapDoneMsg{}
+	}
+}
+
+
 
 // Update handles messages (SPEC §17.7).
 // Update advances the model, then measures what the next render will produce.
@@ -250,6 +290,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case bootstrapFailedMsg:
+		// The full bootstrap sequence failed — transition to recovery.
+		m.err = msg.Err
+		m.transitionTo(ScreenRecovery)
+		return m, nil
+
+	case bootstrapDoneMsg:
+		// Bootstrap succeeded — proceed to snapshot load.
+		return m, m.requestSnapshot()
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1028,6 +1078,17 @@ func (m *Model) measureViewport() {
 type snapshotMsg struct {
 	Snapshot ipc.SnapshotDTO
 	Err      error
+}
+
+// bootstrapDoneMsg reports that the supervisor is reachable. A nil Err
+// means TryBootstrap succeeded; a non-nil Err means the full sequence
+// failed (supervisor missing, exited during startup, stale socket,
+// permission denied, or health failure) and the model has transitioned
+// to ScreenRecovery.
+type bootstrapDoneMsg struct{}
+
+type bootstrapFailedMsg struct {
+	Err error
 }
 
 type planLoadedMsg struct {
@@ -1920,10 +1981,13 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 
 	case "r":
 		if m.screen == ScreenRecovery {
-			// Retry connection to supervisor
+			// Retry the full bring-up sequence: ensure/start supervisor
+			// -> health check -> snapshot. A bare snapshot retry against
+			// an unchanged dead supervisor would loop without progress.
 			m.err = nil
+			m.status = ""
 			m.transitionTo(ScreenBoot)
-			return m, m.requestSnapshot()
+			return m, m.bootstrapCmd()
 		}
 		if m.screen == ScreenRepair && m.SelectedConnection() != nil {
 			// Clear pre-repair diagnostics when manually re-running
@@ -2489,23 +2553,41 @@ func (m *Model) renderRecovery() string {
 	b.WriteString("\n\n")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(m.theme.Intervention).
-		Render("Unable to connect to supervisor\n"))
+		Render("Cannot connect to Portico"))
 	b.WriteString("\n")
+
+	// User-facing explanation first.
+	b.WriteString(lipgloss.NewStyle().
+		Foreground(m.theme.Text).
+		Render("Portico's background process (the supervisor) is not reachable."))
+	b.WriteString("\n\n")
+
+	// Concise technical detail as secondary information.
 	if m.err != nil {
 		b.WriteString(lipgloss.NewStyle().
 			Foreground(m.theme.Muted).
-			Render(fmt.Sprintf("Error: %s\n\n", m.err)))
+			Render(fmt.Sprintf("Reason: %s\n", m.err)))
+		b.WriteString("\n")
 	}
+
+	// Concrete next actions the user can take.
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(m.theme.Text).
-		Render("This usually means:\n"))
-	b.WriteString("  • The supervisor is not running\n")
-	b.WriteString("  • The socket file is missing or inaccessible\n")
-	b.WriteString("  • Permission denied\n")
+		Render("What you can do:"))
 	b.WriteString("\n")
+	b.WriteString("  • Press [r] to retry — Portico will try to start the supervisor again\n")
+	if m.bootstrapper != nil {
+		logPath := m.bootstrapper.SupervisorLogPath()
+		if logPath != "" {
+			b.WriteString(fmt.Sprintf("  • Check the supervisor log: %s\n", logPath))
+		}
+	}
+	b.WriteString("\n")
+
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(m.theme.Stable).
-		Render("[r] Retry connection\n"))
+		Render("[r] Retry"))
+	b.WriteString("   ")
 	b.WriteString(lipgloss.NewStyle().
 		Foreground(m.theme.Muted).
 		Render("[q] Quit"))

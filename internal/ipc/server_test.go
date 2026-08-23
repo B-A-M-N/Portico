@@ -105,6 +105,16 @@ func (nullHandler) HandleSetLaunchMode(mode string) (*LaunchModeDTO, error) {
 func (nullHandler) HandleSupportExport() (*SupportExportDTO, error) {
 	return &SupportExportDTO{}, nil
 }
+
+// Settings are read and written through the supervisor, so the null handler
+// answers with the defaults rather than refusing.
+func (nullHandler) HandleSettings() (*SettingsDTO, error) {
+	return &SettingsDTO{LaunchMode: "auto", DefaultOnDisconnect: "keep_alive"}, nil
+}
+
+func (nullHandler) HandleUpdateSettings(SettingsRequest) (*SettingsDTO, error) {
+	return &SettingsDTO{LaunchMode: "auto", DefaultOnDisconnect: "keep_alive"}, nil
+}
 func (nullHandler) HandleSupervisorStop(ctx context.Context) error { return nil }
 
 func newTestServer(t *testing.T, st *store.Store) *Server {
