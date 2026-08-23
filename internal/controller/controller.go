@@ -1040,14 +1040,19 @@ var ErrNoRepairNeeded = errors.New("no repair needed")
 
 // CanRepair reports whether a repair plan can be produced for the given
 // profile. It should be checked before offering repair in the UI so the user
-// is never shown an action that the backend will refuse. Currently only
-// service-exposure connections are supported.
+// is never shown an action that the backend will refuse.
+//
+// A kind is repairable when its provider has the lifecycle repair needs: an
+// observation to compare against, and steps to restore what is missing. Port
+// forwarding qualifies — its provider has a start step, a stop step and an
+// Observe that reports whether the listener is up — and was refused only because
+// this function named service exposure and stopped.
 func (c *Controller) CanRepair(profile *core.ConnectionProfile) bool {
 	if profile == nil {
 		return false
 	}
 	switch profile.Kind {
-	case core.ConnectionServiceExposure:
+	case core.ConnectionServiceExposure, core.ConnectionPortForward:
 		return true
 	}
 	return false
@@ -1055,10 +1060,10 @@ func (c *Controller) CanRepair(profile *core.ConnectionProfile) bool {
 
 // PlanRepair creates a repair plan for a connection based on findings.
 //
-// Currently supports service-exposure connections only. Non-service kinds
-// (port_forward, client_tunnel, private_network) require kind-specific
-// repair logic that is not yet implemented. Use CanRepair to check before
-// offering repair in the UI.
+// Repair is kind-specific, because what can be wrong differs by kind: a
+// published service has an origin, a connector and provider resources, while a
+// forward has a listener and a target. Each kind's steps are built from its own
+// provider's lifecycle. Use CanRepair to check before offering repair in the UI.
 func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (*core.OperationPlan, error) {
 	c.mu.RLock()
 	profile, ok := c.profiles[connID]
@@ -1089,6 +1094,20 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 	c.mu.RLock()
 	rt, rtOk := c.runtimes[connID]
 	c.mu.RUnlock()
+
+	// Port forwarding has its own repair: a listener, a forwarding process and a
+	// target, none of which a service exposure's origin/connector reasoning
+	// describes.
+	if profile.Kind == core.ConnectionPortForward {
+		forwardSteps, err := c.portForwardRepairSteps(ctx, profile, runtimeOrNil(rt, rtOk))
+		if err != nil {
+			return nil, err
+		}
+		if len(forwardSteps) == 0 {
+			return nil, ErrNoRepairNeeded
+		}
+		return c.finishRepairPlan(ctx, profile, forwardSteps)
+	}
 
 	// Build a repair plan based on origin and connector status. Causal order:
 	// origin must be healthy before the connector can succeed.
@@ -1139,9 +1158,30 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 		return nil, ErrNoRepairNeeded
 	}
 
+	return c.finishRepairPlan(ctx, profile, steps)
+}
+
+// runtimeOrNil returns the runtime when one was found, so a kind-specific step
+// builder can distinguish "no runtime recorded" from a zero one.
+func runtimeOrNil(rt *core.ConnectionRuntime, ok bool) *core.ConnectionRuntime {
+	if !ok {
+		return nil
+	}
+	return rt
+}
+
+// finishRepairPlan assembles the plan around a set of repair steps.
+//
+// It is shared by every kind, so the identity, the expiry, the fingerprint and
+// the stale-plan detection are done once. A second copy per kind is how one of
+// them would come to skip the observed fingerprint and apply against changed
+// provider state.
+func (c *Controller) finishRepairPlan(
+	ctx context.Context, profile *core.ConnectionProfile, steps []core.PlanStep,
+) (*core.OperationPlan, error) {
 	plan := &core.OperationPlan{
 		ID:              core.NewPlanID(),
-		ConnectionID:    connID,
+		ConnectionID:    profile.ID,
 		ProfileRevision: profile.Revision,
 		Provider:        profile.GetProvider().ProviderID,
 		Account:         profile.GetProvider().AccountID,
@@ -1160,7 +1200,7 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 	// plans (delete with no tracked resources) have no provider state
 	// to verify.
 	if planRequiresProvider(plan) {
-		if obs, err := c.Observe(ctx, connID); err == nil {
+		if obs, err := c.Observe(ctx, profile.ID); err == nil {
 			if fp, err := obs.ComputeFingerprint(); err == nil {
 				plan.ObservedFingerprint = fp
 				// Recompute because ObservedFingerprint is part of the fingerprint.

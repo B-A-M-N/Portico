@@ -7,21 +7,6 @@ import (
 
 // Action sets for the management, preview and form screens.
 
-// kindSupportsRepair reports whether the diagnostic engine and the controller
-// can produce a repair for a connection kind.
-//
-// This is the one place the answer lives. It was previously a literal kind
-// comparison in the Home key handler and a second, differently-worded one in
-// the Inspect handler, so the two could disagree about the same connection.
-func kindSupportsRepair(kind string) bool {
-	switch kind {
-	case "", "service_exposure", "port_forward":
-		return true
-	default:
-		return false
-	}
-}
-
 // inspectActions is the operational screen for one connection.
 //
 // Space, Repair and Delete were all executed here and none of them was

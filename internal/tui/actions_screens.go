@@ -148,14 +148,15 @@ func (m Model) homeActions() ActionSet {
 // repairAvailability reports whether diagnosis can run for a connection, and
 // why not when it cannot.
 //
-// The reason is carried by the action rather than produced as a status line
-// after the key is pressed, which is what let Inspect accept `r` on a kind the
-// backend refuses.
+// The answer is the supervisor's, carried on the connection. It was previously a
+// literal kind comparison here and a second, differently-worded one in the
+// Inspect handler, so the interface could refuse a repair the backend supports —
+// which is what happened to port forwarding the moment it became repairable.
 func (m Model) repairAvailability(conn *ipc.ConnectionDTO) (bool, string) {
 	if conn == nil {
 		return false, "no connection is selected"
 	}
-	if !kindSupportsRepair(conn.Kind) {
+	if !conn.Repairable {
 		return false, "Portico cannot yet diagnose a " + screens.ConnectionKindLabel(conn.Kind)
 	}
 	return true, ""

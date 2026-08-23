@@ -31,6 +31,12 @@ type ConnectionDTO struct {
 	ConnectorPID      int    `json:"connector_pid,omitempty"`
 	ConnectorState    string `json:"connector_state"`
 	Error             string `json:"error,omitempty"`
+	// Repairable reports that the supervisor can produce a repair plan for this
+	// connection's kind. It is here so a client offers repair exactly where the
+	// backend supports it: the TUI previously kept its own list of repairable
+	// kinds, which is a second answer to a question the controller already
+	// answers, and the two drifted the moment a kind became repairable.
+	Repairable bool `json:"repairable,omitempty"`
 }
 
 // OriginOwnershipDTO says what happens to the local service when the connection

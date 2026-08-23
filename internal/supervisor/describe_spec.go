@@ -164,6 +164,11 @@ func connectionSummaryDTO(p *core.ConnectionProfile, rt *core.ConnectionRuntime)
 		DesiredState:      string(p.Desired),
 		ProviderID:        string(p.GetProvider().ProviderID),
 		ProviderAccountID: string(p.GetProvider().AccountID),
+		// Whether repair is possible is the controller's answer, carried to the
+		// client rather than re-derived there. A client keeping its own list of
+		// repairable kinds is a second answer that drifts the moment a kind
+		// becomes repairable — which is exactly what happened to port forwarding.
+		Repairable: kindSupportsRepair(p.EffectiveKind()),
 	}
 	if rt != nil {
 		dto.RuntimeState = string(rt.State)
@@ -232,5 +237,20 @@ func describeOriginOwnership(p *core.ConnectionProfile, rt *core.ConnectionRunti
 			Description: "This service runs independently of Portico. Closing or deleting the " +
 				"connection leaves it running.",
 		}
+	}
+}
+
+// kindSupportsRepair reports whether the controller can produce a repair plan
+// for a connection kind.
+//
+// It mirrors controller.CanRepair. The projection runs without a controller in
+// hand — it is given a profile and a runtime — so the kinds are named here, and
+// a test pins the two against each other so neither can move alone.
+func kindSupportsRepair(kind core.ConnectionKind) bool {
+	switch kind {
+	case core.ConnectionServiceExposure, core.ConnectionPortForward:
+		return true
+	default:
+		return false
 	}
 }
