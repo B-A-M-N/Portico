@@ -65,6 +65,17 @@ func (m *WizardModel) Actions() WizardActions {
 		return m.reviewActions()
 	case WizardStepDiscovery:
 		return m.discoveryActions()
+	case WizardStepTunnelID:
+		return m.tunnelStepActions(
+			"Accept this tunnel ID. Portico checks its shape here, so a typo is caught " +
+				"now rather than when the client refuses it.")
+	case WizardStepTunnelMCP:
+		return m.tunnelStepActions(
+			"Accept this address. It is where the tunnel client forwards requests, so it " +
+				"is your MCP server's own address on this machine.")
+	case WizardStepTunnelProfile:
+		return m.tunnelStepActions(
+			"Accept this profile, or leave it empty to use the client's default.")
 	}
 	return m.questionActions()
 }

@@ -787,16 +787,26 @@ func TestUnavailableOutcomeIsRefusedRatherThanSubstituted(t *testing.T) {
 	if m.state.ExposureMode == "temporary_public" || m.state.ExposureMode == "permanent_public" {
 		t.Fatalf("an unavailable private outcome fell back to public exposure: %q", m.state.ExposureMode)
 	}
+	// The refusal explains itself, and the explanation is the provider's own: it
+	// is not installed here, because fullCloudflareSnapshot does not carry it.
+	// The reason used to be a string written into the recipe, which was a second
+	// answer to a question the provider definition already answers — and was wrong
+	// the moment the provider became available.
 	view := m.View()
-	if !strings.Contains(view, "experimental in Portico and off by default") {
-		t.Fatalf("refusal does not explain itself:\n%s", view)
+	if !strings.Contains(view, "not available yet") {
+		t.Fatalf("refusal does not say the outcome is unavailable:\n%s", view)
 	}
-	// It must also say how to enable it, not merely that it is unavailable.
-	if !strings.Contains(view, "PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") {
-		t.Fatalf("refusal does not say how to enable the feature:\n%s", view)
+	if !strings.Contains(view, "openai_tunnel") && !strings.Contains(view, "not installed") {
+		t.Fatalf("refusal does not say what is missing:\n%s", view)
 	}
-	if !strings.Contains(view, "expose it to anyone who finds the URL") {
-		t.Fatalf("refusal does not explain the risk of the alternative:\n%s", view)
+	// It says where to find out what is needed, rather than only that something is.
+	if !strings.Contains(view, "Setup") {
+		t.Fatalf("refusal offers no next step:\n%s", view)
+	}
+	// And it never proposes publishing the MCP server publicly instead, which
+	// would expose it to anyone who found the URL.
+	if strings.Contains(view, "temporary_public") || strings.Contains(view, "permanent_public") {
+		t.Fatalf("the refusal mentions a public alternative:\n%s", view)
 	}
 }
 

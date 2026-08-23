@@ -164,6 +164,12 @@ type WizardState struct {
 	PortForwardRemoteHost string
 	PortForwardRemotePort string
 	PortForwardProtocol   string
+	// TunnelID and TunnelProfile are used when ConnectionKind is
+	// "client_tunnel". The tunnel already exists: Portico manages a client
+	// against a tunnel created in the platform's own settings, and cannot create
+	// one — so the ID is collected rather than generated.
+	TunnelID      string
+	TunnelProfile string
 }
 
 // Wizard step constants
@@ -202,6 +208,11 @@ const (
 	WizardStepPortForwardRemotePort
 	// WizardStepPortForwardProtocol asks for the protocol (TCP/UDP).
 	WizardStepPortForwardProtocol
+	// The client-tunnel questions. They adopt a tunnel that already exists: its
+	// ID, the local MCP server it should reach, and the client profile to run.
+	WizardStepTunnelID
+	WizardStepTunnelMCP
+	WizardStepTunnelProfile
 	WizardStepReview
 	WizardStepCreating
 	WizardStepCreated       // Profile created, ask user what to do next
@@ -240,6 +251,11 @@ type wizardRecipe struct {
 	// Portico cannot honour must say so rather than quietly producing a
 	// different one.
 	Unavailable string
+	// RequiresProvider names a provider this outcome cannot be delivered without.
+	// Whether it is present is read from the snapshot, so the refusal is a fact
+	// about the machine rather than a string written here — which would be wrong
+	// the moment the provider became available.
+	RequiresProvider string
 	// ConnectionKind selects the connection kind to create.
 	ConnectionKind string
 }
@@ -279,14 +295,17 @@ var wizardRecipes = []wizardRecipe{
 		ConnectionKind: "port_forward",
 	},
 	{
-		Label:       "Connect an MCP server to ChatGPT",
-		Explanation: "A local MCP server should reach ChatGPT over a private, client-mediated tunnel rather than a public address.",
-		SourceType:  "mcp_server",
-		Unavailable: "This uses OpenAI's Secure MCP Tunnel, which is experimental in Portico and off by default. " +
-			"Install tunnel-client, create a tunnel in the OpenAI platform, export CONTROL_PLANE_API_KEY, " +
-			"and set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1. " +
-			"Portico will not publish your MCP server at a public address instead: that would expose it to anyone who finds the URL.",
-		ConnectionKind: "client_tunnel",
+		Label: "Connect an MCP server to ChatGPT",
+		Explanation: "A local MCP server should reach ChatGPT over a private, client-mediated tunnel " +
+			"rather than a public address. Portico manages a tunnel you have already created in the " +
+			"OpenAI platform; it does not create one.",
+		SourceType: "mcp_server",
+		// Availability is not stated here. Whether this can be delivered is a fact
+		// about the machine — whether the provider is registered, which its own
+		// definition decides — and a hardcoded refusal here was a second answer to
+		// that question, wrong the moment the provider became available.
+		RequiresProvider: "openai_tunnel",
+		ConnectionKind:   "client_tunnel",
 	},
 	{
 		Label:          "Something else (choose the source yourself)",
@@ -423,8 +442,8 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 		case "enter":
 			recipe := wizardRecipes[m.selected]
-			if recipe.Unavailable != "" {
-				m.err = fmt.Errorf("%s", recipe.Unavailable)
+			if reason := m.recipeUnavailable(recipe); reason != "" {
+				m.err = fmt.Errorf("%s", reason)
 				return nil
 			}
 			m.err = nil
@@ -585,9 +604,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepPortForwardLocalPort
 				m.setInput(m.state.PortForwardLocalPort)
 			case "client_tunnel":
-				// Client tunnel collects MCP endpoint/tunnel ID/profile
-				m.state.Step = WizardStepSource
-				m.setInput(m.state.SourceAddress)
+				// The tunnel already exists, so the first question is which one.
+				m.state.Step = WizardStepTunnelID
+				m.setInput(m.state.TunnelID)
 			default: // service_exposure
 				switch {
 				case m.state.SourceType == "mcp_server":
@@ -630,6 +649,15 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 
 	case WizardStepDiscovery:
 		return m.handleDiscoveryKey(key)
+
+	case WizardStepTunnelID:
+		return m.handleTunnelIDKey(key)
+
+	case WizardStepTunnelMCP:
+		return m.handleTunnelMCPKey(key)
+
+	case WizardStepTunnelProfile:
+		return m.handleTunnelProfileKey(key)
 
 	case WizardStepSource:
 		switch key {
@@ -1246,9 +1274,29 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 			Direction:  "local",
 		}
 	case "client_tunnel":
-		// Client tunnel creation is not yet implemented. Return an explicit
-		// error rather than constructing a knowingly invalid request.
-		return ipc.CreateConnectionRequest{}, fmt.Errorf("client tunnel connections are not yet supported")
+		// Adopting a tunnel that already exists. Portico does not create it — the
+		// adapter refuses to plan without an ID for exactly that reason — so the
+		// request carries the ID the user gave rather than a blank to be filled.
+		if s.TunnelID == "" {
+			return ipc.CreateConnectionRequest{}, fmt.Errorf(
+				"a tunnel ID is required: Portico manages a tunnel you created in the " +
+					"OpenAI platform, and cannot create one")
+		}
+		if s.SourceAddress == "" {
+			return ipc.CreateConnectionRequest{}, fmt.Errorf(
+				"the tunnel needs an MCP server to forward to")
+		}
+		req.ClientTunnel = &ipc.ClientTunnelSpecDTO{
+			Client:   "openai_secure_mcp_tunnel",
+			TunnelID: s.TunnelID,
+			Profile:  s.TunnelProfile,
+			MCP: ipc.MCPSourceDTO{
+				// The transport is HTTP: the client reaches a local MCP server over
+				// it, and the endpoint the user gave is that server's address.
+				Transport: "http",
+				Endpoint:  s.SourceAddress,
+			},
+		}
 	default: // service_exposure
 		req.Source = src
 		req.Exposure = ipc.ExposureDTO{
@@ -1470,6 +1518,18 @@ func (m *WizardModel) View() string {
 		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
 	case WizardStepDiscovery:
 		return m.withError(m.renderDiscovery())
+	case WizardStepTunnelID:
+		return m.withError(m.renderField(
+			"Which tunnel should Portico manage?\n" +
+				"Portico does not create tunnels: create one in the OpenAI platform's\n" +
+				"organization settings, then paste its ID here."))
+	case WizardStepTunnelMCP:
+		return m.withError(m.renderField(
+			"Where is the MCP server the tunnel should reach?\n" +
+				"The address it listens on, such as http://127.0.0.1:8000."))
+	case WizardStepTunnelProfile:
+		return m.withError(m.renderField(
+			"Which client profile should Portico run? (empty to use the default)"))
 	case WizardStepSource:
 		return m.withError(m.renderField(m.sourcePrompt()))
 	case WizardStepPort:
@@ -1569,16 +1629,23 @@ func (m *WizardModel) renderOutcome() string {
 	options := make([]string, 0, len(wizardRecipes))
 	for _, recipe := range wizardRecipes {
 		label := recipe.Label
-		if recipe.Unavailable != "" {
+		// Availability is read from the snapshot, so an outcome that has become
+		// possible stops being marked unavailable without anyone editing a string.
+		if m.recipeUnavailable(recipe) != "" {
 			label += "  (not available yet)"
 		}
 		options = append(options, label)
 	}
 	view := renderMenu("What are you trying to do?", options, m.selected)
 
-	// Show the consequence of the highlighted choice before it is made.
+	// Show the consequence of the highlighted choice before it is made, and what
+	// stands in the way when something does.
 	if m.selected >= 0 && m.selected < len(wizardRecipes) {
-		view += "\n\n" + wizardRecipes[m.selected].Explanation + "\n"
+		recipe := wizardRecipes[m.selected]
+		view += "\n\n" + recipe.Explanation + "\n"
+		if reason := m.recipeUnavailable(recipe); reason != "" {
+			view += "\nThis is not available yet: " + reason + "\n"
+		}
 	}
 	return view
 }

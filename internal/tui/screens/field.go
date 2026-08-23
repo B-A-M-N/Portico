@@ -77,7 +77,10 @@ func isTextStep(step int) bool {
 	switch step {
 	case WizardStepName, WizardStepSource, WizardStepPort,
 		WizardStepCommandArgs, WizardStepCommandWorkingDir,
-		WizardStepHostname, WizardStepProtectionRules:
+		WizardStepHostname, WizardStepProtectionRules,
+		WizardStepPortForwardLocalPort, WizardStepPortForwardRemoteHost,
+		WizardStepPortForwardRemotePort,
+		WizardStepTunnelID, WizardStepTunnelMCP, WizardStepTunnelProfile:
 		return true
 	default:
 		return false

@@ -33,6 +33,10 @@ var wizardStepOrder = []stepRule{
 	{WizardStepPortForwardRemoteHost, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	{WizardStepPortForwardRemotePort, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	{WizardStepPortForwardProtocol, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
+	// The client-tunnel questions: which tunnel, what it reaches, which profile.
+	{WizardStepTunnelID, func(m *WizardModel) bool { return m.state.ConnectionKind == "client_tunnel" }},
+	{WizardStepTunnelMCP, func(m *WizardModel) bool { return m.state.ConnectionKind == "client_tunnel" }},
+	{WizardStepTunnelProfile, func(m *WizardModel) bool { return m.state.ConnectionKind == "client_tunnel" }},
 	{WizardStepMCPMode, func(m *WizardModel) bool { return m.state.SourceType == "mcp_server" }},
 	// The discovery question belongs to an existing service only: a directory, a
 	// command and an MCP endpoint are all things the user names rather than
@@ -175,6 +179,12 @@ func (m *WizardModel) restoreStepInput() {
 		m.setInput(m.state.Hostname)
 	case WizardStepProtectionRules:
 		m.setInput(ProtectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
+	case WizardStepTunnelID:
+		m.setInput(m.state.TunnelID)
+	case WizardStepTunnelMCP:
+		m.setInput(m.state.SourceAddress)
+	case WizardStepTunnelProfile:
+		m.setInput(m.state.TunnelProfile)
 
 	// Menus restore a cursor rather than text, positioned on the stored answer
 	// so going back does not silently move the user's choice.

@@ -105,26 +105,6 @@ func (m *WizardModel) portForwardReview() []reviewSection {
 	}
 }
 
-// clientTunnelReview describes a client-mediated tunnel Portico manages rather
-// than one it created.
-func (m *WizardModel) clientTunnelReview() []reviewSection {
-	return []reviewSection{
-		{title: "What will be reachable", lines: []string{SourceSentence(m.state)}},
-		{title: "How it will be reached", lines: []string{
-			"Through a tunnel the client opens outward. There is no public address, " +
-				"and nothing on this machine is listening for the internet.",
-		}},
-		{title: "Who can reach it", lines: []string{
-			"Only the client the tunnel belongs to.",
-		}},
-		{title: "What Portico will create and manage", lines: ManagedSentence(m.state)},
-		{title: "When you close it", lines: []string{
-			"The tunnel client stops. The tunnel itself continues to exist at the provider.",
-		}},
-		{title: "Startup and quitting", lines: m.lifecycleLines()},
-	}
-}
-
 // providerLines names the provider and account in display terms.
 func (m *WizardModel) providerLines() []string {
 	name := m.state.Provider
