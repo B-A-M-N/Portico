@@ -35,26 +35,8 @@ func truncateToWidth(s string, width int) string {
 	return ansi.Truncate(s, width, "")
 }
 
-// centreOffset returns the starting column at which a string of the given
-// display width is centred on a target column, clamped to zero.
-//
-// This is what the route renderer needs to put a provider label under the
-// gateway node. It divided a rune count by two, so a label containing any wide
-// character was drawn off-centre by half its width.
-func centreOffset(centre int, s string) int {
-	x := centre - displayWidth(s)/2
-	if x < 0 {
-		return 0
-	}
-	return x
-}
-
-// rightAlignOffset returns the starting column at which a string ends at the
-// given column, clamped to zero.
-func rightAlignOffset(end int, s string) int {
-	x := end - displayWidth(s)
-	if x < 0 {
-		return 0
-	}
-	return x
-}
+// Positioning helpers live in the route package, next to the canvas that needs
+// them: centring a label under a node and right-aligning one against an edge are
+// canvas operations, and this package draws with lipgloss rather than on a grid.
+// Copies here were unused, and a second implementation of a measurement is the
+// one that drifts.

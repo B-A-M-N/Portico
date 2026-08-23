@@ -913,7 +913,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focusProviderSetupField()
 			return m, nil
 		}
-		// Success: drop every collected answer, secret included.
+		// Success: drop every collected answer, secret included. The return path
+		// is read first, because clearing the form clears that too.
+		resumeProvider := m.resumeWizardAfterSetup
 		m.clearProviderSetup()
 		// Report what the account can actually do, since a zone is required
 		// only for DNS and custom hostnames.
@@ -934,6 +936,13 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.Response != nil && msg.Response.RestartRequired {
 			m.status += " Restart the supervisor to activate it."
+		}
+		// A wizard sent the user here. It is returned to, on the provider
+		// question, with every answer intact and the recommendation recomputed
+		// against the provider that has just become usable.
+		if resumeProvider != "" && m.wizard != nil {
+			m.resumeWizardAfterSetup = resumeProvider
+			return m, m.finishProviderSetup()
 		}
 		return m, m.requestSnapshot()
 
@@ -1982,6 +1991,11 @@ func (m *Model) clearProviderSetup() {
 	m.providerSetupProviderID = ""
 	m.providerSetupValues = nil
 	m.providerSetupError = ""
+	// The rotation target is cleared with the form. Leaving it set would make the
+	// next account added rotate that account's credential instead.
+	m.replacingAccountID = ""
+	// A wizard waiting to be returned to is not: abandoning the setup form must
+	// still bring the user back to the question they left, with their answers.
 }
 
 // providerSetupFields returns the fields being collected, which come from the
@@ -2060,6 +2074,16 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 			req.Label = m.providerSetupValue("label")
 			req.ZoneID = m.providerSetupValue("zone_id")
 			req.Credential = m.providerSetupValue(m.providerSetupSecretField())
+			// A rotation is not a new account. When the form was opened to
+			// replace an existing account's credential, the identity is
+			// preserved and only the secret is sent: every connection stores
+			// that identity, so creating a second account would leave them all
+			// pointing at the one being replaced.
+			if m.replacingAccountID != "" {
+				m.providerSetupSubmitting = true
+				return m, m.replaceCredentialCmd(
+					m.providerSetupProviderID, m.replacingAccountID, req.Credential)
+			}
 			return m, m.configureProviderAccountCmd(m.providerSetupProviderID, req)
 		}
 		return m, nil
@@ -2070,7 +2094,19 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 	case "esc":
 		if m.providerSetupIndex == 0 {
 			// Leaving setup entirely: nothing collected may persist.
+			//
+			// A wizard is still waiting behind this form. Abandoning setup returns
+			// the user to the question they left rather than dropping them
+			// somewhere else with their answers stranded — the provider simply
+			// remains unconfigured, which the provider question already says.
+			resume := m.resumeWizardAfterSetup
 			m.clearProviderSetup()
+			if resume != "" && m.wizard != nil {
+				m.resumeWizardAfterSetup = ""
+				m.transitionTo(ScreenNewConnection)
+				return m, m.wizard.ResumeAfterSetup(resume, m.providerSnapshot())
+			}
+			m.resumeWizardAfterSetup = ""
 			return m, nil
 		}
 		// Moving back past a secret must not leave it resident while the user
@@ -3134,28 +3170,6 @@ func (m *Model) renderDiscovery() string {
 	return b.String()
 }
 
-// operationDuration reports how long a completed operation took. It returns
-// false when either timestamp is missing or unparseable, so the caller omits
-// the field rather than rendering a misleading zero.
-func operationDuration(op ipc.OperationDTO) (time.Duration, bool) {
-	if op.StartedAt == "" || op.CompletedAt == "" {
-		return 0, false
-	}
-	started, err := time.Parse(time.RFC3339, op.StartedAt)
-	if err != nil {
-		return 0, false
-	}
-	completed, err := time.Parse(time.RFC3339, op.CompletedAt)
-	if err != nil {
-		return 0, false
-	}
-	d := completed.Sub(started)
-	if d < 0 {
-		return 0, false
-	}
-	return d, true
-}
-
 // renderOperations draws the history: what Portico did, to what, and how it ended.
 //
 // The list led with operation IDs and plan fingerprints — the two things a user
@@ -3585,23 +3599,12 @@ func (m *Model) abandonScreenWork() {
 	}
 }
 
-// acceptsGlobalNavigation reports whether a screen may be left by pressing a
-// key that jumps somewhere else.
-//
-// s and p jumped to setup and providers from every screen, including from a
-// plan preview waiting for approval and from an operation in progress. A key
-// that means "go here" must not fire while the screen is asking a question,
-// because the answer to that question is what the keypress looks like.
-func acceptsGlobalNavigation(screen ScreenID) bool {
-	switch screen {
-	case ScreenPlanPreview, ScreenRepair, ScreenOperationProgress,
-		ScreenNewConnection, ScreenAccountRemoval, ScreenEdit, ScreenClone,
-		ScreenBoot, ScreenQuit:
-		return false
-	default:
-		return true
-	}
-}
+// Jump keys are absent from the action sets of screens that are asking a
+// question, so nothing here has to remember to suppress them. acceptsGlobalNavigation
+// used to be that reminder, checked by hand at each jump-key site; the plan
+// preview, the repair screen and the operation progress screen simply do not
+// list Setup or Providers among their actions, which is why s and p no longer
+// leave them.
 
 // selectedOperationID names the operation the history cursor is on.
 func (m *Model) selectedOperationID() string {
@@ -3621,26 +3624,6 @@ func (m *Model) operationEventsForSelection() tea.Cmd {
 	m.operationEvents = nil
 	m.operationEventsFailed = ""
 	return m.loadOperationEventsCmd(id)
-}
-
-// eventSummary pulls a human-readable line out of an event payload.
-func eventSummary(evt ipc.EventDTO) string {
-	if evt.Operation != nil {
-		// An error is what the reader is looking for, so it wins over the
-		// step's own description of what it was trying to do.
-		if evt.Operation.Error != "" {
-			return evt.Operation.Error
-		}
-		if evt.Operation.StepSummary != "" {
-			return evt.Operation.StepSummary
-		}
-	}
-	if data, ok := evt.Data.(map[string]interface{}); ok {
-		if summary, ok := data["summary"].(string); ok {
-			return summary
-		}
-	}
-	return ""
 }
 
 // syncInspectModel copies the data the inspect screen renders from into it.
