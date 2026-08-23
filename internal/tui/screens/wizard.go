@@ -940,7 +940,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				return nil
 			}
 			m.err = nil
-			m.setupProviderID = choice.Value
+			m.RequestProviderSetup(choice.Value)
 			return nil
 		case "up", "k":
 			if m.selected > 0 {

@@ -238,9 +238,18 @@ func TestALateEditPlanDoesNotOpenAPreview(t *testing.T) {
 	m = next.(Model)
 	msg := cmd()
 
-	// The user leaves before the answer arrives.
+	// The user leaves before the answer arrives. The edit is dirty, so escape
+	// asks before discarding; confirming is what actually abandons it.
 	next, _ = m.Update(keyMsg("esc"))
 	m = next.(Model)
+	if m.edit == nil || !m.edit.confirmingDiscard {
+		t.Fatal("leaving a dirty edit did not ask before discarding it")
+	}
+	next, _ = m.Update(keyMsg("y"))
+	m = next.(Model)
+	if m.edit != nil {
+		t.Fatal("confirming the discard did not abandon the edit")
+	}
 
 	next, _ = m.Update(msg)
 	m = next.(Model)

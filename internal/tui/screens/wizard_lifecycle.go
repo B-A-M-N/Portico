@@ -1,5 +1,7 @@
 package screens
 
+import "strings"
+
 // Lifecycle, asked rather than assumed.
 //
 // buildRequest hardcoded AutoStart: true and OnDisconnect: keep_alive. Every
@@ -18,6 +20,36 @@ type LifecycleDefaults struct {
 	// OnDisconnect is "keep_alive" or "close": what happens when the client
 	// that created the connection goes away.
 	OnDisconnect string
+}
+
+// HasAnswers reports whether the user has told the wizard anything yet.
+//
+// It decides whether leaving needs to ask first. A wizard on its opening
+// question with nothing entered can be left freely; one carrying a name, an
+// address and an access policy cannot, because those are decisions the user made
+// and a single keystroke should not erase them.
+func (m *WizardModel) HasAnswers() bool {
+	if m == nil {
+		return false
+	}
+	s := m.state
+	switch {
+	case strings.TrimSpace(s.Name) != "",
+		strings.TrimSpace(s.SourceAddress) != "",
+		strings.TrimSpace(s.Hostname) != "",
+		strings.TrimSpace(s.Port) != "",
+		len(s.CommandArgs) > 0,
+		strings.TrimSpace(s.WorkingDir) != "",
+		len(s.AllowedEmails) > 0,
+		len(s.AllowedDomains) > 0,
+		strings.TrimSpace(s.PortForwardLocalPort) != "",
+		strings.TrimSpace(s.PortForwardRemoteHost) != "",
+		strings.TrimSpace(s.PortForwardRemotePort) != "":
+		return true
+	}
+	// Anything typed into the current field counts too: it is an answer the user
+	// has given, whether or not they have pressed enter on it.
+	return strings.TrimSpace(m.inputValue()) != ""
 }
 
 // WithDefaults applies the installation's lifecycle defaults.

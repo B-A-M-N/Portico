@@ -121,6 +121,21 @@ func (m Model) wizardActions() ActionSet {
 	if m.wizard == nil {
 		return nil
 	}
+	// While a discard confirmation is up, those are the only two answers.
+	if m.wizardConfirmingDiscard {
+		return ActionSet{
+			{
+				ID: ActionDiscard, Keys: []string{"y"}, Label: "Discard and leave", Enabled: true,
+				Primary: true,
+				Help: "Leave without creating anything. Your answers are lost and nothing is " +
+					"left behind.",
+			},
+			{
+				ID: ActionKeepEditing, Keys: []string{"n", "esc"}, Label: "Keep going", Enabled: true,
+				Primary: true, Help: "Return to the question with every answer still in place.",
+			},
+		}
+	}
 	return wizardActionSet(m.wizard.Actions())
 }
 

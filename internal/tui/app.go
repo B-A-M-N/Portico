@@ -227,6 +227,10 @@ type Model struct {
 	wizard  *screens.WizardModel
 	inspect *screens.InspectModel
 	setup   *screens.SetupModel
+	// wizardConfirmingDiscard is set when the user has asked to leave a wizard
+	// that has answers on it. The wizard is the longest sequence of decisions in
+	// the product, and one keystroke should not be able to erase all of them.
+	wizardConfirmingDiscard bool
 	// readiness is what the supervisor says this machine can do. It is held on
 	// the model rather than only inside the setup screen because the empty Home
 	// needs it too: whether setup is genuinely required decides what a new user
@@ -1860,22 +1864,52 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// A discard confirmation is up: those are the only two answers, and every
+	// other key is ignored rather than acting on the question behind it.
+	if m.wizardConfirmingDiscard {
+		switch key {
+		case "y", "Y":
+			m.wizardConfirmingDiscard = false
+			m.wizard = nil
+			m.transitionTo(ScreenHome)
+			m.clearNav()
+			return m, nil
+		case "n", "N", "esc":
+			m.wizardConfirmingDiscard = false
+		}
+		return m, nil
+	}
+
 	switch m.wizard.Step() {
 	case screens.WizardStepOutcome:
-		// Backing out of the first question returns home. It was the intent
-		// question that exited, which stopped being first when the wizard
-		// began by asking what the user was trying to do — so escaping the
-		// outcome question did nothing, and escaping the intent question left
-		// the wizard entirely instead of returning to the outcome it came from.
-		if key == "esc" || key == "q" {
+		// Backing out of the first question leaves the wizard: there is no
+		// earlier question to return to. Several answers may already have been
+		// given on paths that came back here, so it asks first — the wizard is
+		// the longest sequence of decisions in the product, and one keystroke
+		// should not be able to erase all of them.
+		if key == "esc" {
+			if m.wizard.HasAnswers() {
+				m.wizardConfirmingDiscard = true
+				return m, nil
+			}
 			m.wizard = nil
 			m.transitionTo(ScreenHome)
 			m.clearNav()
 			return m, nil
 		}
+	case screens.WizardStepName:
+		// Escaping the name question returns to the outcome, which is the first
+		// question — so the next escape would leave. Asking here, where the
+		// answers still exist, is what stops two keystrokes from erasing them
+		// with no acknowledgement at all.
+		if key == "esc" && m.wizard.HasAnswers() {
+			m.wizardConfirmingDiscard = true
+			return m, nil
+		}
 	case screens.WizardStepComplete:
-		// Done — return home and refresh.
-		if key == "enter" || key == "esc" || key == "q" {
+		// Done — return home and refresh. Nothing is lost here: the connection
+		// has already been created.
+		if key == "enter" || key == "esc" {
 			m.wizard = nil
 			m.transitionTo(ScreenHome)
 			m.clearNav()
@@ -1886,7 +1920,13 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	return m, m.wizard.HandleKey(key)
+	cmd := m.wizard.HandleKey(key)
+	// The wizard may have asked for a provider to be configured. Setup is a child
+	// of the wizard rather than a replacement for it, so every answer survives.
+	if next, setupCmd, started := m.wizardProviderSetupCmd(); started {
+		return next, tea.Batch(cmd, setupCmd)
+	}
+	return m, cmd
 }
 
 // currentLaunchMode reports the mode the screen is currently showing.
@@ -2514,10 +2554,32 @@ func (m *Model) renderNewConnection() string {
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(" NEW CONNECTION "))
 	b.WriteString("\n\n")
+
+	// The discard confirmation replaces the question. Drawing the question behind
+	// it would invite answering that instead.
+	if m.wizardConfirmingDiscard {
+		b.WriteString(m.theme.Style("attention").Render(
+			"You have described a connection that has not been created yet."))
+		b.WriteString("\n\n")
+		b.WriteString("Leaving now discards your answers. Nothing has been created, so nothing " +
+			"will be left behind — but you would start again from the first question.\n\n")
+		b.WriteString(m.actionsFor(ScreenNewConnection).footer(m.theme, m.width))
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	b.WriteString(m.wizard.View())
+	b.WriteString("\n\n")
+	// The footer is the wizard's own description of the current question, so it
+	// cannot advertise a key that question does not accept.
+	b.WriteString(m.actionsFor(ScreenNewConnection).footer(m.theme, m.width))
 	if m.status != "" {
 		b.WriteString("\n\n")
 		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
+	}
+	if m.err != nil {
+		b.WriteString("\n\n")
+		b.WriteString(m.renderUserFacingError())
 	}
 	return b.String()
 }
@@ -3442,6 +3504,15 @@ func compareFindings(before, after []ipc.DiagnosticDTO) (resolved, remaining, ap
 // a typed character as a command. Only screens that are actually asking for
 // text take it.
 func (m *Model) routeTextEntry(msg tea.Msg) (tea.Cmd, bool) {
+	// A confirmation outranks text entry. While one is up the form behind it is
+	// not being edited, so its field must not swallow the answer — n and y are
+	// printable characters, and the wizard's name field consumed both.
+	if m.wizardConfirmingDiscard {
+		return nil, false
+	}
+	if m.edit != nil && m.edit.confirmingDiscard {
+		return nil, false
+	}
 	if m.screen == ScreenNewConnection && m.wizard != nil {
 		return m.wizard.Update(msg)
 	}

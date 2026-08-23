@@ -309,6 +309,26 @@ func (m *Model) renderEdit() string {
 	}
 	b.WriteString(m.edit.detail.Summary.Name + "\n\n")
 
+	// The discard confirmation replaces the form. Drawing the properties behind
+	// the question would invite answering it by editing something else.
+	if m.edit.confirmingDiscard {
+		b.WriteString(m.theme.Style("attention").Render(
+			"You have unsaved changes to this connection."))
+		b.WriteString("\n\n")
+		for _, row := range m.edit.rows() {
+			if !row.changed() {
+				continue
+			}
+			b.WriteString("  " + row.label + ": " + row.current + " → " + row.pending + "\n")
+		}
+		b.WriteString("\n")
+		b.WriteString("Leaving now discards them. Nothing has been saved: an edit is only " +
+			"applied after you preview it.\n\n")
+		b.WriteString(m.actionsFor(ScreenEdit).footer(m.theme, m.width))
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	rows := m.edit.rows()
 	for i, row := range rows {
 		cursor := "  "
@@ -350,12 +370,14 @@ func (m *Model) renderEdit() string {
 	}
 
 	b.WriteString("\n")
-	if m.edit.dirty() {
-		b.WriteString("[enter] change    [p] preview the change    [esc] cancel\n")
-	} else {
-		b.WriteString("[enter] change    [esc] back\n")
+	if !m.edit.dirty() {
 		b.WriteString(m.theme.Style("muted").Render("Nothing has been changed yet.") + "\n")
 	}
+	// The footer is the screen's own action set, so it cannot advertise a key the
+	// screen does not accept nor omit one it does. It previously hardcoded two
+	// different strings, neither of which mentioned the list keys.
+	b.WriteString(m.actionsFor(ScreenEdit).footer(m.theme, m.width))
+	b.WriteString("\n")
 	return b.String()
 }
 
@@ -391,6 +413,22 @@ func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 		return m, nil
 	}
 	rows := m.edit.rows()
+
+	// A discard confirmation is up: those are the only two answers, and every
+	// other key is ignored rather than acting on the edit behind the question.
+	if m.edit.confirmingDiscard {
+		switch key {
+		case "y", "Y":
+			m.edit.requests.cancel()
+			m.edit = nil
+			if !m.popScreen() {
+				m.transitionTo(ScreenHome)
+			}
+		case "n", "N", "esc":
+			m.edit.confirmingDiscard = false
+		}
+		return m, nil
+	}
 
 	// While typing, the field owns everything except committing and abandoning.
 	if m.edit.typing {
@@ -440,6 +478,13 @@ func (m Model) handleEditKey(key string) (Model, tea.Cmd) {
 		return m, m.planEditCmd()
 
 	case "esc":
+		// An edit is an accumulation of decisions. Throwing it away for one
+		// keystroke destroys exactly the work this screen exists to collect, so
+		// leaving with unsaved changes asks first.
+		if m.edit.dirty() {
+			m.edit.confirmingDiscard = true
+			return m, nil
+		}
 		m.edit.requests.cancel()
 		m.edit = nil
 		if !m.popScreen() {

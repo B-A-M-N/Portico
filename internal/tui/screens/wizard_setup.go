@@ -34,6 +34,31 @@ func (m *WizardModel) PendingProviderSetup() (string, bool) {
 	return id, true
 }
 
+// RequestProviderSetup asks for a provider to be configured without leaving the
+// wizard.
+//
+// The provider question sets this from the highlighted choice. It is exported so
+// a caller that already knows which provider is blocking — a recommendation that
+// named an unconfigured provider, for instance — can ask for the same handoff.
+func (m *WizardModel) RequestProviderSetup(providerID string) {
+	if m == nil || providerID == "" {
+		return
+	}
+	m.err = nil
+	m.setupProviderID = providerID
+}
+
+// NameAnswer is the name the user gave the connection.
+//
+// It exists so a caller can check that an answer survived a child workflow
+// without reaching into the wizard's state.
+func (m *WizardModel) NameAnswer() string {
+	if m == nil {
+		return ""
+	}
+	return m.state.Name
+}
+
 // ResumeAfterSetup returns the wizard to the provider question after setup,
 // keeping every answer.
 //
