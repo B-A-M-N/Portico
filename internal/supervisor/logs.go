@@ -107,9 +107,15 @@ func (h *supervisorHandler) HandleConnectionLogs(id string, lines int) (*ipc.Con
 			continue
 		}
 		for _, line := range tail {
+			// Redaction happens first, on the whole line, so a secret cannot
+			// survive by sitting in a part the parser would move.
+			redacted := redactLogLine(line)
+			timestamp, severity, text := parseLogLine(redacted)
 			result.Lines = append(result.Lines, ipc.LogLineDTO{
-				Stream: stream,
-				Text:   redactLogLine(line),
+				Stream:    stream,
+				Text:      text,
+				Timestamp: timestamp,
+				Severity:  severity,
 			})
 		}
 	}

@@ -1554,28 +1554,86 @@ func TestConnectionDetailErrorKeepsPreviousDetail(t *testing.T) {
 
 // TestActivityTabDoesNotFabricateMetrics ensures the inspect screen never
 // presents traffic telemetry it does not collect as merely-empty data.
+//
+// It used to state flatly that telemetry is not collected for any provider. That
+// was a statement about the interface presented as one about Portico: the IPC
+// route, the DTO and the ngrok implementation all existed and nothing asked for
+// them. What must never happen is the opposite error — a zero shown for a
+// counter nobody measured.
 func TestActivityTabDoesNotFabricateMetrics(t *testing.T) {
-	m := readyModel(&fakeClient{detail: &ipc.ConnectionDetailDTO{}}, testSnapshot())
+	t.Run("a provider that reports nothing says so", func(t *testing.T) {
+		m := activityTabModel(t, &ipc.TelemetryDTO{
+			Available:   false,
+			Unavailable: "provider does not expose traffic telemetry",
+		})
+
+		view := m.View().Content
+		for _, forbidden := range []string{
+			"Request rate: --", "Error count:  --", "Latency:      --",
+			"Requests since it opened: 0",
+		} {
+			if strings.Contains(view, forbidden) {
+				t.Fatalf("the activity tab fabricates a metric: %q\n%s", forbidden, view)
+			}
+		}
+		if !strings.Contains(view, "does not expose traffic telemetry") {
+			t.Fatalf("the activity tab does not say why there are no figures:\n%s", view)
+		}
+	})
+
+	t.Run("a provider that reports counts shows them", func(t *testing.T) {
+		m := activityTabModel(t, &ipc.TelemetryDTO{
+			Available:       true,
+			HasCounts:       true,
+			RequestCount:    4213,
+			ConnectionCount: 7,
+			SampledAt:       time.Now().UTC().Format(time.RFC3339),
+		})
+
+		view := m.View().Content
+		if !strings.Contains(view, "4213") {
+			t.Fatalf("the request count the provider reported is not shown:\n%s", view)
+		}
+		if !strings.Contains(view, "7") {
+			t.Fatalf("the connection count the provider reported is not shown:\n%s", view)
+		}
+		// ngrok reports counts and no byte totals. A zero would be
+		// indistinguishable from a measured zero, so the absence is stated.
+		if !strings.Contains(view, "does not report byte totals") {
+			t.Fatalf("an unmeasured counter is not reported as unmeasured:\n%s", view)
+		}
+		if strings.Contains(view, "0 B") {
+			t.Fatalf("an unmeasured byte total was shown as zero:\n%s", view)
+		}
+	})
+}
+
+// activityTabModel opens Inspect on the Activity tab with the given telemetry.
+func activityTabModel(t *testing.T, telemetry *ipc.TelemetryDTO) Model {
+	t.Helper()
+	client := &fakeClient{
+		detail:       &ipc.ConnectionDetailDTO{},
+		telemetryDTO: telemetry,
+	}
+	m := readyModel(client, testSnapshot())
+	m.width = 100
+
 	next, _ := m.Update(keyMsg("enter"))
 	m = next.(Model)
 	next, _ = m.Update(connectionDetailMsg{ConnectionID: "conn-1", Detail: &ipc.ConnectionDetailDTO{}})
 	m = next.(Model)
-
-	// Move to the Activity tab.
-	next, _ = m.Update(keyMsg("right"))
+	next, _ = m.Update(telemetryLoadedMsg{
+		Token:     m.telemetryRequests.start("conn-1"),
+		Telemetry: telemetry,
+	})
 	m = next.(Model)
-	next, _ = m.Update(keyMsg("right"))
-	m = next.(Model)
 
-	view := m.View().Content
-	for _, forbidden := range []string{"Request rate: --", "Error count:  --", "Latency:      --"} {
-		if strings.Contains(view, forbidden) {
-			t.Fatalf("activity view still fabricates a metrics table: %q", forbidden)
-		}
+	// Overview -> Route -> Activity.
+	for i := 0; i < 2; i++ {
+		next, _ = m.Update(keyMsg("right"))
+		m = next.(Model)
 	}
-	if !strings.Contains(view, "not collected") {
-		t.Fatalf("activity view does not state that telemetry is unavailable:\n%s", view)
-	}
+	return m
 }
 
 // TestOperationsScreenDistinguishesEmptyFromUnavailable pins the operations

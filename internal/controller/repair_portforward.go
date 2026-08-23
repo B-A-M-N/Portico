@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 )
@@ -115,15 +114,12 @@ func (c *Controller) portForwardRepairSteps(
 	return steps, nil
 }
 
-// portForwardNeedsRepair reports whether a forward is in a state repair would
-// change. It is the same comparison portForwardRepairSteps makes, used by
-// CanRepair so the interface's offer and the backend's answer cannot disagree.
-func (c *Controller) portForwardNeedsRepair(ctx context.Context, profile *core.ConnectionProfile) bool {
-	c.mu.RLock()
-	rt := c.runtimes[profile.ID]
-	c.mu.RUnlock()
-	steps, err := c.portForwardRepairSteps(ctx, profile, rt)
-	return err == nil && len(steps) > 0
-}
-
-var _ = time.Now
+// There is deliberately no "does this forward need repair" helper here.
+//
+// CanRepair answers whether a kind can be repaired at all, which is static and
+// answerable without touching the provider. Whether a particular connection needs
+// repairing is a different question, it requires an observation, and PlanRepair
+// already answers it by returning ErrNoRepairNeeded. Offering both would give the
+// interface two answers to ask for and one of them would be consulted in the
+// wrong place — gating the Diagnose action on a live observation would make the
+// action bar change shape depending on provider reachability.

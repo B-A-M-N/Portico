@@ -936,6 +936,18 @@ type ConnectionLogsDTO struct {
 type LogLineDTO struct {
 	Stream string `json:"stream"`
 	Text   string `json:"text"`
+	// Timestamp and Severity are populated when the connector's own output
+	// carries them in a form the supervisor recognises, and left empty when it
+	// does not.
+	//
+	// They are not invented. Portico reads rotating log files a connector wrote;
+	// the time a line was read is not the time the event happened, and stamping
+	// lines with it would put a fabricated ordering in front of the user. So a
+	// line whose prefix parses gets its own timestamp, and one that does not gets
+	// none — which the client renders as an unadorned line rather than a blank
+	// column.
+	Timestamp string `json:"timestamp,omitempty"`
+	Severity  string `json:"severity,omitempty"`
 }
 
 // TelemetryDTO is a provider-neutral traffic snapshot for a connection.

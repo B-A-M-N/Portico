@@ -2,6 +2,7 @@ package screens
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
@@ -38,6 +39,11 @@ type InspectModel struct {
 	// LogTail is the authoritative log response, distinguishing "read and
 	// empty" from "could not be read".
 	LogTail *ipc.ConnectionLogsDTO
+	// ctx is what the root model resolved for this screen: display labels,
+	// telemetry, and the drawn route. The screen renders it and does not fetch
+	// it — View stays pure — and does not resolve labels itself, because the
+	// snapshot they come from belongs to the root model.
+	ctx InspectContext
 }
 
 // NewInspect creates a new inspect model.
@@ -102,7 +108,10 @@ func (m *InspectModel) View() string {
 		lines = append(lines, m.renderLogs()...)
 	}
 
-	lines = append(lines, "", "← → Switch tabs  Esc Back")
+	// No footer here. The root model draws the action bar from the screen's
+	// action set, which includes the lifecycle actions Inspect executes — open,
+	// close, repair, edit, copy, delete — none of which this line mentioned even
+	// though the screen accepted all of them.
 
 	result := ""
 	for i, line := range lines {
@@ -125,7 +134,9 @@ func (m *InspectModel) renderOverview() []string {
 		fmt.Sprintf("Name:       %s", conn.Name),
 		fmt.Sprintf("Kind:       %s", ConnectionKindLabel(conn.Kind)),
 		fmt.Sprintf("State:      %s", conn.UserState),
-		fmt.Sprintf("Provider:   %s", conn.ProviderID),
+		// The provider's display name, not its ID. The ID is an identifier and
+		// stays on the Technical tab, where an identifier is what is wanted.
+		fmt.Sprintf("Through:    %s", m.providerLabel()),
 	}
 
 	// Address lines are printed only when there is an address, and labelled by
@@ -142,7 +153,7 @@ func (m *InspectModel) renderOverview() []string {
 		lines = append(lines, "Address:    none yet")
 	}
 	if conn.ProviderAccountID != "" {
-		lines = append(lines, fmt.Sprintf("Account:    %s", conn.ProviderAccountID))
+		lines = append(lines, fmt.Sprintf("Account:    %s", m.accountLabel()))
 	}
 	// What closing this does to the local service. Nothing said whether Portico
 	// started it or merely connected to one already running, which is what a
@@ -187,6 +198,17 @@ func (m *InspectModel) renderRoute() []string {
 		return lines
 	}
 
+	// The drawing comes first: it is the shape of the route at a glance. It is
+	// built by the root model from these same segments, so the picture and the
+	// list below it cannot disagree about which hop is broken.
+	if m.ctx.RouteDrawing != "" {
+		lines = append(lines, strings.Split(m.ctx.RouteDrawing, "\n")...)
+		lines = append(lines, "")
+	}
+
+	// Then the evidence: each hop, what it is, and what went wrong with it. The
+	// drawing shows where the break is; this says what it was.
+	lines = append(lines, "EVIDENCE")
 	for i, seg := range m.Detail.Segments {
 		if i > 0 {
 			lines = append(lines, "        ↓")
@@ -195,9 +217,9 @@ func (m *InspectModel) renderRoute() []string {
 		if label == "" {
 			label = seg.ID
 		}
-		lines = append(lines, fmt.Sprintf("%s  [%s]", label, seg.Status))
+		lines = append(lines, fmt.Sprintf("  %s  [%s]", label, segmentStatusWord(seg.Status)))
 		if seg.Error != "" {
-			lines = append(lines, "  "+seg.Error)
+			lines = append(lines, "    "+seg.Error)
 		}
 	}
 
@@ -256,8 +278,26 @@ func (m *InspectModel) renderActivity() []string {
 		return append(lines, "Loading activity detail...")
 	}
 
-	lines = append(lines, "Traffic telemetry is not collected for this provider.", "")
-	lines = append(lines, "LIVENESS")
+	// Traffic, when the provider reports any. This used to state flatly that
+	// telemetry is not collected for any provider — which was a statement about
+	// the interface, not about Portico: the IPC route, the DTO and the ngrok
+	// implementation all existed, and nothing asked for them.
+	lines = append(lines, "TRAFFIC")
+	switch {
+	case m.ctx.TelemetryUnavailable != "":
+		lines = append(lines, "  "+m.ctx.TelemetryUnavailable)
+	case len(m.ctx.TelemetryLines) > 0:
+		for _, line := range m.ctx.TelemetryLines {
+			lines = append(lines, "  "+line)
+		}
+		if m.ctx.TelemetrySampledAt != "" {
+			lines = append(lines, "  Measured "+m.ctx.TelemetrySampledAt)
+		}
+	default:
+		lines = append(lines, "  Reading traffic figures...")
+	}
+
+	lines = append(lines, "", "LIVENESS")
 
 	if m.Detail.LastVerified != "" {
 		lines = append(lines, "  Last verified:   "+m.Detail.LastVerified)
@@ -367,11 +407,26 @@ func (m *InspectModel) renderLogs() []string {
 	if len(m.LogTail.Lines) == 0 {
 		return append(lines, "The connector has not written any output yet.")
 	}
-	if m.LogTail.Truncated {
-		lines = append(lines, "(showing the most recent lines)", "")
+
+	// What is being shown, so a filtered log that looks empty is not mistaken
+	// for a connector that wrote nothing.
+	lines = append(lines, m.logFilterDescription())
+	if m.ctx.LogFollow {
+		lines = append(lines, "Following: the log is re-read as the connection produces output.")
 	}
-	for _, entry := range m.LogTail.Lines {
-		lines = append(lines, fmt.Sprintf("  [%s] %s", entry.Stream, entry.Text))
+	if m.LogTail.Truncated {
+		lines = append(lines, "Showing the most recent lines.")
+	}
+	lines = append(lines, "")
+
+	filtered := m.filteredLogLines()
+	if len(filtered) == 0 {
+		return append(lines,
+			"  Nothing matches this filter. The connector did write output — press F "+
+				"to show everything.")
+	}
+	for _, entry := range filtered {
+		lines = append(lines, renderLogLine(entry))
 	}
 	return lines
 }
@@ -432,4 +487,28 @@ func (m *RepairModel) View() string {
 		result += line
 	}
 	return result
+}
+
+// segmentStatusWord says what a segment's status means.
+//
+// "healthy", "degraded" and "unknown" are the supervisor's words for its own
+// normalisation. What a user needs to know is whether this hop is working, not
+// working, or unchecked.
+func segmentStatusWord(status string) string {
+	switch status {
+	case "healthy", "ok", "pass":
+		return "working"
+	case "failed", "fail", "broken":
+		return "not working"
+	case "degraded", "warning":
+		return "working, with problems"
+	case "", "unknown":
+		// A hop Portico did not check and one it could not determine are the same
+		// thing to a reader: nothing is being claimed about it. Leaving "unknown"
+		// as the supervisor's own word made it look like a fourth state rather
+		// than an absence of information.
+		return "not checked"
+	default:
+		return status
+	}
 }

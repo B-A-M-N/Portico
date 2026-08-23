@@ -328,6 +328,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return next, cmd
 	}
+	// The Inspect screen's context is rebuilt after every update, for the same
+	// reason the viewport is measured here: it is derived state, and deriving it
+	// during render would mean writing to the copy View is given. Doing it at
+	// each of the several sites that change what it depends on — the snapshot, the
+	// detail, the logs, the telemetry, the selected tab, the terminal width — is
+	// how one of them comes to be forgotten.
+	updated.syncInspectModel()
 	updated.measureViewport()
 	return updated, cmd
 }
@@ -2639,6 +2646,17 @@ func (m *Model) renderInspect() string {
 		b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" %s ", conn.Name)))
 		b.WriteString("\n\n")
 		b.WriteString(inspect.View())
+		if m.status != "" {
+			b.WriteString("\n\n" + m.theme.Style("intervention").Render("  "+m.status))
+		}
+		if m.err != nil {
+			b.WriteString("\n\n" + m.renderUserFacingError())
+		}
+		// The action bar, from the screen's own action set. Inspect executed
+		// Space, Repair and Delete while advertising none of them.
+		b.WriteString("\n\n")
+		b.WriteString(m.actionsFor(ScreenInspect).footer(m.theme, m.width))
+		b.WriteString("\n")
 		return b.String()
 	}
 
@@ -3642,6 +3660,59 @@ func (m *Model) syncInspectModel() {
 	m.inspect.Diagnostics = m.diagnostics
 	m.inspect.Detail = m.connectionDetail
 	m.inspect.LogTail = m.connectionLogs
+	m.inspect.SetContext(m.inspectContext())
+}
+
+// inspectContext is what the Inspect screen cannot resolve for itself: the
+// display labels, which come from the snapshot this model holds; the telemetry,
+// which it does not fetch; and the drawn route, which is built from the same
+// segments its evidence list shows.
+//
+// It is assembled during Update, not during render, because resolving it reads
+// model state and View must stay pure.
+func (m *Model) inspectContext() screens.InspectContext {
+	conn := m.SelectedConnection()
+	if conn == nil {
+		return screens.InspectContext{}
+	}
+
+	ctx := screens.InspectContext{
+		ProviderLabel: m.providerDisplayName(conn.ProviderID),
+		LogStream:     m.logsStream,
+		LogFollow:     m.logsFollow,
+	}
+	if conn.ProviderAccountID != "" {
+		ctx.AccountLabel = m.accountDisplayLabel(conn.ProviderID, conn.ProviderAccountID)
+	}
+
+	// Telemetry, correlated to this connection: a sample held for another one is
+	// not shown against this.
+	sample, unavailable := m.telemetryForSelection()
+	ctx.Telemetry = sample
+	switch {
+	case unavailable != "":
+		ctx.TelemetryUnavailable = "No traffic figures: " + unavailable
+	case sample != nil && !sample.Available:
+		reason := sample.Unavailable
+		if reason == "" {
+			reason = "this provider does not report traffic"
+		}
+		ctx.TelemetryUnavailable = "No traffic figures: " + reason
+	case sample != nil:
+		ctx.TelemetryLines = telemetryLines(sample)
+		if sample.SampledAt != "" {
+			ctx.TelemetrySampledAt = relativeTime(sample.SampledAt, time.Now())
+		}
+	}
+
+	// The drawing. It is built from the authoritative segments, so the picture
+	// and the evidence beneath it cannot disagree about which hop is broken.
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	ctx.RouteDrawing = route.RenderRoute(m.routeViewModel(conn), width, m.useASCII)
+	return ctx
 }
 
 // planMatchesPreview reports whether the loaded plan is for the connection the
