@@ -1126,8 +1126,7 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 	case core.ConnectionPrivateNetwork:
 		return h.createPrivateNetwork(req)
 	case core.ConnectionClientTunnel:
-		return nil, core.ErrValidation(
-			"client tunnel connections are created through their provider's setup flow, not this endpoint")
+		return h.createClientTunnel(req)
 	default:
 		return nil, core.ErrValidation(fmt.Sprintf("unknown connection kind %q", req.Kind))
 	}
@@ -1447,6 +1446,97 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 }
 
 // createPortForward creates a local port forward connection.
+// createClientTunnel adopts a tunnel that already exists.
+//
+// Portico does not create the tunnel: creation happens in the client's own platform, and the
+// adapter refuses to plan without an ID for that reason. So this records a connection that
+// manages a client against a tunnel someone else made — which is why it is an adoption
+// rather than a creation, and why deleting the connection leaves the tunnel in place.
+//
+// This endpoint used to refuse the kind outright, saying tunnels were created "through their
+// provider's setup flow". That was not true of any flow Portico has: the wizard collected the
+// tunnel ID, the endpoint, and the profile, and then had nowhere to send them.
+func (h *supervisorHandler) createClientTunnel(req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	if req.ClientTunnel == nil {
+		return nil, core.ErrValidation("a client tunnel connection requires a client_tunnel specification")
+	}
+	ct := req.ClientTunnel
+
+	client := core.ClientKind(ct.Client)
+	if client == "" {
+		return nil, core.ErrValidation("a client tunnel connection requires the client that mediates it")
+	}
+	if strings.TrimSpace(ct.TunnelID) == "" {
+		return nil, core.ErrValidation(
+			"a tunnel ID is required: Portico manages a tunnel you created in your provider's " +
+				"platform, and cannot create one")
+	}
+
+	// The tunnel needs somewhere to forward to. Accepting a connection with neither an
+	// endpoint nor a command would store one that cannot open.
+	mcp := core.MCPServiceSpec{
+		Transport: core.MCPTransport(ct.MCP.Transport),
+		Endpoint:  strings.TrimSpace(ct.MCP.Endpoint),
+	}
+	if mcp.Transport == "" {
+		mcp.Transport = core.MCPTransportHTTP
+	}
+	if ct.MCP.Command != nil {
+		mcp.Command = &core.CommandSpec{
+			Executable: ct.MCP.Command.Executable,
+			Args:       append([]string(nil), ct.MCP.Command.Args...),
+			WorkingDir: ct.MCP.Command.WorkingDir,
+			Env:        ct.MCP.Command.Env,
+			Port:       ct.MCP.Command.Port,
+			Protocol:   core.Protocol(ct.MCP.Command.Protocol),
+			UseShell:   ct.MCP.Command.UseShell,
+		}
+	}
+	if mcp.Endpoint == "" && mcp.Command == nil {
+		return nil, core.ErrValidation(
+			"the tunnel needs somewhere to forward to: give the address your MCP server listens " +
+				"on, or the command that runs it")
+	}
+
+	providerID := core.ProviderID(req.Provider.ProviderID)
+	if providerID == "" {
+		providerID = "openai_tunnel"
+	}
+
+	profile := &core.ConnectionProfile{
+		Name: req.Name,
+		Kind: core.ConnectionClientTunnel,
+		Spec: core.ConnectionSpec{
+			ClientTunnel: &core.ClientTunnelSpec{
+				Client:   client,
+				MCP:      mcp,
+				TunnelID: strings.TrimSpace(ct.TunnelID),
+				Profile:  ct.Profile,
+			},
+		},
+		Driver: core.DriverSelection{
+			ProviderID: providerID,
+			AccountID:  core.ProviderAccountID(req.Provider.AccountID),
+		},
+		Lifecycle: core.LifecycleSpec{
+			AutoStart:    req.Lifecycle.AutoStart,
+			OnDisconnect: core.DisconnectPolicy(req.Lifecycle.OnDisconnect),
+		},
+		Desired: core.DesiredClosed,
+	}
+
+	created, _, err := h.sup.controller.CreateProfile(context.Background(), profile)
+	if err != nil {
+		return nil, err
+	}
+	if h.sup.ipcServer != nil {
+		if dispatchErr := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); dispatchErr != nil {
+			slog.Warn("dispatch create event", "connection", created.ID, "err", dispatchErr)
+		}
+	}
+	return h.HandleGetConnection(string(created.ID))
+}
+
 // createPrivateNetwork creates a connection that makes this machine, or one service on
 // it, reachable through a private network.
 //

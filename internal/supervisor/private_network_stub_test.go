@@ -83,3 +83,67 @@ func (*stubPrivateNetwork) Observe(_ context.Context,
 		Connector: &core.ObservedConnector{Status: string(core.ConnectorStatusStopped)},
 	}, nil
 }
+
+// stubClientTunnel declares the client-tunnel kind so the registry accepts the profile.
+//
+// The OpenAI adapter has its own tests. What the supervisor tests need is a provider that
+// says it can deliver the kind, so the create and reconstruction paths can be exercised
+// without a tunnel client on the machine.
+type stubClientTunnel struct{}
+
+func (*stubClientTunnel) Identity() core.ProviderIdentity {
+	return core.ProviderIdentity{
+		ID: "stub_client_tunnel", Name: "stub_client_tunnel",
+		DisplayName: "Stub client tunnel",
+	}
+}
+
+func (*stubClientTunnel) Capabilities(context.Context) (core.Capabilities, error) {
+	return core.Capabilities{
+		Kinds:              []core.ConnectionKind{core.ConnectionClientTunnel},
+		TemporaryAddresses: core.CapabilitySupport{Supported: false},
+		CustomHostnames:    core.CapabilitySupport{Supported: false},
+		ManagedDNS:         core.CapabilitySupport{Supported: false},
+		PrivateExposure:    core.CapabilitySupport{Supported: true},
+		Protocols: map[core.Protocol]core.ProtocolCapability{
+			core.ProtocolHTTP: {Supported: true, Private: true},
+		},
+		Redundancy: core.RedundancyCapability{Supported: false, MaxConnectors: 1},
+	}, nil
+}
+
+func (*stubClientTunnel) Authenticate(context.Context, core.AuthRequest) error { return nil }
+
+func (*stubClientTunnel) Plan(_ context.Context,
+	desired core.DesiredConnection) (*core.OperationPlan, error) {
+	plan := &core.OperationPlan{
+		ID: core.NewPlanID(), ConnectionID: desired.Profile.ID,
+		ProfileRevision: desired.Profile.Revision,
+		Provider:        "stub_client_tunnel", Intent: core.IntentOpen,
+		Steps: []core.PlanStep{{
+			ID: "stub-tunnel-step", Kind: core.StepStartConnector,
+			Summary: "Start the tunnel client",
+			Technical: core.TechnicalOperation{
+				Provider: "stub_client_tunnel", Type: "start_client",
+			},
+		}},
+	}
+	plan.Expected.State = core.RuntimeOpen
+	if err := plan.ComputeFingerprint(); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+func (*stubClientTunnel) ExecuteStep(context.Context, core.ConnectionID,
+	core.PlanStep) (core.StepResult, error) {
+	return core.StepResult{StepID: "stub-tunnel-step", Succeeded: true}, nil
+}
+
+func (*stubClientTunnel) Observe(_ context.Context,
+	id core.ConnectionID) (*core.ObservedConnection, error) {
+	return &core.ObservedConnection{
+		ConnectionID: id, ProviderID: "stub_client_tunnel",
+		Connector: &core.ObservedConnector{Status: string(core.ConnectorStatusStopped)},
+	}, nil
+}

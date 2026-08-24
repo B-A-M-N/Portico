@@ -212,19 +212,7 @@ func TestAJoinConnectionSurvivesARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A fresh supervisor over the same database, as a restart builds.
-	registry := provider.NewRegistry()
-	if err := registry.Add(&stubPrivateNetwork{}); err != nil {
-		t.Fatal(err)
-	}
-	restartedCtrl := controller.New(registry, st)
-	restartedCtrl.SetConnectionStorer(st)
-	restarted := &Supervisor{
-		store: st, registry: registry, controller: restartedCtrl, mutating: true,
-	}
-	if err := restarted.loadProfiles(context.Background()); err != nil {
-		t.Fatalf("loadProfiles: %v", err)
-	}
+	restarted := restartedSupervisor(t, st, &stubPrivateNetwork{})
 
 	profile, ok := restarted.controller.GetProfile(core.ConnectionID(created.ID))
 	if !ok {
@@ -249,4 +237,24 @@ func TestAJoinConnectionSurvivesARestart(t *testing.T) {
 	if spec.LocalAddress != "127.0.0.1:3000" {
 		t.Fatalf("the published address came back as %q", spec.LocalAddress)
 	}
+}
+
+// restartedSupervisor builds a fresh supervisor over the same database, as a restart does,
+// and runs the reconstruction step startup runs.
+//
+// Shared by the private-network and client-tunnel tests: both need the same thing, and a
+// second copy would be a second answer to "what does a restart do".
+func restartedSupervisor(t *testing.T, st *store.Store, adapter core.Provider) *Supervisor {
+	t.Helper()
+	registry := provider.NewRegistry()
+	if err := registry.Add(adapter); err != nil {
+		t.Fatalf("registering the provider: %v", err)
+	}
+	ctrl := controller.New(registry, st)
+	ctrl.SetConnectionStorer(st)
+	sup := &Supervisor{store: st, registry: registry, controller: ctrl, mutating: true}
+	if err := sup.loadProfiles(context.Background()); err != nil {
+		t.Fatalf("loadProfiles: %v", err)
+	}
+	return sup
 }
