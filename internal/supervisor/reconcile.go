@@ -80,13 +80,9 @@ func (s *Supervisor) reconcilePrivateNetwork(ctx context.Context, input Reconcil
 		mode = core.PrivateNetworkJoin
 	}
 
-	// Observe from the persisted resources, exactly as restart does. The observation is
-	// the single source of truth; the runtime projection is not, because a restart can
-	// leave a durable inventory with no runtime row.
-	observed, obsErr := s.controller.Observe(ctx, profile.ID)
-	if obsErr != nil {
-		return nil, fmt.Errorf("observing the private network connection: %w", obsErr)
-	}
+	// The observation is the single source of truth; the runtime projection is not,
+	// because a restart can leave a durable inventory with no runtime row.
+	observed := input.Observed
 
 	membership, serve := privateNetworkState(observed)
 
@@ -159,14 +155,12 @@ func (s *Supervisor) reconcilePrivateNetwork(ctx context.Context, input Reconcil
 func (s *Supervisor) reconcileClientTunnel(ctx context.Context, input ReconcileInput, desired core.DesiredConnectionState) (*reconcileDecision, error) {
 	profile := input.Profile
 
-	// Observe the process state from the provider. This is authoritative and cheap.
-	observed, obsErr := s.controller.Observe(ctx, profile.ID)
+	// The observation is authoritative. The runtime projection is not, because a
+	// restart can leave a durable inventory with no runtime row.
+	observed := input.Observed
 	processRunning := false
-	if obsErr == nil && observed != nil && observed.Connector != nil {
-		switch observed.Connector.Status {
-		case string(core.ConnectorStatusRunning):
-			processRunning = true
-		}
+	if observed != nil && observed.Connector != nil {
+		processRunning = observed.Connector.Status == string(core.ConnectorStatusRunning)
 	}
 
 	// Desired closed dominates.

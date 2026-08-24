@@ -258,9 +258,16 @@ func (p *Provider) closeSteps(spec *core.PrivateNetworkSpec, mode core.PrivateNe
 		}}
 	}
 
+	target := spec.LocalAddress
+	params["target"] = target
+
+	// The exact target flows through the plan, so a close is executable from durable
+	// state alone — after a reconstruction or when observation is unavailable, the
+	// step still addresses exactly what Portico created. The provider's in-memory
+	// map is no longer authority.
 	return []core.PlanStep{{
 		ID: "tailnet-unserve", Kind: core.StepStopConnector,
-		Summary:   "Stop publishing the service to the tailnet",
+		Summary:   fmt.Sprintf("Stop publishing %s to the tailnet", target),
 		Technical: core.TechnicalOperation{Provider: "tailscale", Type: "unserve", Parameters: params},
 	}}
 }

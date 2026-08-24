@@ -240,7 +240,6 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 					status.MachineName(), res.ExternalID)
 			default:
 				observed.Status = core.ObservationPresent
-				obs.Connector.Status = string(core.ConnectorStatusRunning)
 			}
 
 		case core.ResourceTailnetServe:
@@ -250,7 +249,6 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 				observed.Detail = serveErr.Error()
 			case serving[res.ExternalID]:
 				observed.Status = core.ObservationPresent
-				obs.Connector.Status = string(core.ConnectorStatusRunning)
 				p.remember(id, res.ExternalID)
 			default:
 				observed.Status = core.ObservationMissing
@@ -263,6 +261,24 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 		}
 
 		obs.ResourceStatuses = append(obs.ResourceStatuses, observed)
+	}
+
+	// Aggregate connector state is derived from the required resource set, not any
+	// single resource. A join needs intact membership. An expose needs intact
+		// membership AND an intact serve — the machine being on the network while the
+	// connection is not being served is not "running".
+	membershipOK := true
+	serveOK := !hasServeResource(resources)
+	for _, res := range obs.ResourceStatuses {
+		switch res.Type {
+		case core.ResourceTailnetMembership:
+			membershipOK = res.Status == core.ObservationPresent
+		case core.ResourceTailnetServe:
+			serveOK = res.Status == core.ObservationPresent
+		}
+	}
+	if membershipOK && serveOK {
+		obs.Connector.Status = string(core.ConnectorStatusRunning)
 	}
 
 	// The tailnet address is not reported here. ObservedConnection has no endpoint
