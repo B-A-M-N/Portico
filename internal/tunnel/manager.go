@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	cf "github.com/cloudflare/cloudflare-go"
 	"github.com/google/uuid"
@@ -123,6 +124,15 @@ func (m *APIManager) Get(ctx context.Context, accountID, tunnelID string) (*Tunn
 				return nil, fmt.Errorf("rate limited: %w", err)
 			}
 		}
+		// The client retries a 429 itself and, when it runs out of retries, reports
+		// exhaustion rather than the status that caused it — so the *cf.Error above
+		// no longer carries 429 and the rate limit was being classified as a generic
+		// transient failure. Both are transient, but they are not the same advice:
+		// one says wait, the other says something is wrong. ObservationRateLimited
+		// exists as its own state precisely because callers act on the difference.
+		if IsRateLimitExhaustion(err) {
+			return nil, fmt.Errorf("rate limited: %w", err)
+		}
 		// 5xx, network failures, timeouts, cancellations, and anything
 		// unclassified are transient — never treated as missing.
 		return nil, fmt.Errorf("transient: %w", err)
@@ -216,4 +226,28 @@ func (m *APIManager) LookupTunnelByName(ctx context.Context, accountID, name str
 		}
 	}
 	return nil, nil
+}
+
+// IsRateLimitExhaustion reports that the client gave up retrying a rate limit.
+//
+// The Cloudflare client retries a 429 on its own schedule and, when it runs out of
+// attempts, returns its own error rather than the status that caused it — so the
+// 429 is no longer recoverable through errors.As. Matching the message is not
+// something to be pleased about, but the alternative is reporting a rate limit as an
+// unclassified failure, which tells the user something is broken when the answer is
+// to wait.
+//
+// It is deliberately narrow: it matches the client's own exhaustion wording and
+// nothing else, so an unrelated error is not quietly relabelled as a rate limit.
+//
+// Exported because the Cloudflare adapter's observation classifier has the same
+// blind spot for the same reason. One implementation, used by both: a second copy of
+// a string match is the copy that stops matching when the client's wording changes.
+func IsRateLimitExhaustion(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "rate limit") &&
+		(strings.Contains(message, "retries") || strings.Contains(message, "exceeded"))
 }

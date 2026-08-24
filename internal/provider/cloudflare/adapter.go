@@ -929,6 +929,14 @@ func classifyObservationError(err error) (core.ObservationStatus, string) {
 			return core.ObservationRateLimited, err.Error()
 		}
 	}
+	// The client retries a 429 itself and, having run out of attempts, returns its
+	// own exhaustion error rather than the status that caused it — so the check
+	// above cannot see the 429 and the rate limit was classified as an
+	// unclassified transient failure. Both are transient, but they are not the same
+	// advice: one says wait, the other says something is wrong.
+	if tunnel.IsRateLimitExhaustion(err) {
+		return core.ObservationRateLimited, err.Error()
+	}
 	// 5xx, network failures, timeouts, cancellations, and anything
 	// unclassified are transient — never treated as missing.
 	return core.ObservationTransient, err.Error()
