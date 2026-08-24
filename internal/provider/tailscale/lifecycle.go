@@ -74,9 +74,9 @@ func (p *Provider) verifyMembership(ctx context.Context, step core.PlanStep) cor
 			ExternalID: identity,
 			Ownership:  core.OwnershipAdopted,
 			Metadata: map[string]string{
-				"tailnet":   status.TailnetName(),
-				"address":   status.PrivateAddress(),
-				"dns_name":  status.MachineName(),
+				"tailnet":  status.TailnetName(),
+				"address":  status.PrivateAddress(),
+				"dns_name": status.MachineName(),
 			},
 		}},
 	}
