@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
@@ -537,11 +539,50 @@ func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Requ
 
 	absPath, err := fb.safePath(relPath)
 	if err != nil {
+		// A file that does not exist is not a forbidden one. safePath opens the
+		// path in order to resolve it, so an absent file and a traversal attempt
+		// both arrive here as errors — and answering "forbidden" for a file that is
+		// simply not there tells the user they lack permission when they do not.
+		if errors.Is(err, syscall.ENOENT) {
+			http.NotFound(w, r)
+			return
+		}
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	http.ServeFile(w, r, absPath)
+	// The file is opened relative to the pinned root descriptor and served from that
+	// descriptor rather than being reopened by name.
+	//
+	// safePath already refuses a symlink pointing outside the root: it resolves the
+	// descriptor through /proc/self/fd and compares the result to the canonical root,
+	// so the escape this looks like it is fixing was already closed. What this closes
+	// is narrower and real — safePath validated one open of the path and
+	// http.ServeFile performed a second, so the bytes sent came from a file that was
+	// resolved again, later, by name. Serving from the descriptor safePath validated
+	// removes the second resolution, and with it the window between them.
+	//
+	// openFile and serveFile were written for this and never called: the browser
+	// constructed the primitives at startup and served by pathname anyway.
+	rel, relErr := filepath.Rel(fb.canonicalRoot, absPath)
+	if relErr != nil || strings.HasPrefix(rel, "..") {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	file, err := fb.rooted.openFile(rel)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			http.NotFound(w, r)
+			return
+		}
+		// ELOOP is what O_NOFOLLOW returns for a symlink, which is the case this
+		// exists to refuse.
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	defer file.Close()
+
+	serveFile(w, r, file, filepath.Base(rel))
 }
 
 // handleUpload processes a file upload. Hidden file targets are rejected by default.
