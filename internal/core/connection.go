@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -830,20 +831,49 @@ func validateClientTunnelSpec(p *ConnectionProfile, spec *ClientTunnelSpec) erro
 }
 
 // validatePrivateNetworkSpec validates a private network specification.
+//
+// NetworkID is optional. A provider whose network is already selected by machine
+// state — Tailscale infers the tailnet from `tailscale status` — may leave it empty
+// and populate it from observed state during planning. A provider that requires an
+// explicit identifier should refuse in its own Plan(). Forcing a beginner to type a
+// tailnet name merely to satisfy an internal field is the failure this avoids.
 func validatePrivateNetworkSpec(spec *PrivateNetworkSpec) error {
 	if spec == nil {
 		return fmt.Errorf("private network spec is nil")
 	}
 
-	if spec.NetworkID == "" {
-		return fmt.Errorf("network ID is required")
+	mode := spec.Mode
+	if mode == "" {
+		mode = PrivateNetworkJoin
 	}
-
-	switch spec.Mode {
-	case PrivateNetworkJoin, PrivateNetworkExpose, "":
-		// valid
+	switch mode {
+	case PrivateNetworkJoin, PrivateNetworkExpose:
 	default:
 		return fmt.Errorf("invalid mode %q, must be join or expose", spec.Mode)
+	}
+
+	// Mode-specific invariants: a join publishes nothing, so carrying an address
+	// would mean a value the mode has nowhere to put.
+	if mode == PrivateNetworkJoin {
+		if spec.LocalAddress != "" {
+			return fmt.Errorf("a join does not publish a service, so it carries no address")
+		}
+		if spec.LocalProtocol != "" {
+			return fmt.Errorf("a join does not publish a service, so it carries no protocol")
+		}
+	}
+
+	// An expose must publish something, and must say where.
+	if mode == PrivateNetworkExpose {
+		if spec.LocalAddress == "" {
+			return fmt.Errorf("publishing a service needs the address it is listening on")
+		}
+		if !strings.Contains(spec.LocalAddress, ":") {
+			return fmt.Errorf("%q is not a host:port address; the network needs to know which port to reach", spec.LocalAddress)
+		}
+		if spec.LocalProtocol == "" {
+			return fmt.Errorf("publishing a service needs a protocol")
+		}
 	}
 
 	return nil

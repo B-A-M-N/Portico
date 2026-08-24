@@ -44,15 +44,186 @@ func (s *Supervisor) computeReconcileDecision(ctx context.Context, input Reconci
 	case core.ConnectionPortForward:
 		return s.reconcilePortForward(ctx, input, desired)
 	case core.ConnectionClientTunnel:
-		// Client tunnels have no public endpoint to reconcile.
-		return &reconcileDecision{Action: "none"}, nil
+		return s.reconcileClientTunnel(ctx, input, desired)
 	case core.ConnectionPrivateNetwork:
-		// Private network not yet implemented.
-		return &reconcileDecision{Action: "none"}, nil
+		return s.reconcilePrivateNetwork(ctx, input, desired)
 	default:
 		return &reconcileDecision{Action: "none"}, nil
 	}
 }
+
+// reconcilePrivateNetwork handles lifecycle recovery for private-network connections.
+//
+// The kind has two modes that mean different things, so they are reconciled differently:
+//
+//   - A join records that this machine is on the network. Portico did not sign the machine
+//     in and will not sign it out, so the only thing to reconcile is the tracking itself.
+//     If the machine has left the network, that is a blocked state the user must resolve
+//     outside Portico — reconciliation reports it rather than pretending to fix it.
+//   - An expose publishes one local address. If the network is no longer serving it, that
+//     is drift Portico owns and restores. If the machine has left the network, there is no
+//     point publishing a serve, so that is blocked too.
+//
+// Reconciliation and repair answer the same question — what is broken and what is the
+// minimum corrective action? — so they use the same observation and the same restore plan.
+// The difference is only how the plan is invoked: reconciliation runs it automatically,
+// repair runs it on request after showing the user what will happen.
+func (s *Supervisor) reconcilePrivateNetwork(ctx context.Context, input ReconcileInput, desired core.DesiredConnectionState) (*reconcileDecision, error) {
+	profile := input.Profile
+	spec := profile.Spec.PrivateNetwork
+	if spec == nil {
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	mode := spec.Mode
+	if mode == "" {
+		mode = core.PrivateNetworkJoin
+	}
+
+	// Observe from the persisted resources, exactly as restart does. The observation is
+	// the single source of truth; the runtime projection is not, because a restart can
+	// leave a durable inventory with no runtime row.
+	observed, obsErr := s.controller.Observe(ctx, profile.ID)
+	if obsErr != nil {
+		return nil, fmt.Errorf("observing the private network connection: %w", obsErr)
+	}
+
+	membership, serve := privateNetworkState(observed)
+
+	// Desired closed dominates — do not repair a connection the user wants closed.
+	if desired == core.DesiredClosed {
+		if mode == core.PrivateNetworkJoin {
+			// A join has nothing Portico created, so closing it is just releasing the
+			// tracking. There is no plan to run.
+			return &reconcileDecision{Action: "none"}, nil
+		}
+		// An expose has a serve Portico created. Withdraw it if it is still published.
+		if serve.present {
+			plan, err := s.controller.PlanClose(ctx, profile.ID)
+			if err != nil {
+				return nil, err
+			}
+			return &reconcileDecision{Action: "close", Plan: plan}, nil
+		}
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	// Desired open. The machine must be on the network before anything else.
+	if membership.status == core.ObservationMissing {
+		return &reconcileDecision{Action: "none", Blocked: fmt.Errorf(
+			"this machine is no longer on the private network. Portico did not sign it in and " +
+				"cannot sign it back in; sign in with the network's own client")}, nil
+	}
+	if membership.status == core.ObservationTransient {
+		// A transient answer says nothing about membership. Acting on it would act on a
+		// guess about a machine-wide setting.
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	if mode == core.PrivateNetworkJoin {
+		// A join with intact membership has nothing to reconcile: there is no resource
+		// Portico created.
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	// An expose with intact membership: the serve must be present too.
+	if serve.present {
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	// The serve Portico owned is missing. Restore it — and use the same narrow plan the
+	// repair path uses, so reconciliation and repair cannot diverge on what "fixed" means.
+	plan, err := s.controller.PlanRepair(ctx, profile.ID)
+	if err != nil {
+		// ErrNoRepairNeeded is a contradiction here: observation says the serve is
+		// missing but repair says there is nothing to do. Surface it rather than
+		// silently returning none, so the connection does not stay broken.
+		if errors.Is(err, controller.ErrNoRepairNeeded) {
+			return &reconcileDecision{Action: "none"}, nil
+		}
+		return nil, err
+	}
+	return &reconcileDecision{Action: "repair", Plan: plan}, nil
+}
+
+// reconcileClientTunnel handles lifecycle recovery for client-tunnel connections.
+//
+// The connection manages a tunnel-client process against a tunnel someone else created.
+// There is no public endpoint and no provider resource Portico owns — the process itself
+// is the connection. So reconciliation is about the process: is it running when it should
+// be, and stopped when it should be.
+//
+// This matters across a graceful shutdown, which stops supervisor-owned connector
+// processes. Without this, a client tunnel that was open when the supervisor shut down
+// stays dead after restart even though its desired state is still open.
+func (s *Supervisor) reconcileClientTunnel(ctx context.Context, input ReconcileInput, desired core.DesiredConnectionState) (*reconcileDecision, error) {
+	profile := input.Profile
+
+	// Observe the process state from the provider. This is authoritative and cheap.
+	observed, obsErr := s.controller.Observe(ctx, profile.ID)
+	processRunning := false
+	if obsErr == nil && observed != nil && observed.Connector != nil {
+		switch observed.Connector.Status {
+		case string(core.ConnectorStatusRunning):
+			processRunning = true
+		}
+	}
+
+	// Desired closed dominates.
+	if desired == core.DesiredClosed {
+		if !processRunning {
+			return &reconcileDecision{Action: "none"}, nil
+		}
+		plan, err := s.controller.PlanClose(ctx, profile.ID)
+		if err != nil {
+			return nil, err
+		}
+		return &reconcileDecision{Action: "close", Plan: plan}, nil
+	}
+
+	// Desired open: if the process is running, the connection is as it should be.
+	if processRunning {
+		return &reconcileDecision{Action: "none"}, nil
+	}
+
+	// The process is not running but should be. Restart it.
+	plan, err := s.controller.PlanOpen(ctx, profile.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &reconcileDecision{Action: "open", Plan: plan}, nil
+}
+
+// privateNetworkResourceState reports whether a private-network resource is
+// authoritatively present. A transient or missing answer means "not present" for the
+// purposes of reconciliation; acting on anything less would act on a guess.
+type privateNetworkResourceState struct {
+	status  core.ObservationStatus
+	present bool
+}
+
+// privateNetworkState extracts the membership and serve status from an observation.
+//
+// It returns the authoritative status of each, so the caller can decide without
+// re-reading the observation.
+func privateNetworkState(observed *core.ObservedConnection) (membership, serve privateNetworkResourceState) {
+	if observed == nil {
+		return
+	}
+	for _, res := range observed.ResourceStatuses {
+		switch res.Type {
+		case core.ResourceTailnetMembership:
+			membership.status = res.Status
+			membership.present = res.Status == core.ObservationPresent
+		case core.ResourceTailnetServe:
+			serve.status = res.Status
+			serve.present = res.Status == core.ObservationPresent
+		}
+	}
+	return
+}
+
+// reconcileServiceExposure handles lifecycle recovery for service-exposure
 
 // reconcilePortForward handles lifecycle recovery for local port forwards.
 // A local forward has no external provider resources — it's just a listener
