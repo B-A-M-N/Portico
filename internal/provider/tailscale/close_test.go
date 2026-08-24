@@ -260,6 +260,45 @@ func TestPlanningRefusesWhenOwnershipCannotBeVerified(t *testing.T) {
 	}
 }
 
+// TestPlanningProceedsWhenNothingOccupiesTheFrontend pins the free case.
+//
+// Live routes exist, but none at the desired frontend identity. Nothing occupies
+// it, so planning proceeds. This is the fourth ownership case, and it is the one a
+// collision check gets wrong by accumulating state instead of returning at the
+// point a refusal is detected.
+func TestPlanningProceedsWhenNothingOccupiesTheFrontend(t *testing.T) {
+	// Two live routes, both on other frontends — one Portico's, one the user's.
+	mine := ServeRoute{
+		FrontendProtocol: "tcp", FrontendPort: "5432", FrontendPath: "/",
+		BackendProtocol: "tcp", BackendHost: "127.0.0.1", BackendPort: "5432",
+	}
+	theirs := ServeRoute{
+		FrontendProtocol: "https", FrontendPort: "8443", FrontendPath: "/",
+		BackendProtocol: "https", BackendHost: "127.0.0.1", BackendPort: "8443",
+	}
+
+	runtime := runtimeWithServe(mine, core.OwnershipManaged)
+	foreign := runtimeWithServe(theirs, core.OwnershipAdopted)
+	runtime.Provider.Resources = append(runtime.Provider.Resources, foreign.Provider.Resources...)
+
+	runner := newFakeRunner().on("status --json", statusRunning, nil)
+	// Desired is http:3000 — neither existing route holds that frontend.
+	plan, err := New(runner).Plan(context.Background(), core.DesiredConnection{
+		Profile: exposeProfile(core.DesiredOpen, "127.0.0.1:3000"),
+		Runtime: runtime,
+	})
+	if err != nil {
+		t.Fatalf("planning refused a free frontend: %v", err)
+	}
+	route, err := serveRouteFromStep(stepFor(t, plan, "serve").Technical.Parameters)
+	if err != nil {
+		t.Fatalf("the serve step carries no route: %v", err)
+	}
+	if route.Identity() != "http:3000:/" {
+		t.Fatalf("planned %s, want http:3000:/", route.Identity())
+	}
+}
+
 // TestAStatusCommandFailureIsTransientNotMissing pins the classification that
 // stops reconciliation acting on a false absence.
 //

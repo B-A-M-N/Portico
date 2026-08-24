@@ -255,26 +255,12 @@ func (p *Provider) openSteps(ctx context.Context, profile *core.ConnectionProfil
 	return steps, expected, nil
 }
 
-// serveOwnership classifies who holds the desired frontend binding.
-type serveOwnership int
-
-const (
-	// serveFrontendFree means no live resource occupies the frontend identity.
-	serveFrontendFree serveOwnership = iota
-	// serveFrontendOwned means Portico has a live managed resource for the exact
-	// frontend identity, so it may verify, repair, or re-plan it.
-	serveFrontendOwned
-	// serveFrontendForeign means the frontend identity is occupied by something
-	// Portico does not manage, so it must not be overwritten.
-	serveFrontendForeign
-)
-
 // serveCollision reports whether the desired frontend identity may be mutated.
 //
 // It returns true (refuse) when the frontend is occupied by anything Portico does
 // not own. The four cases are distinguished explicitly:
 //
-//	nothing occupies the identity                  -> safe to create
+//	nothing occupies the identity                   -> safe to create
 //	live managed resource for the identity          -> Portico owns it, safe
 //	live non-managed resource for the identity      -> foreign, refuse
 //	live resource whose metadata will not parse     -> ownership unverifiable, refuse
@@ -282,9 +268,10 @@ const (
 // The last case is the one that must fail closed. Skipping an unparseable resource
 // would let a corrupt row read as "nothing is there", and Portico would then
 // overwrite a binding whose ownership it could not establish.
+//
+// Every refusal returns at the point it is detected, so reaching the end means the
+// frontend is either free or Portico-owned — both safe to plan against.
 func serveCollision(route ServeRoute, resources []core.ProviderResource) (bool, error) {
-	ownership := serveFrontendFree
-
 	for _, res := range resources {
 		if res.Type != core.ResourceTailnetServe || !res.IsLive() {
 			continue
@@ -306,15 +293,14 @@ func serveCollision(route ServeRoute, resources []core.ProviderResource) (bool, 
 			continue
 		}
 
-		if res.Ownership == core.OwnershipManaged {
-			ownership = serveFrontendOwned
-			continue
+		if res.Ownership != core.OwnershipManaged {
+			// Adopted or external: the user configured this, not Portico.
+			return true, nil
 		}
-		// Adopted or external: the user configured this, not Portico.
-		return true, nil
+		// Portico owns this exact frontend, so it may verify, repair or re-plan it.
 	}
 
-	return ownership == serveFrontendForeign, nil
+	return false, nil
 }
 
 // closeSteps builds the steps that take a connection down.
