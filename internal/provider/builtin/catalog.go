@@ -16,6 +16,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/provider/ngrok"
 	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
 	"github.com/B-A-M-N/portico/internal/provider/portforward"
+	"github.com/B-A-M-N/portico/internal/provider/tailscale"
 )
 
 // Config carries what the composition root reads from configuration and the
@@ -27,6 +28,8 @@ type Config struct {
 	// OpenAITunnelBin is empty to use the client's default name.
 	OpenAITunnelBin     string
 	OpenAITunnelEnabled bool
+	// TailscaleBin is empty to use the client's default name.
+	TailscaleBin string
 }
 
 // Definitions returns every provider compiled into Portico.
@@ -38,7 +41,7 @@ func Definitions(cfg Config) []provider.Definition {
 			Bin: cfg.OpenAITunnelBin, Enabled: cfg.OpenAITunnelEnabled,
 		}),
 		portforward.NewDefinition(),
-		provider.NewUnimplemented("tailscale", "Tailscale", "Portico ships no Tailscale adapter yet"),
+		tailscale.NewDefinition(tailscale.DefinitionConfig{Bin: cfg.TailscaleBin}),
 		provider.NewUnimplemented("zrok", "zrok", "Portico ships no zrok adapter yet"),
 	}
 }

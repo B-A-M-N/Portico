@@ -43,6 +43,7 @@ const (
 	KeyNgrokAPITokenEnv = "ngrok.api_token_env"
 	KeyNgrokAccountID   = "ngrok.account_id"
 	KeyNgrokBin         = "paths.ngrok_bin"
+	KeyTailscaleBin     = "paths.tailscale_bin"
 )
 
 // CurrentConfigVersion is the latest config schema version.
@@ -473,6 +474,19 @@ func NgrokBin() string {
 	bin := viper.GetString(KeyNgrokBin)
 	if bin == "" {
 		return "ngrok"
+	}
+	return bin
+}
+
+// TailscaleBin returns the configured Tailscale client path.
+//
+// An empty value means the default name on PATH, which is what almost every install
+// has. The setting exists for a non-standard location rather than because Portico
+// expects to be told.
+func TailscaleBin() string {
+	bin := viper.GetString(KeyTailscaleBin)
+	if bin == "" {
+		return "tailscale"
 	}
 	return bin
 }

@@ -257,6 +257,14 @@ const (
 	ResourceAccessApp    ResourceType = "access_application"
 	ResourceAccessPolicy ResourceType = "access_policy"
 	ResourceConnector    ResourceType = "connector"
+	// ResourceTailnetMembership records that a machine was confirmed to be on a
+	// private network. It is adopted rather than managed: joining a tailnet is
+	// machine-wide, predates the connection and outlives it, so Portico must never
+	// remove it when a connection goes away.
+	ResourceTailnetMembership ResourceType = "tailnet_membership"
+	// ResourceTailnetServe records one local address published to a private network.
+	// This one Portico does create, so it is managed and is withdrawn on close.
+	ResourceTailnetServe ResourceType = "tailnet_serve"
 )
 
 // DiagnosticFinding represents a diagnostic result attached to a route segment.

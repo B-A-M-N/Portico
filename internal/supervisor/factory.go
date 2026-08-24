@@ -98,6 +98,7 @@ func RunSupervisor(ctx context.Context) error {
 		NgrokBin:            config.NgrokBin(),
 		NgrokEnabled:        os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_NGROK") == "1",
 		OpenAITunnelEnabled: os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") == "1",
+		TailscaleBin:        config.TailscaleBin(),
 	})
 	// The mock provider is never a silent fallback: it appears only on an
 	// explicit development opt-in, because reporting fake success to a
