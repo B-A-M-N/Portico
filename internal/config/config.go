@@ -76,16 +76,9 @@ func Init() error {
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok || errors.Is(err, os.ErrNotExist) {
-			// One-way compatibility read for an existing Flare installation.
-			// New writes always use the XDG Portico path and TOML.
-			legacy := filepath.Join(legacyDir(), "config.yaml")
-			if _, statErr := os.Stat(legacy); statErr == nil {
-				viper.SetConfigFile(legacy)
-				if legacyErr := viper.ReadInConfig(); legacyErr != nil {
-					return fmt.Errorf("reading legacy config: %w", legacyErr)
-				}
-			}
-			return nil
+			// No Portico config yet. An older Flare installation may have one, in
+			// which case it is migrated once rather than read from indefinitely.
+			return migrateLegacyConfig(dir)
 		}
 		return fmt.Errorf("reading config: %w", err)
 	}
@@ -211,6 +204,67 @@ func Dir() (string, error) {
 		return "", fmt.Errorf("creating config directory: %w", err)
 	}
 	return dir, nil
+}
+
+// migrateLegacyConfig imports an older Flare installation's configuration once.
+//
+// This used to be an open-ended compatibility read: when no Portico config existed,
+// viper was pointed at the legacy config.yaml and left there. Two problems followed
+// from that. The settings were re-read from the old file on every start, so the
+// installation never actually moved and a user editing the file Portico documents saw
+// no effect. And viper's config file pointer stayed on the legacy path, so anything
+// writing config without resetting it first would have written YAML back to the old
+// location — the writers here do reset it, which is the only reason that never became
+// a data-loss bug.
+//
+// So the values are read once, written to the Portico path in Portico's format, and
+// the legacy file is renamed rather than deleted. Renaming is deliberate: this is a
+// user's own configuration, and a migration that turns out to have misread something
+// should leave the original recoverable.
+func migrateLegacyConfig(dir string) error {
+	legacy := filepath.Join(legacyDir(), "config.yaml")
+	if _, err := os.Stat(legacy); err != nil {
+		// Nothing to migrate. A fresh installation is the common case and is not a
+		// failure.
+		return nil
+	}
+
+	// Read the legacy file through a separate viper so the values can be inspected
+	// without leaving the global instance pointed at it.
+	legacyValues := viper.New()
+	legacyValues.SetConfigFile(legacy)
+	legacyValues.SetConfigType("yaml")
+	if err := legacyValues.ReadInConfig(); err != nil {
+		return fmt.Errorf("reading the configuration from your previous installation "+
+			"(%s): %w", legacy, err)
+	}
+
+	for _, key := range legacyValues.AllKeys() {
+		// Defaults are already set, so only a value the legacy file actually carries
+		// should override one.
+		if legacyValues.IsSet(key) {
+			viper.Set(key, legacyValues.Get(key))
+		}
+	}
+
+	// Write it where Portico reads from, in the format Portico writes.
+	target := filepath.Join(dir, "config.toml")
+	viper.SetConfigFile(target)
+	viper.SetConfigType("toml")
+	if err := viper.WriteConfigAs(target); err != nil {
+		return fmt.Errorf("saving your previous settings to %s: %w", target, err)
+	}
+
+	// Move the original aside. Leaving it in place would make the next start migrate
+	// again and discard anything changed since.
+	if err := os.Rename(legacy, legacy+".migrated"); err != nil {
+		// The settings are already saved, so this is not worth failing the start
+		// over — but it does mean the next start would migrate again, so it is worth
+		// saying.
+		return fmt.Errorf("your settings were imported to %s, but the old file could "+
+			"not be renamed (%s): %w", target, legacy, err)
+	}
+	return nil
 }
 
 func legacyDir() string {
