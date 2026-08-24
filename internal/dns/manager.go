@@ -96,7 +96,12 @@ func (m *APIManager) GetRecord(ctx context.Context, zoneID, recordID string) (*R
 		Name:    record.Name,
 		Type:    record.Type,
 		Content: record.Content,
-		Proxied: *record.Proxied,
+		// Proxied is a *bool in the client and is nil when the field is absent
+		// from the response — which happens for a body the API did not produce,
+		// such as a proxy's error page returned with a 200. Dereferencing it
+		// crashed the supervisor: a malformed upstream response is a bad response,
+		// not a reason for the process holding every connection to die.
+		Proxied: record.Proxied != nil && *record.Proxied,
 	}, nil
 }
 func (m *APIManager) DeleteRecord(ctx context.Context, zoneID, recordID string) error {
