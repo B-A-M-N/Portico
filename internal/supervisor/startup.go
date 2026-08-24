@@ -257,11 +257,12 @@ func (s *Supervisor) startup(ctx context.Context) error {
 		slog.Error("startup: failed to load profiles", "err", err)
 	}
 
-	// Phase 7: Load saved runtimes.
-	slog.Info("startup: restoring runtimes")
-	if err := s.loadRuntimes(ctx); err != nil {
-		slog.Warn("startup: failed to load some runtimes", "err", err)
-	}
+	// Runtimes are restored by loadProfiles, above. There was a second pass here
+	// doing the same thing: for every profile, load its runtime and restore it.
+	// Two implementations of one step, and this was the weaker one — it logged a
+	// database I/O error at debug level as "no runtime for connection", so a
+	// failure to read stored state was indistinguishable from there being none.
+	// loadProfiles distinguishes them.
 
 	// Phase 8: Load provider resources.
 	slog.Info("startup: restoring provider resources")
@@ -402,21 +403,6 @@ func (s *Supervisor) validateProviders(ctx context.Context) error {
 			slog.Warn("provider capabilities unavailable", "provider", p.ID, "err", err)
 		}
 		_ = caps
-	}
-	return nil
-}
-
-func (s *Supervisor) loadRuntimes(ctx context.Context) error {
-	profiles := s.controller.ListProfiles()
-	for _, p := range profiles {
-		rt, err := s.store.LoadRuntime(ctx, p.ID)
-		if err != nil {
-			slog.Debug("no runtime for connection", "id", p.ID, "err", err)
-			continue
-		}
-		if rt != nil {
-			s.controller.RestoreRuntime(rt)
-		}
 	}
 	return nil
 }
