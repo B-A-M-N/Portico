@@ -69,6 +69,12 @@ func (m *WizardModel) Actions() WizardActions {
 		return m.commandShellActions()
 	case WizardStepCommandEnv:
 		return m.commandEnvActions()
+	case WizardStepPrivateNetworkMode:
+		return m.privateNetworkModeActions()
+	case WizardStepPrivateNetworkAddress:
+		return m.tunnelStepActions(
+			"Accept this address. It is where the service is listening on this machine, and " +
+				"what the other devices on your network will reach.")
 	case WizardStepTunnelID:
 		return m.tunnelStepActions(
 			"Accept this tunnel ID. Portico checks its shape here, so a typo is caught " +

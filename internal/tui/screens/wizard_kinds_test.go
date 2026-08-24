@@ -3,6 +3,8 @@ package screens
 import (
 	"strings"
 	"testing"
+
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 // Creating each connection kind the product supports.
@@ -175,17 +177,55 @@ func TestCreatingAPublishedService(t *testing.T) {
 	}
 }
 
-// TestPrivateNetworkIsNotOfferedYet pins that an unsupported kind is not
-// advertised as creatable.
+// TestPrivateNetworkIsOfferedOnlyWithAProvider pins the rule the old assertion was
+// protecting.
 //
-// Portico models private networks and has no provider that delivers one. Offering
-// the outcome would be a fake affordance: the user would answer questions and the
-// request would be refused.
-func TestPrivateNetworkIsNotOfferedYet(t *testing.T) {
-	for _, recipe := range wizardRecipes {
-		if recipe.ConnectionKind == "private_network" {
-			t.Fatalf("an outcome offers private_network, which no provider delivers: %q",
-				recipe.Label)
+// This test used to assert that private_network was not offered at all, because nothing
+// delivered it. Tailscale does now, so the rule it was really protecting applies instead:
+// the outcome is offerable when a provider can deliver it, and refused with a reason when
+// none can. A user must never answer a series of questions only to have the request
+// refused at the end.
+func TestPrivateNetworkIsOfferedOnlyWithAProvider(t *testing.T) {
+	var recipe wizardRecipe
+	for _, r := range wizardRecipes {
+		if r.ConnectionKind == "private_network" {
+			recipe = r
 		}
+	}
+	if recipe.ConnectionKind == "" {
+		t.Fatal("no outcome offers private_network, which Tailscale now delivers")
+	}
+	// The recipe names the provider it needs rather than carrying a hardcoded refusal,
+	// so availability stays a fact about the machine.
+	if recipe.RequiresProvider != "tailscale" {
+		t.Errorf("the outcome requires %q", recipe.RequiresProvider)
+	}
+
+	// With the provider present it is offerable.
+	withProvider := NewWizard(nil, []ipc.ProviderDTO{{
+		ID: "tailscale", DisplayName: "Tailscale", Selectable: true,
+		Availability: "ready", Readiness: "ready",
+		Capabilities: &ipc.CapabilitySetDTO{
+			Kinds:           []string{"private_network"},
+			PrivateExposure: true,
+		},
+	}})
+	if reason := withProvider.recipeUnavailable(recipe); reason != "" {
+		t.Errorf("the outcome is refused with Tailscale ready: %s", reason)
+	}
+
+	// Without it, the refusal says what is missing rather than offering a dead end.
+	without := NewWizard(nil, nil)
+	reason := without.recipeUnavailable(recipe)
+	if reason == "" {
+		t.Fatal("the outcome is offered with no provider to deliver it")
+	}
+	if !strings.Contains(reason, "tailscale") && !strings.Contains(reason, "not installed") {
+		t.Errorf("the refusal does not say what is missing: %q", reason)
+	}
+
+	// And the explanation says there is no public address, which is the whole point.
+	if !strings.Contains(recipe.Explanation, "no public address") {
+		t.Errorf("the outcome does not say it creates no public address: %q", recipe.Explanation)
 	}
 }

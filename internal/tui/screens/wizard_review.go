@@ -56,6 +56,8 @@ func (m *WizardModel) reviewSections() []reviewSection {
 		return m.portForwardReview()
 	case "client_tunnel":
 		return m.clientTunnelReview()
+	case "private_network":
+		return m.privateNetworkReview()
 	default:
 		return m.serviceExposureReview()
 	}

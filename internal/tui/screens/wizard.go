@@ -177,6 +177,10 @@ type WizardState struct {
 	// shell pipeline could not be created from the interface.
 	CommandUseShell bool
 	CommandEnv      map[string]string
+	// PrivateNetworkMode is "join" or "expose" when ConnectionKind is
+	// "private_network". The two answer different questions and carry different
+	// fields, so the wizard asks which before asking anything else.
+	PrivateNetworkMode string
 }
 
 // Wizard step constants
@@ -224,6 +228,10 @@ const (
 	WizardStepTunnelID
 	WizardStepTunnelMCP
 	WizardStepTunnelProfile
+	// The private-network questions: which of the two things to do, and — for a
+	// publish — the address to publish.
+	WizardStepPrivateNetworkMode
+	WizardStepPrivateNetworkAddress
 	WizardStepReview
 	WizardStepCreating
 	WizardStepCreated       // Profile created, ask user what to do next
@@ -304,6 +312,13 @@ var wizardRecipes = []wizardRecipe{
 		Label:          "Forward a local port",
 		Explanation:    "Portico forwards a local port to a remote host and port. No public address, no DNS, no access protection — just a TCP forward.",
 		ConnectionKind: "port_forward",
+	},
+	{
+		Label: "Reach something over my private network",
+		Explanation: "A machine or a service should be reachable by the other devices on " +
+			"your private network, and by nothing else. There is no public address.",
+		RequiresProvider: "tailscale",
+		ConnectionKind:   "private_network",
 	},
 	{
 		Label: "Connect an MCP server to ChatGPT",
@@ -624,6 +639,11 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				// The tunnel already exists, so the first question is which one.
 				m.state.Step = WizardStepTunnelID
 				m.setInput(m.state.TunnelID)
+			case "private_network":
+				// Which of the two things the network should do, before anything else:
+				// a join publishes nothing and a publish needs an address.
+				m.state.Step = WizardStepPrivateNetworkMode
+				m.selected = 0
 			default: // service_exposure
 				switch {
 				case m.state.SourceType == "mcp_server":
@@ -672,6 +692,12 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 
 	case WizardStepCommandEnv:
 		return m.handleCommandEnvKey(key)
+
+	case WizardStepPrivateNetworkMode:
+		return m.handlePrivateNetworkModeKey(key)
+
+	case WizardStepPrivateNetworkAddress:
+		return m.handlePrivateNetworkAddressKey(key)
 
 	case WizardStepTunnelID:
 		return m.handleTunnelIDKey(key)
@@ -1302,6 +1328,27 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 			Protocol:   protocol,
 			Direction:  "local",
 		}
+	case "private_network":
+		// The address goes on the private-network arm, not in Source: the request is a
+		// tagged union, and populating Source would declare a service exposure — which
+		// carries an exposure mode a public renderer could act on.
+		mode := s.PrivateNetworkMode
+		if mode == "" {
+			mode = "join"
+		}
+		req.PrivateNetwork = &ipc.PrivateNetworkSpecDTO{
+			Mode:        mode,
+			ExposeLocal: mode == "expose",
+		}
+		if mode == "expose" {
+			if s.SourceAddress == "" {
+				return ipc.CreateConnectionRequest{}, fmt.Errorf(
+					"publishing a service to the network needs the address it is listening on")
+			}
+			req.PrivateNetwork.LocalAddress = s.SourceAddress
+			req.PrivateNetwork.LocalProtocol = "http"
+		}
+
 	case "client_tunnel":
 		// Adopting a tunnel that already exists. Portico does not create it — the
 		// adapter refuses to plan without an ID for exactly that reason — so the
@@ -1554,6 +1601,12 @@ func (m *WizardModel) View() string {
 			"Environment for the command (NAME=VALUE, comma separated; empty for none):\n" +
 				"For a secret, write NAME=env:OTHER — Portico reads OTHER from its own\n" +
 				"environment when the command starts, so only the name is saved."))
+	case WizardStepPrivateNetworkMode:
+		return m.withError(m.renderPrivateNetworkMode())
+	case WizardStepPrivateNetworkAddress:
+		return m.withError(m.renderField(
+			"Which service should the network be able to reach?\n" +
+				"The address it is listening on, such as 127.0.0.1:3000."))
 	case WizardStepTunnelID:
 		return m.withError(m.renderField(
 			"Which tunnel should Portico manage?\n" +

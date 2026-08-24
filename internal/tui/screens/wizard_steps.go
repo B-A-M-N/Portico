@@ -34,6 +34,13 @@ var wizardStepOrder = []stepRule{
 	{WizardStepPortForwardRemotePort, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	{WizardStepPortForwardProtocol, func(m *WizardModel) bool { return m.state.ConnectionKind == "port_forward" }},
 	// The client-tunnel questions: which tunnel, what it reaches, which profile.
+	// The private-network questions.
+	{WizardStepPrivateNetworkMode, func(m *WizardModel) bool {
+		return m.state.ConnectionKind == "private_network"
+	}},
+	{WizardStepPrivateNetworkAddress, func(m *WizardModel) bool {
+		return m.state.ConnectionKind == "private_network" && m.state.PrivateNetworkMode == "expose"
+	}},
 	{WizardStepTunnelID, func(m *WizardModel) bool { return m.state.ConnectionKind == "client_tunnel" }},
 	{WizardStepTunnelMCP, func(m *WizardModel) bool { return m.state.ConnectionKind == "client_tunnel" }},
 	{WizardStepTunnelProfile, func(m *WizardModel) bool { return m.state.ConnectionKind == "client_tunnel" }},
@@ -191,6 +198,10 @@ func (m *WizardModel) restoreStepInput() {
 		m.setInput(m.state.Hostname)
 	case WizardStepProtectionRules:
 		m.setInput(ProtectionRulesInput(m.state.AllowedEmails, m.state.AllowedDomains))
+	case WizardStepPrivateNetworkMode:
+		m.selected = privateNetworkModeIndex(m.state.PrivateNetworkMode)
+	case WizardStepPrivateNetworkAddress:
+		m.setInput(m.state.SourceAddress)
 	case WizardStepTunnelID:
 		m.setInput(m.state.TunnelID)
 	case WizardStepTunnelMCP:
