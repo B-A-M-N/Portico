@@ -19,6 +19,11 @@ import (
 //
 // This is the distinction that makes repair trustworthy for this kind: it acts on what
 // Portico owns and says so when the answer is somewhere else.
+//
+// The controller decides WHETHER repair is needed (based on observation statuses);
+// the selected provider decides HOW to realize it (by planning the desired
+// private-network state). The controller does not manufacture Tailscale technical
+// parameters.
 
 // privateNetworkRepairSteps builds the steps that would put a private-network connection
 // back into the state its profile asks for.
@@ -38,8 +43,7 @@ func (c *Controller) privateNetworkRepairSteps(ctx context.Context,
 	}
 
 	membershipPresent := true
-	servePresent := true
-	var serveTarget string
+	serveNeedsRepair := false
 
 	for _, res := range observed.ResourceStatuses {
 		switch res.Type {
@@ -51,9 +55,10 @@ func (c *Controller) privateNetworkRepairSteps(ctx context.Context,
 				membershipPresent = false
 			}
 		case core.ResourceTailnetServe:
-			if res.Status == core.ObservationMissing {
-				servePresent = false
-				serveTarget = res.ExternalID
+			// Both missing and drifted are repairable: Portico owns the frontend
+			// binding in both cases and may safely restore the exact route.
+			if res.Status == core.ObservationMissing || res.Status == core.ObservationDrifted {
+				serveNeedsRepair = true
 			}
 		}
 	}
@@ -74,55 +79,26 @@ func (c *Controller) privateNetworkRepairSteps(ctx context.Context,
 		return nil, nil
 	}
 
-	if servePresent {
+	if !serveNeedsRepair {
 		return nil, nil
 	}
 
-	target := serveTarget
-	if target == "" {
-		target = spec.LocalAddress
+	// The serve Portico owned is missing or drifted. Ask the selected provider to
+	// plan the desired private-network state from the current profile and runtime.
+	// The resulting Tailscale repair may carry: verify membership, verify origin,
+	// serve, verify serve. The extra verification steps are read-only; the actual
+	// mutation is the smallest one — restore the owned Serve route.
+	//
+	// planOpenSteps is used rather than PlanOpen so repair does not re-run the
+	// full open-plan admission path (which would also fingerprint and observe).
+	steps, err := c.planOpenSteps(ctx, profile)
+	if err != nil {
+		return nil, fmt.Errorf("planning the serve restore: %w", err)
 	}
-	if target == "" {
+	if len(steps) == 0 {
 		return nil, core.ErrValidation(
-			"this connection publishes a service but records no address, so Portico cannot " +
-				"publish it again")
+			"this connection publishes a service but the provider produced no repair steps, " +
+				"so Portico cannot publish it again")
 	}
-
-	params := map[string]string{
-		"mode":   string(core.PrivateNetworkExpose),
-		"target": target,
-	}
-	if spec.NetworkID != "" {
-		params["network"] = spec.NetworkID
-	}
-
-	// The origin is verified before republishing. Publishing an address nothing is
-	// listening on produces a name on the network that refuses every connection, which is
-	// harder to diagnose than a refusal now.
-	return []core.PlanStep{
-		{
-			ID: "private-network-verify-origin", Kind: core.StepVerifyOrigin,
-			Summary: fmt.Sprintf("Verify %s is reachable on this machine", target),
-			Technical: core.TechnicalOperation{
-				Provider: profile.Driver.ProviderID,
-				Type:     "verify_origin", Parameters: params,
-			},
-		},
-		{
-			ID: "private-network-reserve", Kind: core.StepCreateTunnel,
-			Summary: fmt.Sprintf("Publish %s to the network again", target),
-			Technical: core.TechnicalOperation{
-				Provider: profile.Driver.ProviderID,
-				Type:     "serve", Parameters: params,
-			},
-		},
-		{
-			ID: "private-network-verify-serve", Kind: core.StepVerifyConnector,
-			Summary: "Confirm the network is serving it",
-			Technical: core.TechnicalOperation{
-				Provider: profile.Driver.ProviderID,
-				Type:     "verify_serve", Parameters: params,
-			},
-		},
-	}, nil
+	return steps, nil
 }

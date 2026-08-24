@@ -319,7 +319,14 @@ func (c *Controller) PlanEdit(ctx context.Context, connID core.ConnectionID, pro
 	wasOpen := current.Desired == core.DesiredOpen &&
 		runtime != nil && runtime.State != core.RuntimeClosed
 
-	if wasOpen && delta.RestartConnector {
+	// A private network has no connector subprocess to pause: membership is
+	// machine-wide and a Serve route is provider configuration. Emitting
+	// stop_connector for one would produce a step the provider does not
+	// implement, so the edit pauses nothing and relies on the resource
+	// deletion steps below to withdraw what the edit supersedes.
+	hasConnectorProcess := current.Kind != core.ConnectionPrivateNetwork
+
+	if wasOpen && delta.RestartConnector && hasConnectorProcess {
 		plan.Steps = append(plan.Steps, core.PlanStep{
 			ID: "edit-stop-connector", Kind: core.StepStopConnector,
 			Summary:   "Pause the connection",
@@ -424,6 +431,12 @@ func deleteStepForResource(providerID core.ProviderID, resource core.ProviderRes
 		kind, operation = core.StepDeleteAccessApp, "delete_access"
 	case core.ResourceAccessPolicy:
 		kind, operation = core.StepDeleteAccessPolicy, "delete_access_policy"
+	case core.ResourceTailnetServe:
+		// The Tailscale Serve route is withdrawn via an unserve step carrying
+		// the exact persisted route metadata. The generic step kind handles
+		// ownership/lifecycle; the provider's technical operation does the
+		// actual withdrawal.
+		kind, operation = core.StepDeleteTailnetServe, "unserve"
 	default:
 		return core.PlanStep{}, false
 	}
@@ -435,6 +448,7 @@ func deleteStepForResource(providerID core.ProviderID, resource core.ProviderRes
 			Provider:   providerID,
 			Type:       operation,
 			ResourceID: resource.ExternalID,
+			Parameters: resource.Metadata,
 		},
 		Destructive: true,
 		Ownership:   core.OwnershipManaged,
@@ -465,9 +479,15 @@ func safeResourceID(id string) string {
 // planOpenSteps produces the steps that would open a connection under the
 // given profile, without touching the stored profile.
 //
-// It exists so an edit can append the reopen to its own plan. The profile is
+// It exists so an edit can append the reopen to its own plan, and so repair can
+// ask the provider to plan the desired state rather than manufacturing
+// provider-specific technical parameters in controller code. The profile is
 // passed explicitly rather than read from the controller, because during an
 // edit the stored profile is still the previous one.
+//
+// The current runtime is passed so a provider can distinguish a frontend Portico
+// owns from one the user configured manually. It is deep-copied: the provider
+// must not be able to mutate controller state through it.
 func (c *Controller) planOpenSteps(ctx context.Context, profile *core.ConnectionProfile) ([]core.PlanStep, error) {
 	prov, err := c.providerForProfile(profile)
 	if err != nil {
@@ -476,6 +496,10 @@ func (c *Controller) planOpenSteps(ctx context.Context, profile *core.Connection
 
 	openProfile := profile.DeepCopy()
 	openProfile.Desired = core.DesiredOpen
+
+	c.mu.RLock()
+	runtimeCopy := c.runtimes[profile.ID].DeepCopy()
+	c.mu.RUnlock()
 
 	// Only service-exposure connections have a local origin model. Port forwards,
 	// client tunnels, and private networks have no service origin — pass nil.
@@ -491,6 +515,7 @@ func (c *Controller) planOpenSteps(ctx context.Context, profile *core.Connection
 
 	plan, err := prov.Plan(ctx, core.DesiredConnection{
 		Profile: openProfile,
+		Runtime: runtimeCopy,
 		Origin:  resolvedOrigin,
 	})
 	if err != nil {

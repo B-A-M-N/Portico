@@ -843,8 +843,17 @@ func (c *Controller) PlanClose(ctx context.Context, connID core.ConnectionID) (*
 		return nil, err
 	}
 
+	// The runtime carries the provider resources Portico actually owns remotely.
+	// A close must target those, not a route re-derived from the current profile:
+	// the profile is what the user wants now, the resource is what exists. It is
+	// deep-copied so the provider cannot mutate controller state through it.
+	c.mu.RLock()
+	runtimeCopy := c.runtimes[connID].DeepCopy()
+	c.mu.RUnlock()
+
 	desired := core.DesiredConnection{
 		Profile: &closedProfile,
+		Runtime: runtimeCopy,
 	}
 
 	plan, err := prov.Plan(ctx, desired)
@@ -907,7 +916,13 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 	// We stop on any status that indicates a process might exist — running,
 	// crashed, unknown, or unstable — to prevent leaking a connector
 	// process during deletion.
-	if rtOk && connectorStatus != core.ConnectorStatusStopped {
+	//
+	// A private network has no connector subprocess: membership is machine-wide
+	// and a Serve route is provider configuration, not a process. Its normalized
+	// connector status reads "running" whenever the route is healthy, so emitting
+	// a stop_connector here would produce a step the provider does not implement.
+	hasConnectorProcess := profile.Kind != core.ConnectionPrivateNetwork
+	if rtOk && hasConnectorProcess && connectorStatus != core.ConnectorStatusStopped {
 		steps = append(steps, core.PlanStep{
 			ID:      "delete-stop-connector",
 			Kind:    core.StepStopConnector,
@@ -958,6 +973,10 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 			// Policies are deleted as part of the Access application deletion.
 			// Skip to avoid duplicate deletion attempts.
 			continue
+		case core.ResourceTailnetServe:
+			stepKind = core.StepDeleteTailnetServe
+			stepType = "unserve"
+			stepSummary = "Withdraw the managed Serve route"
 		default:
 			continue
 		}
@@ -969,6 +988,7 @@ func (c *Controller) PlanDelete(ctx context.Context, connID core.ConnectionID) (
 				Provider:   profile.GetProvider().ProviderID,
 				Type:       stepType,
 				ResourceID: res.ExternalID,
+				Parameters: res.Metadata,
 			},
 			Destructive:  true,
 			Irreversible: true,

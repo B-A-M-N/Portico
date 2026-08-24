@@ -199,7 +199,10 @@ type privateNetworkResourceState struct {
 // privateNetworkState extracts the membership and serve status from an observation.
 //
 // It returns the authoritative status of each, so the caller can decide without
-// re-reading the observation.
+// re-reading the observation. A serve is "present" only when ObservationPresent —
+// both missing and drifted are treated as "not present" so reconciliation repairs
+// them. A drifted serve is one Portico owns and may safely restore; a missing one
+// is one that must be recreated. Both reach the same repair path.
 func privateNetworkState(observed *core.ObservedConnection) (membership, serve privateNetworkResourceState) {
 	if observed == nil {
 		return

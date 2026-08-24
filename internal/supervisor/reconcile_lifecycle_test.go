@@ -135,7 +135,7 @@ func TestAMissingServeIsRestored(t *testing.T) {
 		ResourceStatuses: []core.ObservedResourceStatus{
 			{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
 				Status: core.ObservationPresent},
-			{Type: core.ResourceTailnetServe, ExternalID: "127.0.0.1:3000",
+			{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
 				Status: core.ObservationMissing},
 		},
 	}
@@ -158,7 +158,7 @@ func TestAHealthyExposeNeedsNoReconciliation(t *testing.T) {
 		ResourceStatuses: []core.ObservedResourceStatus{
 			{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
 				Status: core.ObservationPresent},
-			{Type: core.ResourceTailnetServe, ExternalID: "127.0.0.1:3000",
+			{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
 				Status: core.ObservationPresent},
 		},
 	}
@@ -182,7 +182,7 @@ func TestAClosedExposeWithdrawsTheServe(t *testing.T) {
 		ResourceStatuses: []core.ObservedResourceStatus{
 			{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
 				Status: core.ObservationPresent},
-			{Type: core.ResourceTailnetServe, ExternalID: "127.0.0.1:3000",
+			{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
 				Status: core.ObservationPresent},
 		},
 	}

@@ -3,23 +3,19 @@ package tailscale
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // Provider implements private-network connections through the local tailscale client.
+//
+// It holds no in-memory serve authority. All route derivation goes through ServeRoute
+// in serve.go; the durable ProviderResource inventory is the only authority for
+// restart, close, repair, and reconciliation.
 type Provider struct {
 	runner CommandRunner
-
-	mu sync.Mutex
-	// serving records the addresses Portico configured a serve for, per connection.
-	// It is memory only: observation reads the client's own serve configuration, so a
-	// restarted supervisor does not depend on this map being populated.
-	serving map[core.ConnectionID]string
 }
 
 // New builds a Tailscale provider over the given runner.
@@ -27,7 +23,7 @@ func New(runner CommandRunner) *Provider {
 	if runner == nil {
 		runner = NewExecRunner(Binary)
 	}
-	return &Provider{runner: runner, serving: make(map[core.ConnectionID]string)}
+	return &Provider{runner: runner}
 }
 
 // Identity names the provider.
@@ -121,7 +117,7 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 
 	switch profile.Desired {
 	case core.DesiredOpen:
-		steps, expected, err := p.openSteps(ctx, profile, spec, mode)
+		steps, expected, err := p.openSteps(ctx, profile, spec, mode, desired.Runtime)
 		if err != nil {
 			return nil, err
 		}
@@ -131,7 +127,7 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 
 	case core.DesiredClosed:
 		plan.Intent = core.IntentClose
-		plan.Steps = p.closeSteps(spec, mode)
+		plan.Steps = p.closeSteps(profile, spec, mode, desired.Runtime)
 		plan.Expected.State = core.RuntimeClosed
 
 	default:
@@ -146,12 +142,14 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 
 // openSteps builds the steps that bring a connection up.
 func (p *Provider) openSteps(ctx context.Context, profile *core.ConnectionProfile,
-	spec *core.PrivateNetworkSpec, mode core.PrivateNetworkMode) ([]core.PlanStep, core.ExpectedOutcome, error) {
+	spec *core.PrivateNetworkSpec, mode core.PrivateNetworkMode, runtime *core.ConnectionRuntime,
+) ([]core.PlanStep, core.ExpectedOutcome, error) {
 
 	var expected core.ExpectedOutcome
-	params := map[string]string{"mode": string(mode)}
+
+	baseParams := map[string]string{"mode": string(mode)}
 	if spec.NetworkID != "" {
-		params["network"] = spec.NetworkID
+		baseParams["network"] = spec.NetworkID
 	}
 
 	// The plan says what will happen on this machine, so it is built against what the
@@ -185,7 +183,7 @@ func (p *Provider) openSteps(ctx context.Context, profile *core.ConnectionProfil
 	steps := []core.PlanStep{{
 		ID: "tailnet-verify-membership", Kind: core.StepValidateAccount,
 		Summary:   "Confirm this machine is on the tailnet",
-		Technical: core.TechnicalOperation{Provider: "tailscale", Type: "verify_membership", Parameters: params},
+		Technical: core.TechnicalOperation{Provider: "tailscale", Type: "verify_membership", Parameters: baseParams},
 	}}
 
 	expected.State = core.RuntimeOpen
@@ -201,28 +199,47 @@ func (p *Provider) openSteps(ctx context.Context, profile *core.ConnectionProfil
 		}
 
 	case core.PrivateNetworkExpose:
-		target, err := exposeTarget(profile)
+		route, err := serveRouteForProfile(spec)
 		if err != nil {
 			return nil, expected, err
 		}
-		params["target"] = target
+
+		// Foreign-collision check: if a live managed ProviderResource exists for the
+		// same frontend identity, Portico owns it. If a different resource occupies the
+		// same frontend and Portico has no live managed row, refuse before mutation.
+		if runtime != nil {
+			if collision, err := serveCollision(route, runtime.Provider.Resources); err != nil {
+				return nil, expected, err
+			} else if collision {
+				return nil, expected, core.ErrValidation(fmt.Sprintf(
+					"port %s on the tailnet is already configured by something other than this "+
+						"connection; Portico will not overwrite a serve it did not create",
+					route.Identity()))
+			}
+		}
+
+		routeParams := route.StepParameters()
+		for k, v := range baseParams {
+			routeParams[k] = v
+		}
+
 		steps = append(steps,
 			core.PlanStep{
 				ID: "tailnet-verify-origin", Kind: core.StepVerifyOrigin,
-				Summary:   fmt.Sprintf("Verify %s is reachable on this machine", target),
-				Technical: core.TechnicalOperation{Provider: "tailscale", Type: "verify_origin", Parameters: params},
+				Summary:   fmt.Sprintf("Verify %s is reachable on this machine", route.BackendEndpoint()),
+				Technical: core.TechnicalOperation{Provider: "tailscale", Type: "verify_origin", Parameters: routeParams},
 			},
 			core.PlanStep{
 				ID: "tailnet-serve", Kind: core.StepCreateTunnel,
-				Summary: fmt.Sprintf("Publish %s to the tailnet, and only to the tailnet", target),
+				Summary: fmt.Sprintf("Publish %s to the tailnet, and only to the tailnet", route.BackendEndpoint()),
 				Technical: core.TechnicalOperation{
-					Provider: "tailscale", Type: "serve", Parameters: params,
+					Provider: "tailscale", Type: "serve", Parameters: routeParams,
 				},
 			},
 			core.PlanStep{
 				ID: "tailnet-verify-serve", Kind: core.StepVerifyConnector,
 				Summary:   "Confirm the tailnet is serving it",
-				Technical: core.TechnicalOperation{Provider: "tailscale", Type: "verify_serve", Parameters: params},
+				Technical: core.TechnicalOperation{Provider: "tailscale", Type: "verify_serve", Parameters: routeParams},
 			},
 		)
 		if address := status.PrivateAddress(); address != "" {
@@ -238,11 +255,80 @@ func (p *Provider) openSteps(ctx context.Context, profile *core.ConnectionProfil
 	return steps, expected, nil
 }
 
+// serveOwnership classifies who holds the desired frontend binding.
+type serveOwnership int
+
+const (
+	// serveFrontendFree means no live resource occupies the frontend identity.
+	serveFrontendFree serveOwnership = iota
+	// serveFrontendOwned means Portico has a live managed resource for the exact
+	// frontend identity, so it may verify, repair, or re-plan it.
+	serveFrontendOwned
+	// serveFrontendForeign means the frontend identity is occupied by something
+	// Portico does not manage, so it must not be overwritten.
+	serveFrontendForeign
+)
+
+// serveCollision reports whether the desired frontend identity may be mutated.
+//
+// It returns true (refuse) when the frontend is occupied by anything Portico does
+// not own. The four cases are distinguished explicitly:
+//
+//	nothing occupies the identity                  -> safe to create
+//	live managed resource for the identity          -> Portico owns it, safe
+//	live non-managed resource for the identity      -> foreign, refuse
+//	live resource whose metadata will not parse     -> ownership unverifiable, refuse
+//
+// The last case is the one that must fail closed. Skipping an unparseable resource
+// would let a corrupt row read as "nothing is there", and Portico would then
+// overwrite a binding whose ownership it could not establish.
+func serveCollision(route ServeRoute, resources []core.ProviderResource) (bool, error) {
+	ownership := serveFrontendFree
+
+	for _, res := range resources {
+		if res.Type != core.ResourceTailnetServe || !res.IsLive() {
+			continue
+		}
+
+		other, err := serveRouteFromResource(res.Metadata)
+		if err != nil {
+			// The row cannot be interpreted, so it cannot be ruled out as the
+			// occupant of this frontend. Refuse rather than guess: overwriting a
+			// route Portico cannot verify it owns is the failure this prevents.
+			return true, fmt.Errorf(
+				"the tracked serve resource %s carries metadata Portico cannot parse, so it "+
+					"cannot confirm whether it owns %s: %w", res.ExternalID, route.Identity(), err)
+		}
+
+		if !other.IsSameIdentity(route) {
+			// A different frontend. Two Portico Serve connections may coexist, and
+			// the same backend may sit behind two different frontends.
+			continue
+		}
+
+		if res.Ownership == core.OwnershipManaged {
+			ownership = serveFrontendOwned
+			continue
+		}
+		// Adopted or external: the user configured this, not Portico.
+		return true, nil
+	}
+
+	return ownership == serveFrontendForeign, nil
+}
+
 // closeSteps builds the steps that take a connection down.
-func (p *Provider) closeSteps(spec *core.PrivateNetworkSpec, mode core.PrivateNetworkMode) []core.PlanStep {
-	params := map[string]string{"mode": string(mode)}
+//
+// For expose mode, the exact route comes from the live managed ProviderResource in
+// the runtime — NOT from the current profile. The profile is what the user currently
+// wants; the resource is what Portico actually owns remotely. Deletion must target
+// the second one.
+func (p *Provider) closeSteps(profile *core.ConnectionProfile, spec *core.PrivateNetworkSpec,
+	mode core.PrivateNetworkMode, runtime *core.ConnectionRuntime,
+) []core.PlanStep {
+	baseParams := map[string]string{"mode": string(mode)}
 	if spec.NetworkID != "" {
-		params["network"] = spec.NetworkID
+		baseParams["network"] = spec.NetworkID
 	}
 
 	if mode != core.PrivateNetworkExpose {
@@ -254,59 +340,75 @@ func (p *Provider) closeSteps(spec *core.PrivateNetworkSpec, mode core.PrivateNe
 			ID: "tailnet-release", Kind: core.StepStopConnector,
 			Summary: "Stop tracking this machine's tailnet membership. The machine stays " +
 				"signed in — Portico did not sign it in and will not sign it out.",
-			Technical: core.TechnicalOperation{Provider: "tailscale", Type: "release", Parameters: params},
+			Technical: core.TechnicalOperation{Provider: "tailscale", Type: "release", Parameters: baseParams},
 		}}
 	}
 
-	target := spec.LocalAddress
-	params["target"] = target
+	// Expose mode: withdraw the exact route Portico created. Prefer the live managed
+	// resource; fall back to the profile only if no resource has been persisted yet.
+	route, err := serveRouteForClose(spec, runtime)
+	if err != nil {
+		// If we cannot reconstruct the route from either durable or profile state,
+		// the close cannot safely target anything. Return a failing unserve step so
+		// the error surfaces at execution rather than silently leaking the route.
+		return []core.PlanStep{{
+			ID: "tailnet-unserve", Kind: core.StepStopConnector,
+			Summary:   fmt.Sprintf("Stop publishing the tailnet serve (route unavailable: %v)", err),
+			Technical: core.TechnicalOperation{Provider: "tailscale", Type: "unserve", Parameters: baseParams},
+		}}
+	}
 
-	// The exact target flows through the plan, so a close is executable from durable
-	// state alone — after a reconstruction or when observation is unavailable, the
-	// step still addresses exactly what Portico created. The provider's in-memory
-	// map is no longer authority.
+	routeParams := route.StepParameters()
+	for k, v := range baseParams {
+		routeParams[k] = v
+	}
+
 	return []core.PlanStep{{
 		ID: "tailnet-unserve", Kind: core.StepStopConnector,
-		Summary:   fmt.Sprintf("Stop publishing %s to the tailnet", target),
-		Technical: core.TechnicalOperation{Provider: "tailscale", Type: "unserve", Parameters: params},
+		Summary:   fmt.Sprintf("Stop publishing %s to the tailnet", route.Identity()),
+		Technical: core.TechnicalOperation{Provider: "tailscale", Type: "unserve", Parameters: routeParams},
 	}}
 }
 
-// exposeTarget is the local address a serve connection publishes.
-//
-// It comes from the private-network arm's own field. The spec is a strict tagged union,
-// so an expose connection cannot also carry a service-exposure arm — which is why the
-// address is expressed once, on the arm belonging to this kind.
-func exposeTarget(profile *core.ConnectionProfile) (string, error) {
-	spec := profile.Spec.PrivateNetwork
-	if spec != nil {
-		if address := strings.TrimSpace(spec.LocalAddress); address != "" {
-			return normaliseTarget(address)
+// serveRouteForClose reconstructs the route to withdraw for an expose close. It
+// prefers the live managed ProviderResource (what Portico actually owns remotely)
+// over the current profile (what the user wants now).
+func serveRouteForClose(spec *core.PrivateNetworkSpec, runtime *core.ConnectionRuntime) (ServeRoute, error) {
+	if runtime != nil {
+		for _, res := range runtime.Provider.Resources {
+			if res.Type != core.ResourceTailnetServe || !res.IsLive() || res.Ownership != core.OwnershipManaged {
+				continue
+			}
+			route, err := serveRouteFromResource(res.Metadata)
+			if err != nil {
+				return ServeRoute{}, fmt.Errorf(
+					"the managed serve resource %s carries metadata Portico cannot parse, "+
+						"so Portico cannot safely withdraw it: %v", res.ExternalID, err)
+			}
+			return route, nil
 		}
 	}
-	return "", core.ErrValidation(
-		"publishing a service to the tailnet needs the address it is listening on, and this " +
-			"connection does not carry one")
+	// Fall back to the profile — this happens when a profile has not yet produced a
+	// resource (e.g. planned but never executed).
+	return serveRouteForProfile(spec)
 }
 
-// normaliseTarget turns a user-supplied address into what the client expects.
-func normaliseTarget(address string) (string, error) {
-	// A bare port is the common shorthand.
-	if !strings.Contains(address, ":") {
-		return "", core.ErrValidation(fmt.Sprintf(
-			"%q is not a host:port address; the tailnet needs to know which port to publish",
-			address))
+// serveRouteForProfile is the single provider-owned conversion from a private-network
+// spec to a ServeRoute. It consumes LocalAddress and LocalProtocol and produces the
+// deterministic route described in serve.go.
+func serveRouteForProfile(spec *core.PrivateNetworkSpec) (ServeRoute, error) {
+	if spec == nil {
+		return ServeRoute{}, core.ErrValidation("publishing a service to the tailnet needs a private network specification")
 	}
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return "", core.ErrValidation(fmt.Sprintf("%q is not a host:port address: %v", address, err))
+	address := strings.TrimSpace(spec.LocalAddress)
+	if address == "" {
+		return ServeRoute{}, core.ErrValidation(
+			"publishing a service to the tailnet needs the address it is listening on, and this " +
+				"connection does not carry one")
 	}
-	if host == "" {
-		host = "127.0.0.1"
+	protocol := strings.TrimSpace(string(spec.LocalProtocol))
+	if protocol == "" {
+		protocol = "http"
 	}
-	// The same normalisation the serve configuration is read through, so a target
-	// recorded here matches what the client reports back. Two spellings of one
-	// address would make observation report the serve missing, and a serve reported
-	// missing is one reconciliation recreates.
-	return normaliseServeTarget(net.JoinHostPort(host, port)), nil
+	return newServeRouteFromAddress(protocol, address)
 }

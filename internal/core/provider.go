@@ -154,6 +154,10 @@ const (
 	// ObservationRateLimited means the provider rate-limited the
 	// lookup (429). Never treated as missing.
 	ObservationRateLimited ObservationStatus = "rate_limited"
+	// ObservationDrifted means the exact tracked provider resource exists,
+	// but its provider-visible configuration no longer matches the
+	// configuration Portico persisted for that resource.
+	ObservationDrifted ObservationStatus = "drifted"
 )
 
 // ObservedResourceStatus records the observation classification for a

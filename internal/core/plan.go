@@ -169,15 +169,20 @@ const (
 	// that the durable tunnel ID is journaled before any dependent token
 	// retrieval; a failed token fetch is then recoverable rather than
 	// orphaning an unmanaged tunnel.
-	StepAcquireToken          StepKind = "acquire_token"
-	StepVerifyConnector       StepKind = "verify_connector"
-	StepVerifyEndpoint        StepKind = "verify_endpoint"
-	StepStopConnector         StepKind = "stop_connector"
-	StepStopOrigin            StepKind = "stop_origin"
-	StepDeleteTunnel          StepKind = "delete_tunnel"
-	StepDeleteDNSRecord       StepKind = "delete_dns_record"
-	StepDeleteAccessApp       StepKind = "delete_access_application"
-	StepDeleteAccessPolicy    StepKind = "delete_access_policy"
+	StepAcquireToken       StepKind = "acquire_token"
+	StepVerifyConnector    StepKind = "verify_connector"
+	StepVerifyEndpoint     StepKind = "verify_endpoint"
+	StepStopConnector      StepKind = "stop_connector"
+	StepStopOrigin         StepKind = "stop_origin"
+	StepDeleteTunnel       StepKind = "delete_tunnel"
+	StepDeleteDNSRecord    StepKind = "delete_dns_record"
+	StepDeleteAccessApp    StepKind = "delete_access_application"
+	StepDeleteAccessPolicy StepKind = "delete_access_policy"
+	// StepDeleteTailnetServe withdraws a Tailscale Serve route Portico
+	// created. It is the durable-resource deletion step for
+	// ResourceTailnetServe; the provider's technical operation is
+	// "unserve" and is dispatched from Technical.Type.
+	StepDeleteTailnetServe    StepKind = "delete_tailnet_serve"
 	StepRestartConnector      StepKind = "restart_connector"
 	StepUpdateRoute           StepKind = "update_route"
 	StepUpdateDNSRecord       StepKind = "update_dns_record"

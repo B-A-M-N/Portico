@@ -243,6 +243,13 @@ func (e *Engine) checkProvider(ctx context.Context, profile *core.ConnectionProf
 					}
 				}
 			}
+			// A drifted serve is one Portico owns and may safely restore. Surface it
+			// as a provider-route finding rather than silently ignoring it.
+			for _, status := range observed.ResourceStatuses {
+				if status.Status == core.ObservationDrifted {
+					return driftedProviderResourceFinding(profile.ID, observed.ProviderID, status)
+				}
+			}
 		}
 		// Observation errors are treated as unknown, not failure.
 	}
@@ -316,6 +323,30 @@ func missingProviderResourceFinding(connectionID core.ConnectionID, providerID c
 		}
 	default:
 		return nil
+	}
+}
+
+// driftedProviderResourceFinding turns an authoritative exact-ID drift into a
+// provider-route finding. A drifted resource is one Portico owns and may safely
+// restore; it is distinct from missing (absent) and transient (unverifiable).
+// It produces a provider-route finding, not an "observation unavailable" finding
+// and not an externally-removed lifecycle transition.
+func driftedProviderResourceFinding(connectionID core.ConnectionID, providerID core.ProviderID, status core.ObservedResourceStatus) *core.DiagnosticFinding {
+	return &core.DiagnosticFinding{
+		ID:           core.FindingID(fmt.Sprintf("find-%s-route-drifted", connectionID)),
+		ConnectionID: connectionID,
+		Segment:      core.SegmentProviderEdge,
+		Severity:     core.SeverityWarning,
+		Summary:      "Managed provider route has drifted",
+		Explanation: fmt.Sprintf(
+			"Portico owns the route %s but the provider reports a different configuration than what Portico persisted. The route can be restored to the persisted configuration.",
+			status.ExternalID),
+		Evidence: []core.Evidence{{
+			Type: "provider_observation", Source: string(providerID),
+			Message: string(core.ObservationDrifted),
+			Data:    map[string]string{"resource_id": status.ExternalID, "resource_type": string(status.Type), "detail": status.Detail},
+		}},
+		ObservedAt: time.Now().UTC(),
 	}
 }
 

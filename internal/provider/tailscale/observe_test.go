@@ -11,9 +11,9 @@ import (
 // Observing after the supervisor has restarted.
 //
 // A restarted supervisor has no memory of what it configured. It reconstructs the adapter
-// — a fresh Provider with an empty serving map — and observes from the resources it
-// persisted. Every test here builds a new provider rather than reusing one that executed
-// the steps, because reusing it would prove only that the adapter remembers its own work.
+// — a fresh Provider — and observes from the resources it persisted. Every test here
+// builds a new provider rather than reusing one that executed the steps, because reusing
+// it would prove only that the adapter remembers its own work.
 
 // reconstructed builds a provider the way a restarted supervisor does.
 func reconstructed(runner CommandRunner) *Provider { return New(runner) }
@@ -22,17 +22,26 @@ func reconstructed(runner CommandRunner) *Provider { return New(runner) }
 func persistedJoin() []core.ProviderResource {
 	return []core.ProviderResource{{
 		Type:       core.ResourceTailnetMembership,
-		ExternalID: "workstation.tail0abc.ts.net",
+		ExternalID: "n1234567890123456",
 		Ownership:  core.OwnershipAdopted,
 	}}
 }
 
-// persistedServe is what the supervisor stored for a serve connection.
-func persistedServe(target string) []core.ProviderResource {
+// persistedServe is what the supervisor stored for a serve connection. The
+// ExternalID is the frontend identity; the metadata carries the canonical route
+// fields so the route can be reconstructed exactly.
+func persistedServe(route ServeRoute) []core.ProviderResource {
+	metadata := route.ResourceMetadata()
+	metadata["address"] = "workstation.tail0abc.ts.net"
 	return []core.ProviderResource{{
+		Type:       core.ResourceTailnetMembership,
+		ExternalID: "n1234567890123456",
+		Ownership:  core.OwnershipAdopted,
+	}, {
 		Type:       core.ResourceTailnetServe,
-		ExternalID: target,
+		ExternalID: route.Identity(),
 		Ownership:  core.OwnershipManaged,
+		Metadata:   metadata,
 	}}
 }
 
@@ -49,8 +58,8 @@ func statusOf(t *testing.T, obs *core.ObservedConnection,
 	return core.ObservedResourceStatus{}
 }
 
-// TestAJoinIsObservedFromThePersistedMachineName pins exact-identity observation.
-func TestAJoinIsObservedFromThePersistedMachineName(t *testing.T) {
+// TestAJoinIsObservedFromThePersistedNodeID pins exact-identity observation.
+func TestAJoinIsObservedFromThePersistedNodeID(t *testing.T) {
 	runner := newFakeRunner().on("status --json", statusRunning, nil)
 	obs, err := reconstructed(runner).ObserveWithResources(context.Background(),
 		"conn-join", persistedJoin())
@@ -58,7 +67,7 @@ func TestAJoinIsObservedFromThePersistedMachineName(t *testing.T) {
 		t.Fatalf("ObserveWithResources: %v", err)
 	}
 
-	observed := statusOf(t, obs, core.ResourceTailnetMembership, "workstation.tail0abc.ts.net")
+	observed := statusOf(t, obs, core.ResourceTailnetMembership, "n1234567890123456")
 	if observed.Status != core.ObservationPresent {
 		t.Fatalf("membership observed as %q: %s", observed.Status, observed.Detail)
 	}
@@ -103,7 +112,7 @@ func TestASignedOutMachineIsMissingNotTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	observed := statusOf(t, obs, core.ResourceTailnetMembership, "workstation.tail0abc.ts.net")
+	observed := statusOf(t, obs, core.ResourceTailnetMembership, "n1234567890123456")
 	if observed.Status != core.ObservationMissing {
 		t.Fatalf("a signed-out machine observed as %q, want missing", observed.Status)
 	}
@@ -125,7 +134,7 @@ func TestAnUnreachableClientIsTransientNotMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	observed := statusOf(t, obs, core.ResourceTailnetMembership, "workstation.tail0abc.ts.net")
+	observed := statusOf(t, obs, core.ResourceTailnetMembership, "n1234567890123456")
 	if observed.Status == core.ObservationMissing {
 		t.Fatal("an unreachable client was reported as the machine having left the network")
 	}
@@ -136,48 +145,43 @@ func TestAnUnreachableClientIsTransientNotMissing(t *testing.T) {
 
 // TestAServeIsObservedFromTheClientNotFromMemory is the central restart case.
 //
-// The provider observing has never served anything: its map is empty. The only input is
-// the persisted target, and the only source of truth is the client's own configuration.
+// The provider observing has never served anything: it has no in-memory map. The only
+// input is the persisted resource, and the only source of truth is the client's own
+// configuration.
 func TestAServeIsObservedFromTheClientNotFromMemory(t *testing.T) {
+	route := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
 	runner := newFakeRunner().
 		on("status --json", statusRunning, nil).
 		on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
 
 	provider := reconstructed(runner)
-	if got := provider.servedTarget("conn-serve"); got != "" {
-		t.Fatalf("a reconstructed provider already remembers %q", got)
-	}
 
 	obs, err := provider.ObserveWithResources(context.Background(), "conn-serve",
-		persistedServe("127.0.0.1:3000"))
+		persistedServe(route))
 	if err != nil {
 		t.Fatalf("ObserveWithResources: %v", err)
 	}
 
-	observed := statusOf(t, obs, core.ResourceTailnetServe, "127.0.0.1:3000")
+	observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
 	if observed.Status != core.ObservationPresent {
 		t.Fatalf("the serve observed as %q: %s", observed.Status, observed.Detail)
 	}
-	// Observing also re-establishes what to withdraw on close, so a connection created
-	// before a restart can still be closed cleanly.
-	if got := provider.servedTarget("conn-serve"); got != "127.0.0.1:3000" {
-		t.Errorf("observation did not recover the withdrawal target: %q", got)
-	}
 }
 
-// TestAWithdrawnServeIsObservedMissing pins the drift case reconciliation exists for.
+// TestAWithdrawnServeIsObservedMissing pins the missing case reconciliation exists for.
 func TestAWithdrawnServeIsObservedMissing(t *testing.T) {
+	route := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
 	runner := newFakeRunner().
 		on("status --json", statusRunning, nil).
 		on("serve status --json", serveNothing, nil)
 
 	obs, err := reconstructed(runner).ObserveWithResources(context.Background(), "conn-serve",
-		persistedServe("127.0.0.1:3000"))
+		persistedServe(route))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	observed := statusOf(t, obs, core.ResourceTailnetServe, "127.0.0.1:3000")
+	observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
 	if observed.Status != core.ObservationMissing {
 		t.Fatalf("a serve that is gone observed as %q, want missing", observed.Status)
 	}
@@ -186,26 +190,50 @@ func TestAWithdrawnServeIsObservedMissing(t *testing.T) {
 	}
 }
 
+// TestADriftedServeIsObservedDrifted pins the drift case.
+//
+// The client is serving the same frontend identity but a different backend. That is
+// drift Portico owns and may safely restore — it must NOT be reported as missing.
+func TestADriftedServeIsObservedDrifted(t *testing.T) {
+	route := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
+	runner := newFakeRunner().
+		on("status --json", statusRunning, nil).
+		// Client reports the same frontend but a different backend.
+		on("serve status --json", serveHTTP("127.0.0.1:9999"), nil)
+
+	obs, err := reconstructed(runner).ObserveWithResources(context.Background(), "conn-serve",
+		persistedServe(route))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
+	if observed.Status != core.ObservationDrifted {
+		t.Fatalf("a drifted serve observed as %q, want drifted: %s", observed.Status, observed.Detail)
+	}
+}
+
 // TestSomeoneElsesServeIsNotAdopted pins that observation does not claim what it did not
 // create.
 //
-// The client is serving a different address. Portico's own is gone. Reporting present
-// because *something* is served would adopt a configuration the user made by hand, and
-// closing the connection would then withdraw it.
+// The client is serving a different frontend identity. Portico's own is gone. Reporting
+// present because *something* is served would adopt a configuration the user made by hand,
+// and closing the connection would then withdraw it.
 func TestSomeoneElsesServeIsNotAdopted(t *testing.T) {
+	route := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
 	runner := newFakeRunner().
 		on("status --json", statusRunning, nil).
 		on("serve status --json", serveHTTP("127.0.0.1:9999"), nil)
 
 	obs, err := reconstructed(runner).ObserveWithResources(context.Background(), "conn-serve",
-		persistedServe("127.0.0.1:3000"))
+		persistedServe(route))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	observed := statusOf(t, obs, core.ResourceTailnetServe, "127.0.0.1:3000")
+	observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
 	if observed.Status == core.ObservationPresent {
-		t.Fatal("a serve for a different address was adopted as this connection's")
+		t.Fatal("a serve for a different backend was adopted as this connection's")
 	}
 }
 
@@ -216,25 +244,25 @@ func TestSomeoneElsesServeIsNotAdopted(t *testing.T) {
 // make observation report the serve missing, and a missing serve is one reconciliation
 // recreates — so it would republish an address that is already published.
 func TestAnAddressSpelledDifferentlyStillMatches(t *testing.T) {
-	for _, reported := range []string{
+	route := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
+	reportedForms := []string{
 		"127.0.0.1:3000",
 		"http://127.0.0.1:3000",
 		"http://localhost:3000",
 		"http://127.0.0.1:3000/",
-	} {
+	}
+	for _, reported := range reportedForms {
 		runner := newFakeRunner().
-			on("status --json", statusRunning, nil).
-			on("serve status --json", serveHTTP(""), nil)
+			on("status --json", statusRunning, nil)
 		// Script the exact reported form.
-		runner.on("serve status --json", `{"Web":{"h:443":{"Handlers":{"/":{"Proxy":"`+
-			reported+`"}}}}}`, nil)
+		runner.on("serve status --json", serveHTTPProxy(reported), nil)
 
 		obs, err := reconstructed(runner).ObserveWithResources(context.Background(),
-			"conn-serve", persistedServe("127.0.0.1:3000"))
+			"conn-serve", persistedServe(route))
 		if err != nil {
 			t.Fatal(err)
 		}
-		observed := statusOf(t, obs, core.ResourceTailnetServe, "127.0.0.1:3000")
+		observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
 		if observed.Status != core.ObservationPresent {
 			t.Errorf("a serve the client reported as %q was observed as %q",
 				reported, observed.Status)
@@ -261,17 +289,18 @@ func TestObservingNothingQueriesNothing(t *testing.T) {
 // TestObservationIsRepeatableAcrossReconstructions pins that restarting twice reaches the
 // same answer.
 func TestObservationIsRepeatableAcrossReconstructions(t *testing.T) {
+	route := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
 	for attempt := 1; attempt <= 3; attempt++ {
 		runner := newFakeRunner().
 			on("status --json", statusRunning, nil).
 			on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
 
 		obs, err := reconstructed(runner).ObserveWithResources(context.Background(),
-			"conn-serve", persistedServe("127.0.0.1:3000"))
+			"conn-serve", persistedServe(route))
 		if err != nil {
 			t.Fatalf("reconstruction %d: %v", attempt, err)
 		}
-		observed := statusOf(t, obs, core.ResourceTailnetServe, "127.0.0.1:3000")
+		observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
 		if observed.Status != core.ObservationPresent {
 			t.Fatalf("reconstruction %d observed %q", attempt, observed.Status)
 		}
@@ -287,8 +316,113 @@ func TestAStoppedClientIsTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed := statusOf(t, obs, core.ResourceTailnetMembership, "workstation.tail0abc.ts.net")
+	observed := statusOf(t, obs, core.ResourceTailnetMembership, "n1234567890123456")
 	if observed.Status != core.ObservationTransient {
 		t.Fatalf("a stopped client observed as %q, want transient", observed.Status)
+	}
+}
+
+// TestTwoPorticoServeConnectionsCanCoexist pins that two different frontend identities
+// sharing the same backend do not interfere with each other.
+func TestTwoPorticoServeConnectionsCanCoexist(t *testing.T) {
+	routeA := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
+	routeB := ServeRoute{FrontendProtocol: "https", FrontendPort: "8443", BackendProtocol: "https", BackendHost: "127.0.0.1", BackendPort: "3000"}
+	runner := newFakeRunner().
+		on("status --json", statusRunning, nil).
+		on("serve status --json", `{
+			"TCP": {
+				"3000": {"HTTP": true, "HTTPS": false, "TCPForward": ""},
+				"8443": {"HTTP": false, "HTTPS": true, "TCPForward": ""}
+			},
+			"Web": {
+				"workstation.tail0abc.ts.net:3000": {
+					"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}
+				},
+				"workstation.tail0abc.ts.net:8443": {
+					"Handlers": {"/": {"Proxy": "https://127.0.0.1:3000"}}
+				}
+			}
+		}`, nil)
+
+	resources := append(persistedServe(routeA), persistedServe(routeB)[1:]...)
+	obs, err := reconstructed(runner).ObserveWithResources(context.Background(), "conn-serve", resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := statusOf(t, obs, core.ResourceTailnetServe, routeA.Identity())
+	b := statusOf(t, obs, core.ResourceTailnetServe, routeB.Identity())
+	if a.Status != core.ObservationPresent {
+		t.Errorf("route A observed as %q", a.Status)
+	}
+	if b.Status != core.ObservationPresent {
+		t.Errorf("route B observed as %q", b.Status)
+	}
+}
+
+// TestClosingOneServeDoesNotRemoveAnother pins that withdrawing one frontend does not
+// affect a different frontend, even when they share the same backend.
+func TestClosingOneServeDoesNotRemoveAnother(t *testing.T) {
+	routeA := ServeRoute{FrontendProtocol: "http", FrontendPort: "3000", BackendProtocol: "http", BackendHost: "127.0.0.1", BackendPort: "3000"}
+	// Close only route A.
+	runner := newFakeRunner().
+		on("serve --bg --http=3000 off", "", nil).
+		on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
+
+	result, err := New(runner).ExecuteStep(context.Background(), "conn-serve", core.PlanStep{
+		ID: "s", Technical: core.TechnicalOperation{
+			Provider:   "tailscale",
+			Type:       "unserve",
+			Parameters: routeA.StepParameters(),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Succeeded {
+		t.Fatalf("the withdrawal failed: %v", result.Error)
+	}
+	// The close command targets only the http:3000 frontend.
+	if !runner.called("serve --bg --http=3000 off") {
+		t.Fatalf("the close command was wrong: %v", runner.calls())
+	}
+}
+
+// TestAForeignIdenticalRouteIsObservedMissingNotPresent pins that a manually-created
+// serve matching Portico's route is not adopted when Portico has no managed resource.
+func TestAForeignIdenticalRouteIsObservedMissingNotPresent(t *testing.T) {
+	// No persisted resources at all — Portico owns nothing.
+	runner := newFakeRunner().
+		on("status --json", statusRunning, nil).
+		on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
+
+	obs, err := reconstructed(runner).ObserveWithResources(context.Background(), "conn-serve", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.ResourceStatuses) != 0 {
+		t.Fatalf("no resources were queried but %d statuses returned", len(obs.ResourceStatuses))
+	}
+}
+
+// TestAMalformedPersistedResourceIsTransientNotMissing pins that a persisted resource
+// with corrupt metadata is classified transient (unverifiable), not silently skipped.
+func TestAMalformedPersistedResourceIsTransientNotMissing(t *testing.T) {
+	runner := newFakeRunner().
+		on("status --json", statusRunning, nil).
+		on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
+
+	obs, err := reconstructed(runner).ObserveWithResources(context.Background(), "conn-serve",
+		[]core.ProviderResource{{
+			Type:       core.ResourceTailnetServe,
+			ExternalID: "http:3000:/",
+			Ownership:  core.OwnershipManaged,
+			Metadata:   map[string]string{"frontend_protocol": "http"}, // incomplete
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := statusOf(t, obs, core.ResourceTailnetServe, "http:3000:/")
+	if observed.Status != core.ObservationTransient {
+		t.Fatalf("malformed persisted resource observed as %q, want transient", observed.Status)
 	}
 }

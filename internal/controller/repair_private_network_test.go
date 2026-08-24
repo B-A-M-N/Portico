@@ -6,55 +6,41 @@ import (
 	"testing"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider/tailscale"
 )
 
-// Repairing a private-network connection.
+// A stub observer that returns pre-set statuses and plans like the real
+// Tailscale provider.
 //
-// What can be wrong depends on the mode, and so does whether Portico can do anything about
-// it. A publish has a serve Portico created and can put back. A join has nothing Portico
-// created, so a machine that has left the network is reported rather than "repaired" by a
-// step that would fail — which is the difference between a repair the user can trust and
-// one that wastes their time.
+// Repair now asks the provider to plan the desired state rather than
+// manufacturing technical parameters itself, so the stub must be able to plan.
+// It embeds the real adapter over a scripted command runner: that is what makes
+// the test cross the controller→provider boundary instead of stopping at it.
+type networkObserver struct {
+	*tailscale.Provider
+	statuses []core.ObservedResourceStatus
+}
 
-// networkProfile is a private-network connection in the given mode.
-func networkProfile(id core.ConnectionID, mode core.PrivateNetworkMode, address string) *core.ConnectionProfile {
-	return &core.ConnectionProfile{
-		ID: id, Name: "network", Kind: core.ConnectionPrivateNetwork,
-		Desired: core.DesiredOpen, Revision: 1,
-		Driver: core.DriverSelection{ProviderID: "tailscale"},
-		Spec: core.ConnectionSpec{
-			PrivateNetwork: &core.PrivateNetworkSpec{
-				NetworkID: "example.com", Mode: mode,
-				ExposeLocal:  mode == core.PrivateNetworkExpose,
-				LocalAddress: address,
-			},
-		},
+func newNetworkObserver(statuses []core.ObservedResourceStatus) *networkObserver {
+	runner := &scriptedTailscale{}
+	return &networkObserver{
+		Provider: tailscale.New(runner),
+		statuses: statuses,
 	}
 }
 
-// networkObserver answers Observe with the resource statuses a test sets.
-type networkObserver struct{ statuses []core.ObservedResourceStatus }
+// scriptedTailscale answers the status query the adapter makes while planning.
+type scriptedTailscale struct{}
 
-func (*networkObserver) Identity() core.ProviderIdentity {
-	return core.ProviderIdentity{ID: "tailscale", Name: "tailscale", DisplayName: "Tailscale"}
-}
-
-func (*networkObserver) Capabilities(context.Context) (core.Capabilities, error) {
-	return core.Capabilities{
-		Kinds:           []core.ConnectionKind{core.ConnectionPrivateNetwork},
-		PrivateExposure: core.CapabilitySupport{Supported: true},
-	}, nil
-}
-
-func (*networkObserver) Authenticate(context.Context, core.AuthRequest) error { return nil }
-
-func (*networkObserver) Plan(context.Context, core.DesiredConnection) (*core.OperationPlan, error) {
-	return nil, nil
-}
-
-func (*networkObserver) ExecuteStep(context.Context, core.ConnectionID,
-	core.PlanStep) (core.StepResult, error) {
-	return core.StepResult{Succeeded: true}, nil
+func (s *scriptedTailscale) Run(_ context.Context, args ...string) ([]byte, error) {
+	if len(args) > 0 && args[0] == "status" {
+		return []byte(`{
+			"BackendState": "Running",
+			"Self": {"ID": "n1234567890123456", "DNSName": "machine.example.", "TailscaleIPs": ["100.1.2.3"], "Online": true},
+			"CurrentTailnet": {"Name": "example.com"}
+		}`), nil
+	}
+	return []byte(`{}`), nil
 }
 
 func (o *networkObserver) Observe(_ context.Context,
@@ -65,6 +51,14 @@ func (o *networkObserver) Observe(_ context.Context,
 	}, nil
 }
 
+// ObserveWithResources must be overridden too: the embedded adapter implements
+// core.ResourceAwareObserver, and Controller.Observe prefers that method. Without
+// this the promoted method would win and the scripted statuses would be ignored.
+func (o *networkObserver) ObserveWithResources(ctx context.Context,
+	id core.ConnectionID, _ []core.ProviderResource) (*core.ObservedConnection, error) {
+	return o.Observe(ctx, id)
+}
+
 // networkController registers the observer and the profile.
 //
 // It reuses forwardRegistry from the port-forward repair tests rather than adding a second
@@ -73,7 +67,7 @@ func networkController(t *testing.T, profile *core.ConnectionProfile,
 	statuses []core.ObservedResourceStatus) *Controller {
 	t.Helper()
 	c := &Controller{
-		registry: &forwardRegistry{prov: &networkObserver{statuses: statuses}},
+		registry: &forwardRegistry{prov: newNetworkObserver(statuses)},
 		profiles: map[core.ConnectionID]*core.ConnectionProfile{},
 		runtimes: map[core.ConnectionID]*core.ConnectionRuntime{},
 	}
@@ -82,13 +76,31 @@ func networkController(t *testing.T, profile *core.ConnectionProfile,
 	return c
 }
 
+// networkProfile is a private-network connection in the given mode.
+func networkProfile(id core.ConnectionID, mode core.PrivateNetworkMode, address string) *core.ConnectionProfile {
+	spec := &core.PrivateNetworkSpec{
+		NetworkID: "example.com", Mode: mode,
+		ExposeLocal:  mode == core.PrivateNetworkExpose,
+		LocalAddress: address,
+	}
+	if mode == core.PrivateNetworkExpose {
+		spec.LocalProtocol = core.ProtocolHTTP
+	}
+	return &core.ConnectionProfile{
+		ID: id, Name: "network", Kind: core.ConnectionPrivateNetwork,
+		Desired: core.DesiredOpen, Revision: 1,
+		Driver: core.DriverSelection{ProviderID: "tailscale"},
+		Spec:   core.ConnectionSpec{PrivateNetwork: spec},
+	}
+}
+
 // TestAWithdrawnServeIsRepublished pins the drift Portico owns.
 func TestAWithdrawnServeIsRepublished(t *testing.T) {
 	profile := networkProfile("conn-serve", core.PrivateNetworkExpose, "127.0.0.1:3000")
 	c := networkController(t, profile, []core.ObservedResourceStatus{
 		{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
 			Status: core.ObservationPresent},
-		{Type: core.ResourceTailnetServe, ExternalID: "127.0.0.1:3000",
+		{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
 			Status: core.ObservationMissing},
 	})
 
@@ -106,15 +118,29 @@ func TestAWithdrawnServeIsRepublished(t *testing.T) {
 	}
 	// The origin is verified before republishing: publishing an address nothing is
 	// listening on produces a name on the network that refuses every connection.
-	want := []string{"verify_origin", "serve", "verify_serve"}
+	want := []string{"verify_membership", "verify_origin", "serve", "verify_serve"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Fatalf("steps = %v, want %v", types, want)
 	}
-	// The exact recorded address is republished, not a guess.
-	for _, step := range steps {
-		if got := step.Technical.Parameters["target"]; got != "127.0.0.1:3000" {
-			t.Errorf("step %s targets %q", step.ID, got)
-		}
+}
+
+// TestADriftedServeIsRepublished pins that a drifted serve (same frontend, different
+// backend) is also repaired — Portico owns the frontend and may restore it.
+func TestADriftedServeIsRepublished(t *testing.T) {
+	profile := networkProfile("conn-serve", core.PrivateNetworkExpose, "127.0.0.1:3000")
+	c := networkController(t, profile, []core.ObservedResourceStatus{
+		{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
+			Status: core.ObservationPresent},
+		{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
+			Status: core.ObservationDrifted},
+	})
+
+	steps, err := c.privateNetworkRepairSteps(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("privateNetworkRepairSteps: %v", err)
+	}
+	if len(steps) == 0 {
+		t.Fatal("a drifted serve produced no repair")
 	}
 }
 
@@ -124,7 +150,7 @@ func TestAnIntactServeNeedsNoRepair(t *testing.T) {
 	c := networkController(t, profile, []core.ObservedResourceStatus{
 		{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
 			Status: core.ObservationPresent},
-		{Type: core.ResourceTailnetServe, ExternalID: "127.0.0.1:3000",
+		{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
 			Status: core.ObservationPresent},
 	})
 
@@ -193,7 +219,7 @@ func TestATransientObservationIsNotRepaired(t *testing.T) {
 	c := networkController(t, profile, []core.ObservedResourceStatus{
 		{Type: core.ResourceTailnetMembership, ExternalID: "machine.example",
 			Status: core.ObservationTransient, Detail: "the client did not answer"},
-		{Type: core.ResourceTailnetServe, ExternalID: "127.0.0.1:3000",
+		{Type: core.ResourceTailnetServe, ExternalID: "http:3000:/",
 			Status: core.ObservationTransient},
 	})
 

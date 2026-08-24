@@ -115,13 +115,57 @@ const (
 // serveNothing is what the client prints with no serve configured.
 const serveNothing = `{}`
 
-// serveHTTP is a web handler proxying to a local address.
+// serveHTTP is a real Tailscale ServeConfig for an HTTP route proxying to a local
+// address. Web entries are keyed by host:port and the corresponding TCP entry
+// identifies HTTP vs HTTPS via the HTTP/HTTPS booleans.
 func serveHTTP(target string) string {
 	return fmt.Sprintf(`{
+		"TCP": {
+			"3000": {"HTTP": true, "HTTPS": false, "TCPForward": ""}
+		},
 		"Web": {
-			"workstation.tail0abc.ts.net:443": {
+			"workstation.tail0abc.ts.net:3000": {
+				"Handlers": {"/": {"Proxy": "http://%s"}}
+			}
+		}
+	}`, target)
+}
+
+// serveHTTPS is a real Tailscale ServeConfig for an HTTPS route.
+func serveHTTPS(target string) string {
+	return fmt.Sprintf(`{
+		"TCP": {
+			"8443": {"HTTP": false, "HTTPS": true, "TCPForward": ""}
+		},
+		"Web": {
+			"workstation.tail0abc.ts.net:8443": {
+				"Handlers": {"/": {"Proxy": "https://%s"}}
+			}
+		}
+	}`, target)
+}
+
+// serveTCP is a real Tailscale ServeConfig for a raw TCP forward.
+func serveTCP(target string) string {
+	return fmt.Sprintf(`{
+		"TCP": {
+			"5432": {"HTTP": false, "HTTPS": false, "TCPForward": "tcp://%s"}
+		}
+	}`, target)
+}
+
+// serveHTTPProxy is an HTTP ServeConfig whose handler proxies to the exact string
+// given — used to pin that differently-spelled backends still normalize to one
+// canonical route.
+func serveHTTPProxy(proxy string) string {
+	return fmt.Sprintf(`{
+		"TCP": {
+			"3000": {"HTTP": true, "HTTPS": false, "TCPForward": ""}
+		},
+		"Web": {
+			"workstation.tail0abc.ts.net:3000": {
 				"Handlers": {"/": {"Proxy": %q}}
 			}
 		}
-	}`, "http://"+target)
+	}`, proxy)
 }

@@ -876,7 +876,8 @@ func (c *Controller) executeStep(ctx context.Context, plan *core.OperationPlan, 
 
 func isDeleteStep(kind core.StepKind) bool {
 	switch kind {
-	case core.StepDeleteTunnel, core.StepDeleteDNSRecord, core.StepDeleteAccessApp, core.StepDeleteAccessPolicy:
+	case core.StepDeleteTunnel, core.StepDeleteDNSRecord, core.StepDeleteAccessApp, core.StepDeleteAccessPolicy,
+		core.StepDeleteTailnetServe:
 		return true
 	}
 	return false
@@ -893,6 +894,8 @@ func resourceTypeFromStepKind(kind core.StepKind) core.ResourceType {
 		return core.ResourceAccessApp
 	case core.StepDeleteAccessPolicy:
 		return core.ResourceAccessPolicy
+	case core.StepDeleteTailnetServe:
+		return core.ResourceTailnetServe
 	}
 	return ""
 }
@@ -1321,7 +1324,8 @@ func selectResourceByType(resources []core.ProviderResource, desiredType core.Re
 func compensationRequiresResourceID(kind core.StepKind) bool {
 	switch kind {
 	case core.StepDeleteTunnel, core.StepDeleteDNSRecord, core.StepDeleteAccessApp,
-		core.StepDeleteAccessPolicy, core.StepUpdateDNSRecord, core.StepUpdateAccessPolicy:
+		core.StepDeleteAccessPolicy, core.StepDeleteTailnetServe,
+		core.StepUpdateDNSRecord, core.StepUpdateAccessPolicy:
 		return true
 	}
 	return false

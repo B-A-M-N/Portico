@@ -28,6 +28,11 @@ func joinProfile(desired core.DesiredConnectionState) *core.ConnectionProfile {
 // expose connection cannot also carry a service-exposure arm — the address is expressed
 // once, on the arm belonging to this kind.
 func exposeProfile(desired core.DesiredConnectionState, address string) *core.ConnectionProfile {
+	return exposeProfileWithProtocol(desired, address, core.ProtocolHTTP)
+}
+
+// exposeProfileWithProtocol publishes a local address with an explicit protocol.
+func exposeProfileWithProtocol(desired core.DesiredConnectionState, address string, protocol core.Protocol) *core.ConnectionProfile {
 	return &core.ConnectionProfile{
 		ID: "conn-serve", Name: "api on the tailnet",
 		Kind:     core.ConnectionPrivateNetwork,
@@ -39,7 +44,7 @@ func exposeProfile(desired core.DesiredConnectionState, address string) *core.Co
 				Mode:          core.PrivateNetworkExpose,
 				ExposeLocal:   true,
 				LocalAddress:  address,
-				LocalProtocol: core.ProtocolHTTP,
+				LocalProtocol: protocol,
 			},
 		},
 	}

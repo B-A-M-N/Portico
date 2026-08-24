@@ -19,28 +19,3 @@ func networkProfile(id core.ConnectionID, mode core.PrivateNetworkMode, address 
 		Spec:   core.ConnectionSpec{PrivateNetwork: spec},
 	}
 }
-
-// persistedJoin is what the supervisor stored for a join connection.
-func persistedJoin() []core.ProviderResource {
-	return []core.ProviderResource{{
-		Type:       core.ResourceTailnetMembership,
-		ExternalID: "machine.example",
-		Ownership:  core.OwnershipAdopted,
-	}}
-}
-
-// persistedServe is what the supervisor stored for a serve connection.
-func persistedServe(target string) []core.ProviderResource {
-	return []core.ProviderResource{
-		{
-			Type:       core.ResourceTailnetMembership,
-			ExternalID: "machine.example",
-			Ownership:  core.OwnershipAdopted,
-		},
-		{
-			Type:       core.ResourceTailnetServe,
-			ExternalID: target,
-			Ownership:  core.OwnershipManaged,
-		},
-	}
-}

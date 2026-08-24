@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -23,16 +24,12 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 	case "verify_origin":
 		return p.verifyOrigin(step), nil
 	case "serve":
-		return p.serve(ctx, connectionID, step), nil
+		return p.serve(ctx, step), nil
 	case "verify_serve":
 		return p.verifyServe(ctx, step), nil
 	case "unserve":
-		return p.unserve(ctx, connectionID, step), nil
+		return p.unserve(ctx, step), nil
 	case "release":
-		// Releasing a join connection changes nothing on the machine. It exists so
-		// closing has a step to journal and so the summary can tell the user the
-		// machine stays signed in.
-		p.forget(connectionID)
 		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 	default:
 		return core.StepResult{StepID: step.ID, Succeeded: false},
@@ -59,13 +56,6 @@ func (p *Provider) verifyMembership(ctx context.Context, step core.PlanStep) cor
 			Error: fmt.Errorf("the tailscale client reports %q rather than running",
 				status.BackendState)}
 	}
-
-	// The observed membership is recorded as a resource so the supervisor persists
-	// what was confirmed. Ownership is adopted, never managed: Portico did not sign
-	// this machine in and must not delete the membership when the connection goes.
-	// The stable node identifier is identity: it does not change when the device is
-	// renamed, so Portico does not lose track of a connection that merely changed
-	// its DNS name.
 	identity := status.NodeID()
 	return core.StepResult{
 		StepID: step.ID, Succeeded: true,
@@ -82,43 +72,68 @@ func (p *Provider) verifyMembership(ctx context.Context, step core.PlanStep) cor
 	}
 }
 
-// verifyOrigin probes the local address before publishing it.
-//
-// Publishing an address nothing is listening on produces a tailnet name that refuses
-// every connection, which is harder to diagnose than a refusal now.
+// verifyOrigin probes the local backend before publishing it. It reconstructs the
+// exact route from the step so that protocol-aware probing (TCP dial vs HTTP/HTTPS
+// probe) matches the protocol being published.
 func (p *Provider) verifyOrigin(step core.PlanStep) core.StepResult {
-	target := step.Technical.Parameters["target"]
-	if target == "" {
-		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("the plan carried no address to publish")}
-	}
-	conn, err := net.DialTimeout("tcp", target, dialTimeout)
+	route, err := serveRouteFromStep(step.Technical.Parameters)
 	if err != nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("nothing is listening on %s: %w", target, err)}
+			Error: fmt.Errorf("the plan carried no address to publish: %w", err)}
 	}
-	conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	switch route.BackendProtocol {
+	case "http", "https":
+		if err := probeHTTPBackend(ctx, route); err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false,
+				Error: fmt.Errorf("%s is not reachable: %w", route.BackendEndpoint(), err)}
+		}
+	default:
+		// TCP (and anything else) — verify something is listening on the port.
+		conn, err := net.DialTimeout("tcp", route.BackendTarget(), dialTimeout)
+		if err != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false,
+				Error: fmt.Errorf("nothing is listening on %s: %w", route.BackendEndpoint(), err)}
+		}
+		conn.Close()
+	}
 	return core.StepResult{StepID: step.ID, Succeeded: true}
 }
 
-// serve publishes the local address to the tailnet.
-func (p *Provider) serve(ctx context.Context, connectionID core.ConnectionID,
-	step core.PlanStep) core.StepResult {
+// probeHTTPBackend issues a GET to the canonical backend URL and reports whether it
+// gets a response. Any response (even 5xx) is enough to confirm something is listening.
+func probeHTTPBackend(ctx context.Context, route ServeRoute) error {
+	endpoint := route.BackendEndpoint()
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint+"/", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
 
-	target := step.Technical.Parameters["target"]
-	if target == "" {
-		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("the plan carried no address to publish")}
+// serve publishes the local address to the tailnet and persists the exact route.
+//
+// The route's identity is the durable ExternalID. The route's own ResourceMetadata
+// reuses the canonical step encoding — these two can never drift, because they are
+// the same map produced by the same function.
+func (p *Provider) serve(ctx context.Context, step core.PlanStep) core.StepResult {
+	route, err := serveRouteFromStep(step.Technical.Parameters)
+	if err != nil {
+		return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}
 	}
 
-	// `--bg` so the serve outlives the command. Without it the client would hold the
-	// foreground until interrupted, and the step would never return.
-	if _, err := p.runner.Run(ctx, "serve", "--bg", target); err != nil {
+	if _, err := p.runner.Run(ctx, route.OpenArgs()...); err != nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("the tailscale client would not publish %s: %w", target, err)}
+			Error: fmt.Errorf("the tailscale client would not publish %s: %w", route.Identity(), err)}
 	}
-
-	p.remember(connectionID, target)
 
 	status, statusErr := readStatus(ctx, p.runner)
 	address := ""
@@ -126,77 +141,97 @@ func (p *Provider) serve(ctx context.Context, connectionID core.ConnectionID,
 		address = status.PrivateAddress()
 	}
 
-	// The serve is a resource Portico created, so it is owned: closing the connection
-	// withdraws exactly this, and nothing else the user configured by hand.
+	metadata := route.ResourceMetadata()
+	metadata["address"] = address
+
 	return core.StepResult{
 		StepID: step.ID, Succeeded: true,
 		Resources: []core.ProviderResource{{
 			Type:       core.ResourceTailnetServe,
-			ExternalID: target,
+			ExternalID: route.Identity(),
 			Ownership:  core.OwnershipManaged,
-			Metadata:   map[string]string{"address": address},
+			Metadata:   metadata,
 		}},
 	}
 }
 
-// verifyServe confirms the client reports the serve.
+// verifyServe confirms the client reports the exact route Portico created.
+//
+// Same frontend identity + same complete backend → success. Same frontend identity +
+// different backend → failure (drift is reported by the step that repairs it). No
+// frontend identity → failure (missing is reported by the step that recreates it).
 func (p *Provider) verifyServe(ctx context.Context, step core.PlanStep) core.StepResult {
-	target := step.Technical.Parameters["target"]
-	serving, err := p.servedTargets(ctx)
+	route, err := serveRouteFromStep(step.Technical.Parameters)
+	if err != nil {
+		return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}
+	}
+
+	serving, err := p.observedRoutes(ctx)
 	if err != nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
 			Error: fmt.Errorf("could not read the tailscale serve configuration: %w", err)}
 	}
-	if !serving[target] {
-		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("the client accepted the request but does not report serving %s", target)}
+
+	for _, observed := range serving {
+		if observed.Equal(route) {
+			return core.StepResult{StepID: step.ID, Succeeded: true}
+		}
 	}
-	return core.StepResult{StepID: step.ID, Succeeded: true}
+	return core.StepResult{StepID: step.ID, Succeeded: false,
+		Error: fmt.Errorf("the client accepted the request but does not report serving %s", route.Identity())}
 }
 
-// unserve withdraws the serve Portico configured.
-func (p *Provider) unserve(ctx context.Context, connectionID core.ConnectionID,
-	step core.PlanStep) core.StepResult {
-
-	target := step.Technical.Parameters["target"]
-	if target == "" {
-		target = p.servedTarget(connectionID)
-	}
-	if target == "" {
-		// Nothing recorded to withdraw. That is the desired state, so it succeeds
-		// rather than failing a close because there was nothing to close.
-		p.forget(connectionID)
-		return core.StepResult{StepID: step.ID, Succeeded: true}
+// unserve withdraws the exact serve Portico configured. The route must be
+// reconstructable from the step; if it cannot, the step fails.
+//
+// A successful absence after an idempotent repeated close is acceptable only when a
+// follow-up authoritative observation confirms the frontend binding is gone.
+func (p *Provider) unserve(ctx context.Context, step core.PlanStep) core.StepResult {
+	route, err := serveRouteFromStep(step.Technical.Parameters)
+	if err != nil {
+		return core.StepResult{StepID: step.ID, Succeeded: false,
+			Error: fmt.Errorf("cannot reconstruct the serve to withdraw: %w", err)}
 	}
 
-	if _, err := p.runner.Run(ctx, "serve", "--bg", "off", target); err != nil {
-		// Already withdrawn is success: closing twice must not fail. Anything else is
-		// reported, because a serve left running keeps the service reachable after
-		// the user asked for it to stop.
-		serving, statusErr := p.servedTargets(ctx)
-		if statusErr == nil && !serving[target] {
-			p.forget(connectionID)
+	if _, err := p.runner.Run(ctx, route.CloseArgs()...); err != nil {
+		// The close command failed. Verify whether the route is still present — an
+		// idempotent repeated close may report failure when the binding is already gone.
+		serving, statusErr := p.observedRoutes(ctx)
+		if statusErr == nil {
+			for _, observed := range serving {
+				if observed.IsSameIdentity(route) {
+					return core.StepResult{StepID: step.ID, Succeeded: false,
+						Error: fmt.Errorf("the tailscale client would not stop publishing %s: %w", route.Identity(), err)}
+				}
+			}
+			// The frontend binding is gone — the close effectively succeeded.
 			return core.StepResult{StepID: step.ID, Succeeded: true}
 		}
 		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("the tailscale client would not stop publishing %s: %w", target, err)}
+			Error: fmt.Errorf("the tailscale client would not stop publishing %s: %w", route.Identity(), err)}
 	}
-
-	p.forget(connectionID)
 	return core.StepResult{StepID: step.ID, Succeeded: true}
 }
 
-// Observe reports the connection's state from the client, not from memory.
+// observedRoutes reads the full serve configuration the client reports. A non-zero
+// exit code from `tailscale serve status --json` is an observation failure/transient,
+// NOT a valid empty config — permission, daemon, and version failures can still
+// produce partial output. Empty valid `{}` on success means "nothing served".
+func (p *Provider) observedRoutes(ctx context.Context) ([]ServeRoute, error) {
+	out, err := p.runner.Run(ctx, "serve", "status", "--json")
+	if err != nil {
+		return nil, err
+	}
+	return observedRoutes(out)
+}
+
+// Observe reports the connection's state from the durable resource inventory — never
+// from adapter memory. The provider reconstructs solely from ProviderResource rows.
 func (p *Provider) Observe(ctx context.Context, id core.ConnectionID) (*core.ObservedConnection, error) {
 	return p.ObserveWithResources(ctx, id, nil)
 }
 
 // ObserveWithResources observes from the durable resource inventory.
-//
-// A restarted supervisor has no memory of what it configured, so the resources it
-// persisted are the input: the membership it confirmed and the exact serve target it
-// created. Both are checked against the client's own state by exact identifier, never
-// by looking for something that resembles Portico's.
 func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionID,
 	resources []core.ProviderResource) (*core.ObservedConnection, error) {
 
@@ -208,11 +243,10 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 
 	status, statusErr := readStatus(ctx, p.runner)
 
-	// Serve state is read once, because several resources may ask about it.
-	var serving map[string]bool
+	var serving []ServeRoute
 	var serveErr error
 	if hasServeResource(resources) {
-		serving, serveErr = p.servedTargets(ctx)
+		serving, serveErr = p.observedRoutes(ctx)
 	}
 
 	for _, res := range resources {
@@ -225,8 +259,6 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 		case core.ResourceTailnetMembership:
 			switch {
 			case statusErr != nil:
-				// A client that cannot be reached says nothing about membership.
-				// Reporting it missing would make reconciliation act on a guess.
 				observed.Status = core.ObservationTransient
 				observed.Detail = statusErr.Error()
 			case status.NeedsLogin() || status.NeedsMachineAuth():
@@ -236,9 +268,6 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 				observed.Status = core.ObservationTransient
 				observed.Detail = fmt.Sprintf("the client reports %q", status.BackendState)
 			case !membershipMatches(status, res.ExternalID):
-				// The machine is on a tailnet under a different identifier than the
-				// one recorded. That is not the resource Portico confirmed, so it is
-				// not reported as present.
 				observed.Status = core.ObservationMissing
 				observed.Detail = fmt.Sprintf(
 					"this machine is now %q on the tailnet, not %q",
@@ -252,12 +281,31 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 			case serveErr != nil:
 				observed.Status = core.ObservationTransient
 				observed.Detail = serveErr.Error()
-			case serving[res.ExternalID]:
-				observed.Status = core.ObservationPresent
-				p.remember(id, res.ExternalID)
 			default:
-				observed.Status = core.ObservationMissing
-				observed.Detail = fmt.Sprintf("the tailnet is not serving %s", res.ExternalID)
+				expected, err := serveRouteFromResource(res.Metadata)
+				if err != nil {
+					observed.Status = core.ObservationTransient
+					observed.Detail = err.Error()
+					break
+				}
+				var matching *ServeRoute
+				for i := range serving {
+					if serving[i].IsSameIdentity(expected) {
+						matching = &serving[i]
+						break
+					}
+				}
+				if matching == nil {
+					observed.Status = core.ObservationMissing
+					observed.Detail = fmt.Sprintf("the tailnet is not serving %s", res.ExternalID)
+				} else if matching.Equal(expected) {
+					observed.Status = core.ObservationPresent
+				} else {
+					observed.Status = core.ObservationDrifted
+					observed.Detail = fmt.Sprintf(
+						"the route %s is now serving %s, not %s",
+						res.ExternalID, matching.BackendEndpoint(), expected.BackendEndpoint())
+				}
 			}
 
 		default:
@@ -268,10 +316,6 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 		obs.ResourceStatuses = append(obs.ResourceStatuses, observed)
 	}
 
-	// Aggregate connector state is derived from the required resource set, not any
-	// single resource. A join needs intact membership. An expose needs intact
-	// membership AND an intact serve — the machine being on the network while the
-	// connection is not being served is not "running".
 	membershipOK := true
 	serveOK := !hasServeResource(resources)
 	for _, res := range obs.ResourceStatuses {
@@ -286,14 +330,9 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 		obs.Connector.Status = string(core.ConnectorStatusRunning)
 	}
 
-	// The tailnet address is not reported here. ObservedConnection has no endpoint
-	// field, and inventing one would mean a second place the address comes from: the
-	// plan's Expected.PrivateAddress is what the supervisor records, and the
-	// membership resource's metadata carries what was observed.
 	return obs, nil
 }
 
-// hasServeResource reports whether any resource needs the serve configuration read.
 func hasServeResource(resources []core.ProviderResource) bool {
 	for _, res := range resources {
 		if res.Type == core.ResourceTailnetServe {
@@ -303,45 +342,8 @@ func hasServeResource(resources []core.ProviderResource) bool {
 	return false
 }
 
-// servedTargets reads which local addresses the client is publishing.
-func (p *Provider) servedTargets(ctx context.Context) (map[string]bool, error) {
-	out, err := p.runner.Run(ctx, "serve", "status", "--json")
-	if err != nil {
-		// A client with no serve configuration exits non-zero on some versions while
-		// printing usable output, so the output is parsed before the error is
-		// reported — otherwise "nothing is served" reads as "the client is broken".
-		if targets, parseErr := parseServeStatus(out); parseErr == nil {
-			return targets, nil
-		}
-		return nil, err
-	}
-	return parseServeStatus(out)
-}
-
-// remember records the target Portico is serving for a connection.
-func (p *Provider) remember(id core.ConnectionID, target string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.serving[id] = target
-}
-
-// forget drops the recorded target.
-func (p *Provider) forget(id core.ConnectionID) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.serving, id)
-}
-
-// servedTarget is the target recorded for a connection, if this process configured it.
-func (p *Provider) servedTarget(id core.ConnectionID) string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.serving[id]
-}
-
 // membershipMatches reports whether the observed membership corresponds to the
-// recorded resource. It matches on the stable node identifier, with a fallback to
-// the DNS name so resource rows written by an earlier Portico are still recognised.
+// recorded resource.
 func membershipMatches(status *Status, recordedID string) bool {
 	if recordedID == "" {
 		return false
@@ -350,7 +352,5 @@ func membershipMatches(status *Status, recordedID string) bool {
 	if current == recordedID {
 		return true
 	}
-	// Compatibility: an older Portico stored the DNS name as identity. Match it so
-	// the resource is still recognised after an upgrade.
 	return status.MachineName() == recordedID && recordedID != ""
 }

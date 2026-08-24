@@ -13,7 +13,7 @@ import (
 //
 // Observation is what a restarted supervisor depends on: it has no memory of what it
 // configured, so it observes from the resources it persisted. These tests reconstruct the
-// provider — a fresh adapter with an empty map — and observe from that inventory.
+// provider — a fresh adapter — and observe from that inventory.
 
 // stepFor finds a step by its technical type.
 func stepFor(t *testing.T, plan *core.OperationPlan, kind string) core.PlanStep {
@@ -60,8 +60,8 @@ func TestVerifyingMembershipRecordsAnAdoptedResource(t *testing.T) {
 		t.Fatalf("membership recorded as %q; Portico did not create it and must not delete it",
 			resource.Ownership)
 	}
-	if resource.ExternalID != "workstation.tail0abc.ts.net" {
-		t.Fatalf("membership recorded under %q", resource.ExternalID)
+	if resource.ExternalID != "n1234567890123456" {
+		t.Fatalf("membership recorded under %q, want the stable node ID", resource.ExternalID)
 	}
 }
 
@@ -88,7 +88,7 @@ func TestVerifyingMembershipFailsWhenSignedOut(t *testing.T) {
 func TestServingPublishesAndRecordsAManagedResource(t *testing.T) {
 	runner := newFakeRunner().
 		on("status --json", statusRunning, nil).
-		on("serve --bg 127.0.0.1:3000", "", nil).
+		on("serve --bg --http=3000 http://127.0.0.1:3000", "", nil).
 		on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
 	provider := New(runner)
 
@@ -106,8 +106,8 @@ func TestServingPublishesAndRecordsAManagedResource(t *testing.T) {
 		t.Fatalf("the serve failed: %v", result.Error)
 	}
 	// --bg, or the client would hold the foreground and the step would never return.
-	if !runner.called("serve --bg 127.0.0.1:3000") {
-		t.Fatalf("the serve was not run in the background: %v", runner.calls())
+	if !runner.called("serve --bg --http=3000 http://127.0.0.1:3000") {
+		t.Fatalf("the serve was not run with the correct command: %v", runner.calls())
 	}
 	if len(result.Resources) != 1 {
 		t.Fatalf("recorded %d resources", len(result.Resources))
@@ -120,8 +120,13 @@ func TestServingPublishesAndRecordsAManagedResource(t *testing.T) {
 	if resource.Ownership != core.OwnershipManaged {
 		t.Fatalf("the serve is recorded as %q; Portico created it", resource.Ownership)
 	}
-	if resource.ExternalID != "127.0.0.1:3000" {
+	// ExternalID is the frontend identity, not the backend target.
+	if resource.ExternalID != "http:3000:/" {
 		t.Fatalf("the serve is recorded under %q", resource.ExternalID)
+	}
+	// Metadata carries the canonical route fields.
+	if resource.Metadata["frontend_protocol"] != "http" || resource.Metadata["backend_host"] != "127.0.0.1" {
+		t.Fatalf("metadata does not carry the route: %v", resource.Metadata)
 	}
 
 	// And the verify step confirms the client actually reports it.
@@ -135,6 +140,64 @@ func TestServingPublishesAndRecordsAManagedResource(t *testing.T) {
 	}
 }
 
+// TestServingHTTPSPublishesAndRecordsAManagedResource pins the HTTPS expose path.
+func TestServingHTTPSPublishesAndRecordsAManagedResource(t *testing.T) {
+	runner := newFakeRunner().
+		on("status --json", statusRunning, nil).
+		on("serve --bg --https=8443 https://127.0.0.1:8443", "", nil).
+		on("serve status --json", serveHTTPS("127.0.0.1:8443"), nil)
+	provider := New(runner)
+
+	plan, err := provider.Plan(context.Background(),
+		core.DesiredConnection{Profile: exposeProfileWithProtocol(core.DesiredOpen, "127.0.0.1:8443", core.ProtocolHTTPS)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := provider.ExecuteStep(context.Background(), "conn-serve", stepFor(t, plan, "serve"))
+	if err != nil {
+		t.Fatalf("ExecuteStep: %v", err)
+	}
+	if !result.Succeeded {
+		t.Fatalf("the serve failed: %v", result.Error)
+	}
+	if !runner.called("serve --bg --https=8443 https://127.0.0.1:8443") {
+		t.Fatalf("the serve was not run with the correct command: %v", runner.calls())
+	}
+	if result.Resources[0].ExternalID != "https:8443:/" {
+		t.Fatalf("the serve is recorded under %q", result.Resources[0].ExternalID)
+	}
+}
+
+// TestServingTCPPublishesAndRecordsAManagedResource pins the TCP expose path.
+func TestServingTCPPublishesAndRecordsAManagedResource(t *testing.T) {
+	runner := newFakeRunner().
+		on("status --json", statusRunning, nil).
+		on("serve --bg --tcp=5432 tcp://127.0.0.1:5432", "", nil).
+		on("serve status --json", serveTCP("127.0.0.1:5432"), nil)
+	provider := New(runner)
+
+	plan, err := provider.Plan(context.Background(),
+		core.DesiredConnection{Profile: exposeProfileWithProtocol(core.DesiredOpen, "127.0.0.1:5432", core.ProtocolTCP)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := provider.ExecuteStep(context.Background(), "conn-serve", stepFor(t, plan, "serve"))
+	if err != nil {
+		t.Fatalf("ExecuteStep: %v", err)
+	}
+	if !result.Succeeded {
+		t.Fatalf("the serve failed: %v", result.Error)
+	}
+	if !runner.called("serve --bg --tcp=5432 tcp://127.0.0.1:5432") {
+		t.Fatalf("the serve was not run with the correct command: %v", runner.calls())
+	}
+	if result.Resources[0].ExternalID != "tcp:5432:/" {
+		t.Fatalf("the serve is recorded under %q", result.Resources[0].ExternalID)
+	}
+}
+
 // TestAServeTheClientDoesNotReportFailsVerification pins that acceptance is not proof.
 //
 // The client exiting zero means the request was accepted. Whether the tailnet is serving
@@ -143,13 +206,16 @@ func TestServingPublishesAndRecordsAManagedResource(t *testing.T) {
 func TestAServeTheClientDoesNotReportFailsVerification(t *testing.T) {
 	runner := newFakeRunner().
 		on("status --json", statusRunning, nil).
-		on("serve --bg", "", nil).
+		on("serve --bg --http=3000 http://127.0.0.1:3000", "", nil).
 		on("serve status --json", serveNothing, nil)
 
 	result, err := New(runner).ExecuteStep(context.Background(), "conn-serve", core.PlanStep{
 		ID: "s", Technical: core.TechnicalOperation{
 			Provider: "tailscale", Type: "verify_serve",
-			Parameters: map[string]string{"target": "127.0.0.1:3000"},
+			Parameters: map[string]string{
+				"frontend_protocol": "http", "frontend_port": "3000", "frontend_path": "/",
+				"backend_protocol": "http", "backend_host": "127.0.0.1", "backend_port": "3000",
+			},
 		},
 	})
 	if err != nil {
@@ -168,7 +234,10 @@ func TestVerifyingTheOriginRefusesAnAddressNothingListensOn(t *testing.T) {
 		core.PlanStep{
 			ID: "s", Technical: core.TechnicalOperation{
 				Provider: "tailscale", Type: "verify_origin",
-				Parameters: map[string]string{"target": "127.0.0.1:1"},
+				Parameters: map[string]string{
+					"frontend_protocol": "tcp", "frontend_port": "1", "frontend_path": "/",
+					"backend_protocol": "tcp", "backend_host": "127.0.0.1", "backend_port": "1",
+				},
 			},
 		})
 	if err != nil {
@@ -186,12 +255,15 @@ func TestVerifyingTheOriginRefusesAnAddressNothingListensOn(t *testing.T) {
 func TestClosingWithdrawsExactlyWhatWasServed(t *testing.T) {
 	runner := newFakeRunner().
 		on("status --json", statusRunning, nil).
-		on("serve --bg off 127.0.0.1:3000", "", nil)
+		on("serve --bg --http=3000 off", "", nil)
 
 	result, err := New(runner).ExecuteStep(context.Background(), "conn-serve", core.PlanStep{
 		ID: "s", Technical: core.TechnicalOperation{
 			Provider: "tailscale", Type: "unserve",
-			Parameters: map[string]string{"target": "127.0.0.1:3000"},
+			Parameters: map[string]string{
+				"frontend_protocol": "http", "frontend_port": "3000", "frontend_path": "/",
+				"backend_protocol": "http", "backend_host": "127.0.0.1", "backend_port": "3000",
+			},
 		},
 	})
 	if err != nil {
@@ -200,8 +272,8 @@ func TestClosingWithdrawsExactlyWhatWasServed(t *testing.T) {
 	if !result.Succeeded {
 		t.Fatalf("the withdrawal failed: %v", result.Error)
 	}
-	if !runner.called("serve --bg off 127.0.0.1:3000") {
-		t.Fatalf("the exact served address was not withdrawn: %v", runner.calls())
+	if !runner.called("serve --bg --http=3000 off") {
+		t.Fatalf("the exact served frontend was not withdrawn: %v", runner.calls())
 	}
 }
 
@@ -211,13 +283,16 @@ func TestClosingWithdrawsExactlyWhatWasServed(t *testing.T) {
 // has been reached, and failing the close would leave a connection that cannot be closed.
 func TestClosingTwiceSucceeds(t *testing.T) {
 	runner := newFakeRunner().
-		on("serve --bg off", "serve config does not exist", errors.New("exit status 1")).
+		on("serve --bg --http=3000 off", "serve config does not exist", errors.New("exit status 1")).
 		on("serve status --json", serveNothing, nil)
 
 	result, err := New(runner).ExecuteStep(context.Background(), "conn-serve", core.PlanStep{
 		ID: "s", Technical: core.TechnicalOperation{
 			Provider: "tailscale", Type: "unserve",
-			Parameters: map[string]string{"target": "127.0.0.1:3000"},
+			Parameters: map[string]string{
+				"frontend_protocol": "http", "frontend_port": "3000", "frontend_path": "/",
+				"backend_protocol": "http", "backend_host": "127.0.0.1", "backend_port": "3000",
+			},
 		},
 	})
 	if err != nil {
@@ -234,14 +309,17 @@ func TestClosingTwiceSucceeds(t *testing.T) {
 // Reporting success would tell them it is closed when it is not.
 func TestAFailedWithdrawalIsReported(t *testing.T) {
 	runner := newFakeRunner().
-		on("serve --bg off", "permission denied", errors.New("exit status 1")).
+		on("serve --bg --http=3000 off", "permission denied", errors.New("exit status 1")).
 		// Still serving, so the failure was real.
 		on("serve status --json", serveHTTP("127.0.0.1:3000"), nil)
 
 	result, err := New(runner).ExecuteStep(context.Background(), "conn-serve", core.PlanStep{
 		ID: "s", Technical: core.TechnicalOperation{
 			Provider: "tailscale", Type: "unserve",
-			Parameters: map[string]string{"target": "127.0.0.1:3000"},
+			Parameters: map[string]string{
+				"frontend_protocol": "http", "frontend_port": "3000", "frontend_path": "/",
+				"backend_protocol": "http", "backend_host": "127.0.0.1", "backend_port": "3000",
+			},
 		},
 	})
 	if err != nil {

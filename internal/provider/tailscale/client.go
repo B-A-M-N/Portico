@@ -7,10 +7,10 @@
 // and `expose`. Tailscale has two primitives that answer exactly those:
 //
 //   - `tailscale up` brings this machine onto a tailnet. That is `join`: the machine
-//     becomes reachable by other devices on the network, and nothing local is
+//     becomes reachable by the other devices on the network, and nothing local is
 //     published.
 //   - `tailscale serve` publishes one local address to the tailnet, and only to the
-//     tailnet. That is `expose`: a service on this machine becomes reachable by other
+//     tailnet. That is `expose`: a service on this machine becomes reachable by the other
 //     devices, with no public address anywhere.
 //
 // Nothing else in Tailscale is implemented. `tailscale funnel` publishes to the whole
@@ -35,13 +35,18 @@
 // does not claim it, and closing such a connection does not log the machine out.
 // Serving is per-address and Portico does own what it created, so closing a serve
 // connection withdraws exactly the serve it configured.
+//
+// # ServeRoute is the canonical representation
+//
+// All Serve-specific code operates on `ServeRoute` defined in `serve.go`. There are no
+// parallel meanings (string target, map[string]bool, backend-as-identity). One route
+// type, one normalization, one identity.
 package tailscale
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -209,99 +214,4 @@ func parseStatus(out []byte) (*Status, error) {
 		return nil, fmt.Errorf("could not read the tailscale client's status output: %w", err)
 	}
 	return &status, nil
-}
-
-// ServeConfig is the part of `tailscale serve status --json` Portico reads.
-//
-// The client's document maps a listening port to its handlers, and each handler names
-// the local address it proxies to. Portico published a local address, so that is what
-// it looks for: the set of proxy targets currently configured.
-type ServeConfig struct {
-	TCP map[string]*ServeTCP `json:"TCP"`
-	Web map[string]*ServeWeb `json:"Web"`
-}
-
-// ServeTCP is a raw TCP forward to a local port.
-type ServeTCP struct {
-	// TCPForward is the local address, as host:port.
-	TCPForward string `json:"TCPForward"`
-}
-
-// ServeWeb is an HTTP handler set for one listening address.
-type ServeWeb struct {
-	Handlers map[string]*ServeHandler `json:"Handlers"`
-}
-
-// ServeHandler is one path handler.
-type ServeHandler struct {
-	// Proxy is the local address requests are forwarded to.
-	Proxy string `json:"Proxy"`
-}
-
-// parseServeStatus returns the set of local addresses currently being served.
-//
-// Addresses are normalised so a target Portico recorded as 127.0.0.1:3000 matches a
-// client reporting http://127.0.0.1:3000. Comparing the raw strings would report a
-// serve as missing whenever the client chose a different but equivalent spelling, and
-// a serve reported missing is one reconciliation would recreate.
-func parseServeStatus(out []byte) (map[string]bool, error) {
-	targets := map[string]bool{}
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
-		// No serve configuration is a valid answer, not a parse failure.
-		return targets, nil
-	}
-
-	var config ServeConfig
-	if err := json.Unmarshal(out, &config); err != nil {
-		return nil, fmt.Errorf("could not read the tailscale serve configuration: %w", err)
-	}
-	for _, forward := range config.TCP {
-		if forward == nil {
-			continue
-		}
-		if target := normaliseServeTarget(forward.TCPForward); target != "" {
-			targets[target] = true
-		}
-	}
-	for _, web := range config.Web {
-		if web == nil {
-			continue
-		}
-		for _, handler := range web.Handlers {
-			if handler == nil {
-				continue
-			}
-			if target := normaliseServeTarget(handler.Proxy); target != "" {
-				targets[target] = true
-			}
-		}
-	}
-	return targets, nil
-}
-
-// normaliseServeTarget reduces a proxy target to host:port.
-func normaliseServeTarget(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ""
-	}
-	// The client may report a scheme; Portico records a bare address.
-	for _, scheme := range []string{"http://", "https://", "https+insecure://", "tcp://"} {
-		value = strings.TrimPrefix(value, scheme)
-	}
-	value = strings.TrimSuffix(value, "/")
-	// A trailing path is not part of the address.
-	if slash := strings.IndexByte(value, '/'); slash >= 0 {
-		value = value[:slash]
-	}
-	// localhost and 127.0.0.1 are the same host, and the client is not consistent
-	// about which it echoes back.
-	if host, port, err := net.SplitHostPort(value); err == nil {
-		if host == "localhost" {
-			host = "127.0.0.1"
-		}
-		return net.JoinHostPort(host, port)
-	}
-	return value
 }
