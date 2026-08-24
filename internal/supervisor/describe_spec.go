@@ -248,7 +248,8 @@ func describeOriginOwnership(p *core.ConnectionProfile, rt *core.ConnectionRunti
 // a test pins the two against each other so neither can move alone.
 func kindSupportsRepair(kind core.ConnectionKind) bool {
 	switch kind {
-	case core.ConnectionServiceExposure, core.ConnectionPortForward:
+	case core.ConnectionServiceExposure, core.ConnectionPortForward,
+		core.ConnectionPrivateNetwork:
 		return true
 	default:
 		return false

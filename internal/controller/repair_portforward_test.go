@@ -44,16 +44,21 @@ func TestAPortForwardCanBeRepaired(t *testing.T) {
 	if !c.CanRepair(forwardProfile("conn-forward")) {
 		t.Fatal("a port forward is still reported as unrepairable")
 	}
-	// And the kinds that genuinely have no repair path still say so, rather than
-	// CanRepair becoming a blanket yes.
-	for _, kind := range []core.ConnectionKind{
-		core.ConnectionPrivateNetwork, core.ConnectionClientTunnel,
-	} {
-		profile := forwardProfile("conn-x")
-		profile.Kind = kind
-		if c.CanRepair(profile) {
-			t.Errorf("%s is reported repairable with no repair path implemented", kind)
-		}
+	// Private networks are repairable too, since the Tailscale adapter landed: a serve
+	// Portico created and the network is no longer serving is drift it can put back.
+	network := forwardProfile("conn-network")
+	network.Kind = core.ConnectionPrivateNetwork
+	if !c.CanRepair(network) {
+		t.Error("a private network is reported unrepairable, but it has a repair path")
+	}
+
+	// A client tunnel still says no, so CanRepair has not become a blanket yes. Portico
+	// manages a client against a tunnel someone else created; there is no resource of its
+	// own to put back.
+	tunnel := forwardProfile("conn-tunnel")
+	tunnel.Kind = core.ConnectionClientTunnel
+	if c.CanRepair(tunnel) {
+		t.Error("a client tunnel is reported repairable with no repair path implemented")
 	}
 }
 

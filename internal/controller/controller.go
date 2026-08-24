@@ -1052,7 +1052,8 @@ func (c *Controller) CanRepair(profile *core.ConnectionProfile) bool {
 		return false
 	}
 	switch profile.Kind {
-	case core.ConnectionServiceExposure, core.ConnectionPortForward:
+	case core.ConnectionServiceExposure, core.ConnectionPortForward,
+		core.ConnectionPrivateNetwork:
 		return true
 	}
 	return false
@@ -1107,6 +1108,21 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 			return nil, ErrNoRepairNeeded
 		}
 		return c.finishRepairPlan(ctx, profile, forwardSteps)
+	}
+
+	// A private network has its own repair too. What can be wrong depends on the mode: a
+	// publish has a serve Portico created and can put back, and a join has nothing Portico
+	// created — so a machine that has left the network is reported rather than
+	// "repaired" by a step that would fail.
+	if profile.Kind == core.ConnectionPrivateNetwork {
+		networkSteps, err := c.privateNetworkRepairSteps(ctx, profile)
+		if err != nil {
+			return nil, err
+		}
+		if len(networkSteps) == 0 {
+			return nil, ErrNoRepairNeeded
+		}
+		return c.finishRepairPlan(ctx, profile, networkSteps)
 	}
 
 	// Build a repair plan based on origin and connector status. Causal order:
