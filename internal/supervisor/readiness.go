@@ -106,6 +106,11 @@ func (h *supervisorHandler) HandleReadiness() (*ipc.ReadinessDTO, error) {
 		readiness.Connections = append(readiness.Connections, entry)
 	}
 
+	// The health checks, computed once here so doctor, the setup screen and the
+	// recovery flow all read the same answers rather than each deriving their own
+	// from the provider list.
+	readiness.Checks = h.healthChecks(ctx)
+
 	readiness.Summary = summariseReadiness(readiness)
 	return readiness, nil
 }

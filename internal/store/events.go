@@ -111,6 +111,30 @@ func (s *Store) OldestEventSeq(ctx context.Context) (int64, error) {
 	return seq.Int64, nil
 }
 
+// EventJournalHealth reports the size and span of the retained journal.
+//
+// Health checks need to distinguish an empty journal from one that has been
+// trimmed: a client reconnecting with a cursor older than the oldest retained
+// sequence cannot be replayed to, and a journal that has stopped being trimmed
+// grows without bound. Both are answerable here and nowhere else, because the
+// supervisor is the only component that opens the database.
+func (s *Store) EventJournalHealth(ctx context.Context) (count int64, oldest int64, newest int64, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var oldestVal, newestVal sql.NullInt64
+	row := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*), MIN(seq), MAX(seq) FROM events")
+	if err := row.Scan(&count, &oldestVal, &newestVal); err != nil {
+		return 0, 0, 0, fmt.Errorf("query event journal health: %w", err)
+	}
+	return count, oldestVal.Int64, newestVal.Int64, nil
+}
+
+// EventRetentionLimit is the number of events the journal keeps, so a health
+// check can say how close to the limit the journal is running rather than
+// reporting a raw count nobody can interpret.
+func EventRetentionLimit() int { return eventRetentionCount }
+
 // GetEventsSince returns events with sequence greater than afterSeq, ordered by seq.
 // Used for SSE replay on reconnect.
 func (s *Store) GetEventsSince(ctx context.Context, afterSeq int64, limit int) ([]core.Event, error) {

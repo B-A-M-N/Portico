@@ -182,10 +182,39 @@ type HealthDTO struct {
 	ComputedAt string         `json:"computed_at,omitempty"`
 }
 
-// HealthCheckDTO is a single health check result.
+// HealthCheckDTO is one named question about this machine, and its answer.
+//
+// It replaces four separate interpretations of health. Readiness aggregated
+// provider availability and per-connection blockers; doctor re-derived provider
+// status from the same fields with its own switch, reaching its own verdicts; setup
+// rendered readiness; recovery interpreted a failure to connect. Each had its own
+// idea of what "ready" meant, and the copy that drifted was whichever one nobody
+// was reading.
+//
+// The shape carries what a reader needs in the order they need it: what was
+// checked, how it came out, what that means, what to do, and the technical detail
+// last. This type existed with only a state and a detail string and had no callers
+// at all — it is completed here rather than replaced, because a second health type
+// would be the fifth interpretation.
 type HealthCheckDTO struct {
-	State       string `json:"state"`
-	Detail      string `json:"detail,omitempty"`
+	// ID names the check so a client can find one without matching on its title.
+	ID string `json:"id,omitempty"`
+	// Title is what was checked, in the user's words.
+	Title string `json:"title,omitempty"`
+	// State is "ok", "attention", "problem" or "unknown".
+	//
+	// "unknown" is not "ok": a check that could not be run must not report a pass,
+	// because that is how a broken machine looks healthy.
+	State string `json:"state"`
+	// Summary states the finding in one sentence.
+	Summary string `json:"summary,omitempty"`
+	// Detail explains it, for a reader who wants to know why it matters.
+	Detail string `json:"detail,omitempty"`
+	// NextAction is the concrete thing to do about it, when there is one.
+	NextAction string `json:"next_action,omitempty"`
+	// Technical is the underlying error or measurement. It is secondary
+	// information and belongs behind the explanation, never instead of it.
+	Technical   string `json:"technical,omitempty"`
 	LastChecked string `json:"last_checked,omitempty"`
 }
 
@@ -996,6 +1025,14 @@ type ReadinessDTO struct {
 	LaunchModePinnedBy string                   `json:"launch_mode_pinned_by,omitempty"`
 	Providers          []ProviderReadinessDTO   `json:"providers,omitempty"`
 	Connections        []ConnectionReadinessDTO `json:"connections,omitempty"`
+	// Checks are the machine's health, as the supervisor sees it.
+	//
+	// They are carried here rather than on a route of their own because readiness
+	// and health are the same question asked by different screens: the setup screen
+	// wants to know what to fix, doctor wants to print it, and both were deriving
+	// their own answers from the provider list. One set of checks, computed once,
+	// read by everything.
+	Checks []HealthCheckDTO `json:"checks,omitempty"`
 }
 
 // LaunchModeRequest asks the supervisor to change the startup gate.

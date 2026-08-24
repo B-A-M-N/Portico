@@ -82,9 +82,20 @@ func (m *SetupModel) View() string {
 		b.WriteString(fmt.Sprintf("             fixed by %s; unset it to change this here\n",
 			m.Readiness.LaunchModePinnedBy))
 	} else {
-		b.WriteString("             applies until the supervisor restarts\n")
+		// The mode is written to the config file the supervisor owns, so an
+		// explicit choice survives a restart. This used to say it applied only
+		// until the supervisor restarted, which was true before settings were
+		// persisted and has been wrong since.
+		b.WriteString("             saved, and kept across restarts\n")
 	}
 	b.WriteString("\n")
+
+	// What Portico can see about this machine. These are the supervisor's own
+	// checks — the same ones `portico doctor` prints — so the screen a user opens
+	// when something is wrong and the command they run agree about what is wrong.
+	if section := m.renderChecks(); section != "" {
+		b.WriteString(section)
+	}
 
 	b.WriteString("PROVIDERS\n")
 	for i, p := range m.Readiness.Providers {

@@ -4603,6 +4603,36 @@ type CleanupItem struct {
 // deliberately independent from provider_resources: this is the path for
 // resources created successfully before the normal persistence transaction
 // failed.
+// CountUnresolvedCleanupItems reports how many provider resources Portico has
+// recorded and not yet finished removing.
+//
+// An unresolved item is a resource that exists at the provider with a Portico
+// record saying it should not. It is the state that quietly costs money and blocks
+// account removal, and nothing surfaced it: a health check that omits it reports a
+// clean machine while resources accumulate at the provider.
+func (s *Store) CountUnresolvedCleanupItems(ctx context.Context) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// Every state this table records is an unfinished obligation: a row is written
+	// when compensation could not run, could not be journaled, failed, or finished
+	// with an unknown outcome — "compensation_pending", "compensation_failed" and
+	// "outcome_unknown" are the states in use, and there is no "resolved".
+	//
+	// Nothing removes a row either, so this counts every obligation ever recorded
+	// rather than only the outstanding ones. That is worth stating plainly: the
+	// number is a lower bound on trouble and not a live queue depth, and a health
+	// check must describe it as history rather than implying the resources are
+	// still there. Discharging these records is unbuilt work, tracked in
+	// docs/REMAINING_WORK.md; counting them is how it stops being invisible.
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM resource_cleanup_items`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count unresolved cleanup items: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) RecordCleanupItem(ctx context.Context, item CleanupItem) error {
 	if item.OperationID == "" || item.ConnectionID == "" || item.ProviderID == "" || item.ResourceType == "" || item.ExternalID == "" || item.State == "" {
 		return fmt.Errorf("invalid cleanup item")

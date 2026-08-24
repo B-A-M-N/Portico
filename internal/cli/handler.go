@@ -795,82 +795,137 @@ func handleDiscover(cmd *cobra.Command) error {
 	return nil
 }
 
+// handleDoctor reports what Portico can see about this machine.
+//
+// It used to make its own health judgements: a switch over provider availability
+// strings, reaching verdicts the readiness screen reached differently from the same
+// data. Two interpretations of one field is one too many, and the one that drifted
+// was whichever nobody was reading.
+//
+// So doctor now prints the supervisor's checks. It adds only what the supervisor
+// cannot answer — the state of files on this machine, which doctor can see without
+// a supervisor running — and stays read-only: everything below observes and nothing
+// changes state.
 func handleDoctor(cmd *cobra.Command) error {
 	fmt.Println("Portico Doctor")
 	fmt.Println("==============")
 	launcher := app.NewLauncher()
 	paths := launcher.GetPaths()
-	doctorFileStatus("Database", paths.DatabasePath, 0600)
 
-	// Secret store path is versioned and managed by the SecretStore. Report the
-	// active key path through the store rather than hardcoding "portico-key.bin".
+	// Local files first, because these are answerable whether or not a supervisor
+	// is running — and when one is not, they are all a user gets.
+	doctorFileStatus("Database", paths.DatabasePath, 0600)
 	doctorSecretKeyStatus(filepath.Dir(paths.DatabasePath))
 
 	// Doctor is observational by default. In particular, it must not call
 	// getClient because that helper starts a supervisor when none is running.
 	client := launcher.ConnectToSupervisor()
 	if err := client.Health(cmd.Context()); err != nil {
-		fmt.Printf("✗ Supervisor: not running (%v)\n", err)
+		fmt.Printf("\n✗ Supervisor: not running (%v)\n", err)
+		fmt.Println("  Everything below needs a running supervisor. Start one with:")
+		fmt.Println("    portico supervisor run")
 		return fmt.Errorf("supervisor is not running: %w", err)
 	}
+
 	snap, err := client.Snapshot(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("read supervisor snapshot: %w", err)
 	}
-	fmt.Printf("✓ Supervisor reachable (seq: %d)\n", snap.LastSeq)
-	fmt.Printf("✓ Connections: %d\n", len(snap.Connections))
-	// Check providers — use Availability/Readiness rather than Authenticated.
-	providers, err := client.ListProviders(cmd.Context())
-	if err != nil {
-		fmt.Printf("⚠ Provider list: %v\n", err)
-	} else {
-		fmt.Printf("✓ Providers: %d\n", len(providers))
-		for _, p := range providers {
-			status := "✓"
-			reason := p.Availability
-			switch p.Availability {
-			case "ready":
-				if p.Stability == "experimental" || p.Stability == "beta" {
-					status = "~"
-					reason = p.Availability + " • " + p.Stability
-				}
-			case "unconfigured":
-				status = "~"
-				reason = "setup required"
-			case "client_missing":
-				status = "✗"
-				reason = "client not installed"
-			case "degraded":
-				status = "✗"
-				reason = "degraded"
-			case "not_implemented":
-				status = "-"
-				reason = "not implemented"
-			case "experimental":
-				status = "~"
-				reason = "experimental"
-			}
-			fmt.Printf("  %s %s (%s: %s)\n", status, p.DisplayName, p.ID, reason)
-		}
-	}
-	// Check connections
 	running := 0
 	for _, c := range snap.Connections {
 		if c.RuntimeState == "open" {
 			running++
 		}
 	}
-	fmt.Printf("✓ Running connections: %d/%d\n", running, len(snap.Connections))
-	// Discovery check — separate error vs zero services.
-	result, err := client.Discovery(cmd.Context())
+	fmt.Printf("\n✓ Supervisor reachable (seq: %d)\n", snap.LastSeq)
+	fmt.Printf("✓ Connections: %d, of which %d open\n", len(snap.Connections), running)
+
+	// The supervisor's own checks. Readiness carries them, so this is the same
+	// interpretation the setup screen shows rather than a second one.
+	readiness, err := client.Readiness(cmd.Context())
 	if err != nil {
-		fmt.Printf("⚠ Discovery failed: %v\n", err)
-	} else if len(result.Services) > 0 {
-		fmt.Printf("✓ Discovery: %d services available\n", len(result.Services))
-	} else {
-		fmt.Printf("~ Discovery: 0 services found\n")
+		fmt.Printf("\n⚠ Could not read the supervisor's health checks: %v\n", err)
+		return nil
 	}
+
+	fmt.Println()
+	if readiness.Summary != "" {
+		fmt.Println(readiness.Summary)
+		fmt.Println()
+	}
+
+	problems := 0
+	for _, check := range readiness.Checks {
+		fmt.Printf("%s %s\n", doctorCheckMark(check.State), doctorCheckTitle(check))
+		if check.Summary != "" {
+			fmt.Printf("    %s\n", check.Summary)
+		}
+		if check.Detail != "" {
+			fmt.Printf("    %s\n", check.Detail)
+		}
+		if check.NextAction != "" {
+			fmt.Printf("    → %s\n", check.NextAction)
+		}
+		// Technical detail is secondary and printed last, so a reader who does not
+		// need it does not have to read past it to find what to do.
+		if check.Technical != "" {
+			fmt.Printf("    (%s)\n", check.Technical)
+		}
+		if check.State == "problem" {
+			problems++
+		}
+	}
+
+	// Connections that cannot open, with the reason. The supervisor computed these
+	// blockers; doctor reports them rather than working them out again.
+	var blocked []ipc.ConnectionReadinessDTO
+	for _, conn := range readiness.Connections {
+		if !conn.Ready {
+			blocked = append(blocked, conn)
+		}
+	}
+	if len(blocked) > 0 {
+		fmt.Printf("\n%d connection(s) cannot open:\n", len(blocked))
+		for _, conn := range blocked {
+			fmt.Printf("  ✗ %s\n", conn.Name)
+			for _, blocker := range conn.Blockers {
+				fmt.Printf("      %s\n", blocker)
+			}
+		}
+	}
+
+	if problems > 0 {
+		// A non-zero exit is how a script learns something is wrong. The message
+		// says what it means, because "exit 1" on its own does not.
+		fmt.Printf("\n%d problem(s) will stop Portico working.\n", problems)
+		return fmt.Errorf("%d health problem(s) found", problems)
+	}
+	fmt.Println("\nNothing is wrong that Portico can see.")
 	return nil
+}
+
+// doctorCheckMark is the leading glyph for a check's state.
+func doctorCheckMark(state string) string {
+	switch state {
+	case "ok":
+		return "✓"
+	case "attention":
+		return "~"
+	case "problem":
+		return "✗"
+	default:
+		// Unknown is not a pass. Printing a tick for a check that could not run is
+		// how a broken machine reads as a healthy one.
+		return "?"
+	}
+}
+
+// doctorCheckTitle names the check, falling back to its ID.
+func doctorCheckTitle(check ipc.HealthCheckDTO) string {
+	if check.Title != "" {
+		return check.Title
+	}
+	return check.ID
 }
 
 // doctorSecretKeyStatus reports the status of the secret store installation key.
