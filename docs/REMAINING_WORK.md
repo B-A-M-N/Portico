@@ -2,7 +2,14 @@
 
 **Baseline:** `da0667e` (`feat: harden Portico connection lifecycle`)
 
-**Last reviewed against:** `be5f524`. Two audit remediations have landed since the
+**Last reviewed against:** `a08db44`. Sections marked Done below were verified against
+the tests named in them at that commit; where a claim is only partly true, it says which
+part. Several entries were stale before that review — rotate-in-place and the
+429/5xx/malformed/timeout coverage were both listed as open after they had landed — so
+treat any unqualified item as unverified rather than as an open gap, and check the named
+test before trusting a Done.
+
+Earlier note, retained: two audit remediations have landed since the
 baseline. Items below may already be done — each section states its current
 state, and `ACCEPTANCE_MATRIX.md` maps completed requirements to the tests that
 hold them. Treat an unqualified item here as unverified rather than as an open
@@ -55,8 +62,20 @@ treated as an implementation defect.
    fingerprint binding preview to apply, and a durable record written in the
    deleting transaction.
 
-   **Still missing:** account *update* — a credential can be replaced by
-   configuring the provider again, but there is no explicit rotate-in-place.
+   **Done since.** Rotate-in-place exists: `PUT
+   /v1/providers/{id}/accounts/{accountID}/credential`, a client method, and a
+   `Replace credential` action on the providers screen. The identity
+   `(provider_id, account_id)` is preserved — every connection stores it, so
+   creating a second account would leave them all pointing at the one being
+   replaced — and the new credential is validated before anything is committed,
+   so a rejected one leaves the working credential untouched. Covered in
+   `internal/supervisor/account_credential_test.go`, including an assertion that
+   no response body carries the secret.
+
+   Re-verification is implemented alongside it, against the supervisor-owned
+   credential store: it fetches the credential without exposing it, validates it
+   through the provider's own validator, and updates the durable account status
+   in both directions.
 
 2. **Not done.** The token still comes from the environment. Command arguments
    are refused with the reason, and the secret stays out of logs, events and
@@ -107,9 +126,24 @@ on the lookup instead of recreating it.
 **What remains**
 
 1. **Done.** Fake API fixtures for tunnel, DNS, Access application and policy.
-2. **Partly done.** 404 and 401/403 are covered for every manager. **429, 5xx,
-   malformed JSON and timeouts are not**, and neither is exact-ID observation
-   after a reconstructed supervisor.
+2. **Done, except exact-ID observation after a reconstructed supervisor.**
+   404 and 401/403 were already covered for every manager. 429, 5xx, malformed
+   JSON and timeouts now are, through the fake HTTP API and the real client:
+   `internal/dns/failure_test.go`, `internal/access/failure_test.go`,
+   `internal/tunnel/failure_test.go`, and
+   `internal/provider/cloudflare/classify_test.go` for the shared classifier.
+
+   The invariant those hold is that nothing unclassified is ever reported as
+   missing, because a resource reported missing gets recreated. Writing them
+   found two defects. `dns.GetRecord` dereferenced `record.Proxied`, a `*bool`
+   that is nil when the field is absent, so a proxy's HTML error page returned
+   with a 200 crashed the supervisor. And the Cloudflare client retries a 429
+   itself and then reports exhaustion rather than the status, so `errors.As`
+   could not see it and a rate limit was classified as an unclassified transient
+   failure — `tunnel.IsRateLimitExhaustion` is the single place that is now
+   recognised, used by both the tunnel manager and the adapter's classifier.
+
+   **Still missing:** exact-ID observation after a reconstructed supervisor.
 3. **Done at the decision level, not through the fake API.**
    `internal/supervisor/reconcile_test.go` proves that DNS-only, Access
    application-only and Access policy-only drift each produce the narrowest
@@ -124,8 +158,20 @@ on the lookup instead of recreating it.
    What is **not** covered is the same drift arriving from the fake HTTP API
    through the real client, so a change in how a response is classified would
    not be caught by them.
-4. **Not done.** Credential-file creation, readiness and cleanup across
-   connector start failure paths are not exercised through the real adapter.
+4. **Done.** `internal/provider/cloudflare/credential_failure_test.go` covers
+   the start failing, readiness never arriving, `start` panicking, an
+   uncreatable credential directory, an unset directory, a repeated cleanup, a
+   sweep meeting an entry it cannot remove, and a sweep of a directory that does
+   not exist yet.
+
+   Verified by mutation: moving the deferred cleanup to after a successful start
+   — the obvious way to write it — leaves a token on disk on both the
+   start-failure and panic paths, and two of those tests fail naming the file.
+   That is why removal is deferred rather than placed on each exit.
+
+   These are still unit-level against `withCredentialFileUntilReady` rather than
+   driven through a connector start in the real adapter, which would need a
+   process to start and fail on demand.
 
 **Acceptance**
 
@@ -270,24 +316,46 @@ credential, socket, database, and cleanup health.
 
 **Current state**
 
-Portico writes its XDG TOML configuration and reads/migrates legacy Flare
-configuration and credential files for compatibility. This is safer than the
-old plaintext fallback but leaves two concepts of account setup.
+The indefinite split read is gone. `migrateLegacyConfig` imports a legacy
+`config.yaml` once — through a separate viper instance, so the global one is never
+left pointing at the old file — writes it to the Portico path in TOML, and renames
+the original to `config.yaml.migrated` rather than deleting it.
+
+That renaming is what makes it happen once. Previously viper was pointed at the
+legacy file and left there, so the settings were re-read on every start: the
+installation never moved, and a user editing the file Portico documents saw no
+effect. A mutation test holds this — skipping the rename reproduces the old
+behaviour, including a setting the user changed after migrating being overwritten
+by the old file on the next start (`internal/config/legacy_migration_test.go`).
+
+The credential path already migrated explicitly: `LoadCredential` reads a legacy
+plaintext credential, re-saves it encrypted, and removes the original.
 
 **Implementation**
 
 1. Define the final Portico-only configuration contract in user documentation:
    `PORTICO_*`, XDG config/state/runtime paths, and account repository.
-2. Add an explicit, idempotent migration command that imports legacy settings
-   and reports exactly what it moved. Back up before changing legacy files.
+   **Still open** — this is a documentation task, not a code one.
+2. ~~Add an explicit, idempotent migration command that imports legacy settings
+   and reports exactly what it moved.~~ **Done**, as a migration at startup
+   rather than a separate command: a user should not have to know to run one. It
+   is idempotent because the source is renamed, and the original is kept rather
+   than backed up separately.
 3. Remove automatic legacy reads after a defined compatibility release window.
-4. Delete instructions that tell users to run `flare` commands.
+   **Still open**, and now a smaller change: there is one read, at one site,
+   which can be deleted when the window closes.
+4. Delete instructions that tell users to run `flare` commands. **Still open.**
 
 **Acceptance**
 
-- A fresh install never creates or needs a Flare path.
-- A legacy install migrates once without exposing plaintext tokens and reports
-  any ambiguous values for user confirmation.
+- A fresh install never creates or needs a Flare path. *(Holds —
+  `TestAFreshInstallationIsNotAFailure` also pins that it writes no config file
+  for settings nobody has set.)*
+- A legacy install migrates once without exposing plaintext tokens.
+  *(`TestLegacySettingsAreImportedOnce`, `TestASecondStartDoesNotMigrateAgain`.)*
+- **Not met:** reporting ambiguous values for user confirmation. The migration
+  imports what it finds and reports a file it could not read; it does not ask
+  about a value it is unsure of.
 
 ### Complete key lifecycle operations
 
