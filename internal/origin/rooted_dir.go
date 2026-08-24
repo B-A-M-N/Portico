@@ -1,18 +1,23 @@
-// P0 #2: Descriptor-relative filesystem operations.
+// Descriptor-relative filesystem operations for the built-in file browser.
 //
-// On Linux, openat2 with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS would be ideal
-// but is not available in Go's standard library without cgo. We use the
-// best available primitives:
+// On Linux, openat2 with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS would be ideal but is
+// not available in Go's standard library without cgo. What is used instead:
 //
-//   - openat() with O_NOFOLLOW to prevent symlink traversal
-//   - Keep fds open during the entire operation to minimize TOCTOU window
-//   - For download: serve from the open *os.File via http.ServeContent
-//   - For directory listing: enumerate via fd where possible
-//   - For delete: open parent fd, validate, unlinkat
-//   - For upload: open destination dir fd, create temp within it
+//   - openat() with O_NOFOLLOW so a symlink is refused rather than followed
+//   - the resulting descriptor is resolved through /proc/self/fd and compared to the
+//     canonical root, so a path that leaves the root is refused even when each
+//     component looked acceptable
+//   - the descriptor is kept open and served from, so the bytes sent come from the
+//     file that was checked rather than from a second resolution by name
 //
-// The remaining TOCTOU window is between path validation and the operation.
-// Without openat2, this cannot be fully eliminated in pure Go.
+// What is here is what the browser calls. This file previously also carried openDir,
+// statRel, unlinkRel, createTemp and a FileInfo wrapper for statRel's result, none of
+// which had ever had a caller. They are removed rather than kept: two of them offered
+// no protection the callers did not already have (createTemp was os.CreateTemp with
+// path joining, and the delete path already uses unlinkat through os.Remove), and
+// openDir would have handed out the browser's own root descriptor for ".", so closing
+// it would have closed the root. Unused code that looks like a security primitive is
+// worse than absent code, because the next reader assumes the guarantee exists.
 
 package origin
 
@@ -24,7 +29,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -85,60 +89,21 @@ func (rd *rootedDir) openFile(rel string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), ""), nil
 }
 
-// openDir opens a directory relative to root.
-func (rd *rootedDir) openDir(rel string) (*os.File, error) {
-	fd, _, err := rd.openRelative(rel, unix.O_RDONLY|unix.O_DIRECTORY)
-	if err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), ""), nil
-}
-
-// statRelative stats a path relative to root without following symlinks.
-func (rd *rootedDir) statRel(rel string) (os.FileInfo, error) {
-	rel = strings.TrimPrefix(rel, "/")
-	rel = filepath.Clean(rel)
-	if rel == "." || rel == "" {
-		return os.Stat(rd.canonicalRoot)
-	}
-	var st unix.Stat_t
-	if err := unix.Fstatat(rd.rootFd, rel, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return nil, fmt.Errorf("stat: %w", err)
-	}
-	return &rootedFileInfo{st: st, name: filepath.Base(rel)}, nil
-}
-
-// unlinkRelative removes a file relative to root without following symlinks.
-func (rd *rootedDir) unlinkRel(rel string) error {
-	rel = strings.TrimPrefix(rel, "/")
-	rel = filepath.Clean(rel)
-	if rel == "." || rel == "" {
-		return fmt.Errorf("cannot remove root")
-	}
-	if filepath.IsAbs(rel) {
-		return fmt.Errorf("absolute path not allowed")
-	}
-	if strings.HasPrefix(rel, "..") || strings.Contains(rel, "/..") {
-		return fmt.Errorf("path traversal rejected")
-	}
-	if err := unix.Unlinkat(rd.rootFd, rel, 0); err != nil {
-		return fmt.Errorf("removing: %w", err)
-	}
-	return nil
-}
-
-// createTemp creates a temporary file within the root directory.
-func (rd *rootedDir) createTemp(dir, pattern string) (*os.File, error) {
-	dir = strings.TrimPrefix(dir, "/")
-	dir = filepath.Clean(dir)
-	if dir == "." || dir == "" {
-		return os.CreateTemp(rd.canonicalRoot, pattern)
-	}
-	return os.CreateTemp(rd.canonicalRoot+"/"+dir, pattern)
-}
-
 // renameNoReplace renames src to dst atomically without replacing existing files.
 // P0 #2: Now uses RENAME_NOREPLACE on Linux via unix.Renameat2.
+// renameNoReplace renames src to dst and refuses to replace an existing file.
+//
+// An upload writes a temporary file and renames it into place, so a rename that
+// silently replaced an existing file would let one upload destroy another's result
+// without either being told.
+//
+// There used to be a second implementation of this, split across
+// builtin_filebrowser_linux.go and builtin_filebrowser_other.go as renameNoReplaceImpl,
+// with no caller. It was removed rather than adopted: the !linux arm fell back to
+// os.Rename, which does replace silently, and the package does not build on !linux
+// anyway — O_PATH, allowlistedEnv and verifyOriginIdentity are all Linux-only and
+// untagged. A cross-platform fallback that cannot be reached, and would weaken the
+// guarantee if it were, is worse than none.
 func renameNoReplace(src, dst string) error {
 	if err := unix.Renameat2(0, src, 0, dst, unix.RENAME_NOREPLACE); err != nil {
 		if errors.Is(err, syscall.EEXIST) {
@@ -148,21 +113,6 @@ func renameNoReplace(src, dst string) error {
 	}
 	return nil
 }
-
-// rootedFileInfo wraps unix.Stat_t to implement os.FileInfo.
-type rootedFileInfo struct {
-	st   unix.Stat_t
-	name string
-}
-
-func (fi *rootedFileInfo) Name() string      { return fi.name }
-func (fi *rootedFileInfo) Size() int64       { return fi.st.Size }
-func (fi *rootedFileInfo) Mode() os.FileMode { return os.FileMode(fi.st.Mode) }
-func (fi *rootedFileInfo) ModTime() time.Time {
-	return time.Unix(int64(fi.st.Mtim.Sec), int64(fi.st.Mtim.Nsec))
-}
-func (fi *rootedFileInfo) IsDir() bool      { return fi.st.Mode&syscall.S_IFDIR != 0 }
-func (fi *rootedFileInfo) Sys() interface{} { return fi.st }
 
 // serveFile serves a file from an open fd using http.ServeContent.
 // This avoids the TOCTOU window of path-based serving.
