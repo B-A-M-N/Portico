@@ -135,6 +135,22 @@ func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, erro
 			if cur.Mode != prop.Mode {
 				delta.Changes = append(delta.Changes, "mode")
 				delta.RestartConnector = true
+				// Switching between joining and publishing changes what Portico owns,
+				// so the serve it created for the old mode no longer applies.
+				delta.invalidate(core.ResourceTailnetServe)
+			}
+			if cur.LocalAddress != prop.LocalAddress {
+				delta.Changes = append(delta.Changes, "published address")
+				delta.RestartConnector = true
+				// The serve names the address it publishes, so a different address is a
+				// different serve. The old one is withdrawn rather than left running
+				// alongside — otherwise the previous address stays reachable.
+				delta.invalidate(core.ResourceTailnetServe)
+			}
+			if cur.LocalProtocol != prop.LocalProtocol {
+				delta.Changes = append(delta.Changes, "protocol")
+				delta.RestartConnector = true
+				delta.invalidate(core.ResourceTailnetServe)
 			}
 		}
 	case core.ConnectionClientTunnel:

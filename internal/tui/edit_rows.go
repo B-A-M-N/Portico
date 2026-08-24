@@ -256,3 +256,55 @@ func sourceDescription(source ipc.SourceDTO) string {
 		return "a service on this machine"
 	}
 }
+
+// privateNetworkRows are the properties of a private-network connection.
+//
+// The mode decides whether there is an address at all, so a join is told that rather than
+// offered a field its spec has nowhere to put.
+func (s *editState) privateNetworkRows() []editRow {
+	network := s.detail.DesiredSpec.PrivateNetwork
+	mode := network.Mode
+	if s.networkMode != nil {
+		mode = *s.networkMode
+	}
+
+	rows := []editRow{{
+		field:    editNetworkMode,
+		label:    "What the network does",
+		current:  privateNetworkModeWord(network.Mode),
+		pending:  privateNetworkModeWord(derefString(s.networkMode)),
+		choices:  []string{"join", "expose"},
+		editable: true,
+		explain: "Whether the network can reach this machine, or one service running on it. " +
+			"Neither creates a public address.",
+	}}
+
+	if mode == "expose" {
+		rows = append(rows, editRow{
+			field: editNetworkAddress, label: "Published address",
+			current: network.LocalAddress, pending: derefString(s.networkAddress),
+			editable: true,
+			explain: "The address the service is listening on. Changing it withdraws the old " +
+				"one, so the previous address stops being reachable.",
+		})
+	} else {
+		rows = append(rows, editRow{
+			field: editNetworkAddress, label: "Published address", editable: false,
+			reason: "this connection makes the machine reachable rather than publishing a " +
+				"service, so there is no address to publish",
+		})
+	}
+	return rows
+}
+
+// privateNetworkModeWord says what a mode does rather than naming it.
+func privateNetworkModeWord(mode string) string {
+	switch mode {
+	case "join":
+		return "lets the network reach this machine"
+	case "expose":
+		return "publishes one service to the network"
+	default:
+		return mode
+	}
+}

@@ -688,9 +688,14 @@ type UpdateConnectionRequest struct {
 	// It is a separate arm rather than a widening of Spec because the specs are a
 	// tagged union: exactly one applies to a given connection, and a request
 	// carrying the wrong one is a request to change the kind, which is refused.
-	PortForward *PortForwardDTO     `json:"port_forward,omitempty"`
-	Driver      *DriverSelectionDTO `json:"driver,omitempty"`
-	Lifecycle   *LifecycleDTO       `json:"lifecycle,omitempty"`
+	PortForward *PortForwardDTO `json:"port_forward,omitempty"`
+	// PrivateNetwork carries a private network's own editable fields: the network, the
+	// mode, and the address a publish makes reachable. Like PortForward it is a separate
+	// arm, because the specs are a tagged union and a request carrying the wrong one is a
+	// request to change the kind.
+	PrivateNetwork *PrivateNetworkSpecDTO `json:"private_network,omitempty"`
+	Driver         *DriverSelectionDTO    `json:"driver,omitempty"`
+	Lifecycle      *LifecycleDTO          `json:"lifecycle,omitempty"`
 }
 
 // ProviderRecommendationRequest asks the supervisor to recommend a driver.

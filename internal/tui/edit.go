@@ -51,6 +51,11 @@ const (
 	editRemoteHost
 	editRemotePort
 	editForwardProtocol
+	// Private-network fields. The controller has classified changes to the network and
+	// the mode since the kind existed, and to the published address since it became
+	// deliverable.
+	editNetworkMode
+	editNetworkAddress
 )
 
 // editState holds an edit in progress.
@@ -98,6 +103,10 @@ type editState struct {
 	remoteHost      *string
 	remotePort      *string
 	forwardProtocol *string
+
+	// Private-network properties.
+	networkMode    *string
+	networkAddress *string
 
 	// caps and usable are what the provider declares and what accounts it has,
 	// resolved by the root model from the snapshot. They decide which choices the
@@ -153,6 +162,8 @@ func (s *editState) rows() []editRow {
 		rows = append(rows, s.serviceExposureRows()...)
 	case s.detail.DesiredSpec.PortForward != nil:
 		rows = append(rows, s.portForwardRows()...)
+	case s.detail.DesiredSpec.PrivateNetwork != nil:
+		rows = append(rows, s.privateNetworkRows()...)
 	default:
 		rows = append(rows, editRow{
 			field: editHostname, label: "Address", editable: false,
@@ -321,6 +332,24 @@ func (s *editState) request() ipc.UpdateConnectionRequest {
 			forward.Protocol = *s.forwardProtocol
 		}
 		req.PortForward = &forward
+	}
+	if s.detail.DesiredSpec.PrivateNetwork != nil &&
+		(s.networkMode != nil || s.networkAddress != nil) {
+		// Sent whole, like the forward arm: the supervisor merges field by field, so an
+		// unchanged field must carry its current value.
+		network := *s.detail.DesiredSpec.PrivateNetwork
+		if s.networkMode != nil {
+			network.Mode = *s.networkMode
+			network.ExposeLocal = network.Mode == "expose"
+			if network.Mode == "join" {
+				network.LocalAddress = ""
+				network.LocalProtocol = ""
+			}
+		}
+		if s.networkAddress != nil && network.Mode != "join" {
+			network.LocalAddress = *s.networkAddress
+		}
+		req.PrivateNetwork = &network
 	}
 	return req
 }
@@ -654,6 +683,14 @@ func (s *editState) currentChoice(field editableField) string {
 		return ""
 	case editAccount:
 		return s.effectiveAccount()
+	case editNetworkMode:
+		if s.networkMode != nil {
+			return *s.networkMode
+		}
+		if network := s.detail.DesiredSpec.PrivateNetwork; network != nil {
+			return network.Mode
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -689,6 +726,13 @@ func (s *editState) setChoice(field editableField, value string) {
 		s.forwardProtocol = &value
 	case editAccount:
 		s.accountID = &value
+	case editNetworkMode:
+		s.networkMode = &value
+		if value == "join" {
+			// A join publishes nothing, so an address entered for a publish is dropped
+			// rather than sent with a mode that has nowhere to put it.
+			s.networkAddress = nil
+		}
 	}
 }
 
@@ -752,6 +796,16 @@ func (m *Model) commitEditField(value string) {
 			return
 		}
 		m.edit.remoteHost = &value
+	case editNetworkAddress:
+		if value == "" {
+			m.edit.err = "publishing a service needs the address it is listening on"
+			return
+		}
+		if !strings.Contains(value, ":") {
+			m.edit.err = "the network needs to know which port to reach, as host:port"
+			return
+		}
+		m.edit.networkAddress = &value
 	}
 	m.edit.err = ""
 }

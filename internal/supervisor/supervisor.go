@@ -1766,6 +1766,41 @@ func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionR
 			}
 		}
 	}
+	if req.PrivateNetwork != nil {
+		// The specs are a tagged union, so a private-network request against another kind
+		// is a request to change the kind — refused here with the reason rather than by
+		// silently writing a spec the profile does not have.
+		if proposed.Spec.PrivateNetwork == nil {
+			return nil, core.ErrValidation(
+				"this connection is not a private network, so it has no network settings to change")
+		}
+		spec := proposed.Spec.PrivateNetwork
+		if req.PrivateNetwork.NetworkID != "" {
+			spec.NetworkID = req.PrivateNetwork.NetworkID
+		}
+		if req.PrivateNetwork.Mode != "" {
+			spec.Mode = core.PrivateNetworkMode(req.PrivateNetwork.Mode)
+			spec.ExposeLocal = spec.Mode == core.PrivateNetworkExpose
+			// A join publishes nothing, so switching to one drops the address rather
+			// than keeping a value the mode has nowhere to put.
+			if spec.Mode == core.PrivateNetworkJoin {
+				spec.LocalAddress = ""
+				spec.LocalProtocol = ""
+			}
+		}
+		if req.PrivateNetwork.LocalAddress != "" {
+			spec.LocalAddress = req.PrivateNetwork.LocalAddress
+		}
+		if req.PrivateNetwork.LocalProtocol != "" {
+			spec.LocalProtocol = core.Protocol(req.PrivateNetwork.LocalProtocol)
+		}
+		// A publish with no address cannot open, so the edit is refused rather than
+		// saved into a state whose next open fails.
+		if spec.Mode == core.PrivateNetworkExpose && spec.LocalAddress == "" {
+			return nil, core.ErrValidation(
+				"publishing a service to the network needs the address it is listening on")
+		}
+	}
 	if req.PortForward != nil {
 		// The specs are a tagged union, so a forward request against a published
 		// service is a request to change the kind — which the delta classifier
