@@ -105,7 +105,11 @@ type Status struct {
 
 // StatusDevice is one device on the tailnet.
 type StatusDevice struct {
-	// DNSName is the machine's name on the tailnet, with a trailing dot.
+	// ID is the stable Tailscale node identifier. It does not change when the
+	// device is renamed, and is the identity Portico uses for membership.
+	ID string `json:"ID"`
+	// DNSName is the machine's name on the tailnet, with a trailing dot. It is
+	// human-visible and mutable, so it is not identity.
 	DNSName string `json:"DNSName"`
 	// TailscaleIPs are the addresses other devices reach this machine at.
 	TailscaleIPs []string `json:"TailscaleIPs"`
@@ -150,6 +154,22 @@ func (s *Status) MachineName() string {
 		return ""
 	}
 	return strings.TrimSuffix(s.Self.DNSName, ".")
+}
+
+// NodeID is the stable Tailscale node identifier, or a DNS-name-based fallback for
+// resource rows written by an earlier implementation that did not record it. The
+// fallback keeps existing connections working across an upgrade; new rows always
+// carry the real ID.
+func (s *Status) NodeID() string {
+	if s == nil || s.Self == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(s.Self.ID); id != "" {
+		return id
+	}
+	// Compatibility: an older Portico stored the DNS name as identity. Match it so
+	// the resource is still recognised.
+	return s.MachineName()
 }
 
 // PrivateAddress is the address other devices on the tailnet reach this machine at.

@@ -63,15 +63,20 @@ func (p *Provider) verifyMembership(ctx context.Context, step core.PlanStep) cor
 	// The observed membership is recorded as a resource so the supervisor persists
 	// what was confirmed. Ownership is adopted, never managed: Portico did not sign
 	// this machine in and must not delete the membership when the connection goes.
+	// The stable node identifier is identity: it does not change when the device is
+	// renamed, so Portico does not lose track of a connection that merely changed
+	// its DNS name.
+	identity := status.NodeID()
 	return core.StepResult{
 		StepID: step.ID, Succeeded: true,
 		Resources: []core.ProviderResource{{
 			Type:       core.ResourceTailnetMembership,
-			ExternalID: status.MachineName(),
+			ExternalID: identity,
 			Ownership:  core.OwnershipAdopted,
 			Metadata: map[string]string{
-				"tailnet": status.TailnetName(),
-				"address": status.PrivateAddress(),
+				"tailnet":   status.TailnetName(),
+				"address":   status.PrivateAddress(),
+				"dns_name":  status.MachineName(),
 			},
 		}},
 	}
@@ -230,14 +235,14 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 			case !status.Joined():
 				observed.Status = core.ObservationTransient
 				observed.Detail = fmt.Sprintf("the client reports %q", status.BackendState)
-			case status.MachineName() != res.ExternalID:
-				// The machine is on a tailnet under a different name than the one
-				// recorded. That is not the resource Portico confirmed, so it is not
-				// reported as present.
+			case !membershipMatches(status, res.ExternalID):
+				// The machine is on a tailnet under a different identifier than the
+				// one recorded. That is not the resource Portico confirmed, so it is
+				// not reported as present.
 				observed.Status = core.ObservationMissing
 				observed.Detail = fmt.Sprintf(
 					"this machine is now %q on the tailnet, not %q",
-					status.MachineName(), res.ExternalID)
+					status.NodeID(), res.ExternalID)
 			default:
 				observed.Status = core.ObservationPresent
 			}
@@ -265,7 +270,7 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 
 	// Aggregate connector state is derived from the required resource set, not any
 	// single resource. A join needs intact membership. An expose needs intact
-		// membership AND an intact serve — the machine being on the network while the
+	// membership AND an intact serve — the machine being on the network while the
 	// connection is not being served is not "running".
 	membershipOK := true
 	serveOK := !hasServeResource(resources)
@@ -332,4 +337,20 @@ func (p *Provider) servedTarget(id core.ConnectionID) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.serving[id]
+}
+
+// membershipMatches reports whether the observed membership corresponds to the
+// recorded resource. It matches on the stable node identifier, with a fallback to
+// the DNS name so resource rows written by an earlier Portico are still recognised.
+func membershipMatches(status *Status, recordedID string) bool {
+	if recordedID == "" {
+		return false
+	}
+	current := status.NodeID()
+	if current == recordedID {
+		return true
+	}
+	// Compatibility: an older Portico stored the DNS name as identity. Match it so
+	// the resource is still recognised after an upgrade.
+	return status.MachineName() == recordedID && recordedID != ""
 }

@@ -43,7 +43,7 @@ func (*stubReconcile) Identity() core.ProviderIdentity {
 }
 func (*stubReconcile) Capabilities(context.Context) (core.Capabilities, error) {
 	return core.Capabilities{
-		Kinds: []core.ConnectionKind{core.ConnectionPrivateNetwork, core.ConnectionClientTunnel},
+		Kinds:           []core.ConnectionKind{core.ConnectionPrivateNetwork, core.ConnectionClientTunnel},
 		PrivateExposure: core.CapabilitySupport{Supported: true},
 		Protocols: map[core.Protocol]core.ProtocolCapability{
 			core.ProtocolHTTP: {Supported: true, Private: true},
@@ -226,7 +226,7 @@ func TestAStoppedClientTunnelIsRestarted(t *testing.T) {
 	profile := reconcileClientTunnelProfile()
 	obs := &core.ObservedConnection{
 		ConnectionID: profile.ID, ProviderID: "stub_reconcile",
-		Connector:    &core.ObservedConnector{Status: string(core.ConnectorStatusStopped)},
+		Connector: &core.ObservedConnector{Status: string(core.ConnectorStatusStopped)},
 	}
 
 	decision, err := testSupervisor(t, profile, obs).computeReconcileDecision(context.Background(),
@@ -244,7 +244,7 @@ func TestAHealthyClientTunnelNeedsNoReconciliation(t *testing.T) {
 	profile := reconcileClientTunnelProfile()
 	obs := &core.ObservedConnection{
 		ConnectionID: profile.ID, ProviderID: "stub_reconcile",
-		Connector:    &core.ObservedConnector{Status: string(core.ConnectorStatusRunning)},
+		Connector: &core.ObservedConnector{Status: string(core.ConnectorStatusRunning)},
 	}
 
 	decision, err := testSupervisor(t, profile, obs).computeReconcileDecision(context.Background(),
@@ -263,7 +263,7 @@ func TestAClosedClientTunnelIsStopped(t *testing.T) {
 	profile.Desired = core.DesiredClosed
 	obs := &core.ObservedConnection{
 		ConnectionID: profile.ID, ProviderID: "stub_reconcile",
-		Connector:    &core.ObservedConnector{Status: string(core.ConnectorStatusRunning)},
+		Connector: &core.ObservedConnector{Status: string(core.ConnectorStatusRunning)},
 	}
 
 	decision, err := testSupervisor(t, profile, obs).computeReconcileDecision(context.Background(),
