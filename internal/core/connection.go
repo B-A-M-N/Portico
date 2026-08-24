@@ -108,6 +108,17 @@ type PrivateNetworkSpec struct {
 	NetworkID   string             `json:"network_id"`
 	Mode        PrivateNetworkMode `json:"mode"`
 	ExposeLocal bool               `json:"expose_local"`
+	// LocalAddress is the host:port published to the network when Mode is
+	// PrivateNetworkExpose. It is empty for a join, which publishes nothing.
+	//
+	// It lives here rather than in a ServiceExposure arm because the spec is a strict
+	// tagged union: exactly one arm may be populated, and a connection carrying both
+	// would be refused. So "the thing being made reachable" is expressed once per kind,
+	// in that kind's own arm.
+	LocalAddress string `json:"local_address,omitempty"`
+	// LocalProtocol is how Portico reaches that address — not how the network reaches
+	// it, which is the network's own business.
+	LocalProtocol Protocol `json:"local_protocol,omitempty"`
 }
 
 // PrivateNetworkMode indicates how the connection interacts with the private network.

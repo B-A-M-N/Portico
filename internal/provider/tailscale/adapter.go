@@ -267,17 +267,15 @@ func (p *Provider) closeSteps(spec *core.PrivateNetworkSpec, mode core.PrivateNe
 
 // exposeTarget is the local address a serve connection publishes.
 //
-// `expose` needs something to expose. The address comes from the profile's own source
-// so the field means the same thing it means for every other kind, rather than
-// Tailscale reading a differently named field.
+// It comes from the private-network arm's own field. The spec is a strict tagged union,
+// so an expose connection cannot also carry a service-exposure arm — which is why the
+// address is expressed once, on the arm belonging to this kind.
 func exposeTarget(profile *core.ConnectionProfile) (string, error) {
-	if exposure := profile.Spec.ServiceExposure; exposure != nil && exposure.Source.Existing != nil {
-		if address := strings.TrimSpace(exposure.Source.Existing.Address); address != "" {
+	spec := profile.Spec.PrivateNetwork
+	if spec != nil {
+		if address := strings.TrimSpace(spec.LocalAddress); address != "" {
 			return normaliseTarget(address)
 		}
-	}
-	if forward := profile.Spec.PortForward; forward != nil && forward.LocalPort > 0 {
-		return normaliseTarget(fmt.Sprintf("127.0.0.1:%d", forward.LocalPort))
 	}
 	return "", core.ErrValidation(
 		"publishing a service to the tailnet needs the address it is listening on, and this " +

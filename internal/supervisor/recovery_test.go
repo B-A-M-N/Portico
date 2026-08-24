@@ -2112,18 +2112,39 @@ func TestCreateConnectionSupportsPortForwardAndRefusesTheRest(t *testing.T) {
 		}
 	})
 
-	t.Run("private network with arm is refused as not implemented", func(t *testing.T) {
-		// With the arm present, the kind is refused as not implemented.
+	t.Run("private network needs a provider that can deliver it", func(t *testing.T) {
+		// The kind is implemented now, so the refusal here is about this registry: it
+		// holds no private-network provider. That is the honest reason, and it is a
+		// different one from "the kind does not exist" — which is what this used to
+		// assert, before the Tailscale adapter landed.
 		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
 			Name:           "net",
 			Kind:           string(core.ConnectionPrivateNetwork),
-			PrivateNetwork: &ipc.PrivateNetworkSpecDTO{NetworkID: "tailscale"},
+			PrivateNetwork: &ipc.PrivateNetworkSpecDTO{NetworkID: "example.com", Mode: "join"},
 		})
 		if err == nil {
-			t.Fatal("a private network connection was accepted despite having no adapter")
+			t.Fatal("a private network connection was accepted with no provider to deliver it")
 		}
-		if !strings.Contains(err.Error(), "not implemented") {
-			t.Fatalf("refusal does not explain itself: %v", err)
+		if !strings.Contains(err.Error(), "tailscale") {
+			t.Fatalf("the refusal does not name the missing provider: %v", err)
+		}
+	})
+
+	t.Run("an expose without an address is refused", func(t *testing.T) {
+		// Mode-specific validation runs before the provider is looked up, so this
+		// refusal is about the request rather than about the registry.
+		_, err := handler.HandleCreateConnection(ipc.CreateConnectionRequest{
+			Name: "net",
+			Kind: string(core.ConnectionPrivateNetwork),
+			PrivateNetwork: &ipc.PrivateNetworkSpecDTO{
+				NetworkID: "example.com", Mode: "expose",
+			},
+		})
+		if err == nil {
+			t.Fatal("an expose with nothing to expose was accepted")
+		}
+		if !strings.Contains(err.Error(), "address") {
+			t.Fatalf("the refusal does not say what is missing: %v", err)
 		}
 	})
 

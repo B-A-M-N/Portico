@@ -24,9 +24,9 @@ func joinProfile(desired core.DesiredConnectionState) *core.ConnectionProfile {
 
 // exposeProfile publishes a local address to the tailnet.
 //
-// The address comes from the service-exposure source, which is where every other kind
-// carries "the thing being made reachable". A Tailscale-specific field would mean the
-// same concept had two names.
+// The address is on the private-network arm. The spec is a strict tagged union, so an
+// expose connection cannot also carry a service-exposure arm — the address is expressed
+// once, on the arm belonging to this kind.
 func exposeProfile(desired core.DesiredConnectionState, address string) *core.ConnectionProfile {
 	return &core.ConnectionProfile{
 		ID: "conn-serve", Name: "api on the tailnet",
@@ -35,12 +35,11 @@ func exposeProfile(desired core.DesiredConnectionState, address string) *core.Co
 		Revision: 2,
 		Driver:   core.DriverSelection{ProviderID: "tailscale"},
 		Spec: core.ConnectionSpec{
-			PrivateNetwork: &core.PrivateNetworkSpec{Mode: core.PrivateNetworkExpose},
-			ServiceExposure: &core.ServiceExposureSpec{
-				Source: core.SourceSpec{
-					Kind:     core.SourceExisting,
-					Existing: &core.ExistingServiceSpec{Address: address},
-				},
+			PrivateNetwork: &core.PrivateNetworkSpec{
+				Mode:          core.PrivateNetworkExpose,
+				ExposeLocal:   true,
+				LocalAddress:  address,
+				LocalProtocol: core.ProtocolHTTP,
 			},
 		},
 	}
@@ -218,7 +217,6 @@ func TestServingPlansTheStepsInOrder(t *testing.T) {
 // TestServingNeedsAnAddress pins that the plan refuses rather than publishing nothing.
 func TestServingNeedsAnAddress(t *testing.T) {
 	profile := exposeProfile(core.DesiredOpen, "")
-	profile.Spec.ServiceExposure = nil
 
 	runner := newFakeRunner().on("status --json", statusRunning, nil)
 	_, err := New(runner).Plan(context.Background(), core.DesiredConnection{Profile: profile})

@@ -109,6 +109,16 @@ type PrivateNetworkSpecDTO struct {
 	NetworkID   string `json:"network_id"`
 	Mode        string `json:"mode,omitempty"` // "join" or "expose"
 	ExposeLocal bool   `json:"expose_local,omitempty"`
+	// LocalAddress is the host:port published to the network when Mode is "expose",
+	// and empty for a join, which publishes nothing.
+	//
+	// It is carried here rather than in the request's Source field because the request
+	// is a tagged union: populating Source declares a service exposure, and a request
+	// carrying both arms is refused. Each kind expresses "the thing being made
+	// reachable" on its own arm.
+	LocalAddress string `json:"local_address,omitempty"`
+	// LocalProtocol is how Portico reaches that address.
+	LocalProtocol string `json:"local_protocol,omitempty"`
 }
 
 // ClientTunnelSpecDTO describes a client-mediated tunnel with no public address.

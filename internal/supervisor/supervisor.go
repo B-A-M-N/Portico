@@ -1124,9 +1124,7 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 	case core.ConnectionPortForward:
 		return h.createPortForward(req)
 	case core.ConnectionPrivateNetwork:
-		return nil, core.ErrValidation(
-			"private network connections are not implemented: Portico ships no adapter that can join or expose " +
-				"through a private network yet")
+		return h.createPrivateNetwork(req)
 	case core.ConnectionClientTunnel:
 		return nil, core.ErrValidation(
 			"client tunnel connections are created through their provider's setup flow, not this endpoint")
@@ -1449,6 +1447,90 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 }
 
 // createPortForward creates a local port forward connection.
+// createPrivateNetwork creates a connection that makes this machine, or one service on
+// it, reachable through a private network.
+//
+// The two modes mean different things and carry different fields, so they are validated
+// separately rather than accepting whatever the request happens to hold: a join needs
+// nothing local, and an expose needs the address it is publishing.
+func (h *supervisorHandler) createPrivateNetwork(req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
+	if req.PrivateNetwork == nil {
+		return nil, core.ErrValidation("a private network connection requires a private_network specification")
+	}
+	pn := req.PrivateNetwork
+
+	mode := core.PrivateNetworkMode(pn.Mode)
+	if mode == "" {
+		mode = core.PrivateNetworkJoin
+	}
+	switch mode {
+	case core.PrivateNetworkJoin, core.PrivateNetworkExpose:
+	default:
+		return nil, core.ErrValidation(fmt.Sprintf(
+			"private network mode %q is not supported; Portico can join a network or publish one "+
+				"local service to it", pn.Mode))
+	}
+
+	providerID := core.ProviderID(req.Provider.ProviderID)
+	if providerID == "" {
+		providerID = "tailscale"
+	}
+
+	profile := &core.ConnectionProfile{
+		Name: req.Name,
+		Kind: core.ConnectionPrivateNetwork,
+		Spec: core.ConnectionSpec{
+			PrivateNetwork: &core.PrivateNetworkSpec{
+				NetworkID:   pn.NetworkID,
+				Mode:        mode,
+				ExposeLocal: mode == core.PrivateNetworkExpose,
+			},
+		},
+		Driver: core.DriverSelection{
+			ProviderID: providerID,
+			AccountID:  core.ProviderAccountID(req.Provider.AccountID),
+		},
+		Lifecycle: core.LifecycleSpec{
+			AutoStart:    req.Lifecycle.AutoStart,
+			OnDisconnect: core.DisconnectPolicy(req.Lifecycle.OnDisconnect),
+		},
+		Desired: core.DesiredClosed,
+	}
+
+	// An expose carries the address it publishes on its own arm.
+	//
+	// The spec is a strict tagged union — exactly one arm may be populated — so the
+	// address cannot go in a ServiceExposure arm alongside it. That is a better
+	// constraint than it first appears: an exposure arm would carry an exposure mode,
+	// and a public one recorded there would let a later edit or a route renderer treat
+	// this as reachable from the internet, which is the one thing this kind promises it
+	// is not.
+	if mode == core.PrivateNetworkExpose {
+		address := strings.TrimSpace(pn.LocalAddress)
+		if address == "" {
+			return nil, core.ErrValidation(
+				"publishing a service to a private network needs the address it is listening on")
+		}
+		protocol := core.Protocol(pn.LocalProtocol)
+		if protocol == "" {
+			protocol = core.ProtocolHTTP
+		}
+		profile.Spec.PrivateNetwork.LocalAddress = address
+		profile.Spec.PrivateNetwork.LocalProtocol = protocol
+	}
+
+	created, _, err := h.sup.controller.CreateProfile(context.Background(), profile)
+	if err != nil {
+		return nil, err
+	}
+	if h.sup.ipcServer != nil {
+		if dispatchErr := h.sup.ipcServer.DispatchCommittedEvents(context.Background()); dispatchErr != nil {
+			slog.Warn("dispatch create event", "connection", created.ID, "err", dispatchErr)
+		}
+	}
+	return h.HandleGetConnection(string(created.ID))
+}
+
 func (h *supervisorHandler) createPortForward(req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
 	if req.PortForward == nil {
 		return nil, core.ErrValidation("a port forward connection requires a port_forward specification")
