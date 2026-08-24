@@ -106,13 +106,20 @@ func StartTimeOf(pid int) (uint64, error) {
 }
 
 // readCommandHash returns a SHA-256 hash of the process's /proc/[pid]/cmdline.
+//
+// An empty cmdline means the process has exited: the kernel keeps the /proc entry
+// for a zombie, and /proc/N/exe still resolves, but cmdline is cleared. So this is
+// not a hash that could not be computed — it is a process that is no longer
+// running, and saying "empty cmdline for pid N" describes the symptom while hiding
+// the cause. A caller that started a command and immediately failed here spent ten
+// seconds looking like a bug in identity capture.
 func readCommandHash(pid int) (string, error) {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
 		return "", err
 	}
 	if len(data) == 0 {
-		return "", fmt.Errorf("empty cmdline for pid %d", pid)
+		return "", fmt.Errorf("%w: pid %d has no command line, which means it has exited", ErrProcessExited, pid)
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
@@ -147,7 +154,27 @@ func allowlistedEnv(extra map[string]string) []string {
 	}
 	// Explicit command values: include all names that pass validation.
 	// These override inherited values but are NOT filtered by the allowlist.
+	//
+	// A value of the form env:NAME is a reference: what the connection stores is
+	// the name of a variable, and the value is read here, at start, from the
+	// supervisor's own environment. That is how a command needing an API key can be
+	// run without the key being written into the connection's saved configuration —
+	// where it would end up in the database, in previews and in support exports.
+	//
+	// This is the one place the reference is resolved, so the plaintext exists only
+	// in the child's environment block and never in anything Portico persists. A
+	// reference to a variable the supervisor does not have is omitted rather than
+	// passed through as the literal string "env:NAME", which the child would read
+	// as a nonsense credential and fail on obscurely.
 	for k, v := range extra {
+		if core.IsEnvReference(v) {
+			resolved, ok := os.LookupEnv(core.EnvReferenceName(v))
+			if !ok {
+				continue
+			}
+			result[k] = k + "=" + resolved
+			continue
+		}
 		result[k] = k + "=" + v
 	}
 	// Emit in deterministic order

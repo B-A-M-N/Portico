@@ -3,6 +3,7 @@ package screens
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/mail"
 	"strconv"
@@ -170,6 +171,12 @@ type WizardState struct {
 	// one — so the ID is collected rather than generated.
 	TunnelID      string
 	TunnelProfile string
+	// CommandUseShell and CommandEnv configure a command Portico runs. Both are
+	// carried by the source DTO, honoured by the origin manager and exposed by the
+	// CLI; the wizard could set neither, so a command needing an API key or a
+	// shell pipeline could not be created from the interface.
+	CommandUseShell bool
+	CommandEnv      map[string]string
 }
 
 // Wizard step constants
@@ -191,6 +198,10 @@ const (
 	WizardStepProtocol
 	WizardStepCommandArgs
 	WizardStepCommandWorkingDir
+	// WizardStepCommandShell asks whether the command runs through a shell, and
+	// WizardStepCommandEnv collects its environment.
+	WizardStepCommandShell
+	WizardStepCommandEnv
 	WizardStepDirectoryMode
 	WizardStepDirectorySPA
 	WizardStepMCPTransport
@@ -650,6 +661,12 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 	case WizardStepDiscovery:
 		return m.handleDiscoveryKey(key)
 
+	case WizardStepCommandShell:
+		return m.handleCommandShellKey(key)
+
+	case WizardStepCommandEnv:
+		return m.handleCommandEnvKey(key)
+
 	case WizardStepTunnelID:
 		return m.handleTunnelIDKey(key)
 
@@ -766,8 +783,10 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepMCPTransport
 				m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
 			} else {
-				m.state.Step = WizardStepExposure
-				m.selected = firstAvailable(m.exposureChoices())
+				// How the command runs and what it is given, before how it is
+				// exposed: they are properties of the thing being published.
+				m.state.Step = WizardStepCommandShell
+				m.selected = boolIndex(m.state.CommandUseShell)
 			}
 		default:
 			m.setInput(editInput(m.inputValue(), key))
@@ -1211,6 +1230,8 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 			WorkingDir: s.WorkingDir,
 			Port:       port,
 			Protocol:   "http",
+			UseShell:   s.CommandUseShell,
+			Env:        maps.Clone(s.CommandEnv),
 		}
 	case "mcp_server":
 		transport := s.MCPTransport
@@ -1226,6 +1247,8 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 				WorkingDir: s.WorkingDir,
 				Port:       port,
 				Protocol:   "http",
+				UseShell:   s.CommandUseShell,
+				Env:        maps.Clone(s.CommandEnv),
 			}
 		} else {
 			src.MCP.Endpoint = s.SourceAddress
@@ -1518,6 +1541,13 @@ func (m *WizardModel) View() string {
 		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
 	case WizardStepDiscovery:
 		return m.withError(m.renderDiscovery())
+	case WizardStepCommandShell:
+		return m.withError(m.renderCommandShell())
+	case WizardStepCommandEnv:
+		return m.withError(m.renderField(
+			"Environment for the command (NAME=VALUE, comma separated; empty for none):\n" +
+				"For a secret, write NAME=env:OTHER — Portico reads OTHER from its own\n" +
+				"environment when the command starts, so only the name is saved."))
 	case WizardStepTunnelID:
 		return m.withError(m.renderField(
 			"Which tunnel should Portico manage?\n" +

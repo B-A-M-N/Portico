@@ -65,6 +65,10 @@ func (m *WizardModel) Actions() WizardActions {
 		return m.reviewActions()
 	case WizardStepDiscovery:
 		return m.discoveryActions()
+	case WizardStepCommandShell:
+		return m.commandShellActions()
+	case WizardStepCommandEnv:
+		return m.commandEnvActions()
 	case WizardStepTunnelID:
 		return m.tunnelStepActions(
 			"Accept this tunnel ID. Portico checks its shape here, so a typo is caught " +

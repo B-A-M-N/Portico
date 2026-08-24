@@ -3,7 +3,6 @@ package core
 import (
 	"fmt"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -836,18 +835,6 @@ func validatePrivateNetworkSpec(spec *PrivateNetworkSpec) error {
 		return fmt.Errorf("invalid mode %q, must be join or expose", spec.Mode)
 	}
 
-	return nil
-}
-
-func validateCommandEnvironment(environment map[string]string) error {
-	for name := range environment {
-		upper := strings.ToUpper(name)
-		if strings.Contains(upper, "TOKEN") || strings.Contains(upper, "SECRET") ||
-			strings.Contains(upper, "PASSWORD") || strings.Contains(upper, "CREDENTIAL") ||
-			strings.HasSuffix(upper, "_KEY") {
-			return fmt.Errorf("command environment variable %q appears to contain a credential; use a provider or OS secret reference instead", name)
-		}
-	}
 	return nil
 }
 

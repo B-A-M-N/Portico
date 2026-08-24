@@ -21,6 +21,16 @@ import (
 // accepted for signaling or adoption.
 var ErrIdentityPartial = errors.New("origin: partial process identity")
 
+// ErrProcessExited reports that the process is no longer running, discovered while
+// reading its identity.
+//
+// A command that exits immediately — because its port was taken, or its arguments
+// were wrong — leaves a zombie whose /proc entry still exists and whose command
+// line is cleared. Distinguishing that from a failure to read identity is what lets
+// the caller report why the command did not start rather than reporting that
+// Portico could not hash something.
+var ErrProcessExited = errors.New("origin: the process exited immediately after starting")
+
 // LocalCommand launches a local command and exposes its HTTP port. The
 // started process is owned by the LocalCommand for its lifetime; the supplied
 // Start context is only used for startup cancellation. The process runs in a
@@ -145,6 +155,15 @@ func (l *LocalCommand) Start(ctx context.Context) (string, error) {
 		// Identity is required for downstream signaling.
 		_ = l.stopProcessGroupUnsafe()
 		pw.Close()
+		// A process that exited before its identity could be captured did not fail
+		// to be identified — it failed to run. Reporting the former sends the reader
+		// looking at Portico's identity capture; reporting the latter sends them to
+		// the command's own output, which is where the answer is.
+		if errors.Is(err, ErrProcessExited) {
+			return "", fmt.Errorf(
+				"the command exited immediately: %s. Its output is in the connector log; a "+
+					"common cause is the port already being in use", l.cfg.Command)
+		}
 		return "", fmt.Errorf("record identity: %w", err)
 	}
 	l.identity = id

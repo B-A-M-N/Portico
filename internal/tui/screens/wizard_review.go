@@ -149,6 +149,15 @@ func (m *WizardModel) sourceDetailLines() []string {
 	if m.state.SourceType == "mcp_server" && m.state.MCPTransport != "" {
 		out = append(out, "The MCP server is reached over "+m.state.MCPTransport+".")
 	}
+	if m.state.CommandUseShell {
+		// Worth stating: a shell parses the line, so what runs is not exactly the
+		// executable named — and shell features are available to it.
+		out = append(out, "It runs through a shell, so pipes and redirection work.")
+	}
+	// What the command is given. A literal value is not printed; a reference is,
+	// because the variable's name is not a secret and seeing it is how someone
+	// checks they wrote the right one.
+	out = append(out, CommandEnvSummary(m.state.CommandEnv)...)
 	if m.state.SourceProtocol != "" && m.state.SourceType == "existing_service" {
 		out = append(out, fmt.Sprintf("Portico connects to it over %s.", m.state.SourceProtocol))
 	}

@@ -80,7 +80,8 @@ func isTextStep(step int) bool {
 		WizardStepHostname, WizardStepProtectionRules,
 		WizardStepPortForwardLocalPort, WizardStepPortForwardRemoteHost,
 		WizardStepPortForwardRemotePort,
-		WizardStepTunnelID, WizardStepTunnelMCP, WizardStepTunnelProfile:
+		WizardStepTunnelID, WizardStepTunnelMCP, WizardStepTunnelProfile,
+		WizardStepCommandEnv:
 		return true
 	default:
 		return false

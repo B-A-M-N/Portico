@@ -52,6 +52,14 @@ var wizardStepOrder = []stepRule{
 	}},
 	{WizardStepCommandArgs, func(m *WizardModel) bool { return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure" }},
 	{WizardStepCommandWorkingDir, func(m *WizardModel) bool { return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure" }},
+	// How the command runs, and what it is given. Both are properties of a command
+	// Portico starts, so they are asked only where Portico starts one.
+	{WizardStepCommandShell, func(m *WizardModel) bool {
+		return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepCommandEnv, func(m *WizardModel) bool {
+		return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure"
+	}},
 	{WizardStepDirectoryMode, func(m *WizardModel) bool {
 		return m.state.SourceType == "directory" && m.state.ConnectionKind == "service_exposure"
 	}},
@@ -175,6 +183,10 @@ func (m *WizardModel) restoreStepInput() {
 		m.setInput(commandArgsInput(m.state.CommandArgs))
 	case WizardStepCommandWorkingDir:
 		m.setInput(m.state.WorkingDir)
+	case WizardStepCommandEnv:
+		m.setInput(commandEnvInput(m.state.CommandEnv))
+	case WizardStepCommandShell:
+		m.selected = boolIndex(m.state.CommandUseShell)
 	case WizardStepHostname:
 		m.setInput(m.state.Hostname)
 	case WizardStepProtectionRules:

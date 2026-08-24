@@ -58,12 +58,7 @@ func TestManager_CommandLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is required for command-origin lifecycle test")
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
+	port := reservablePort(t)
 
 	manager := NewManager()
 	connectionID := core.ConnectionID("command-lifecycle")
@@ -154,4 +149,41 @@ func TestManager_RejectsNonHTTPCommandProtocol(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Fatalf("Plan error = %v, want protocol rejection", err)
 	}
+}
+
+// reservablePort returns a loopback port for a child process to bind.
+//
+// Binding to :0 and closing tells you a port was free a moment ago. Between then
+// and the child binding it, anything on the machine can take it — including another
+// test in the same package, which is why running this test twelve times in a row
+// used to fail. When it happens the child exits at once, and the run spends ten
+// seconds before reporting it.
+//
+// A port cannot be handed to another process atomically, so the race cannot be
+// closed here. What can be removed is the collision with this suite's own
+// concurrent runs: the port comes from a range picked per test name and attempt,
+// checked immediately before use, so two tests never draw the same number and a
+// port taken by something else is retried rather than handed over.
+func reservablePort(t *testing.T) int {
+	t.Helper()
+	for attempt := 0; attempt < 40; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
+
+		// Claimable a second time, immediately before it is handed over: a port
+		// something else has taken in the meantime is discarded here rather than
+		// producing a child that exits.
+		probe, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+		if err != nil {
+			continue
+		}
+		probe.Close()
+		return port
+	}
+	t.Fatal("could not reserve a free loopback port")
+	return 0
 }
