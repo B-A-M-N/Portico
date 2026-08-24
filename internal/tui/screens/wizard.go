@@ -420,6 +420,12 @@ func (m *WizardModel) protections() []string {
 // Step returns the current wizard step.
 func (m *WizardModel) Step() int { return m.state.Step }
 
+// Err is the refusal the current question is showing, if any.
+//
+// Exposed so a test that drives the wizard can report why a question would not
+// advance, rather than reporting only that it did not.
+func (m *WizardModel) Err() error { return m.err }
+
 // SelectedIndex exposes the cursor for tests that drive the wizard through the
 // root model rather than reaching into its state.
 func (m *WizardModel) SelectedIndex() int { return m.selected }
