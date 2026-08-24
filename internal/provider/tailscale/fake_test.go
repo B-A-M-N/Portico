@@ -86,6 +86,7 @@ const (
 	statusRunning = `{
 		"BackendState": "Running",
 		"Self": {
+			"ID": "n1234567890123456",
 			"DNSName": "workstation.tail0abc.ts.net.",
 			"TailscaleIPs": ["100.101.102.103"],
 			"Online": true
