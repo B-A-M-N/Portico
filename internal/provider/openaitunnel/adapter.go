@@ -260,6 +260,7 @@ func (p *Provider) Plan(_ context.Context, desired core.DesiredConnection) (*cor
 		}
 		if spec.MCP.Endpoint != "" {
 			params["mcp_server_url"] = spec.MCP.Endpoint
+			params["mcp_transport"] = string(spec.MCP.Transport)
 		} else {
 			params["mcp_command"] = spec.MCP.Command.Executable
 		}
@@ -331,7 +332,7 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 	case core.StepVerifyOrigin:
 		return p.verifyOrigin(ctx, step), nil
 	case core.StepValidateAccount:
-		return p.validateClient(step), nil
+		return p.validateClient(ctx, step), nil
 	case core.StepStartConnector:
 		return p.startClient(ctx, connectionID, step), nil
 	case core.StepVerifyConnector:
@@ -351,14 +352,18 @@ func (p *Provider) verifyOrigin(ctx context.Context, step core.PlanStep) core.St
 		// to probe here. Saying so is better than reporting a vacuous success.
 		return core.StepResult{StepID: step.ID, Succeeded: true}
 	}
-	if err := p.probe(ctx, endpoint); err != nil {
+	transport := core.MCPTransport(step.Technical.Parameters["mcp_transport"])
+	// MCPServiceCheck performs a protocol-aware probe — an initialize POST for
+	// Streamable HTTP, an event-stream GET for SSE — instead of a generic GET,
+	// which a legitimate Streamable HTTP server may legitimately answer 405.
+	if err := core.MCPServiceCheck(ctx, endpoint, transport); err != nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("local MCP server at %s is not reachable: %w", endpoint, err)}
+			Error: fmt.Errorf("local MCP server at %s did not answer the MCP handshake: %w", endpoint, err)}
 	}
 	return core.StepResult{StepID: step.ID, Succeeded: true}
 }
 
-func (p *Provider) validateClient(step core.PlanStep) core.StepResult {
+func (p *Provider) validateClient(ctx context.Context, step core.PlanStep) core.StepResult {
 	if _, err := p.lookPath(p.binPath); err != nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
 			Error: fmt.Errorf("%s is not installed or not on PATH; download it from the OpenAI platform's tunnel settings", p.binPath)}
@@ -367,6 +372,21 @@ func (p *Provider) validateClient(step core.PlanStep) core.StepResult {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
 			Error: fmt.Errorf("no control plane API key is stored and %s is not set; run 'portico provider login %s' or export %s",
 				CredentialEnvVar, ProviderID, CredentialEnvVar)}
+	}
+	// The upstream doctor is the preflight authority: it checks the real
+	// client contract (flags, credential acceptance, MCP reachability, health
+	// listener) from inside, where Portico can only approximate. A failed
+	// doctor stops the operation before a process exists.
+	report, err := p.runDoctorPreflight(ctx,
+		step.Technical.Parameters["tunnel_id"],
+		step.Technical.Parameters["mcp_server_url"])
+	if err != nil {
+		return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}
+	}
+	if len(report.Issues) > 0 {
+		return core.StepResult{StepID: step.ID, Succeeded: false,
+			Error: fmt.Errorf("tunnel-client doctor reported problems: %s",
+				strings.Join(report.Issues, "; "))}
 	}
 	return core.StepResult{StepID: step.ID, Succeeded: true}
 }
