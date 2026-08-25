@@ -148,14 +148,8 @@ func TestTheTunnelRequestCarriesWhatWasCollected(t *testing.T) {
 
 	m.setInput("http://127.0.0.1:8000")
 	m.HandleKey("enter")
-	if m.Step() != WizardStepTunnelProfile {
-		t.Fatalf("step after the MCP address = %d, err %v", m.Step(), m.err)
-	}
-
-	m.setInput("work")
-	m.HandleKey("enter")
 	if m.Step() != WizardStepReview {
-		t.Fatalf("step after the profile = %d, want review", m.Step())
+		t.Fatalf("step after the MCP address = %d, want review (the client-profile question was removed: Portico never applied it)", m.Step())
 	}
 
 	req, err := m.buildRequest()
@@ -171,8 +165,8 @@ func TestTheTunnelRequestCarriesWhatWasCollected(t *testing.T) {
 	if req.ClientTunnel.TunnelID != id {
 		t.Fatalf("tunnel ID = %q, want the one collected", req.ClientTunnel.TunnelID)
 	}
-	if req.ClientTunnel.Profile != "work" {
-		t.Fatalf("profile = %q", req.ClientTunnel.Profile)
+	if req.ClientTunnel.Profile != "" {
+		t.Fatalf("the never-applied profile still reached the request as %q", req.ClientTunnel.Profile)
 	}
 	if req.ClientTunnel.MCP.Endpoint != "http://127.0.0.1:8000" {
 		t.Fatalf("MCP endpoint = %q", req.ClientTunnel.MCP.Endpoint)
@@ -190,27 +184,27 @@ func TestTheTunnelRequestCarriesWhatWasCollected(t *testing.T) {
 	}
 }
 
-// TestTheProfileIsOptional pins that a choice most users do not need to make is
-// not demanded.
-func TestTheProfileIsOptional(t *testing.T) {
+// TestTheProfileQuestionIsGone pins item 11's resolution: the wizard no longer
+// asks for a native client profile, because Portico never applied it — the
+// collected value had no effect on the launched client. Portico is the
+// configuration authority: tunnel ID, credential, MCP endpoint, health.
+func TestTheProfileQuestionIsGone(t *testing.T) {
 	m := wizardAtTunnelID(t)
 	m.setInput("tunnel_" + strings.Repeat("c", 32))
 	m.HandleKey("enter")
 	m.setInput("http://127.0.0.1:8000")
 	m.HandleKey("enter")
 
-	// Empty profile: accepted.
-	m.setInput("")
-	m.HandleKey("enter")
+	// The MCP address question leads directly to review.
 	if m.Step() != WizardStepReview {
-		t.Fatalf("an empty profile was refused: step %d, err %v", m.Step(), m.err)
+		t.Fatalf("step = %d, want review with no profile question in between", m.Step())
 	}
 	req, err := m.buildRequest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if req.ClientTunnel.Profile != "" {
-		t.Errorf("an empty profile became %q", req.ClientTunnel.Profile)
+		t.Errorf("a profile reached the request: %q", req.ClientTunnel.Profile)
 	}
 }
 
@@ -221,8 +215,6 @@ func TestTheTunnelReviewDoesNotClaimPorticoCreatedIt(t *testing.T) {
 	m.setInput("tunnel_" + strings.Repeat("d", 32))
 	m.HandleKey("enter")
 	m.setInput("http://127.0.0.1:8000")
-	m.HandleKey("enter")
-	m.setInput("")
 	m.HandleKey("enter")
 
 	view := m.View()
@@ -285,9 +277,7 @@ func TestTheWizardWritesTheCanonicalTransportIdentity(t *testing.T) {
 	m.setInput("tunnel_" + strings.Repeat("e", 32))
 	m.HandleKey("enter")
 	m.setInput("http://127.0.0.1:8000")
-	m.HandleKey("enter")
-	m.setInput("")
-	m.HandleKey("enter") // optional profile
+	m.HandleKey("enter") // straight to review: the never-applied profile question was removed
 
 	if m.state.Provider != string(core.ProviderIDClientTunnel) {
 		t.Fatalf("wizard state carries provider %q", m.state.Provider)

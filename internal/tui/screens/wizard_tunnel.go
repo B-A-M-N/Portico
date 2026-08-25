@@ -65,8 +65,9 @@ func (m *WizardModel) handleTunnelMCPKey(key string) tea.Cmd {
 		}
 		m.err = nil
 		m.state.SourceAddress = endpoint
-		m.state.Step = WizardStepTunnelProfile
-		m.setInput(m.state.TunnelProfile)
+		m.state.Provider = string(core.ProviderIDClientTunnel)
+		m.state.Step = WizardStepReview
+		m.selected = 0
 	default:
 		m.setInput(editInput(m.inputValue(), key))
 	}
@@ -126,13 +127,9 @@ func (m *WizardModel) clientTunnelReview() []reviewSection {
 func (m *WizardModel) tunnelManagedLines() []string {
 	lines := []string{
 		"The tunnel client process: Portico starts it, watches it, and stops it.",
-	}
-	if m.state.TunnelProfile != "" {
-		lines = append(lines, "It runs with the client profile "+m.state.TunnelProfile+".")
-	}
-	lines = append(lines,
 		"Portico did not create the tunnel and will not delete it. Deleting this",
-		"connection stops the client and leaves the tunnel in place.")
+		"connection stops the client and leaves the tunnel in place.",
+	}
 	return lines
 }
 

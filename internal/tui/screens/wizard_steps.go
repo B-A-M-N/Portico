@@ -57,6 +57,12 @@ var wizardStepOrder = []stepRule{
 	{WizardStepProtocol, func(m *WizardModel) bool {
 		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure"
 	}},
+	{WizardStepHealth, func(m *WizardModel) bool {
+		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure"
+	}},
+	{WizardStepHealthPath, func(m *WizardModel) bool {
+		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure" && m.state.HealthEnabled
+	}},
 	{WizardStepCommandArgs, func(m *WizardModel) bool { return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure" }},
 	{WizardStepCommandWorkingDir, func(m *WizardModel) bool { return m.isCommandOrigin() && m.state.ConnectionKind == "service_exposure" }},
 	// How the command runs, and what it is given. Both are properties of a command
@@ -231,6 +237,10 @@ func (m *WizardModel) restoreStepInput() {
 		}
 	case WizardStepProtocol:
 		m.selected = indexOfString([]string{"http", "https"}, m.state.SourceProtocol)
+	case WizardStepHealth:
+		m.selected = boolIndex(m.state.HealthEnabled)
+	case WizardStepHealthPath:
+		m.setInput(m.state.HealthPath)
 	case WizardStepDirectoryMode:
 		m.selected = directoryModeIndex(m.directoryModeChoices(), m.state.DirectoryMode)
 	case WizardStepDirectorySPA:
