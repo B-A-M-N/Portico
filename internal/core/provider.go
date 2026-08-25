@@ -16,6 +16,11 @@ type StepResult struct {
 	Error               error
 	Resources           []ProviderResource   // resources created/modified by this step
 	CredentialMutations []CredentialMutation // credentials created/modified by this step
+	// Notes carry provider-reported qualifications on a successful step —
+	// most importantly, that service health is UNKNOWN for an endpoint
+	// protected by Access, where the public probe proves only the edge.
+	// Notes must never contain secrets; they are journaled and displayed.
+	Notes []string
 }
 
 // CredentialMutation describes a credential that should be persisted
@@ -104,6 +109,15 @@ type ResolvedOrigin struct {
 	URL      string
 	Protocol Protocol
 	Owned    bool
+}
+
+// GatewayService owns the local proxy that sits between a client-mediated
+// transport and its MCP origin. The service lifetime belongs to the
+// supervisor, not to an apply request, so implementations must not tie the
+// running gateway to the caller's cancellation after StartGateway returns.
+type GatewayService interface {
+	StartGateway(ctx context.Context, connectionID ConnectionID, upstream string, authTokens []string) (endpoint string, err error)
+	StopGateway(connectionID ConnectionID) error
 }
 
 // DesiredConnection describes the desired connection state

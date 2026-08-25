@@ -1540,6 +1540,17 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			}
 		}
 
+		// Truthfulness for Access-protected endpoints (audit item 22): a 2xx
+		// from behind Access proves the edge and the route work, but an
+		// application-level probe cannot authenticate through Access, so the
+		// application itself is NOT verified. Record that honestly on the
+		// result instead of promoting "edge exists" to "service works". No
+		// bypass path is added to make this check green.
+		if conn.accessID != "" {
+			res := core.StepResult{StepID: step.ID, Succeeded: true}
+			res.Notes = []string{"service health unknown: the endpoint is protected by Cloudflare Access, which Portico does not authenticate through; the public probe verified the edge route only"}
+			return res, nil
+		}
 		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 
 	case core.StepStopConnector:
