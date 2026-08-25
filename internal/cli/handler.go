@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	"github.com/B-A-M-N/portico/internal/app"
@@ -61,6 +62,34 @@ func getClient(cmd *cobra.Command) (*ipc.Client, error) {
 	}
 
 	return client, nil
+}
+
+func handleRotateSecretKey(cmd *cobra.Command) error {
+	yes, _ := cmd.Flags().GetBool("yes")
+	if !yes {
+		confirmed, err := confirm("Rotate the installation encryption key and re-encrypt all stored credentials? [y/N] ")
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			fmt.Println("Key rotation cancelled")
+			return nil
+		}
+	}
+	client, err := getClient(cmd)
+	if err != nil {
+		return err
+	}
+	result, err := client.RotateSecretKey(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("rotate installation key: %w", err)
+	}
+	jsonFlag, _ := cmd.Flags().GetBool("json")
+	if jsonFlag {
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(result)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Installation key rotated to version %d at %s\n", result.Version, result.RotatedAt)
+	return nil
 }
 
 func runSupervisor(cmd *cobra.Command) error {
@@ -704,11 +733,38 @@ func handleProviderLogin(cmd *cobra.Command, id string) error {
 
 // collectSetupValues gathers the fields a provider declared.
 //
-// Non-secret values come from flags or the environment. Secrets come only from
-// the environment: a secret passed as an argument is in the shell history and
-// visible in the process list to every user on the machine.
+// Non-secret values come from flags or the environment. Secrets come from the
+// environment, an interactive no-echo TTY prompt, stdin, or an inherited file
+// descriptor. There is deliberately no secret-valued CLI flag.
+// maxCredentialBytes bounds credential input. No real API key approaches this
+// size; anything larger means the caller piped something else (or a whole
+// file) and it must be rejected rather than buffered into memory.
+const maxCredentialBytes = 64 * 1024
+
+// readBounded reads at most limit+1 bytes, failing with an explicit error on
+// overflow instead of silently consuming an unbounded stream.
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		// Zero the oversized buffer before discarding it.
+		for i := range data {
+			data[i] = 0
+		}
+		return nil, fmt.Errorf("credential exceeds %d bytes; pipe only the key itself", limit)
+	}
+	return data, nil
+}
+
 func collectSetupValues(cmd *cobra.Command, flow *ipc.SetupFlowDTO) (map[string]string, error) {
 	values := map[string]string{}
+	readStdin, _ := cmd.Flags().GetBool("credential-stdin")
+	credentialFD, _ := cmd.Flags().GetInt("credential-fd")
+	if readStdin && credentialFD >= 0 {
+		return nil, fmt.Errorf("choose only one of --credential-stdin and --credential-fd")
+	}
 
 	for _, field := range flow.Fields {
 		var value string
@@ -728,13 +784,44 @@ func collectSetupValues(cmd *cobra.Command, flow *ipc.SetupFlowDTO) (map[string]
 				}
 			}
 		}
+		if value == "" && field.Secret {
+			var secret string
+			var readErr error
+			switch {
+			case readStdin:
+				var data []byte
+				data, readErr = readBounded(cmd.InOrStdin(), maxCredentialBytes)
+				secret = strings.TrimSpace(string(data))
+			case credentialFD >= 0:
+				file := os.NewFile(uintptr(credentialFD), "credential-fd")
+				if file == nil {
+					readErr = fmt.Errorf("invalid credential file descriptor %d", credentialFD)
+				} else {
+					var data []byte
+					data, readErr = readBounded(file, maxCredentialBytes)
+					_ = file.Close()
+					secret = strings.TrimSpace(string(data))
+				}
+			case stdinIsTTY() && term.IsTerminal(os.Stdin.Fd()):
+				fmt.Fprintf(cmd.ErrOrStderr(), "%s: ", field.Label)
+				var data []byte
+				data, readErr = term.ReadPassword(os.Stdin.Fd())
+				fmt.Fprintln(cmd.ErrOrStderr())
+				secret = strings.TrimSpace(string(data))
+			}
+			if readErr != nil {
+				return nil, fmt.Errorf("read %s securely: %w", field.Label, readErr)
+			}
+			if secret != "" {
+				value = secret
+			}
+		}
 
 		if value == "" && field.Required {
 			if field.Secret {
 				return nil, fmt.Errorf(
-					"%s is required; set %s in the environment — Portico never accepts a secret "+
-						"as a command argument, because arguments are recorded in shell history "+
-						"and visible in the process list",
+					"%s is required; set %s, use --credential-stdin, --credential-fd, or enter it at a TTY prompt — "+
+						"Portico never accepts a secret as a command argument because arguments are recorded in shell history and visible in process listings",
 					field.Label, strings.Join(field.EnvVars, " or "))
 			}
 			return nil, fmt.Errorf("%s is required; pass --%s or set %s",
@@ -999,6 +1086,10 @@ func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, erro
 	source, _ := cmd.Flags().GetString("source")
 	sourceType, _ := cmd.Flags().GetString("source-type")
 	protocol, _ := cmd.Flags().GetString("source-protocol")
+	healthEnabled, _ := cmd.Flags().GetBool("health-enabled")
+	healthPath, _ := cmd.Flags().GetString("health-path")
+	healthTimeout, _ := cmd.Flags().GetString("health-timeout")
+	healthInterval, _ := cmd.Flags().GetString("health-interval")
 	port, _ := cmd.Flags().GetInt("source-port")
 	args, _ := cmd.Flags().GetStringArray("source-arg")
 	workingDir, _ := cmd.Flags().GetString("source-working-dir")
@@ -1018,7 +1109,13 @@ func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, erro
 		if addressErr != nil {
 			return nil, addressErr
 		}
-		sourceDTO.Existing = &ipc.ExistingSourceDTO{Address: source, Protocol: protocol}
+		sourceDTO.Existing = &ipc.ExistingSourceDTO{
+			Address: source, Protocol: protocol,
+			Health: &ipc.HealthCheckSpecDTO{
+				Enabled: healthEnabled, Path: healthPath,
+				Timeout: healthTimeout, Interval: healthInterval,
+			},
+		}
 	case "directory":
 		sourceDTO.Directory = &ipc.DirectorySourceDTO{Path: source, Mode: directoryMode, SPAFallback: directorySPA, AllowUpload: directoryUpload, AllowDelete: directoryDelete}
 	case "command":

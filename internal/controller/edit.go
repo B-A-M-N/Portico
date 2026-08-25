@@ -164,6 +164,17 @@ func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, erro
 				delta.Changes = append(delta.Changes, "tunnel ID")
 				delta.RestartConnector = true
 			}
+			// MCP endpoint and transport changes alter what the client
+			// forwards to: they require a semantic restart so the client is
+			// relaunched against the new origin and re-verified with /readyz.
+			if cur.MCP.Endpoint != prop.MCP.Endpoint {
+				delta.Changes = append(delta.Changes, "MCP endpoint")
+				delta.RestartConnector = true
+			}
+			if cur.MCP.Transport != prop.MCP.Transport {
+				delta.Changes = append(delta.Changes, "MCP transport")
+				delta.RestartConnector = true
+			}
 		}
 	}
 

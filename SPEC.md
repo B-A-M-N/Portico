@@ -2840,7 +2840,8 @@ Portico v0.1 is complete only when all items pass.
 - Observation.
 - Rollback.
 - Quick Tunnel constraints.
-- Metrics collection.
+- Connector operational telemetry (reachability, restart count, state);
+  cloudflared traffic metrics are a later-phase item, not v0.1 DoD.
 - Drift detection.
 - Managed-resource ownership.
 - Address-preserving connector repair.
