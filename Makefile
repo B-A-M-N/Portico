@@ -8,7 +8,7 @@ LDFLAGS  = -s -w \
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate acceptance release-check clean
+.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate acceptance release-check artifact-check clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -62,13 +62,19 @@ validate: fmt-check
 acceptance:
 	./scripts/verify_acceptance_matrix.sh
 
+# artifact-check exercises the packaged binary, not the working-tree binary.
+# Release CI passes the archive it just built to the same script.
+artifact-check: build
+	@set -eu; tmp="$$(mktemp -d .release-artifact-check.XXXXXX)"; trap 'rm -rf "$$tmp"' EXIT; tar -czf "$$tmp/portico.tar.gz" portico; ./scripts/verify_release_artifact.sh "$$tmp/portico.tar.gz"
+
 # release-check is the canonical complete release gate. It runs everything
 # that tag publishing requires: format, build, vet, staticcheck, tests,
 # race, vulnerability scan, module-tidy diff, and acceptance. CI and
 # release should call this single target so "all release gates passed"
 # means the same thing everywhere.
 release-check: validate acceptance
-	go run golang.org/x/vuln/cmd/govulncheck@pinned ./... 2>/dev/null || go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	GOVULNCHECK_VERSION=v1.1.4; \
+	go run golang.org/x/vuln/cmd/govulncheck@$$GOVULNCHECK_VERSION ./...
 	go mod tidy -diff
 	@echo
 	@echo "All release gates + release-check passed."

@@ -1,0 +1,15 @@
+# Keep third-party GitHub Actions pinned to full commit SHAs
+# (.github/workflows/release.yml). Dependabot proposes version bumps as new
+# commits, so the pin never silently ages into a mutable-tag dependency.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "actions/*"
+          - "dominikh/*"
+          - "softprops/*"
