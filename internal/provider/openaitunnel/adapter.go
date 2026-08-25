@@ -412,7 +412,13 @@ func (p *Provider) clientProcessSpec(step core.PlanStep) core.ProcessSpec {
 		Executable: p.binPath,
 		Args:       args,
 		Env:        []string{CredentialEnvVar + "=" + os.Getenv(CredentialEnvVar)},
-		Restart:    core.RestartAlways,
+		// The client is not stateless: a correct relaunch needs the gateway
+		// running first and its current endpoint in --mcp.server-url, which
+		// the generic actor cannot know (a crash stops the gateway, and
+		// blind re-execution would point at the dead one). RestartNever
+		// leaves restart to supervisor reconciliation, which replans the
+		// whole chain — gateway, credential, client, /readyz.
+		Restart: core.RestartNever,
 	}
 }
 

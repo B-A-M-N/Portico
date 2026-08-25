@@ -984,6 +984,25 @@ const connectorReadyTimeout = 10 * time.Second
 // before it is considered to have consumed the token credential file.
 const connectorReadyGrace = 2 * time.Second
 
+// connectorSpec builds the base process specification for a cloudflared
+// connector.
+//
+// cloudflared is not stateless. A permanent relaunch needs a fresh token file
+// (the original was deleted after initial readiness), and a quick-tunnel
+// relaunch gets a NEW trycloudflare.com URL that only provider planning can
+// rediscover and publish. RestartAlways would re-execute argv pointing at a
+// deleted token file or silently strand the old URL. RestartNever hands
+// restart to supervisor reconciliation, which replans semantically through
+// the provider.
+func (p *Provider) connectorSpec(connectionID core.ConnectionID) core.ProcessSpec {
+	return core.ProcessSpec{
+		Executable: p.cloudflaredBin,
+		Restart:    core.RestartNever,
+		StdoutPath: filepath.Join(p.logDir, fmt.Sprintf("connector-%s.out", safeShortID(string(connectionID), 8))),
+		StderrPath: filepath.Join(p.logDir, fmt.Sprintf("connector-%s.err", safeShortID(string(connectionID), 8))),
+	}
+}
+
 // launchConnector starts a cloudflared connector for the connection and
 // records the resulting PID in the in-memory connection state.
 //
@@ -994,12 +1013,7 @@ const connectorReadyGrace = 2 * time.Second
 // cancellation, and success (after the connector has consumed it).
 // The token path and contents are never logged.
 func (p *Provider) launchConnector(ctx context.Context, connectionID core.ConnectionID, conn *cfConnection, mode, originURL string) (core.ConnectorHandle, error) {
-	spec := core.ProcessSpec{
-		Executable: p.cloudflaredBin,
-		Restart:    core.RestartAlways,
-		StdoutPath: filepath.Join(p.logDir, fmt.Sprintf("connector-%s.out", safeShortID(string(connectionID), 8))),
-		StderrPath: filepath.Join(p.logDir, fmt.Sprintf("connector-%s.err", safeShortID(string(connectionID), 8))),
-	}
+	spec := p.connectorSpec(connectionID)
 
 	var handle core.ConnectorHandle
 	var err error
