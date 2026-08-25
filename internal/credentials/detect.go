@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // SourceKind names where a credential was found.
@@ -101,7 +103,7 @@ func candidates() []candidate {
 			action:      "Run: ngrok config add-authtoken <token>",
 		},
 		{
-			provider:    "openai_tunnel",
+			provider:    string(core.ProviderIDClientTunnel),
 			kind:        SourceEnvironment,
 			locations:   []string{"CONTROL_PLANE_API_KEY"},
 			description: "Lets the Secure MCP Tunnel client reach the OpenAI control plane.",

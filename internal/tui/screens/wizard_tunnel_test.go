@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
@@ -19,8 +20,8 @@ import (
 // tunnelSnapshot has the tunnel provider registered and usable.
 func tunnelSnapshot() []ipc.ProviderDTO {
 	return []ipc.ProviderDTO{{
-		ID: "openai_tunnel", Name: "openai_tunnel",
-		DisplayName: "OpenAI Secure MCP Tunnel",
+		ID: string(core.ProviderIDClientTunnel), Name: string(core.ProviderIDClientTunnel),
+		DisplayName: "Client-mediated MCP transport",
 		Selectable:  true, Availability: "ready", Readiness: "ready",
 		Stability: "experimental",
 		Capabilities: &ipc.CapabilitySetDTO{
@@ -88,7 +89,7 @@ func TestTheTunnelOutcomeIsAvailableWhenTheProviderIs(t *testing.T) {
 
 	// A provider that is present but not usable gives its own reason.
 	blocked := NewWizard(nil, []ipc.ProviderDTO{{
-		ID: "openai_tunnel", DisplayName: "OpenAI Secure MCP Tunnel",
+		ID: string(core.ProviderIDClientTunnel), DisplayName: "Client-mediated MCP transport",
 		Selectable:   false,
 		SetupActions: []string{"install tunnel-client", "export CONTROL_PLANE_API_KEY"},
 	}})
@@ -255,5 +256,49 @@ func TestTheTunnelQuestionsAdvertiseTheirActions(t *testing.T) {
 				t.Errorf("step %d advertises %q with no explanation", step, action.Label)
 			}
 		}
+	}
+}
+
+// TestTheWizardWritesTheCanonicalTransportIdentity pins the vertical identity
+// contract: the recipe names client_tunnel, the wizard state carries it, and
+// the create request persists Driver.ProviderID as client_tunnel. The TUI once
+// generated the legacy workload spelling while the backend had normalized to
+// the transport identity — every side passed its own test and the persisted
+// row still carried a name the registry would not hold.
+func TestTheWizardWritesTheCanonicalTransportIdentity(t *testing.T) {
+	var recipe wizardRecipe
+	found := false
+	for _, r := range wizardRecipes {
+		if r.ConnectionKind == "client_tunnel" {
+			recipe, found = r, true
+		}
+	}
+	if !found {
+		t.Fatal("no client-tunnel outcome is offered")
+	}
+	if recipe.RequiresProvider != string(core.ProviderIDClientTunnel) {
+		t.Fatalf("recipe requires provider %q, want %q",
+			recipe.RequiresProvider, core.ProviderIDClientTunnel)
+	}
+
+	m := wizardAtTunnelID(t)
+	m.setInput("tunnel_" + strings.Repeat("e", 32))
+	m.HandleKey("enter")
+	m.setInput("http://127.0.0.1:8000")
+	m.HandleKey("enter")
+	m.setInput("")
+	m.HandleKey("enter") // optional profile
+
+	if m.state.Provider != string(core.ProviderIDClientTunnel) {
+		t.Fatalf("wizard state carries provider %q", m.state.Provider)
+	}
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if req.Provider.ProviderID != string(core.ProviderIDClientTunnel) {
+		t.Fatalf("create request carries provider %q, want %q — the legacy "+
+			"workload name must never be written again",
+			req.Provider.ProviderID, core.ProviderIDClientTunnel)
 	}
 }

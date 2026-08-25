@@ -2,10 +2,11 @@ package screens
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // Managing an existing OpenAI Secure MCP Tunnel.
@@ -22,10 +23,10 @@ import (
 // client profile — and the review says plainly that Portico did not create the
 // tunnel and will not delete it.
 
-// tunnelIDPattern is the client's own requirement: tunnel_ then 32 lowercase
-// alphanumerics. Checking it here means a typo is refused on the question that
-// asked for it rather than by the adapter at open time.
-var tunnelIDPattern = regexp.MustCompile(`^tunnel_[a-z0-9]{32}$`)
+// Tunnel-ID validation lives in core (ValidateTunnelID): the wizard and the
+// adapter share one authority for the control plane's format. Checking it here
+// means a typo is refused on the question that asked for it rather than by the
+// adapter at open time.
 
 // handleTunnelIDKey collects the identifier of a tunnel that already exists.
 func (m *WizardModel) handleTunnelIDKey(key string) tea.Cmd {
@@ -33,21 +34,14 @@ func (m *WizardModel) handleTunnelIDKey(key string) tea.Cmd {
 	case "esc":
 		m.goBack()
 	case "enter":
-		id := strings.TrimSpace(m.inputValue())
-		if id == "" {
+		if err := core.ValidateTunnelID(m.inputValue()); err != nil {
 			m.err = fmt.Errorf(
-				"a tunnel ID is required: Portico manages a tunnel you have already created " +
-					"in the OpenAI platform, and cannot create one for you")
-			return nil
-		}
-		if !tunnelIDPattern.MatchString(id) {
-			m.err = fmt.Errorf(
-				"that does not look like a tunnel ID: the client expects tunnel_ followed by " +
-					"32 lowercase letters or digits")
+				"that is not a usable tunnel ID: %v. Portico manages a tunnel you have already "+
+					"created in the OpenAI platform, and cannot create one for you", err)
 			return nil
 		}
 		m.err = nil
-		m.state.TunnelID = id
+		m.state.TunnelID = strings.TrimSpace(m.inputValue())
 		m.state.Step = WizardStepTunnelMCP
 		m.setInput(m.state.SourceAddress)
 	default:
@@ -89,7 +83,7 @@ func (m *WizardModel) handleTunnelProfileKey(key string) tea.Cmd {
 		// would demand a choice most users do not need to make.
 		m.err = nil
 		m.state.TunnelProfile = strings.TrimSpace(m.inputValue())
-		m.state.Provider = "openai_tunnel"
+		m.state.Provider = string(core.ProviderIDClientTunnel)
 		m.state.Step = WizardStepReview
 		m.selected = 0
 	default:

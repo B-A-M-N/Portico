@@ -16,8 +16,11 @@ func (c *Controller) providerForProfile(profile *core.ConnectionProfile) (core.P
 		return nil, core.ErrValidation("profile is required")
 	}
 	provider := profile.GetProvider()
-	providerID := provider.ProviderID
+	providerID := core.NormalizeProviderID(provider.ProviderID)
 	prov := c.registry.Get(providerID)
+	// The legacy workload spelling is normalized above before lookup: durable
+	// rows carrying it still resolve, but it is never registered as a second
+	// provider or exposed in new plans.
 	if prov == nil {
 		return nil, core.ErrProviderNotFound(providerID)
 	}
@@ -84,6 +87,14 @@ func (c *Controller) validateProviderForProfile(ctx context.Context, profile *co
 	constraints := core.CheckConstraints(caps.Constraints, profile)
 	if len(constraints) > 0 {
 		return core.ErrValidation(fmt.Sprintf("provider %q cannot satisfy profile requirements: %s", providerID, constraints[0].Message))
+	}
+
+	// Profile intent is validated independently from the transport driver. This
+	// is what permits one OpenAI profile to select Cloudflare, ngrok, Tailscale,
+	// or another compatible transport without manufacturing an OpenAI provider
+	// for each combination.
+	if err := c.validateProfileTransport(profile, caps); err != nil {
+		return err
 	}
 
 	return nil

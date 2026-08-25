@@ -14,6 +14,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
@@ -132,6 +133,10 @@ type WizardState struct {
 	Name           string
 	SourceAddress  string
 	SourceProtocol string
+	// Existing-service health settings. The probe is enabled by default for a
+	// service chosen in the wizard; the path is optional and defaults to root.
+	HealthEnabled  bool
+	HealthPath     string
 	Port           string
 	CommandArgs    []string
 	WorkingDir     string
@@ -223,6 +228,8 @@ const (
 	WizardStepPortForwardRemotePort
 	// WizardStepPortForwardProtocol asks for the protocol (TCP/UDP).
 	WizardStepPortForwardProtocol
+	WizardStepHealth
+	WizardStepHealthPath
 	// The client-tunnel questions. They adopt a tunnel that already exists: its
 	// ID, the local MCP server it should reach, and the client profile to run.
 	WizardStepTunnelID
@@ -330,7 +337,7 @@ var wizardRecipes = []wizardRecipe{
 		// about the machine — whether the provider is registered, which its own
 		// definition decides — and a hardcoded refusal here was a second answer to
 		// that question, wrong the moment the provider became available.
-		RequiresProvider: "openai_tunnel",
+		RequiresProvider: string(core.ProviderIDClientTunnel),
 		ConnectionKind:   "client_tunnel",
 	},
 	{
@@ -360,7 +367,7 @@ func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO) *WizardMod
 		client:     client,
 		ctx:        context.Background(), // default; root model should call WithContext
 		caps:       providerCapabilities{providers: providers},
-		state:      WizardState{Step: WizardStepOutcome},
+		state:      WizardState{Step: WizardStepOutcome, HealthEnabled: true},
 		field:      NewField(),
 	}
 }
@@ -782,8 +789,50 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 		case "enter":
 			m.state.SourceProtocol = protocols[m.selected]
+			m.state.Step = WizardStepHealth
+			m.selected = boolIndex(m.state.HealthEnabled)
+		}
+
+	case WizardStepHealth:
+		switch key {
+		case "up", "k":
+			if m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if m.selected < 1 {
+				m.selected++
+			}
+		case "enter":
+			m.state.HealthEnabled = m.selected == 1
+			if m.state.HealthEnabled {
+				m.state.Step = WizardStepHealthPath
+				m.setInput(m.state.HealthPath)
+			} else {
+				m.state.HealthPath = ""
+				m.state.Step = WizardStepExposure
+				m.selected = firstAvailable(m.exposureChoices())
+			}
+		case "esc":
+			m.goBack()
+		}
+
+	case WizardStepHealthPath:
+		switch key {
+		case "esc":
+			m.goBack()
+		case "enter":
+			path := strings.TrimSpace(m.inputValue())
+			if path != "" && !strings.HasPrefix(path, "/") {
+				m.err = fmt.Errorf("health path must start with /")
+				return nil
+			}
+			m.err = nil
+			m.state.HealthPath = path
 			m.state.Step = WizardStepExposure
 			m.selected = firstAvailable(m.exposureChoices())
+		default:
+			m.setInput(editInput(m.inputValue(), key))
 		}
 
 	case WizardStepCommandArgs:
@@ -1245,7 +1294,10 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 		if protocol == "" {
 			protocol = "http"
 		}
-		src.Existing = &ipc.ExistingSourceDTO{Address: addr, Protocol: protocol}
+		src.Existing = &ipc.ExistingSourceDTO{
+			Address: addr, Protocol: protocol,
+			Health: &ipc.HealthCheckSpecDTO{Enabled: s.HealthEnabled, Path: s.HealthPath},
+		}
 	case "directory":
 		src.Directory = &ipc.DirectorySourceDTO{
 			Path:        s.SourceAddress,
@@ -1628,6 +1680,10 @@ func (m *WizardModel) View() string {
 		return m.withError(m.renderField("Local port (empty to skip):"))
 	case WizardStepProtocol:
 		return m.renderProtocol()
+	case WizardStepHealth:
+		return renderMenu("Probe the existing service after connecting?", []string{"No", "Yes"}, m.selected)
+	case WizardStepHealthPath:
+		return m.withError(m.renderField("Optional health path (empty to probe the service root):"))
 	case WizardStepCommandArgs:
 		return m.withError(m.renderField(
 			"Command arguments (space separated; quote any argument containing spaces; empty to skip):\n" +
