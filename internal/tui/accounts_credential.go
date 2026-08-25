@@ -94,11 +94,24 @@ func (m *Model) applyAccountVerified(msg accountVerifiedMsg) tea.Cmd {
 //
 // It does not build a second credential form. The provider's declared setup flow
 // is the one description of what its credential looks like.
+//
+// Identity is FIXED during a rotation (audit item 24): the account's label and
+// its zone are shown as read-only context, and only the secret is prompted for.
+// Fields that identify the account are pre-filled and disabled so the form can
+// never read as though an Account ID or Zone ID changes with the secret.
 func (m Model) beginCredentialReplacement(row accountRow) (Model, tea.Cmd, bool) {
 	next, cmd := m.beginProviderSetup(row.ProviderID)
 	next.replacingAccountID = row.AccountID
-	next.status = "Enter a new credential for " + row.Label +
-		". It is checked before it replaces the old one."
+	for i := range next.providerSetupFlow.Fields {
+		f := &next.providerSetupFlow.Fields[i]
+		switch f.ID {
+		case "account_id", "zone_id", "label":
+			f.Required = false
+			f.Description = "(unchanged during credential replacement) " + f.Description
+		}
+	}
+	next.status = "Replace the credential for " + row.Label +
+		". Its identity stays fixed; only the secret changes. It is checked before it replaces the old one."
 	return next, cmd, true
 }
 

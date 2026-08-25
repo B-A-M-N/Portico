@@ -286,17 +286,30 @@ func (m *Model) renderProvidersScreen() string {
 	}
 
 	b.WriteString("\n")
-	// Context-sensitive actions.
-	// Provider rows: only add/setup actions. Account rows: remove.
-	// [x] is never available on a provider row — implicit removal of the
-	// first account would be too destructive.
-	if row, ok := m.selectedScreenRow(); ok {
-		switch row.Kind {
-		case rowKindProvider:
-			b.WriteString("[a] add account   ")
-		case rowKindAccount:
-			b.WriteString("[x] remove account   ")
+	// Footer hints come from the ACTION REGISTRY, not a second hardcoded
+	// list (audit item 24). The registry already knows which actions apply to
+	// the selected row — provider rows get add/setup; account rows get
+	// verify, replace-credential and remove — so the footer can never claim a
+	// key the handler would ignore, or omit one it would honor.
+	if actions := m.providerActions(); len(actions) > 0 {
+		hints := make([]string, 0, len(actions))
+		for _, action := range actions {
+			if !action.Enabled || action.Primary {
+				continue
+			}
+			for _, key := range action.Keys {
+				switch key {
+				case "up", "down", "k", "j":
+					continue // navigation is implicit, not footer material
+				}
+				hints = append(hints, "["+key+"] "+strings.ToLower(action.Label))
+				break
+			}
 		}
+		b.WriteString(strings.Join(hints, "   "))
+	}
+	if row, ok := m.selectedScreenRow(); ok && row.Kind == rowKindProvider {
+		b.WriteString("[a] add account   ")
 	}
 	b.WriteString("[esc] back\n")
 
