@@ -268,6 +268,11 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 				core.ProtocolHTTP:  {Supported: true, Public: true},
 				core.ProtocolHTTPS: {Supported: true, Public: true},
 			},
+			Streaming: core.CapabilitySupport{
+				Supported: false,
+				Stability: core.StabilityBeta,
+				Notes:     []string{"Quick Tunnels do not preserve SSE streaming"},
+			},
 			Telemetry: core.TelemetryCapability{
 				Supported:     false,
 				RequestCounts: false,
@@ -318,6 +323,11 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 		Protocols: map[core.Protocol]core.ProtocolCapability{
 			core.ProtocolHTTP:  {Supported: true, Public: true},
 			core.ProtocolHTTPS: {Supported: true, Public: true},
+		},
+		Streaming: core.CapabilitySupport{
+			Supported: true,
+			Stability: core.StabilityBeta,
+			Notes:     []string{"the managed HTTPS transport preserves streaming responses"},
 		},
 		Telemetry: core.TelemetryCapability{
 			// Metrics collection is not wired into the supervisor yet. Do not
@@ -439,7 +449,18 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 						Parameters: map[string]string{
 							"mode":       "quick",
 							"origin_url": originURL,
-						}}},
+						}},
+					// A failed public-endpoint verification must not leave
+					// cloudflared running against a URL nothing published.
+					// Idempotent: stopping an absent connector succeeds.
+					Compensation: &core.CompensationStep{
+						ID:   "comp-cf-connector-stop",
+						Kind: core.StepStopConnector,
+						Technical: core.TechnicalOperation{
+							Provider: "cloudflare",
+							Type:     "stop_connector",
+						},
+					}},
 				core.PlanStep{ID: "cf-verify", Kind: core.StepVerifyEndpoint, Summary: "Verify public URL reachable",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_endpoint",
 						Parameters: map[string]string{"origin_url": originURL}}},
@@ -578,7 +599,19 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			plan.Steps = append(plan.Steps,
 				core.PlanStep{ID: "cf-connector", Kind: core.StepStartConnector, Summary: "Start cloudflared connector",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "start_connector",
-						Parameters: map[string]string{"mode": "permanent", "origin_url": originURL}}},
+						Parameters: map[string]string{"mode": "permanent", "origin_url": originURL}},
+					// Reverse compensation order stops the connector before
+					// the tunnel/DNS/Access resources are deleted, so
+					// cloudflared never runs against infrastructure that is
+					// being rolled back underneath it.
+					Compensation: &core.CompensationStep{
+						ID:   "comp-cf-connector-stop",
+						Kind: core.StepStopConnector,
+						Technical: core.TechnicalOperation{
+							Provider: "cloudflare",
+							Type:     "stop_connector",
+						},
+					}},
 				core.PlanStep{ID: "cf-verify-connector", Kind: core.StepVerifyConnector, Summary: "Verify connector process",
 					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "verify_connector"}},
 				core.PlanStep{ID: "cf-verify", Kind: core.StepVerifyEndpoint, Summary: "Verify endpoint reachable",

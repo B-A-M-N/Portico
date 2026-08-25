@@ -290,6 +290,18 @@ func (p *Provider) Plan(_ context.Context, desired core.DesiredConnection) (*cor
 				ID: "tunnel-start", Kind: core.StepStartConnector,
 				Summary:   "Start the tunnel client",
 				Technical: core.TechnicalOperation{Provider: ProviderID, Type: "start_client", Parameters: params},
+				// If a later step fails — most importantly /readyz never
+				// passing — this rolls back everything startClient created:
+				// the client process and the local gateway. Idempotent by
+				// construction: stopping an already-stopped client succeeds.
+				Compensation: &core.CompensationStep{
+					ID:   "comp-tunnel-stop",
+					Kind: core.StepStopConnector,
+					Technical: core.TechnicalOperation{
+						Provider: ProviderID,
+						Type:     "stop_client",
+					},
+				},
 			},
 			{
 				ID: "tunnel-verify", Kind: core.StepVerifyConnector,
