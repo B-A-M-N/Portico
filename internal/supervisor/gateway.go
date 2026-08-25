@@ -86,11 +86,24 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 
 // Runtime returns the gateway projection without exposing the gateway object
 // or any authentication material.
+//
+// The projection consults the gateway's LIVE state, not just the fact that a
+// handle exists (audit item 29): a gateway whose server goroutine exited
+// after reaching Ready must not be reported as an available endpoint, which
+// would leave Runtime.Gateway claiming a working front while nothing listened.
 func (m *gatewayManager) Runtime(connID core.ConnectionID) (core.GatewayRuntime, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	h, ok := m.gateways[connID]
 	if !ok {
+		return core.GatewayRuntime{}, false
+	}
+	if h.gateway.State() != gateway.GatewayStateReady || h.gateway.Addr() == "" {
+		// Dead or dying: drop the stale handle so a later StartGateway can
+		// rebuild cleanly. The caller sees "no gateway", which reconciliation
+		// treats as degraded and repairs — the honest answer.
+		h.cancel()
+		delete(m.gateways, connID)
 		return core.GatewayRuntime{}, false
 	}
 	return core.GatewayRuntime{

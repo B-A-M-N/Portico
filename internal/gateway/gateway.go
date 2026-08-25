@@ -11,8 +11,8 @@
 // Chat Completions and Responses use SSE streaming.
 //
 // Security: Gateway credentials terminate at the gateway. The Portico
-// Authorization header is stripped before forwarding. Upstream auth uses
-// a separate credential domain.
+// Authorization header is stripped before forwarding. There is currently no
+// upstream-auth injection mechanism; see the note on Gateway.director.
 package gateway
 
 import (
@@ -103,9 +103,22 @@ func New(cfg Config) (*Gateway, error) {
 		return nil, fmt.Errorf("gateway: upstream URL is required")
 	}
 
-	upstream, err := url.Parse(cfg.Upstream)
-	if err != nil {
-		return nil, fmt.Errorf("gateway: parse upstream: %w", err)
+	upstream, parseErr := url.Parse(cfg.Upstream)
+	if parseErr != nil {
+		return nil, fmt.Errorf("gateway: parse upstream: %w", parseErr)
+	}
+	// Hardened upstream validation (audit item 28): the upstream must be an
+	// absolute URL with an explicitly supported scheme. A relative or
+	// scheme-less URL would make httputil.ReverseProxy resolve it against the
+	// incoming request, letting a caller influence where traffic is sent.
+	if !upstream.IsAbs() || upstream.Host == "" {
+		return nil, fmt.Errorf("gateway: upstream %q must be an absolute URL with a host", cfg.Upstream)
+	}
+	switch upstream.Scheme {
+	case "http", "https":
+		// supported
+	default:
+		return nil, fmt.Errorf("gateway: upstream scheme %q is not supported (use http or https)", upstream.Scheme)
 	}
 
 	validTokens := make(map[string]struct{})
@@ -166,8 +179,16 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 	g.mu.Lock()
 	g.listener = listener
+	// Timeouts (audit item 28): ReadHeaderTimeout bounds slow-header attacks
+	// without ever cutting off a legitimate request body; IdleTimeout reclaims
+	// idle keep-alive connections. Deliberately NO WriteTimeout: it would kill
+	// legitimate long-lived SSE streams, which this gateway exists to carry.
+	readHeaderTimeout := 10 * time.Second
+	idleTimeout := 120 * time.Second
 	g.server = &http.Server{
-		Handler: g.handler(),
+		Handler:           g.handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
 	}
 	g.state = GatewayStateReady
 	g.startedAt = time.Now().UTC()
@@ -234,6 +255,17 @@ func (g *Gateway) BaseURL() string {
 	return g.URL()
 }
 
+// UpstreamURL returns the configured upstream without exposing mutable proxy
+// internals to the supervisor.
+func (g *Gateway) UpstreamURL() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.upstream == nil {
+		return ""
+	}
+	return g.upstream.String()
+}
+
 // State returns the current lifecycle state.
 func (g *Gateway) State() GatewayState {
 	g.mu.RLock()
@@ -298,7 +330,19 @@ func (g *Gateway) unauthorized(w http.ResponseWriter, reason string) {
 }
 
 // director rewrites the request to route to the upstream.
+//
+// Upstream auth: the gateway credential is stripped here because it
+// authenticates the caller TO PORTICO, and must not leak to the upstream.
+// There is currently no upstream-auth injection mechanism; if one is added it
+// must use a separate credential source, never the gateway's tokens.
 func (g *Gateway) director(r *http.Request) {
+	// Preserve the ORIGINAL host before it is overwritten: X-Forwarded-Host
+	// must name the host the client used, not the upstream we are about to
+	// point at. The old code set these after clobbering r.Host, so the
+	// upstream saw its own name in X-Forwarded-Host — breaking virtual-host
+	// routing and any origin check an application performed.
+	originalHost := r.Host
+
 	r.URL.Scheme = g.upstream.Scheme
 	r.URL.Host = g.upstream.Host
 	r.Host = g.upstream.Host
@@ -307,9 +351,13 @@ func (g *Gateway) director(r *http.Request) {
 	r.Header.Del("Authorization")
 
 	// Set standard forwarded headers.
-	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		r.Header.Set("X-Forwarded-For", clientIP)
+	} else {
+		r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	}
 	r.Header.Set("X-Forwarded-Proto", "http")
-	r.Header.Set("X-Forwarded-Host", r.Host)
+	r.Header.Set("X-Forwarded-Host", originalHost)
 
 	// Ensure hop-by-hop headers are not forwarded.
 	r.Header.Del("Connection")
