@@ -412,8 +412,18 @@ func TestWizardProtocolSelection(t *testing.T) {
 	if m.state.SourceProtocol != "https" {
 		t.Fatalf("protocol = %q, want https", m.state.SourceProtocol)
 	}
+	if m.state.Step != WizardStepHealth {
+		t.Fatalf("step = %d, want health settings", m.state.Step)
+	}
+	// Enable the probe and leave its path at the service root.
+	m.HandleKey("down")
+	m.HandleKey("enter")
+	if m.state.Step != WizardStepHealthPath {
+		t.Fatalf("step = %d, want health path", m.state.Step)
+	}
+	m.HandleKey("enter")
 	if m.state.Step != WizardStepExposure {
-		t.Fatalf("step = %d, want exposure", m.state.Step)
+		t.Fatalf("step = %d, want exposure after health settings", m.state.Step)
 	}
 }
 

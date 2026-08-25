@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
@@ -163,6 +164,42 @@ func (m *InspectModel) renderOverview() []string {
 	}
 	if conn.ConnectorPID > 0 {
 		lines = append(lines, fmt.Sprintf("Connector:  PID %d (%s)", conn.ConnectorPID, conn.ConnectorState))
+	}
+	// Client tunnels report THREE separate facts, never collapsed (audit
+	// item 13): is the local MCP server answering; did the tunnel client reach
+	// the control plane (/readyz); and has ChatGPT-side connector attachment
+	// been verified — which Portico cannot see at all, so it is always
+	// reported as unknown rather than inferred from the other two.
+	if conn.Kind == string(core.ConnectionClientTunnel) {
+		lines = append(lines, "", "TUNNEL READINESS")
+		localReady, runtimeReady := "not checked", "not checked"
+		if m.Detail != nil && m.Detail.Health != nil {
+			switch m.Detail.Health.Service.State {
+			case "ok", "pass":
+				localReady = "ready"
+			case "problem", "fail":
+				localReady = "not ready"
+			default:
+				localReady = "unknown"
+			}
+			switch m.Detail.Health.Transport.State {
+			case "ok", "pass":
+				runtimeReady = "ready (control plane reachable)"
+			case "problem", "fail":
+				runtimeReady = "not ready"
+				if d := m.Detail.Health.Transport.Detail; d != "" {
+					runtimeReady += " — " + d
+				}
+			default:
+				runtimeReady = "unknown"
+			}
+		}
+		lines = append(lines,
+			fmt.Sprintf("  Local MCP:        %s", localReady),
+			fmt.Sprintf("  Tunnel runtime:   %s", runtimeReady),
+			"  ChatGPT attachment: unknown (Portico cannot see ChatGPT-side setup;",
+			"                      register the app in the OpenAI platform yourself)",
+		)
 	}
 	if conn.Error != "" {
 		lines = append(lines, "", "Error:", conn.Error)

@@ -241,6 +241,8 @@ func TestEveryConditionalStepIsBothVisitedAndSkipped(t *testing.T) {
 	}{
 		{WizardStepPort, "port"},
 		{WizardStepProtocol, "protocol"},
+		{WizardStepHealth, "health probe"},
+		{WizardStepHealthPath, "health path"},
 		{WizardStepCommandArgs, "command arguments"},
 		{WizardStepCommandWorkingDir, "working directory"},
 		{WizardStepHostname, "hostname"},

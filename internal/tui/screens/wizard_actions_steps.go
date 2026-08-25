@@ -122,6 +122,8 @@ func (m *WizardModel) currentMenuLength() int {
 		return 2
 	case WizardStepProtocol:
 		return 2
+	case WizardStepHealth:
+		return 2
 	case WizardStepPortForwardProtocol:
 		return len(portForwardProtocolChoices())
 	case WizardStepDirectoryMode:
