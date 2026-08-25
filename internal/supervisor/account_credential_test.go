@@ -40,6 +40,12 @@ func (v *stubValidator) Validate(_ context.Context, _, _, credential string) (*A
 	return &AccountValidation{AccountAccessible: v.accessible}, nil
 }
 
+// VerifyZone satisfies the widened AccountValidator interface: tests using the
+// stub do not exercise zone verification, so it verifies nothing.
+func (v *stubValidator) VerifyZone(_ context.Context, _, _ string) ([]ZoneSummary, error) {
+	return nil, nil
+}
+
 // storedAccount puts one account and its credential in the store.
 func storedAccount(t *testing.T, h *supervisorHandler, status core.ProviderAccountStatus) core.ProviderAccount {
 	t.Helper()

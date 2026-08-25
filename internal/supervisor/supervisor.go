@@ -2854,10 +2854,18 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 	}
 
 	// A supplied zone must actually belong to the account, otherwise DNS work
-	// would fail later with an error far from its cause.
-	if zoneID != "" && len(validation.Zones) > 0 {
+	// would fail later with an error far from its cause. Verification of a
+	// supplied zone ID is MANDATORY and exact: it can no longer pass merely
+	// because zone listing returned some rows — listing is optional discovery,
+	// while DNS capability comes only from proving this exact zone.
+	if zoneID != "" {
+		zones, zErr := validator.VerifyZone(ctx, credential, zoneID)
+		if zErr != nil {
+			resp := &ipc.ConfigureProviderAccountResponse{}
+			return resp, core.ErrValidation(zErr.Error())
+		}
 		known := false
-		for _, z := range validation.Zones {
+		for _, z := range zones {
 			if z.ID == zoneID {
 				known = true
 				break
@@ -2865,7 +2873,7 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 		}
 		if !known {
 			return nil, core.ErrValidation(fmt.Sprintf(
-				"zone %s is not visible to this token; leave the zone blank to configure tunnels without DNS", zoneID))
+				"zone %s could not be verified against this account; leave the zone blank to configure tunnels without DNS", zoneID))
 		}
 	}
 
@@ -2876,6 +2884,9 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 	metadata := map[string]string{}
 	if zoneID != "" {
 		metadata["zone_id"] = zoneID
+		// Recorded only after the exact-zone verification above succeeded, so
+		// DNS capability is always backed by a proven zone.
+		metadata["zone_verified"] = "true"
 	}
 	credentialRef := providerCredentialRef("cloudflare", accountID)
 	account := core.ProviderAccount{

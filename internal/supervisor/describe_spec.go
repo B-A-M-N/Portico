@@ -96,6 +96,12 @@ func describeSource(src core.SourceSpec) ipc.SourceDTO {
 			Address:  src.Existing.Address,
 			Protocol: string(src.Existing.Protocol),
 		}
+		if health := src.Existing.Health; health.Configured || health.Enabled || health.Path != "" || health.Timeout != 0 || health.Interval != 0 {
+			dto.Existing.Health = &ipc.HealthCheckSpecDTO{
+				Enabled: health.Enabled, Path: health.Path,
+				Timeout: health.Timeout.String(), Interval: health.Interval.String(),
+			}
+		}
 	}
 	if src.Directory != nil {
 		dto.Directory = &ipc.DirectorySourceDTO{
@@ -161,6 +167,7 @@ func connectionSummaryDTO(p *core.ConnectionProfile, rt *core.ConnectionRuntime)
 		ID:                string(p.ID),
 		Name:              p.Name,
 		Kind:              string(p.EffectiveKind()),
+		ProfileKind:       p.EffectiveProfileKind(),
 		DesiredState:      string(p.Desired),
 		ProviderID:        string(p.GetProvider().ProviderID),
 		ProviderAccountID: string(p.GetProvider().AccountID),
@@ -249,7 +256,7 @@ func describeOriginOwnership(p *core.ConnectionProfile, rt *core.ConnectionRunti
 func kindSupportsRepair(kind core.ConnectionKind) bool {
 	switch kind {
 	case core.ConnectionServiceExposure, core.ConnectionPortForward,
-		core.ConnectionPrivateNetwork:
+		core.ConnectionPrivateNetwork, core.ConnectionClientTunnel:
 		return true
 	default:
 		return false

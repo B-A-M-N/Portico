@@ -53,7 +53,10 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 	}
 
 	// Start the gateway.
-	gwCtx, cancel := context.WithCancel(ctx)
+	// Gateway lifetime is supervisor-owned. Detach it from an apply request's
+	// cancellation; StopGateway and StopAll remain the explicit lifecycle
+	// boundaries.
+	gwCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	go func() {
 		if err := gw.Start(gwCtx); err != nil {
 			slog.Error("gateway stopped", "connection", connID, "error", err)
@@ -79,6 +82,22 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 	cancel()
 	_ = gw.Stop()
 	return "", fmt.Errorf("gateway did not start in time")
+}
+
+// Runtime returns the gateway projection without exposing the gateway object
+// or any authentication material.
+func (m *gatewayManager) Runtime(connID core.ConnectionID) (core.GatewayRuntime, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.gateways[connID]
+	if !ok {
+		return core.GatewayRuntime{}, false
+	}
+	return core.GatewayRuntime{
+		Endpoint:  h.gateway.URL(),
+		Upstream:  h.gateway.UpstreamURL(),
+		StartedAt: h.gateway.StartedAt(),
+	}, true
 }
 
 // StopGateway stops the gateway for the connection.

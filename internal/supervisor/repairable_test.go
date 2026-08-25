@@ -59,7 +59,7 @@ func TestTheConnectionDTOCarriesRepairability(t *testing.T) {
 	tunnel := &core.ConnectionProfile{
 		ID: "conn-tunnel", Name: "mcp", Kind: core.ConnectionClientTunnel,
 	}
-	if dto := connectionSummaryDTO(tunnel, nil); dto.Repairable {
-		t.Error("a client tunnel is projected as repairable with no repair path")
+	if dto := connectionSummaryDTO(tunnel, nil); !dto.Repairable {
+		t.Error("a client tunnel is projected as unrepairable")
 	}
 }

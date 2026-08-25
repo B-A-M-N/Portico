@@ -199,11 +199,26 @@ type stubAccountValidator struct {
 	result *AccountValidation
 	err    error
 	calls  int
+	// zoneResults drives VerifyZone: zone ID -> summaries, or an error.
+	zoneResults map[string][]ZoneSummary
+	zoneErr     error
+	zoneCalls   int
 }
 
 func (s *stubAccountValidator) Validate(context.Context, string, string, string) (*AccountValidation, error) {
 	s.calls++
 	return s.result, s.err
+}
+
+func (s *stubAccountValidator) VerifyZone(_ context.Context, _, zoneID string) ([]ZoneSummary, error) {
+	s.zoneCalls++
+	if s.zoneErr != nil {
+		return nil, s.zoneErr
+	}
+	if s.zoneResults == nil {
+		return []ZoneSummary{{ID: zoneID, Name: "example.com"}}, nil
+	}
+	return s.zoneResults[zoneID], nil
 }
 
 func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing.T) {
@@ -941,7 +956,7 @@ func TestCloudflareSetupRejectsZoneNotVisibleToToken(t *testing.T) {
 	validator := &stubAccountValidator{result: &AccountValidation{
 		AccountAccessible: true,
 		Zones:             []ZoneSummary{{ID: "zone-real", Name: "example.com"}},
-	}}
+	}, zoneErr: errors.New("zone zone-typo is not accessible with this token")}
 	handler := &supervisorHandler{sup: cloudflareTestSupervisor(t, st, validator)}
 
 	_, err := handler.HandleConfigureProviderAccount("cloudflare", ipc.ConfigureProviderAccountRequest{

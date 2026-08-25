@@ -87,6 +87,7 @@ func RunSupervisor(ctx context.Context) error {
 	// produces the same result as a restart.
 	services := provider.RuntimeServices{
 		Processes:         &processManagerAdapter{mgr: procMgr},
+		Gateways:          sup.gatewayMgr,
 		TunnelCredentials: st,
 		ConnectorDir:      paths.ConnectorDir,
 		LogDir:            paths.LogDir,

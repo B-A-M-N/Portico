@@ -55,6 +55,10 @@ func (s *Supervisor) SetProviderDefinitions(defs []provider.Definition, services
 
 // definitionFor returns the definition for one provider ID.
 func (c *activationCoordinator) definitionFor(id core.ProviderID) provider.Definition {
+	// Compatibility for profiles and setup requests created before the
+	// workload/transport split. The alias is resolved only at lookup time; the
+	// provider registry contains the transport ID alone.
+	id = core.NormalizeProviderID(id)
 	for _, def := range c.definitions {
 		if def.Identity().ID == id {
 			return def
@@ -71,6 +75,7 @@ func (c *activationCoordinator) definitionFor(id core.ProviderID) provider.Defin
 // client was not installed, could not tell you what it needed — which is the
 // moment that information matters most.
 func (s *Supervisor) setupDefinitionFor(id string) (provider.SetupDefinition, error) {
+	id = string(core.NormalizeProviderID(core.ProviderID(id)))
 	var def provider.Definition
 	if s.activation != nil {
 		def = s.activation.definitionFor(core.ProviderID(id))
