@@ -249,16 +249,25 @@ func (s *Supervisor) maybeStopGateway(connID core.ConnectionID) {
 }
 
 // gatewayNeeded reports whether the connection needs a gateway.
+//
+// The decision derives from PROFILE INTENT, not just connection kind. An
+// OpenAI-compatible API exposed through a public transport must have the
+// gateway in the traffic path — the provider tunnels to the gateway endpoint,
+// which authenticates and allows SSE — rather than at the raw local API.
 func (s *Supervisor) gatewayNeeded(p *core.ConnectionProfile, rt *core.ConnectionRuntime) bool {
-	// Only client tunnels need the gateway for now.
-	if p.Kind != core.ConnectionClientTunnel {
-		return false
+	switch p.EffectiveProfileKind() {
+	case core.ProfileOpenAIMCP:
+		// Only the client-mediated transport uses the gateway for MCP.
+		if p.Kind != core.ConnectionClientTunnel {
+			return false
+		}
+		return p.Spec.ClientTunnel != nil &&
+			p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel
+	case core.ProfileOpenAICompatible:
+		// An openai_compatible service exposure is always gateway-fronted.
+		return true
 	}
-	if p.Spec.ClientTunnel == nil {
-		return false
-	}
-	// Only OpenAI Secure MCP Tunnel uses the gateway.
-	return p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel
+	return false
 }
 
 // runHealthChecks performs three-state health checks (PROCESS, TRANSPORT, SERVICE)
@@ -403,9 +412,15 @@ func (s *Supervisor) checkService(ctx context.Context, rt *core.ConnectionRuntim
 	}
 
 	var err error
-	switch p.Kind {
-	case core.ConnectionClientTunnel:
-		if p.Spec.ClientTunnel != nil && p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel {
+	// Dispatch by PROFILE INTENT (audit item 27), not connection kind alone:
+	// the intent names what the service is supposed to be, so it names the
+	// check that can prove it works.
+	switch p.EffectiveProfileKind() {
+	case core.ProfileOpenAICompatible:
+		// An OpenAI-compatible API must answer /v1/models.
+		err = core.OpenAIServiceCheck(ctx, endpoint)
+	case core.ProfileOpenAIMCP:
+		if p.Kind == core.ConnectionClientTunnel && p.Spec.ClientTunnel != nil {
 			mcpEndpoint := endpoint
 			if rt.Gateway != nil && rt.Gateway.Endpoint != "" {
 				mcpEndpoint = rt.Gateway.Endpoint
@@ -416,24 +431,8 @@ func (s *Supervisor) checkService(ctx context.Context, rt *core.ConnectionRuntim
 			break
 		}
 		err = core.DefaultServiceCheck(ctx, endpoint)
-	case core.ConnectionServiceExposure:
-		protocol := connectionProtocol(p)
-		probeURL := endpointURL(endpoint, protocol)
-		if source := p.GetSource(); source.Existing != nil {
-			health := source.Existing.Health
-			probeURL = healthProbeURL(probeURL, health.Path)
-			if health.Timeout > 0 {
-				probeCtx, cancel := context.WithTimeout(ctx, health.Timeout)
-				err = core.DefaultServiceCheck(probeCtx, probeURL)
-				cancel()
-			} else {
-				err = core.DefaultServiceCheck(ctx, probeURL)
-			}
-			break
-		}
-		err = core.DefaultServiceCheck(ctx, endpoint)
 	default:
-		err = core.DefaultServiceCheck(ctx, endpoint)
+		err = s.defaultServiceCheckFor(ctx, p, endpoint)
 	}
 
 	return core.HealthCheck{
@@ -485,6 +484,24 @@ func (s *Supervisor) checkClientTunnelTransport(ctx context.Context, rt *core.Co
 			LastChecked: time.Now().UTC(),
 		}
 	}
+}
+
+// defaultServiceCheckFor performs the configured/default HTTP service check
+// for web-service profiles, honoring an existing service's health path.
+func (s *Supervisor) defaultServiceCheckFor(ctx context.Context, p *core.ConnectionProfile, endpoint string) error {
+	protocol := connectionProtocol(p)
+	probeURL := endpointURL(endpoint, protocol)
+	if source := p.GetSource(); source.Existing != nil {
+		health := source.Existing.Health
+		probeURL = healthProbeURL(probeURL, health.Path)
+		if health.Timeout > 0 {
+			probeCtx, cancel := context.WithTimeout(ctx, health.Timeout)
+			err := core.DefaultServiceCheck(probeCtx, probeURL)
+			cancel()
+			return err
+		}
+	}
+	return core.DefaultServiceCheck(ctx, probeURL)
 }
 
 func processCheckApplicable(profile *core.ConnectionProfile) bool {
