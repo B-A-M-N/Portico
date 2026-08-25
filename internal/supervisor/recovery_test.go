@@ -1419,14 +1419,15 @@ func TestAGuidanceFlowCannotBeSubmitted(t *testing.T) {
 	}
 }
 
-// TestTheOpenAITunnelDeclaresGuidance checks the real adapter, not a stand-in.
-// Its credential reaches the client through the supervisor's environment
-// (validateClient and clientProcessSpec both read it with os.Getenv), so a form
-// that appeared to save it would be a lie the setup screen told.
-func TestTheOpenAITunnelDeclaresGuidance(t *testing.T) {
+// TestTheOpenAITunnelStoresItsRuntimeCredential checks the real adapter, not a
+// stand-in. The control-plane key is now stored encrypted through the standard
+// account contract instead of demanded from the supervisor's environment —
+// which is the whole point of the change: setup that only printed instructions
+// left the provider unconfigured no matter what the user did on screen.
+func TestTheOpenAITunnelStoresItsRuntimeCredential(t *testing.T) {
 	flow := openaitunnel.New("", nil).SetupFlow()
-	if flow.StoresAccount() {
-		t.Fatal("the OpenAI tunnel offers to store a credential it cannot use")
+	if !flow.StoresAccount() {
+		t.Fatal("the OpenAI tunnel still refuses to store its runtime credential")
 	}
 }
 
@@ -1591,20 +1592,35 @@ func TestAnUnstatedAccountStatusIsPending(t *testing.T) {
 	}
 }
 
-// TestGuidanceReasonComesFromTheProvider ensures the explanation is declared by
-// the provider that knows how its client obtains a credential, rather than
-// asserted centrally and happening to be right for the first such provider.
-func TestGuidanceReasonComesFromTheProvider(t *testing.T) {
+// TestTheStoredRuntimeKeyIsDeliveredToTheAdapter ensures the stored credential
+// actually flows: configure through the generic handler, reactivate, and find
+// the adapter holding the decrypted key rather than depending on the
+// supervisor's environment (which the test keeps empty).
+func TestTheStoredRuntimeKeyIsDeliveredToTheAdapter(t *testing.T) {
+	ctx := context.Background()
 	st := newRecoveryTestStore(t)
-	sup, _ := activationTestSupervisor(t, st, openaitunnel.NewDefinition(openaitunnel.DefinitionConfig{}))
+	sup, _ := activationTestSupervisor(t, st, openaitunnel.NewDefinition(openaitunnel.DefinitionConfig{Enabled: true}))
 	handler := &supervisorHandler{sup: sup}
 
-	flow, err := handler.HandleProviderSetupFlow("openai_tunnel")
+	resp, err := handler.HandleConfigureProviderAccount(string(core.ProviderIDClientTunnel),
+		ipc.ConfigureProviderAccountRequest{
+			Credential: "sk-test-runtime-key-0001",
+		})
 	if err != nil {
-		t.Fatalf("HandleProviderSetupFlow: %v", err)
+		t.Fatalf("configure: %v", err)
 	}
-	if !strings.Contains(flow.GuidanceReason, openaitunnel.CredentialEnvVar) {
-		t.Fatalf("the reason does not name the variable to export: %q", flow.GuidanceReason)
+	if !resp.Validated {
+		t.Fatalf("the runtime key was not accepted: %+v", resp)
+	}
+	if err := sup.ActivateProvider(ctx, core.ProviderIDClientTunnel); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	prov := sup.registry.Get(core.ProviderIDClientTunnel)
+	if prov == nil {
+		t.Fatal("the transport was not registered after activation")
+	}
+	if err := prov.Authenticate(ctx, core.AuthRequest{ProviderID: core.ProviderIDClientTunnel}); err != nil {
+		t.Fatalf("the activated adapter cannot resolve the stored key: %v", err)
 	}
 }
 

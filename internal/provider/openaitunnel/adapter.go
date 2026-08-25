@@ -75,6 +75,13 @@ type Provider struct {
 	lookPath func(string) (string, error)
 	// probe is injectable so readiness can be tested without a live client.
 	probe func(ctx context.Context, url string) error
+	// storedCredential is the decrypted runtime key handed over by activation.
+	// When set it takes precedence over the supervisor's environment, so a
+	// rotation through Portico takes effect at the next semantic restart
+	// without touching the daemon's environment. It is held only in memory:
+	// persistence is the store's encrypted row, and the value never reaches
+	// argv, plans, events, logs, or DTOs.
+	storedCredential string
 }
 
 // SetAdminBaseURL overrides where the client's health endpoints are expected.
@@ -112,6 +119,22 @@ func NewWithGateway(binPath string, procMgr core.ConnectorProcessService, gatewa
 // tests may leave it unset.
 func (p *Provider) SetRuntimeDir(dir string) {
 	p.runtimeDir = dir
+}
+
+// SetCredential installs the decrypted stored runtime key as the adapter's
+// credential source. Called by activation with material decrypted by the
+// supervisor's credential store; the value lives only in this struct.
+func (p *Provider) SetCredential(secret string) {
+	p.storedCredential = secret
+}
+
+// credential resolves the control-plane key from the single authority: the
+// stored key when one was activated, otherwise the supervisor's environment.
+func (p *Provider) credential() string {
+	if p.storedCredential != "" {
+		return p.storedCredential
+	}
+	return os.Getenv(CredentialEnvVar)
 }
 
 // Identity returns the provider identity.
@@ -171,57 +194,23 @@ func (p *Provider) Capabilities(context.Context) (core.Capabilities, error) {
 	}, nil
 }
 
-// Authenticate reports whether the control-plane credential is present.
-// Portico does not validate the key itself; that happens when the client runs.
+// Authenticate reports whether a control-plane key is resolvable. Portico does
+// not validate the key itself; that happens when the client runs and is
+// reported honestly through readiness observation.
 func (p *Provider) Authenticate(context.Context, core.AuthRequest) error {
-	if os.Getenv(CredentialEnvVar) == "" {
-		return fmt.Errorf("%s is not set; the tunnel client cannot reach the OpenAI control plane", CredentialEnvVar)
+	if p.credential() == "" {
+		return fmt.Errorf("no control plane API key is stored and %s is not set; run 'portico provider login %s'",
+			CredentialEnvVar, ProviderID)
 	}
 	return nil
 }
 
-// SetupFlow declares what the provider needs, for the generic setup screen.
-//
-// This is guidance, not a form. The tunnel client reads the control-plane key
-// from the supervisor's own environment — see validateClient and
-// clientProcessSpec, both of which call os.Getenv(CredentialEnvVar) — and
-// nothing here reads Portico's account store. A credential stored through
-// Portico would therefore change nothing, and setup would report success while
-// the connection went on failing for exactly the reason it failed before.
-//
-// The tunnel ID is not account state either: it belongs to the connection
+// The tunnel ID is not account state: it belongs to the connection
 // (ClientTunnelSpec.TunnelID) and reaches the client through step parameters.
-func openAITunnelSetupFlow() core.SetupFlow {
-	return core.SetupFlow{
-		Kind:    core.SetupGuidance,
-		Summary: "Connect a local MCP server to ChatGPT over a private, outbound-only tunnel.",
-		GuidanceReason: "The tunnel client reads " + CredentialEnvVar + " from the supervisor's own " +
-			"environment, so Portico has nowhere to put a credential you enter here. Export it before " +
-			"starting the supervisor.",
-		Fields: []core.SetupField{
-			{
-				ID:          "tunnel_id",
-				Label:       "Tunnel ID",
-				Description: "Create a tunnel in the OpenAI platform's organization settings, then paste its ID here. Portico does not create tunnels.",
-				Required:    true,
-				Placeholder: "tunnel_...",
-			},
-			{
-				ID:          "credential",
-				Label:       "Control plane API key",
-				Description: "Supplied to the client through " + CredentialEnvVar + ". Never placed in a command line.",
-				Secret:      true,
-				Required:    true,
-			},
-		},
-		CapabilityNotes: []string{
-			"The connection is outbound-only: no inbound port is opened and no public address is created.",
-			"Creating the tunnel and registering the app in ChatGPT happen on OpenAI's platform, not in Portico.",
-		},
-	}
-}
-
+// The setup flow itself is declared by the definition, which owns what
+// configuration means before any adapter exists.
 func (p *Provider) SetupFlow() core.SetupFlow { return openAITunnelSetupFlow() }
+
 
 // Plan produces the operation plan for a client tunnel.
 //
@@ -374,9 +363,10 @@ func (p *Provider) validateClient(step core.PlanStep) core.StepResult {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
 			Error: fmt.Errorf("%s is not installed or not on PATH; download it from the OpenAI platform's tunnel settings", p.binPath)}
 	}
-	if os.Getenv(CredentialEnvVar) == "" {
+	if p.credential() == "" {
 		return core.StepResult{StepID: step.ID, Succeeded: false,
-			Error: fmt.Errorf("%s is not set; the tunnel client cannot reach the OpenAI control plane", CredentialEnvVar)}
+			Error: fmt.Errorf("no control plane API key is stored and %s is not set; run 'portico provider login %s' or export %s",
+				CredentialEnvVar, ProviderID, CredentialEnvVar)}
 	}
 	return core.StepResult{StepID: step.ID, Succeeded: true}
 }
@@ -411,7 +401,7 @@ func (p *Provider) clientProcessSpec(step core.PlanStep) core.ProcessSpec {
 	return core.ProcessSpec{
 		Executable: p.binPath,
 		Args:       args,
-		Env:        []string{CredentialEnvVar + "=" + os.Getenv(CredentialEnvVar)},
+		Env:        []string{CredentialEnvVar + "=" + p.credential()},
 		// The client is not stateless: a correct relaunch needs the gateway
 		// running first and its current endpoint in --mcp.server-url, which
 		// the generic actor cannot know (a crash stops the gateway, and

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider"
@@ -67,20 +68,114 @@ func (d *Definition) MissingBinaryEntry() provider.CatalogEntry {
 	return d.CatalogEntry()
 }
 
-// SetupFlow declares guidance. It is served from the definition so it remains
-// available when no adapter is installed.
+// SetupFlow declares what the provider needs, for the generic setup screen.
+//
+// The control-plane key is stored encrypted in Portico's credential repository
+// through the standard account contract: the CLI collects it via hidden TTY,
+// stdin or an inherited file descriptor, the supervisor encrypts it, and the
+// adapter receives it decrypted only when building a child process. The
+// environment variable remains a fallback for machines configured before
+// stored credentials existed.
 func (d *Definition) SetupFlow() core.SetupFlow { return openAITunnelSetupFlow() }
 
-// PrepareAccount always refuses. A guidance provider has no account to prepare,
-// and returning one would let the supervisor persist a row nothing reads.
-func (d *Definition) PrepareAccount(map[string]string) (provider.PreparedAccount, error) {
-	return provider.PreparedAccount{}, fmt.Errorf(
-		"the OpenAI tunnel is configured outside Portico; its client reads %s from the "+
-			"supervisor's environment, so there is nothing here to save", CredentialEnvVar)
+func openAITunnelSetupFlow() core.SetupFlow {
+	return core.SetupFlow{
+		Kind:        core.SetupAccount,
+		Summary:     "Connect a local MCP server to ChatGPT over a private, outbound-only tunnel.",
+		SecretField: "credential",
+		Fields: []core.SetupField{
+			{
+				ID:          "credential",
+				Label:       "Control plane API key",
+				Description: "A restricted runtime key with Tunnels Read + Use. Stored encrypted; supplied to the client through its environment, never a command line.",
+				Secret:      true,
+				Required:    true,
+				EnvVars:     []string{CredentialEnvVar},
+			},
+		},
+		CapabilityNotes: []string{
+			"The connection is outbound-only: no inbound port is opened and no public address is created.",
+			"Creating the tunnel and registering the app in ChatGPT happen on OpenAI's platform, not in Portico.",
+			"Portico cannot confirm this key with OpenAI from here; its validity is proven when the client first reaches the control plane, and a refused key shows up as a not-ready connection rather than a silent failure.",
+		},
+	}
 }
 
-// Activate builds the accountless runtime. It ignores req.Accounts because the
-// coordinator never passes accounts to a provider that stores none.
+// runtimeCredentialAccountID names the transport's single implicit account.
+// The OpenAI tunnel is accountless upstream, but Portico's encrypted
+// credential store keys secrets by account reference, so the runtime key gets
+// exactly one durable identity.
+func runtimeCredentialAccountID() core.ProviderAccountID {
+	return core.ProviderAccountID(ProviderID)
+}
+
+// PrepareAccount turns submitted setup values into the transport's canonical
+// runtime-credential account.
+//
+// Only the credential belongs here. The tunnel ID is per-connection state
+// (ClientTunnelSpec.TunnelID), collected in the wizard, and must not be
+// mistaken for account identity.
+func (d *Definition) PrepareAccount(values map[string]string) (provider.PreparedAccount, error) {
+	credential := strings.TrimSpace(values["credential"])
+	if credential == "" {
+		return provider.PreparedAccount{}, fmt.Errorf(
+			"a control plane API key is required; create a restricted runtime key with Tunnels Read + Use in the OpenAI platform")
+	}
+	if err := validateRuntimeKeyShape(credential); err != nil {
+		return provider.PreparedAccount{}, err
+	}
+	accountID := runtimeCredentialAccountID()
+	return provider.PreparedAccount{
+		Account: core.ProviderAccount{
+			ID:            accountID,
+			Provider:      ProviderID,
+			Label:         "OpenAI runtime key",
+			CredentialRef: fmt.Sprintf("%s:runtime-key", ProviderID),
+		},
+		Secret: []byte(credential),
+	}, nil
+}
+
+// VerifyAccount implements the optional verification capability with a
+// deliberately local check.
+//
+// A real control-plane round trip would need more of the key's own authority
+// than a least-privilege runtime key should carry, so the authoritative proof
+// that the key works is /readyz after launch — which observation surfaces
+// honestly as a not-ready connection when the key is refused. What setup CAN
+// rule out locally is a truncated paste or an obviously malformed value, and
+// refusing those here beats storing them.
+func (d *Definition) VerifyAccount(_ context.Context, account provider.PreparedAccount) (core.SetupValidation, error) {
+	if err := validateRuntimeKeyShape(string(account.Secret)); err != nil {
+		return core.SetupValidation{}, err
+	}
+	return core.SetupValidation{
+		Notes: []string{
+			"The key was checked locally only. Its authority is confirmed when the tunnel client first reaches the OpenAI control plane.",
+			"Use a restricted runtime key with Tunnels Read + Use — not an admin key.",
+		},
+	}, nil
+}
+
+// validateRuntimeKeyShape rules out values no real key could be: empty,
+// whitespace-padded pastes, embedded whitespace, or absurd lengths.
+func validateRuntimeKeyShape(key string) error {
+	if strings.TrimSpace(key) == "" {
+		return fmt.Errorf("a control plane API key is required")
+	}
+	if strings.ContainsAny(key, " \t\r\n") {
+		return fmt.Errorf("the API key contains whitespace; copy it again without surrounding spaces")
+	}
+	if len(key) < 8 || len(key) > 4096 {
+		return fmt.Errorf("the API key length (%d characters) is outside anything a real key produces", len(key))
+	}
+	return nil
+}
+
+// Activate builds the accountless runtime when no stored credential exists,
+// falling back to the environment. With a stored runtime key the adapter is
+// built from that decrypted secret instead — see Activate's credential
+// resolution below.
 func (d *Definition) Activate(ctx context.Context, req provider.ActivationRequest) (provider.Installation, error) {
 	entry := d.CatalogEntry()
 
@@ -101,12 +196,26 @@ func (d *Definition) Activate(ctx context.Context, req provider.ActivationReques
 		}
 	}
 
-	// Check for the credential.
-	if req.Services.Getenv != nil && req.Services.Getenv(CredentialEnvVar) == "" {
+	// Check for the credential. A stored, decrypted runtime key wins; the
+	// environment is the fallback. Both are resolved through the adapter's
+	// single credential source so plan-time validation and the child env can
+	// never disagree about where the key came from.
+	var credential string
+	for _, material := range req.Accounts {
+		if len(material.Secret) > 0 {
+			credential = string(material.Secret)
+			break
+		}
+	}
+	envConfigured := req.Services.Getenv != nil && req.Services.Getenv(CredentialEnvVar) != ""
+	if credential == "" && !envConfigured {
 		entry.Availability = provider.AvailabilityUnconfigured
-		entry.Reason = fmt.Sprintf("%s is not set; the tunnel client cannot reach the OpenAI control plane", CredentialEnvVar)
+		entry.Reason = fmt.Sprintf(
+			"no control plane API key is stored; configure one with 'portico provider login %s' (or export %s)",
+			ProviderID, CredentialEnvVar)
 		entry.SetupActions = []string{
-			fmt.Sprintf("Export %s before starting the supervisor", CredentialEnvVar),
+			fmt.Sprintf("Run: portico provider login %s", ProviderID),
+			fmt.Sprintf("Or export %s before starting the supervisor", CredentialEnvVar),
 		}
 		if !d.cfg.Enabled {
 			entry.SetupActions = append(entry.SetupActions,
@@ -116,6 +225,9 @@ func (d *Definition) Activate(ctx context.Context, req provider.ActivationReques
 	}
 
 	adapter := NewWithGateway(d.cfg.Bin, req.Services.Processes, req.Services.Gateways)
+	if credential != "" {
+		adapter.SetCredential(credential)
+	}
 	if req.Services.ConnectorDir != "" {
 		// Per-connection health URL files live under Portico's private state,
 		// not the shared temp dir.
