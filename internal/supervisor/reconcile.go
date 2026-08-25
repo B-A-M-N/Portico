@@ -175,7 +175,20 @@ func (s *Supervisor) reconcileClientTunnel(ctx context.Context, input ReconcileI
 		return &reconcileDecision{Action: "close", Plan: plan}, nil
 	}
 
-	// Desired open: if the process is running, the connection is as it should be.
+	// Desired open: a running process is only half the story. The provider's
+	// observation distinguishes running (answering /readyz — the control plane
+	// is reachable) from unstable (alive but not ready, e.g. after a control
+	// plane outage or a credential refusal). An unstable client is reopened:
+	// the open plan stops it, rebuilds the gateway and credential state, and
+	// starts it again, which blind PID liveness would have waved through.
+	if observed != nil && observed.Connector != nil &&
+		observed.Connector.Status == string(core.ConnectorStatusUnstable) {
+		// The repair path is the same machinery the user's explicit repair
+		// uses, so automatic and requested recovery cannot diverge on what
+		// "fixed" means. clientTunnelRepairSteps replays the provider's open
+		// plan, which stops the unready client before starting a new one.
+		return s.repairDecision(ctx, profile.ID)
+	}
 	if processRunning {
 		return &reconcileDecision{Action: "none"}, nil
 	}

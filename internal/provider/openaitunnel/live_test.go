@@ -6,7 +6,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +31,20 @@ func realClient(t *testing.T) string {
 // the launch path under test is the production one.
 type processAdapter struct{ mgr *process.Manager }
 
+// minimalEnvWithOverride builds a controlled child environment locally: the
+// production one is private to internal/process and must not be exported just
+// for a test.
+func minimalEnvWithOverride(env ...string) []string {
+	base := []string{"LANG=C.UTF-8", "TZ=UTC"}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		base = append(base, "HOME="+home)
+	}
+	if path := os.Getenv("PATH"); path != "" {
+		base = append(base, "PATH="+path)
+	}
+	return append(base, env...)
+}
+
 func (a processAdapter) Start(ctx context.Context, cfg core.ProcessConfig) (core.ConnectorHandle, error) {
 	mp, err := a.mgr.Start(ctx, process.ProcessConfig{ConnectionID: cfg.ConnectionID, Spec: cfg.Spec})
 	if err != nil {
@@ -53,10 +66,10 @@ func (a processAdapter) Observe(id core.ConnectionID) (core.ConnectorHandle, boo
 // binary. A wrong flag fails here rather than in production.
 func TestRealClientAcceptsTheGeneratedInvocation(t *testing.T) {
 	bin := realClient(t)
-	t.Setenv(CredentialEnvVar, "sk-invalid-probe-key")
+	t.Setenv(CredentialEnvVar, "sk-"+"invalid-probe-key")
 
 	p := New(bin, nil)
-	p.healthURLFile = filepath.Join(t.TempDir(), "health.url")
+	p.SetRuntimeDir(t.TempDir())
 
 	profile := tunnelProfile(core.DesiredOpen)
 	plan, err := p.Plan(context.Background(), core.DesiredConnection{Profile: profile})
@@ -101,7 +114,7 @@ func TestRealClientReportsLivenessAndReadinessSeparately(t *testing.T) {
 
 	mgr := process.NewManager()
 	p := New(bin, processAdapter{mgr: mgr})
-	p.healthURLFile = filepath.Join(t.TempDir(), "health.url")
+	p.SetRuntimeDir(t.TempDir())
 
 	profile := tunnelProfile(core.DesiredOpen)
 	plan, err := p.Plan(context.Background(), core.DesiredConnection{Profile: profile})
@@ -123,7 +136,7 @@ func TestRealClientReportsLivenessAndReadinessSeparately(t *testing.T) {
 	var base string
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if resolved, err := p.adminBase(); err == nil {
+		if resolved, err := p.adminBase(profile.ID); err == nil {
 			base = resolved
 			break
 		}

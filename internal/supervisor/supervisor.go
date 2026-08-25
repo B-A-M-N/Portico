@@ -3,9 +3,12 @@ package supervisor
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -215,27 +218,31 @@ func (s *Supervisor) handleProcessEvent(event process.ProcessEvent) {
 	}
 }
 
-// maybeStartGateway starts the gateway for a connection if needed.
-//
-// NOTE: Currently disabled. The gateway traffic path is not yet designed.
-// The OpenAI Secure MCP Tunnel provider points tunnel-client directly at the
-// local MCP server, not at a gateway. Wiring the gateway into that path
-// requires starting the gateway BEFORE the tunnel client and passing the
-// gateway endpoint as --mcp.server-url. That topology is not yet implemented.
+// maybeStartGateway projects the already-started gateway into runtime state.
+// The OpenAI profile starts the gateway before its client process, because the
+// client must receive the gateway endpoint as its MCP origin. The process
+// event arrives afterward and is the supervisor's durable projection point.
 func (s *Supervisor) maybeStartGateway(connID core.ConnectionID, rt *core.ConnectionRuntime) {
-	// Disabled until gateway traffic path is designed.
+	p, ok := s.controller.GetProfile(connID)
+	if !ok || !s.gatewayNeeded(p, rt) {
+		return
+	}
+	if runtime, exists := s.gatewayMgr.Runtime(connID); exists {
+		rt.Gateway = &runtime
+		s.controller.RestoreRuntime(rt)
+		return
+	}
+	slog.Warn("OpenAI gateway was not running when connector became ready", "connection", connID)
 }
 
 // maybeStopGateway stops the gateway for a connection if running.
 func (s *Supervisor) maybeStopGateway(connID core.ConnectionID) {
-	s.mu.RLock()
 	rt, ok := s.controller.GetRuntime(connID)
-	s.mu.RUnlock()
-	if !ok || rt.Gateway == nil {
-		return
-	}
 	if err := s.gatewayMgr.StopGateway(connID); err != nil {
 		slog.Warn("failed to stop gateway", "connection", connID, "error", err)
+	}
+	if !ok || rt.Gateway == nil {
+		return
 	}
 	rt.Gateway = nil
 	s.controller.RestoreRuntime(rt)
@@ -273,11 +280,19 @@ func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.Connection
 
 	desired := p.Desired
 
-	// PROCESS check: Is the connector alive?
+	// PROCESS check: Is the connector alive? Local forwards relay in-process,
+	// while Tailscale is observed through its machine-wide daemon. N/A is not a
+	// failure and must not be converted into one by a missing PID.
 	if desired == core.DesiredClosed {
 		report.Process = core.HealthCheck{
 			State:       core.CheckNotApplicable,
 			Detail:      "connection is closed",
+			LastChecked: time.Now().UTC(),
+		}
+	} else if !processCheckApplicable(p) {
+		report.Process = core.HealthCheck{
+			State:       core.CheckNotApplicable,
+			Detail:      processNotApplicableDetail(p),
 			LastChecked: time.Now().UTC(),
 		}
 	} else if rt.Connector.Status == core.ConnectorStatusRunning && rt.Connector.PID > 0 {
@@ -294,17 +309,29 @@ func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.Connection
 		}
 	}
 
-	// TRANSPORT check: Is the tunnel reachable?
+	// TRANSPORT check: use a probe appropriate to the connection protocol.
 	if desired == core.DesiredClosed {
 		report.Transport = core.HealthCheck{
 			State:       core.CheckNotApplicable,
 			Detail:      "connection is closed",
 			LastChecked: time.Now().UTC(),
 		}
+	} else if p.Kind == core.ConnectionClientTunnel {
+		// A client tunnel's transport is the tunnel-client runtime itself, not
+		// a public or private address (there is none). /healthz means the
+		// process is alive; /readyz means it actually reached the control
+		// plane. Only /readyz answers "is this tunnel carrying traffic".
+		report.Transport = s.checkClientTunnelTransport(ctx, rt)
+	} else if !transportCheckApplicable(p) {
+		report.Transport = core.HealthCheck{
+			State:       core.CheckNotApplicable,
+			Detail:      transportNotApplicableDetail(p),
+			LastChecked: time.Now().UTC(),
+		}
 	} else if rt.Endpoint.PublicAddress != "" {
-		report.Transport = s.checkTransport(ctx, rt.Endpoint.PublicAddress)
+		report.Transport = s.checkTransport(ctx, p, rt.Endpoint.PublicAddress)
 	} else if rt.Endpoint.PrivateAddress != "" {
-		report.Transport = s.checkTransport(ctx, rt.Endpoint.PrivateAddress)
+		report.Transport = s.checkTransport(ctx, p, rt.Endpoint.PrivateAddress)
 	} else {
 		report.Transport = core.HealthCheck{
 			State:       core.CheckUnknown,
@@ -314,12 +341,18 @@ func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.Connection
 	}
 
 	// SERVICE check: Does the application work?
-	if report.Process.State == core.CheckPass && report.Transport.State == core.CheckPass {
+	if serviceCheckApplicable(p) && report.Process.State == core.CheckPass &&
+		(report.Transport.State == core.CheckPass || report.Transport.State == core.CheckNotApplicable) {
 		report.Service = s.checkService(ctx, rt)
-	} else if desired == core.DesiredClosed {
+	} else if desired == core.DesiredClosed || !serviceCheckApplicable(p) {
 		report.Service = core.HealthCheck{
-			State:       core.CheckNotApplicable,
-			Detail:      "connection is closed",
+			State: core.CheckNotApplicable,
+			Detail: func() string {
+				if desired == core.DesiredClosed {
+					return "connection is closed"
+				}
+				return serviceNotApplicableDetail(p)
+			}(),
 			LastChecked: time.Now().UTC(),
 		}
 	} else {
@@ -336,8 +369,20 @@ func (s *Supervisor) runHealthChecks(ctx context.Context, connID core.Connection
 }
 
 // checkTransport verifies the endpoint is reachable.
-func (s *Supervisor) checkTransport(ctx context.Context, endpoint string) core.HealthCheck {
-	err := core.DefaultServiceCheck(ctx, endpoint)
+func (s *Supervisor) checkTransport(ctx context.Context, profile *core.ConnectionProfile, endpoint string) core.HealthCheck {
+	protocol := connectionProtocol(profile)
+	var err error
+	if protocol == core.ProtocolTCP {
+		conn, dialErr := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", endpoint)
+		err = dialErr
+		if conn != nil {
+			_ = conn.Close()
+		}
+	} else if protocol == core.ProtocolUDP {
+		err = fmt.Errorf("UDP transport probing is not implemented")
+	} else {
+		err = core.DefaultServiceCheck(ctx, endpointURL(endpoint, protocol))
+	}
 	return core.HealthCheck{
 		State:       errState(err),
 		Detail:      errString(err),
@@ -361,9 +406,30 @@ func (s *Supervisor) checkService(ctx context.Context, rt *core.ConnectionRuntim
 	switch p.Kind {
 	case core.ConnectionClientTunnel:
 		if p.Spec.ClientTunnel != nil && p.Spec.ClientTunnel.Client == core.ClientOpenAISecureMCPTunnel {
-			// OpenAI Secure MCP Tunnel uses MCP, not OpenAI HTTP API.
-			// MCP check is not implemented yet.
-			return core.HealthCheck{State: core.CheckUnknown, Detail: "MCP health check not implemented", LastChecked: time.Now().UTC()}
+			mcpEndpoint := endpoint
+			if rt.Gateway != nil && rt.Gateway.Endpoint != "" {
+				mcpEndpoint = rt.Gateway.Endpoint
+			} else if p.Spec.ClientTunnel.MCP.Endpoint != "" {
+				mcpEndpoint = p.Spec.ClientTunnel.MCP.Endpoint
+			}
+			err = core.MCPServiceCheck(ctx, mcpEndpoint, p.Spec.ClientTunnel.MCP.Transport)
+			break
+		}
+		err = core.DefaultServiceCheck(ctx, endpoint)
+	case core.ConnectionServiceExposure:
+		protocol := connectionProtocol(p)
+		probeURL := endpointURL(endpoint, protocol)
+		if source := p.GetSource(); source.Existing != nil {
+			health := source.Existing.Health
+			probeURL = healthProbeURL(probeURL, health.Path)
+			if health.Timeout > 0 {
+				probeCtx, cancel := context.WithTimeout(ctx, health.Timeout)
+				err = core.DefaultServiceCheck(probeCtx, probeURL)
+				cancel()
+			} else {
+				err = core.DefaultServiceCheck(ctx, probeURL)
+			}
+			break
 		}
 		err = core.DefaultServiceCheck(ctx, endpoint)
 	default:
@@ -375,6 +441,136 @@ func (s *Supervisor) checkService(ctx context.Context, rt *core.ConnectionRuntim
 		Detail:      errString(err),
 		LastChecked: time.Now().UTC(),
 	}
+}
+
+// checkClientTunnelTransport probes the tunnel-client runtime's /readyz
+// endpoint, which is the client tunnel's transport: it answers 200 only when
+// the client has actually reached the OpenAI control plane. /healthz liveness
+// alone would report a tunnel as up while no traffic could move.
+//
+// The probe goes through the provider's Observe, which resolves this
+// connection's own health URL file and validates it as loopback HTTP before
+// using it. A connection whose runtime has never started reports unknown,
+// which is honest: Portico does not know, rather than pretending all is well.
+func (s *Supervisor) checkClientTunnelTransport(ctx context.Context, rt *core.ConnectionRuntime) core.HealthCheck {
+	observed, err := s.observeConnection(ctx, rt.ConnectionID)
+	if err != nil || observed == nil || observed.Connector == nil {
+		return core.HealthCheck{
+			State:       core.CheckUnknown,
+			Detail:      "the tunnel client's readiness could not be determined",
+			LastChecked: time.Now().UTC(),
+		}
+	}
+	switch observed.Connector.Status {
+	case string(core.ConnectorStatusRunning):
+		return core.HealthCheck{
+			State:       core.CheckPass,
+			Detail:      "tunnel client is ready (control plane reachable)",
+			LastChecked: time.Now().UTC(),
+		}
+	case string(core.ConnectorStatusStopped):
+		return core.HealthCheck{
+			State:       core.CheckFail,
+			Detail:      "the tunnel client is not running",
+			LastChecked: time.Now().UTC(),
+		}
+	default:
+		detail := observed.Connector.LastError
+		if detail == "" {
+			detail = "the tunnel client is alive but not ready"
+		}
+		return core.HealthCheck{
+			State:       core.CheckFail,
+			Detail:      detail,
+			LastChecked: time.Now().UTC(),
+		}
+	}
+}
+
+func processCheckApplicable(profile *core.ConnectionProfile) bool {
+	return profile != nil && profile.Kind != core.ConnectionPortForward && profile.Kind != core.ConnectionPrivateNetwork
+}
+
+func processNotApplicableDetail(profile *core.ConnectionProfile) string {
+	if profile != nil && profile.Kind == core.ConnectionPortForward {
+		return "the forward relay runs in-process"
+	}
+	return "the provider observes a machine-wide network daemon"
+}
+
+func transportCheckApplicable(profile *core.ConnectionProfile) bool {
+	return profile != nil && profile.Kind != core.ConnectionClientTunnel && profile.Kind != core.ConnectionPrivateNetwork
+}
+
+func transportNotApplicableDetail(profile *core.ConnectionProfile) string {
+	if profile != nil && profile.Kind == core.ConnectionClientTunnel {
+		return "the client tunnel is outbound-only; its profile and MCP checks answer reachability"
+	}
+	return "private-network reachability is answered by the network provider"
+}
+
+func serviceCheckApplicable(profile *core.ConnectionProfile) bool {
+	if profile == nil || profile.Kind == core.ConnectionPortForward || profile.Kind == core.ConnectionPrivateNetwork {
+		return false
+	}
+	if profile.Kind == core.ConnectionServiceExposure {
+		if source := profile.GetSource(); source.Existing != nil {
+			return !source.Existing.Health.Configured || source.Existing.Health.Enabled
+		}
+	}
+	return true
+}
+
+func serviceNotApplicableDetail(profile *core.ConnectionProfile) string {
+	if profile != nil && profile.Kind == core.ConnectionServiceExposure {
+		if source := profile.GetSource(); source.Existing != nil && !source.Existing.Health.Enabled {
+			return "the existing-service health probe is disabled"
+		}
+	}
+	return "service probe is not applicable to this connection kind"
+}
+
+func healthProbeURL(base, path string) string {
+	if path == "" {
+		return base
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(path, "/")
+	return u.String()
+}
+
+func connectionProtocol(profile *core.ConnectionProfile) core.Protocol {
+	if profile == nil {
+		return core.ProtocolHTTP
+	}
+	switch profile.Kind {
+	case core.ConnectionPortForward:
+		if profile.Spec.PortForward != nil && profile.Spec.PortForward.Protocol != "" {
+			return profile.Spec.PortForward.Protocol
+		}
+		return core.ProtocolTCP
+	case core.ConnectionServiceExposure:
+		if exposure := profile.GetExposure(); exposure.Protocol != "" {
+			return exposure.Protocol
+		}
+		if source := profile.GetSource(); source.Existing != nil && source.Existing.Protocol != "" {
+			return source.Existing.Protocol
+		}
+	}
+	return core.ProtocolHTTP
+}
+
+func endpointURL(endpoint string, protocol core.Protocol) string {
+	if strings.Contains(endpoint, "://") {
+		return endpoint
+	}
+	if protocol == core.ProtocolHTTPS {
+		return "https://" + endpoint
+	}
+	return "http://" + endpoint
 }
 
 func errState(err error) core.CheckState {
@@ -1133,8 +1329,9 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 
 	// Convert IPC DTO to core profile.
 	profile := &core.ConnectionProfile{
-		Name: req.Name,
-		Kind: core.ConnectionServiceExposure,
+		Name:        req.Name,
+		Kind:        core.ConnectionServiceExposure,
+		ProfileKind: req.ProfileKind,
 		Spec: core.ConnectionSpec{
 			ServiceExposure: &core.ServiceExposureSpec{
 				Source: core.SourceSpec{
@@ -1163,6 +1360,13 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 		}
 		if profile.Spec.ServiceExposure.Source.Existing.Protocol == "" {
 			profile.Spec.ServiceExposure.Source.Existing.Protocol = core.ProtocolHTTP
+		}
+		if req.Source.Existing.Health != nil {
+			health, err := healthSpecFromDTO(req.Source.Existing.Health)
+			if err != nil {
+				return nil, err
+			}
+			profile.Spec.ServiceExposure.Source.Existing.Health = health
 		}
 	}
 	if req.Source.Directory != nil {
@@ -1406,6 +1610,9 @@ func (h *supervisorHandler) HandleUpdateConnection(id string, req ipc.UpdateConn
 	if req.Lifecycle != nil {
 		unsupported = append(unsupported, "lifecycle")
 	}
+	if req.ProfileKind != nil {
+		unsupported = append(unsupported, "profile kind")
+	}
 	if len(unsupported) > 0 {
 		// These changes are applied through the edit plan, which pauses the
 		// connection, removes the provider resources the new profile no longer
@@ -1500,12 +1707,13 @@ func (h *supervisorHandler) createClientTunnel(req ipc.CreateConnectionRequest) 
 
 	providerID := core.ProviderID(req.Provider.ProviderID)
 	if providerID == "" {
-		providerID = "openai_tunnel"
+		providerID = "client_tunnel"
 	}
 
 	profile := &core.ConnectionProfile{
-		Name: req.Name,
-		Kind: core.ConnectionClientTunnel,
+		Name:        req.Name,
+		Kind:        core.ConnectionClientTunnel,
+		ProfileKind: req.ProfileKind,
 		Spec: core.ConnectionSpec{
 			ClientTunnel: &core.ClientTunnelSpec{
 				Client:   client,
@@ -1854,6 +2062,13 @@ func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionR
 				Address:  req.Spec.Source.Existing.Address,
 				Protocol: core.Protocol(req.Spec.Source.Existing.Protocol),
 			}
+			if req.Spec.Source.Existing.Health != nil {
+				health, err := healthSpecFromDTO(req.Spec.Source.Existing.Health)
+				if err != nil {
+					return nil, err
+				}
+				spec.Source.Existing.Health = health
+			}
 		}
 	}
 	if req.PrivateNetwork != nil {
@@ -1918,6 +2133,41 @@ func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionR
 		}
 	}
 	return proposed, nil
+}
+
+// healthSpecFromDTO is the single wire-to-core conversion for existing-service
+// health settings. Durations remain human-readable on the IPC boundary and are
+// validated before an edit or create can reach the controller.
+func healthSpecFromDTO(dto *ipc.HealthCheckSpecDTO) (core.HealthCheckSpec, error) {
+	if dto == nil {
+		return core.HealthCheckSpec{}, nil
+	}
+	parse := func(label, raw string) (time.Duration, error) {
+		if strings.TrimSpace(raw) == "" {
+			return 0, nil
+		}
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return 0, fmt.Errorf("health %s must be a positive duration such as 5s: %q", label, raw)
+		}
+		return d, nil
+	}
+	timeout, err := parse("timeout", dto.Timeout)
+	if err != nil {
+		return core.HealthCheckSpec{}, err
+	}
+	interval, err := parse("interval", dto.Interval)
+	if err != nil {
+		return core.HealthCheckSpec{}, err
+	}
+	path := strings.TrimSpace(dto.Path)
+	if path != "" {
+		u, err := url.Parse(path)
+		if err != nil || u.IsAbs() || !strings.HasPrefix(path, "/") {
+			return core.HealthCheckSpec{}, fmt.Errorf("health path must be an absolute path such as /healthz: %q", dto.Path)
+		}
+	}
+	return core.HealthCheckSpec{Enabled: dto.Enabled, Path: path, Timeout: timeout, Interval: interval, Configured: true}, nil
 }
 
 // describeEditOutcome states what the edit achieves in plain language.
@@ -2146,6 +2396,42 @@ func (h *supervisorHandler) HandleUpdateSettings(req ipc.SettingsRequest) (*ipc.
 		}
 	}
 	return h.HandleSettings()
+}
+
+// HandleRotateSecretKey is the supervisor-owned operational key rotation.
+// Store.RotateSecretKey rewrites every encrypted credential transactionally;
+// this handler adds the durable audit event and broadcasts the committed event
+// through the normal IPC journal path.
+func (h *supervisorHandler) HandleRotateSecretKey() (*ipc.RotateSecretKeyDTO, error) {
+	if h.sup.store == nil {
+		return nil, fmt.Errorf("secret store is not initialized")
+	}
+	ctx := context.Background()
+	startedAt := time.Now().UTC()
+	startedPayload, _ := json.Marshal(map[string]any{"started_at": startedAt.Format(time.RFC3339)})
+	if _, err := h.sup.store.AppendEvent(ctx, "", "", string(core.EventSecretKeyRotationStarted), "started", startedAt, startedPayload); err != nil {
+		return nil, fmt.Errorf("record key rotation start: %w", err)
+	}
+	version, err := h.sup.store.RotateSecretKey(ctx)
+	if err != nil {
+		failedAt := time.Now().UTC()
+		failedPayload, _ := json.Marshal(map[string]any{"failed_at": failedAt.Format(time.RFC3339)})
+		if _, eventErr := h.sup.store.AppendEvent(ctx, "", "", string(core.EventSecretKeyRotationFailed), "failed", failedAt, failedPayload); eventErr != nil {
+			slog.Error("failed to record key rotation failure", "error", eventErr)
+		}
+		return nil, fmt.Errorf("rotate installation key: %w", err)
+	}
+	now := time.Now().UTC()
+	payload, _ := json.Marshal(map[string]any{"version": version, "rotated_at": now.Format(time.RFC3339)})
+	if _, err := h.sup.store.AppendEvent(ctx, "", "", string(core.EventSecretKeyRotationCompleted), "succeeded", now, payload); err != nil {
+		return nil, fmt.Errorf("record key rotation completion: %w", err)
+	}
+	if h.sup.ipcServer != nil {
+		if err := h.sup.ipcServer.DispatchCommittedEvents(ctx); err != nil {
+			return nil, fmt.Errorf("dispatch key rotation event: %w", err)
+		}
+	}
+	return &ipc.RotateSecretKeyDTO{Version: version, RotatedAt: now.Format(time.RFC3339)}, nil
 }
 
 // HandleProviderSetupFlow returns a provider's declarative setup requirements.

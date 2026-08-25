@@ -3,6 +3,7 @@ package openaitunnel
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,12 +15,47 @@ type fakeProcess struct {
 	started core.ProcessSpec
 	stopped bool
 	running bool
+	// startedByConnection records every start by connection ID, so tests
+	// driving more than one connection can tell the specs apart.
+	startedByConnection map[core.ConnectionID]core.ProcessSpec
+}
+
+type fakeGateway struct {
+	upstream string
+	started  bool
+	stopped  bool
+}
+
+func (g *fakeGateway) StartGateway(_ context.Context, _ core.ConnectionID, upstream string, _ []string) (string, error) {
+	g.upstream = upstream
+	g.started = true
+	return "http://127.0.0.1:49152", nil
+}
+
+func (g *fakeGateway) StopGateway(core.ConnectionID) error {
+	g.stopped = true
+	return nil
 }
 
 func (f *fakeProcess) Start(_ context.Context, cfg core.ProcessConfig) (core.ConnectorHandle, error) {
 	f.started = cfg.Spec
 	f.running = true
+	f.startedByConnection[cfg.ConnectionID] = cfg.Spec
 	return core.ConnectorHandle{PID: 4242}, nil
+}
+
+// startedFor returns the spec started for one connection, for tests that run
+// more than one.
+func (f *fakeProcess) startedFor(id core.ConnectionID) core.ProcessSpec {
+	return f.startedByConnection[id]
+}
+
+// writeFile records the health URL a client would have reported.
+func writeFile(t *testing.T, path, url string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(url), 0600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 func (f *fakeProcess) Stop(core.ConnectionID, time.Duration) error { f.stopped = true; return nil }
 func (f *fakeProcess) Observe(core.ConnectionID) (core.ConnectorHandle, bool) {
@@ -35,6 +71,8 @@ func testProvider(t *testing.T) (*Provider, *fakeProcess) {
 	p := New("tunnel-client", proc)
 	p.lookPath = func(string) (string, error) { return "/usr/local/bin/tunnel-client", nil }
 	p.probe = func(context.Context, string) error { return nil }
+	p.SetRuntimeDir(t.TempDir())
+	proc.startedByConnection = make(map[core.ConnectionID]core.ProcessSpec)
 	return p, proc
 }
 
@@ -148,6 +186,39 @@ func TestCredentialNeverEntersArgv(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("argv %q missing documented flag %q", joined, want)
 		}
+	}
+}
+
+func TestClientUsesGatewayAsMCPOrigin(t *testing.T) {
+	t.Setenv(CredentialEnvVar, "sk-control-plane")
+	p, proc := testProvider(t)
+	gateway := &fakeGateway{}
+	p.gateways = gateway
+
+	step := core.PlanStep{ID: "start", Kind: core.StepStartConnector, Technical: core.TechnicalOperation{
+		Parameters: map[string]string{
+			"tunnel_id":      "tunnel_0123456789abcdef0123456789abcdef",
+			"mcp_server_url": "http://127.0.0.1:8787/mcp",
+		},
+	}}
+	result := p.startClient(context.Background(), "conn-mcp", step)
+	if !result.Succeeded {
+		t.Fatalf("start result = %#v", result)
+	}
+	if !gateway.started || gateway.upstream != "http://127.0.0.1:8787/mcp" {
+		t.Fatalf("gateway start = %#v", gateway)
+	}
+	joined := strings.Join(proc.started.Args, " ")
+	if !strings.Contains(joined, "url=http://127.0.0.1:49152") {
+		t.Fatalf("client was not pointed at the gateway: %q", joined)
+	}
+	if strings.Contains(joined, "url=http://127.0.0.1:8787/mcp") {
+		t.Fatalf("client still points directly at the MCP origin: %q", joined)
+	}
+
+	stop := p.stopClient("conn-mcp", core.PlanStep{ID: "stop"})
+	if !stop.Succeeded || !gateway.stopped {
+		t.Fatalf("stop result = %#v, gateway = %#v", stop, gateway)
 	}
 }
 

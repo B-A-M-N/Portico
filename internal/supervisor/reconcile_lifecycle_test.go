@@ -257,6 +257,35 @@ func TestAHealthyClientTunnelNeedsNoReconciliation(t *testing.T) {
 	}
 }
 
+// TestAnAliveButUnreadyClientTunnelIsRepaired pins the truthfulness rule at
+// the reconciliation layer: a client that answers /healthz while /readyz fails
+// is observed unstable, and reconciliation must act on it rather than accept
+// PID liveness as a working tunnel. This is exactly the state a control-plane
+// outage or a refused credential produces.
+func TestAnAliveButUnreadyClientTunnelIsRepaired(t *testing.T) {
+	profile := reconcileClientTunnelProfile()
+	obs := &core.ObservedConnection{
+		ConnectionID: profile.ID, ProviderID: "stub_reconcile",
+		Connector: &core.ObservedConnector{
+			PID:       4242,
+			Status:    string(core.ConnectorStatusUnstable),
+			LastError: "the tunnel client is running but not ready (control plane unreachable or credential rejected)",
+		},
+	}
+
+	decision, err := testSupervisor(t, profile, obs).computeReconcileDecision(context.Background(),
+		ReconcileInput{Profile: profile, Observed: obs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Action != "repair" {
+		t.Fatalf("an alive-but-unready tunnel produced action %q, want repair", decision.Action)
+	}
+	if decision.Plan == nil || len(decision.Plan.Steps) == 0 {
+		t.Fatal("the repair decision carries no steps")
+	}
+}
+
 // TestAClosedClientTunnelIsStopped pins the close path.
 func TestAClosedClientTunnelIsStopped(t *testing.T) {
 	profile := reconcileClientTunnelProfile()

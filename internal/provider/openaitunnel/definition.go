@@ -3,6 +3,7 @@ package openaitunnel
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider"
@@ -29,15 +30,15 @@ func NewDefinition(cfg DefinitionConfig) *Definition {
 
 func (d *Definition) Identity() core.ProviderIdentity {
 	return core.ProviderIdentity{
-		ID: "openai_tunnel", Name: "openai_tunnel", DisplayName: "OpenAI Secure MCP Tunnel",
+		ID: ProviderID, Name: string(ProviderID), DisplayName: "Client-mediated MCP transport",
 	}
 }
 
 func (d *Definition) CatalogEntry() provider.CatalogEntry {
 	entry := provider.CatalogEntry{
-		ID:           "openai_tunnel",
-		Name:         "openai_tunnel",
-		DisplayName:  "OpenAI Secure MCP Tunnel",
+		ID:           ProviderID,
+		Name:         string(ProviderID),
+		DisplayName:  "Client-mediated MCP transport",
 		Availability: provider.AvailabilityExperimental,
 		Stability:    core.StabilityExperimental,
 		Reason: "the adapter has not been exercised against a live tunnel; it can start and " +
@@ -114,7 +115,12 @@ func (d *Definition) Activate(ctx context.Context, req provider.ActivationReques
 		return provider.Installation{Catalog: entry}, nil
 	}
 
-	adapter := New(d.cfg.Bin, req.Services.Processes)
+	adapter := NewWithGateway(d.cfg.Bin, req.Services.Processes, req.Services.Gateways)
+	if req.Services.ConnectorDir != "" {
+		// Per-connection health URL files live under Portico's private state,
+		// not the shared temp dir.
+		adapter.SetRuntimeDir(filepath.Dir(req.Services.ConnectorDir))
+	}
 
 	// The adapter is selectable when explicitly enabled. The experimental stability
 	// warning remains in the catalog Reason so the UI surfaces it.
