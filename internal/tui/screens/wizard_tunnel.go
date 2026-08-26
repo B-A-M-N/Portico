@@ -68,6 +68,7 @@ func (m *WizardModel) handleTunnelMCPKey(key string) tea.Cmd {
 		m.state.Provider = string(core.ProviderIDClientTunnel)
 		m.state.Step = WizardStepReview
 		m.selected = 0
+		return nil
 	default:
 		m.setInput(editInput(m.inputValue(), key))
 	}
@@ -80,10 +81,7 @@ func (m *WizardModel) handleTunnelProfileKey(key string) tea.Cmd {
 	case "esc":
 		m.goBack()
 	case "enter":
-		// Optional: the client has a default profile, and requiring a value here
-		// would demand a choice most users do not need to make.
 		m.err = nil
-		m.state.TunnelProfile = strings.TrimSpace(m.inputValue())
 		m.state.Provider = string(core.ProviderIDClientTunnel)
 		m.state.Step = WizardStepReview
 		m.selected = 0

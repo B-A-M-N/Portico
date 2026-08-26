@@ -3,6 +3,8 @@ package screens
 import (
 	"fmt"
 	"strings"
+
+	"github.com/B-A-M-N/portico/internal/core"
 )
 
 // The review, around what the user asked for.
@@ -29,6 +31,15 @@ func (m *WizardModel) renderReview() string {
 			b.WriteString("  " + line + "\n")
 		}
 		b.WriteString("\n")
+	}
+
+	// The OpenAI-compatibility probe result, when this outcome asked for one.
+	if m.state.ProfileKind == string(core.ProfileOpenAICompatible) {
+		if m.probeSummary != "" {
+			b.WriteString("COMPATIBILITY CHECK\n  " + m.probeSummary + "\n\n")
+		} else if m.err == nil {
+			b.WriteString("COMPATIBILITY CHECK\n  checking the endpoint speaks the OpenAI API...\n\n")
+		}
 	}
 
 	b.WriteString("What should Portico do?\n")

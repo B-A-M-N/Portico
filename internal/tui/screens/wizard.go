@@ -16,6 +16,7 @@ import (
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/profile/openai"
 )
 
 // ConnectionCreator is the subset of the IPC client the wizard needs.
@@ -85,6 +86,12 @@ type WizardModel struct {
 	// replaced a plain string that could only append and truncate.
 	field textinput.Model
 	err   error
+	// openAIProbeResult holds the compatibility probe outcome for outcomes
+	// that requested one (see wizardRecipe.ProbeOpenAICompatibility). It is
+	// display state: models detected, auth requirement. Never a secret.
+	openAIProbeResult *openai.OpenAICompatibility
+	// probeSummary is the user-facing one-line reading of that result.
+	probeSummary string
 	// caps derives every menu from what providers declare, replacing a single
 	// "is Cloudflare configured" boolean that decided what the user was shown.
 	caps providerCapabilities
@@ -175,7 +182,9 @@ type WizardState struct {
 	// against a tunnel created in the platform's own settings, and cannot create
 	// one — so the ID is collected rather than generated.
 	TunnelID      string
-	TunnelProfile string
+	// ProfileKind carries the provider-neutral service intent chosen by the
+	// recipe into the create request. Internal vocabulary; never displayed.
+	ProfileKind string
 	// CommandUseShell and CommandEnv configure a command Portico runs. Both are
 	// carried by the source DTO, honoured by the origin manager and exposed by the
 	// CLI; the wizard could set neither, so a command needing an API key or a
@@ -267,6 +276,14 @@ type wizardRecipe struct {
 	// Explanation states, in plain language, what will happen and who will be
 	// able to reach the service.
 	Explanation string
+	// ProfileKind is carried into the create request. Internal vocabulary
+	// ("profile kind") never reaches the user; the recipe's plain-language
+	// label and explanation are the interface.
+	ProfileKind string
+	// ProbeOpenAICompatibility marks an outcome whose local endpoint should be
+	// checked for OpenAI compatibility before review: models detected, whether
+	// auth is required, and whether streaming is available.
+	ProbeOpenAICompatibility bool
 	SourceType  string
 	Exposure    string
 	Protection  string
@@ -314,6 +331,18 @@ var wizardRecipes = []wizardRecipe{
 		Explanation:    "Portico starts a command, waits for it to listen, and publishes it. Portico stops the command when the connection closes.",
 		SourceType:     "command",
 		ConnectionKind: "service_exposure",
+	},
+	{
+		Label: "Share a local OpenAI-compatible API",
+		Explanation: "A local inference server speaking the OpenAI API (like llama.cpp, Ollama or " +
+			"vLLM) should be reachable over the internet with gateway authentication in front of it. " +
+			"Portico checks the endpoint speaks the OpenAI API before publishing anything.",
+		SourceType:               "existing_service",
+		Exposure:                 "permanent_public",
+		Protection:               string(core.ProtectionNone),
+		ConnectionKind:           "service_exposure",
+		ProfileKind:              core.ProfileOpenAICompatible,
+		ProbeOpenAICompatibility: true,
 	},
 	{
 		Label:          "Forward a local port",
@@ -503,6 +532,10 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.SourceType = recipe.SourceType
 			m.state.ExposureMode = recipe.Exposure
 			m.state.Protection = recipe.Protection
+			// Carry the provider-neutral service intent. The user never sees
+			// the term; the supervisor uses it to pick gateway behavior and
+			// the right service-health probe.
+			m.state.ProfileKind = recipe.ProfileKind
 			// Route based on connection kind.
 			switch recipe.ConnectionKind {
 			case "port_forward":
@@ -1405,6 +1438,7 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 		// Adopting a tunnel that already exists. Portico does not create it — the
 		// adapter refuses to plan without an ID for exactly that reason — so the
 		// request carries the ID the user gave rather than a blank to be filled.
+		req.ProfileKind = s.ProfileKind
 		if s.TunnelID == "" {
 			return ipc.CreateConnectionRequest{}, fmt.Errorf(
 				"a tunnel ID is required: Portico manages a tunnel you created in the " +
@@ -1417,7 +1451,6 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 		req.ClientTunnel = &ipc.ClientTunnelSpecDTO{
 			Client:   "openai_secure_mcp_tunnel",
 			TunnelID: s.TunnelID,
-			Profile:  s.TunnelProfile,
 			MCP: ipc.MCPSourceDTO{
 				// The transport is HTTP: the client reaches a local MCP server over
 				// it, and the endpoint the user gave is that server's address.
@@ -1426,6 +1459,7 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 			},
 		}
 	default: // service_exposure
+		req.ProfileKind = s.ProfileKind
 		req.Source = src
 		req.Exposure = ipc.ExposureDTO{
 			Mode:             s.ExposureMode,
@@ -1752,6 +1786,19 @@ func (m *WizardModel) advanceFromSource() {
 		m.state.Step = WizardStepExposure
 		m.selected = firstAvailable(m.exposureChoices())
 	}
+}
+
+// enterReview transitions to the review screen. For outcomes that requested an
+// OpenAI-compatibility probe and none has run yet, it fires one; the reply
+// updates the review in place when (and only when) this wizard generation is
+// still the live one.
+func (m *WizardModel) enterReview() tea.Cmd {
+	m.state.Step = WizardStepReview
+	m.selected = 0
+	if m.state.ProfileKind == string(core.ProfileOpenAICompatible) && m.probeSummary == "" && m.openAIProbeResult == nil {
+		return m.probeOpenAICompatibilityCmd()
+	}
+	return nil
 }
 
 func (m *WizardModel) sourcePrompt() string {

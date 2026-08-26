@@ -143,6 +143,9 @@ func (m Model) handleAction(id ActionID, act Action) (Model, tea.Cmd, bool) {
 		}
 		return m, m.loadSettingsCmd(), true
 
+	case ActionRotateSecretKey:
+		return m, m.rotateSecretKeyCmd(), true
+
 	case ActionRetry:
 		// The whole bring-up sequence, not a bare snapshot retry against an
 		// unchanged dead supervisor.

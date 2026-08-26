@@ -35,7 +35,9 @@ type settingsState struct {
 	err      string
 	// loadErr records a failed read, which must be reported as a failed read
 	// rather than rendered as a screenful of defaults.
-	loadErr string
+	loadErr  string
+	rotating bool
+	rotation string
 }
 
 // settingRow is one line on the settings screen.
@@ -235,6 +237,11 @@ func (m *Model) renderSettings() string {
 	if m.settings.err != "" {
 		b.WriteString("\n")
 		b.WriteString(m.theme.Style("intervention").Render(m.settings.err))
+		b.WriteString("\n")
+	}
+	if m.settings.rotation != "" {
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render(m.settings.rotation))
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")

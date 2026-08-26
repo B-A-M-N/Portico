@@ -212,8 +212,6 @@ func (m *WizardModel) restoreStepInput() {
 		m.setInput(m.state.TunnelID)
 	case WizardStepTunnelMCP:
 		m.setInput(m.state.SourceAddress)
-	case WizardStepTunnelProfile:
-		m.setInput(m.state.TunnelProfile)
 
 	// Menus restore a cursor rather than text, positioned on the stored answer
 	// so going back does not silently move the user's choice.

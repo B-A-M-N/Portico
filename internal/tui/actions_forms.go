@@ -228,5 +228,10 @@ func (m Model) settingsActions() ActionSet {
 			DisabledReason: "a change is being saved",
 			Help:           "Re-read the settings the supervisor currently holds.",
 		},
+		{
+			ID: ActionRotateSecretKey, Keys: []string{"K"}, Label: "Rotate encryption key", Enabled: !pending && m.settings != nil && !m.settings.rotating,
+			DisabledReason: "a settings operation is already in flight", Primary: true,
+			Help: "Re-encrypt every stored credential under a new installation key. Key material never leaves the supervisor.",
+		},
 	}
 }

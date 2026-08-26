@@ -21,6 +21,7 @@ type SupervisorClient interface {
 	// the config file, which only the supervisor opens.
 	Settings(ctx context.Context) (*ipc.SettingsDTO, error)
 	UpdateSettings(ctx context.Context, req ipc.SettingsRequest) (*ipc.SettingsDTO, error)
+	RotateSecretKey(ctx context.Context) (*ipc.RotateSecretKeyDTO, error)
 	// Telemetry is the traffic sample a provider supplies for a connection,
 	// when it supplies one. The IPC route, the DTO and the ngrok
 	// implementation all existed while no client asked for them.

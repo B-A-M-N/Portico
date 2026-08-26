@@ -688,6 +688,8 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case settingsSavedMsg:
 		m.applySettingsSaved(msg)
+	case secretKeyRotatedMsg:
+		m.applySecretKeyRotated(msg)
 		return m, nil
 
 	case telemetryLoadedMsg:
@@ -962,6 +964,12 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case screens.ProviderRecommendationMsg:
 		if m.wizard != nil {
 			m.wizard.HandleRecommendation(msg)
+		}
+		return m, nil
+
+	case screens.OpenAICompatProbedMsg:
+		if m.wizard != nil {
+			m.wizard.HandleOpenAICompatProbed(msg)
 		}
 		return m, nil
 

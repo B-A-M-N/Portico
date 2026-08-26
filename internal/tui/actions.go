@@ -68,6 +68,7 @@ const (
 	// the cursor's index.
 	ActionDefaultAutoStart    ActionID = "default_auto_start"
 	ActionDefaultOnDisconnect ActionID = "default_on_disconnect"
+	ActionRotateSecretKey     ActionID = "rotate_secret_key"
 	ActionShowMore            ActionID = "show_more"
 	ActionFilter              ActionID = "filter"
 	ActionFollowLogs          ActionID = "follow_logs"

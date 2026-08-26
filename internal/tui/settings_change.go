@@ -1,6 +1,10 @@
 package tui
 
 import (
+	"context"
+	"fmt"
+	"time"
+
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
@@ -50,6 +54,44 @@ func (m Model) changeSelectedSetting() (Model, tea.Cmd, bool) {
 
 	m.settings.err = ""
 	return m, m.saveSettingsCmd(req), true
+}
+
+type secretKeyRotatedMsg struct {
+	Result *ipc.RotateSecretKeyDTO
+	Err    error
+}
+
+func (m *Model) rotateSecretKeyCmd() tea.Cmd {
+	if m.settings == nil {
+		return nil
+	}
+	m.settings.rotating = true
+	client := m.client
+	ctx := m.rootCtx
+	return func() tea.Msg {
+		if client == nil {
+			return secretKeyRotatedMsg{Err: fmt.Errorf("no supervisor connection")}
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		result, err := client.RotateSecretKey(reqCtx)
+		return secretKeyRotatedMsg{Result: result, Err: err}
+	}
+}
+
+func (m *Model) applySecretKeyRotated(msg secretKeyRotatedMsg) {
+	if m.settings == nil {
+		return
+	}
+	m.settings.rotating = false
+	if msg.Err != nil {
+		m.settings.err = describeError(msg.Err).Summary
+		return
+	}
+	m.settings.err = ""
+	if msg.Result != nil {
+		m.settings.rotation = fmt.Sprintf("Installation encryption key rotated to version %d.", msg.Result.Version)
+	}
 }
 
 // applySettingsLoaded installs the settings the supervisor reported.

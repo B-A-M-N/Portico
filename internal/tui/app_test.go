@@ -413,6 +413,10 @@ func (f *fakeClient) UpdateSettings(_ context.Context, req ipc.SettingsRequest) 
 	return &updated, nil
 }
 
+func (f *fakeClient) RotateSecretKey(_ context.Context) (*ipc.RotateSecretKeyDTO, error) {
+	return &ipc.RotateSecretKeyDTO{Version: 2, RotatedAt: "2026-08-25T00:00:00Z"}, nil
+}
+
 func (f *fakeClient) Telemetry(_ context.Context, id string) (*ipc.TelemetryDTO, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -809,6 +813,8 @@ func TestWizardCreateFlowIsAsync(t *testing.T) {
 	steps = append(steps, "enter")                     // address: empty (port next)
 	steps = append(steps, "8", "0", "8", "0", "enter") // port: 8080
 	steps = append(steps, "enter")                     // protocol: http (default)
+	steps = append(steps, "enter")                     // health probe: yes (default)
+	steps = append(steps, "enter")                     // health path: service root
 	steps = append(steps, "enter")                     // exposure: temporary_public
 	steps = append(steps, "enter")                     // protection: none
 	steps = append(steps, "enter")                     // provider: cloudflare
