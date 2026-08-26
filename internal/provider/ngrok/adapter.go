@@ -191,6 +191,11 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 			core.ProtocolHTTP:  {Supported: true, Public: true},
 			core.ProtocolHTTPS: {Supported: true, Public: true},
 		},
+		Streaming: core.CapabilitySupport{
+			Supported: true,
+			Stability: core.StabilityBeta,
+			Notes:     []string{"ngrok forwards streaming HTTP responses"},
+		},
 		Telemetry: core.TelemetryCapability{
 			Supported:     true,
 			RequestCounts: true,
@@ -241,8 +246,14 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 		if desired.Origin == nil || desired.Origin.URL == "" {
 			return nil, fmt.Errorf("ngrok: a resolved origin is required to open a connection")
 		}
+		// The gateway endpoint, when supplied, is the effective transport
+		// target (audit R1): ngrok forwards to it without knowing why.
+		target := desired.Origin.URL
+		if desired.GatewayEndpoint != "" {
+			target = desired.GatewayEndpoint
+		}
 		intent = core.IntentOpen
-		steps = p.planOpenSteps(profile, desired.Origin.URL)
+		steps = p.planOpenSteps(profile, target)
 	case core.DesiredClosed:
 		intent = core.IntentClose
 		steps = p.planCloseSteps(profile)

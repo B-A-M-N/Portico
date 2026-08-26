@@ -404,6 +404,12 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 	if desired.Origin != nil {
 		originURL = desired.Origin.URL
 	}
+	// The gateway endpoint, when supplied, is the EFFECTIVE transport target
+	// (audit R1): the provider transports to it without knowing why it is a
+	// gateway rather than the raw service.
+	if desired.GatewayEndpoint != "" {
+		originURL = desired.GatewayEndpoint
+	}
 	plan := &core.OperationPlan{
 		ID:              core.NewPlanID(),
 		ConnectionID:    profile.ID,

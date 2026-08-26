@@ -115,25 +115,36 @@ func TestOriginManager_StopAllTerminatesProcessGroup(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh is required for process-group termination test")
 	}
-	port := freeLoopbackPort(t)
-
-	manager := origin.NewManager()
-	connID := core.ConnectionID("pgroup-" + strconv.Itoa(port))
-	// Run the shell explicitly: "sh -c 'python3 -m http.server PORT & wait'"
-	// so the listener becomes a descendant of sh in the same process group.
-	cfg := core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
-		Executable: "sh",
-		Args: []string{
-			"-c", "python3 -m http.server " + strconv.Itoa(port) + " & wait",
-		},
-		Port: port,
-	}}
-	resolved, err := manager.Plan(connID, cfg)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
+	var port int
+	var manager *origin.Manager
+	var connID core.ConnectionID
+	var cfg core.SourceSpec
+	var resolved *core.ResolvedOrigin
+	var startErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		port = freeLoopbackPort(t)
+		manager = origin.NewManager()
+		connID = core.ConnectionID("pgroup-" + strconv.Itoa(port))
+		// Run the shell explicitly: "sh -c 'python3 -m http.server PORT & wait'"
+		// so the listener becomes a descendant of sh in the same process group.
+		cfg = core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
+			Executable: "sh",
+			Args: []string{
+				"-c", "python3 -m http.server " + strconv.Itoa(port) + " & wait",
+			},
+			Port: port,
+		}}
+		resolved, startErr = manager.Plan(connID, cfg)
+		if startErr != nil {
+			t.Fatalf("Plan: %v", startErr)
+		}
+		startErr = manager.Start(context.Background(), connID, cfg, resolved.URL)
+		if startErr == nil {
+			break
+		}
 	}
-	if err := manager.Start(context.Background(), connID, cfg, resolved.URL); err != nil {
-		t.Fatalf("Start: %v", err)
+	if startErr != nil {
+		t.Fatalf("Start after retries: %v", startErr)
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	if response, err := client.Get(resolved.URL); err != nil {

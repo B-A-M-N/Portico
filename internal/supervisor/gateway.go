@@ -30,7 +30,7 @@ func newGatewayManager() *gatewayManager {
 
 // StartGateway starts a gateway for the connection and returns its endpoint.
 // The gateway is started asynchronously and the function returns once it's ready.
-func (m *gatewayManager) StartGateway(ctx context.Context, connID core.ConnectionID, upstream string, authTokens []string) (string, error) {
+func (m *gatewayManager) StartGateway(ctx context.Context, connID core.ConnectionID, spec core.GatewayStartSpec) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -41,12 +41,13 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 		delete(m.gateways, connID)
 	}
 
-	// Create the gateway.
+	// Create the gateway. Authentication policy is taken from the spec as
+	// declared — never inferred from token presence.
 	gw, err := gateway.New(gateway.Config{
 		ListenAddr:   "127.0.0.1:0",
-		Upstream:     upstream,
-		AuthRequired: len(authTokens) > 0,
-		ValidTokens:  authTokens,
+		Upstream:     spec.Upstream,
+		AuthRequired: spec.AuthRequired,
+		ValidTokens:  spec.AuthTokens,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create gateway: %w", err)
@@ -69,7 +70,7 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 		if gw.State() == gateway.GatewayStateReady && gw.Addr() != "" {
 			m.gateways[connID] = &gatewayHandle{gateway: gw, cancel: cancel}
 			endpoint := gw.URL()
-			slog.Info("gateway started", "connection", connID, "endpoint", endpoint, "upstream", upstream)
+			slog.Info("gateway started", "connection", connID, "endpoint", endpoint, "upstream", spec.Upstream, "auth_required", spec.AuthRequired)
 			return endpoint, nil
 		}
 		if gw.State() == gateway.GatewayStateFailed {

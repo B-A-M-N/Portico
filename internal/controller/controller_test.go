@@ -139,6 +139,44 @@ func TestCreateProfileDefaultsProtectedSessionTTL(t *testing.T) {
 	}
 }
 
+func TestDirectoryOriginPortsAreDurableAndCollisionFree(t *testing.T) {
+	ctrl := New(newTestRegistry(mock.New()), newTestJournal())
+	newDirectoryProfile := func(name string) *core.ConnectionProfile {
+		profile := newFailureTestProfile()
+		profile.Name = name
+		profile.Spec.ServiceExposure.Source = core.SourceSpec{
+			Kind: core.SourceDirectory,
+			Directory: &core.DirectorySpec{
+				Path: t.TempDir(), Mode: core.DirectoryModeRead,
+			},
+		}
+		return profile
+	}
+
+	first, _, err := ctrl.CreateProfile(context.Background(), newDirectoryProfile("first"))
+	if err != nil {
+		t.Fatalf("create first directory: %v", err)
+	}
+	second, _, err := ctrl.CreateProfile(context.Background(), newDirectoryProfile("second"))
+	if err != nil {
+		t.Fatalf("create second directory: %v", err)
+	}
+	firstPort := first.Spec.ServiceExposure.Source.Directory.ListenPort
+	secondPort := second.Spec.ServiceExposure.Source.Directory.ListenPort
+	if firstPort == 0 || secondPort == 0 {
+		t.Fatalf("directory ports were not persisted: %d, %d", firstPort, secondPort)
+	}
+	if firstPort == secondPort {
+		t.Fatalf("directory ports collided: %d", firstPort)
+	}
+
+	clone := newDirectoryProfile("duplicate")
+	clone.Spec.ServiceExposure.Source.Directory.ListenPort = firstPort
+	if _, _, err := ctrl.CreateProfile(context.Background(), clone); err == nil {
+		t.Fatal("CreateProfile accepted a duplicate directory origin port")
+	}
+}
+
 func TestCreateProfilePersistsTheOnlyConfiguredAccount(t *testing.T) {
 	child := &accountBoundMockProvider{Provider: mock.New(), accountID: "account-a"}
 	parent := &multiAccountMockProvider{Provider: mock.New(), children: map[core.ProviderAccountID]core.Provider{"account-a": child}}

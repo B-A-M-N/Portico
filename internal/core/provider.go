@@ -111,12 +111,36 @@ type ResolvedOrigin struct {
 	Owned    bool
 }
 
-// GatewayService owns the local proxy that sits between a client-mediated
-// transport and its MCP origin. The service lifetime belongs to the
-// supervisor, not to an apply request, so implementations must not tie the
-// running gateway to the caller's cancellation after StartGateway returns.
+// GatewayStartSpec is the explicit configuration for starting a gateway.
+//
+// Security policy is declared, never inferred (audit R1): AuthRequired comes
+// from the profile's gateway intent, not from whether tokens happen to have
+// been passed. A caller that requires authentication but supplies no tokens
+// gets a generated credential whose lifecycle the supervisor owns — it is
+// stored encrypted, handed to the appropriate surface, and never appears in
+// plans, events, logs or runtime DTOs.
+type GatewayStartSpec struct {
+	// Upstream is the local service endpoint the gateway fronts.
+	Upstream string
+	// AuthRequired states whether callers must authenticate at the gateway.
+	AuthRequired bool
+	// AuthTokens are accepted credentials when AuthRequired is true. When
+	// empty and AuthRequired is true, the implementation generates one.
+	AuthTokens []string
+	// AllowSSE declares that long-lived event-stream responses must pass
+	// through unbuffered.
+	AllowSSE bool
+}
+
+// GatewayService owns the local proxy that sits between a transport and its
+// origin. Lifecycle authority belongs to the supervisor/controller layer: a
+// provider never decides whether its workload needs a gateway — it receives
+// the effective transport target and forwards to it. The service lifetime
+// belongs to the supervisor, not to an apply request, so implementations must
+// not tie the running gateway to the caller's cancellation after StartGateway
+// returns.
 type GatewayService interface {
-	StartGateway(ctx context.Context, connectionID ConnectionID, upstream string, authTokens []string) (endpoint string, err error)
+	StartGateway(ctx context.Context, connectionID ConnectionID, spec GatewayStartSpec) (endpoint string, err error)
 	StopGateway(connectionID ConnectionID) error
 }
 
@@ -125,6 +149,12 @@ type DesiredConnection struct {
 	Profile *ConnectionProfile
 	Runtime *ConnectionRuntime
 	Origin  *ResolvedOrigin
+	// GatewayEndpoint is the effective transport target when the profile
+	// intent requires a gateway-fronted origin. When set, the provider MUST
+	// transport to this endpoint instead of Origin.URL — it does not need to
+	// know why the target is a gateway rather than the raw service, only that
+	// this is where traffic goes. Empty means transport directly.
+	GatewayEndpoint string
 }
 
 // AuthRequest describes an authentication request

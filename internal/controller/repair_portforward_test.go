@@ -52,13 +52,17 @@ func TestAPortForwardCanBeRepaired(t *testing.T) {
 		t.Error("a private network is reported unrepairable, but it has a repair path")
 	}
 
-	// A client tunnel still says no, so CanRepair has not become a blanket yes. Portico
-	// manages a client against a tunnel someone else created; there is no resource of its
-	// own to put back.
+	// A client tunnel is repairable by restarting its local client and gateway;
+	// the provider still owns the exact process and transport details.
 	tunnel := forwardProfile("conn-tunnel")
 	tunnel.Kind = core.ConnectionClientTunnel
-	if c.CanRepair(tunnel) {
-		t.Error("a client tunnel is reported repairable with no repair path implemented")
+	tunnel.Spec.PortForward = nil
+	tunnel.Spec.ClientTunnel = &core.ClientTunnelSpec{
+		MCP:      core.MCPServiceSpec{Endpoint: "http://127.0.0.1:8787/mcp"},
+		TunnelID: "tunnel_0123456789abcdef0123456789abcdef",
+	}
+	if !c.CanRepair(tunnel) {
+		t.Error("a client tunnel is reported unrepairable")
 	}
 }
 

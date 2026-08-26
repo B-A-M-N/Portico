@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	profilepkg "github.com/B-A-M-N/portico/internal/profile"
+	"github.com/B-A-M-N/portico/internal/profile/openai"
 	"github.com/B-A-M-N/portico/internal/provider"
 )
 
@@ -28,6 +30,7 @@ type Controller struct {
 	operations       map[core.OperationID]*operationRecord
 	plans            map[core.PlanID]*core.OperationPlan
 	registry         provider.Registry
+	profileRegistry  *profilepkg.Registry
 	accounts         []core.ProviderAccountID
 	journal          Journal
 	deleteFinalizer  DeleteConnectionFinalizer
@@ -43,6 +46,7 @@ type Controller struct {
 	cleanupRecorder  CleanupRecorder
 	eventDispatcher  CommittedEventDispatcher
 	originManager    OriginManager
+	gatewayEndpoint GatewayEndpointResolver
 	operationMu      sync.Mutex
 	operationWG      sync.WaitGroup
 	acceptingOps     bool
@@ -112,15 +116,43 @@ type StepEvent struct {
 // New creates a new controller.
 func New(registry provider.Registry, journal Journal) *Controller {
 	return &Controller{
-		profiles:     make(map[core.ConnectionID]*core.ConnectionProfile),
-		runtimes:     make(map[core.ConnectionID]*core.ConnectionRuntime),
-		operations:   make(map[core.OperationID]*operationRecord),
-		plans:        make(map[core.PlanID]*core.OperationPlan),
-		registry:     registry,
+		profiles:   make(map[core.ConnectionID]*core.ConnectionProfile),
+		runtimes:   make(map[core.ConnectionID]*core.ConnectionRuntime),
+		operations: make(map[core.OperationID]*operationRecord),
+		plans:      make(map[core.PlanID]*core.OperationPlan),
+		registry:   registry,
+		profileRegistry: profilepkg.NewRegistry(
+			openai.Definition{},
+			openai.MCPDefinition{},
+			profilepkg.Descriptor{ProfileKind: profilepkg.ProfileWebService, DisplayName: "Web service"},
+		),
 		accounts:     nil,
 		journal:      journal,
 		acceptingOps: true,
 	}
+}
+
+// GatewayEndpointResolver reports the running gateway endpoint for a
+// connection, or empty when none is running. It is supplied by the supervisor,
+// which owns gateway lifecycle; the controller only consults it while planning
+// so the provider's plan carries the EFFECTIVE transport target.
+type GatewayEndpointResolver func(connID core.ConnectionID) string
+
+// SetGatewayEndpointResolver installs the resolver. Nil disables gateway
+// targeting: providers plan against the raw origin.
+func (c *Controller) SetGatewayEndpointResolver(resolve GatewayEndpointResolver) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gatewayEndpoint = resolve
+}
+
+// effectiveGatewayTarget returns the endpoint a transport must use for this
+// connection: the running gateway when one exists, otherwise empty.
+func (c *Controller) effectiveGatewayTarget(connID core.ConnectionID) string {
+	if c.gatewayEndpoint == nil {
+		return ""
+	}
+	return c.gatewayEndpoint(connID)
 }
 
 // ShutdownOperations prevents new mutations, cancels active operation
@@ -250,6 +282,9 @@ func (c *Controller) CreateProfile(
 	if profile.ID == "" {
 		profile.ID = core.NewConnectionID()
 	}
+	if err := c.assignDirectoryPortLocked(profile, ""); err != nil {
+		return nil, nil, core.ErrValidation(err.Error())
+	}
 	// For backward compatibility, use the accessor methods
 	provider := profile.GetProvider()
 	if provider.AccountID == "" && provider.ProviderID != "" {
@@ -319,6 +354,64 @@ func (c *Controller) CreateProfile(
 	return storedProfile.DeepCopy(), rt.DeepCopy(), nil
 }
 
+// assignDirectoryPortLocked makes the local origin endpoint part of the
+// durable profile rather than a value chosen only when execution starts.
+// CreateProfile calls this while holding c.mu; update paths use the wrapper
+// below. Legacy profiles with a zero port occupy their deterministic fallback
+// so a newly assigned profile cannot collide with them.
+func (c *Controller) assignDirectoryPortLocked(profile *core.ConnectionProfile, ignoreID core.ConnectionID) error {
+	if profile == nil || profile.Spec.ServiceExposure == nil ||
+		profile.Spec.ServiceExposure.Source.Directory == nil {
+		return nil
+	}
+	directory := profile.Spec.ServiceExposure.Source.Directory
+
+	used := make(map[int]struct{}, len(c.profiles))
+	for id, existing := range c.profiles {
+		if id == ignoreID || existing == nil || existing.Spec.ServiceExposure == nil ||
+			existing.Spec.ServiceExposure.Source.Directory == nil {
+			continue
+		}
+		port := existing.Spec.ServiceExposure.Source.Directory.ListenPort
+		if port == 0 {
+			port = core.DirectoryPortForConnection(id)
+		}
+		used[port] = struct{}{}
+	}
+	if directory.ListenPort != 0 {
+		if _, occupied := used[directory.ListenPort]; occupied {
+			return fmt.Errorf("directory origin port %d is already allocated", directory.ListenPort)
+		}
+		return nil
+	}
+
+	preferred := core.DirectoryPortForConnection(profile.ID)
+	for offset := 0; offset < core.DirectoryPortSpan; offset++ {
+		port := core.DirectoryPortStart + (preferred-core.DirectoryPortStart+offset)%core.DirectoryPortSpan
+		if _, occupied := used[port]; occupied {
+			continue
+		}
+		directory.ListenPort = port
+		return nil
+	}
+	return fmt.Errorf("no durable directory origin port is available")
+}
+
+func (c *Controller) assignDirectoryPort(profile, existing *core.ConnectionProfile) error {
+	if profile == nil || profile.Spec.ServiceExposure == nil ||
+		profile.Spec.ServiceExposure.Source.Directory == nil {
+		return nil
+	}
+	directory := profile.Spec.ServiceExposure.Source.Directory
+	if directory.ListenPort == 0 && existing != nil && existing.Spec.ServiceExposure != nil &&
+		existing.Spec.ServiceExposure.Source.Directory != nil {
+		directory.ListenPort = existing.Spec.ServiceExposure.Source.Directory.ListenPort
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.assignDirectoryPortLocked(profile, profile.ID)
+}
+
 // GetProfile returns a defensive copy of a profile by ID.
 func (c *Controller) GetProfile(id core.ConnectionID) (*core.ConnectionProfile, bool) {
 	c.mu.RLock()
@@ -366,6 +459,18 @@ func (c *Controller) ListRuntimes() []*core.ConnectionRuntime {
 // UpdateProfile updates a profile and bumps the revision.
 // It validates the profile and rejects stale updates using optimistic concurrency.
 func (c *Controller) UpdateProfile(ctx context.Context, profile *core.ConnectionProfile, expectedRevision uint64) error {
+	// Preserve an existing directory allocation during edits. A newly added
+	// directory receives an unused allocation before validation and persistence.
+	c.mu.RLock()
+	existing, ok := c.profiles[profile.ID]
+	c.mu.RUnlock()
+	if !ok {
+		return core.ErrProfileNotFound(profile.ID)
+	}
+	if err := c.assignDirectoryPort(profile, existing); err != nil {
+		return core.ErrValidation(err.Error())
+	}
+
 	// Validate the updated profile before storing
 	if err := profile.Validate(); err != nil {
 		return core.ErrValidation(err.Error())
@@ -379,15 +484,6 @@ func (c *Controller) UpdateProfile(ctx context.Context, profile *core.Connection
 	// Validate provider compatibility (kind support, protocols, protection, etc.).
 	if err := c.validateProviderForProfile(ctx, profile); err != nil {
 		return err
-	}
-
-	// Load existing profile to preserve CreatedAt
-	c.mu.RLock()
-	existing, ok := c.profiles[profile.ID]
-	c.mu.RUnlock()
-
-	if !ok {
-		return core.ErrProfileNotFound(profile.ID)
 	}
 
 	// Preserve CreatedAt
@@ -692,6 +788,14 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 	desired := core.DesiredConnection{
 		Profile: openProfile,
 		Origin:  resolvedOrigin,
+	}
+	// When a supervisor-owned gateway is running for this connection, the
+	// transport must target IT, not the raw origin (audit R1). The provider
+	// receives the effective endpoint and stays ignorant of why.
+	if resolvedOrigin != nil {
+		if gw := c.effectiveGatewayTarget(connID); gw != "" {
+			desired.GatewayEndpoint = gw
+		}
 	}
 
 	plan, err := prov.Plan(ctx, desired)
@@ -1073,7 +1177,7 @@ func (c *Controller) CanRepair(profile *core.ConnectionProfile) bool {
 	}
 	switch profile.Kind {
 	case core.ConnectionServiceExposure, core.ConnectionPortForward,
-		core.ConnectionPrivateNetwork:
+		core.ConnectionPrivateNetwork, core.ConnectionClientTunnel:
 		return true
 	}
 	return false
@@ -1143,6 +1247,21 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 			return nil, ErrNoRepairNeeded
 		}
 		return c.finishRepairPlan(ctx, profile, networkSteps)
+	}
+
+	// A client tunnel owns no remote resource to reconcile. Its repair is a
+	// causal restart of the local client (and, when configured, its local
+	// gateway). The provider's open plan supplies the exact client arguments
+	// and gateway ordering.
+	if profile.Kind == core.ConnectionClientTunnel {
+		tunnelSteps, err := c.clientTunnelRepairSteps(ctx, profile, runtimeOrNil(rt, rtOk))
+		if err != nil {
+			return nil, err
+		}
+		if len(tunnelSteps) == 0 {
+			return nil, ErrNoRepairNeeded
+		}
+		return c.finishRepairPlan(ctx, profile, tunnelSteps)
 	}
 
 	// Build a repair plan based on origin and connector status. Causal order:

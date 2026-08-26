@@ -193,7 +193,12 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 		}()
 		ctx := operationCtx
 		completedSteps := []completedExecution{}
-		for _, step := range plan.Steps {
+		for _, plannedStep := range plan.Steps {
+			// Some provider steps depend on the exact external ID returned by a
+			// preceding step. Resolve those dependencies from the committed
+			// results immediately before execution so a preview never has to
+			// guess an ID that does not exist yet.
+			step := materializeStepDependencies(plannedStep, completedSteps)
 			// Handle controller-local steps that don't go to the provider.
 			if step.Kind == core.StepFinalizeLocalDeletion {
 				// Finalize local deletion is a controller action, not a provider operation.
@@ -1319,6 +1324,28 @@ func selectResourceByType(resources []core.ProviderResource, desiredType core.Re
 		}
 	}
 	return found
+}
+
+// materializeStepDependencies fills IDs that are created by earlier steps in
+// the same plan. The application ID is deliberately not put into the preview
+// because it does not exist until the application-create step succeeds.
+func materializeStepDependencies(step core.PlanStep, completed []completedExecution) core.PlanStep {
+	if step.Kind != core.StepCreateAccessPolicy || step.Technical.Parameters["app_id"] != "" {
+		return step
+	}
+	for i := len(completed) - 1; i >= 0; i-- {
+		appID := selectResourceByType(completed[i].Result.Resources, core.ResourceAccessApp)
+		if appID == "" {
+			continue
+		}
+		step = step.Clone()
+		if step.Technical.Parameters == nil {
+			step.Technical.Parameters = make(map[string]string)
+		}
+		step.Technical.Parameters["app_id"] = appID
+		return step
+	}
+	return step
 }
 
 func compensationRequiresResourceID(kind core.StepKind) bool {

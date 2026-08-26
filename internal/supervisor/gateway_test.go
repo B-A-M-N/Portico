@@ -32,7 +32,7 @@ func TestGatewayManager_StartStop(t *testing.T) {
 	defer server.Close()
 
 	connID := core.ConnectionID("test-conn-1")
-	endpoint, err := mgr.StartGateway(context.Background(), connID, upstream, nil)
+	endpoint, err := mgr.StartGateway(context.Background(), connID, core.GatewayStartSpec{Upstream: upstream})
 	if err != nil {
 		t.Fatalf("StartGateway: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestGatewayManager_StopAll(t *testing.T) {
 	// Start multiple gateways.
 	connIDs := []core.ConnectionID{"conn-1", "conn-2"}
 	for _, id := range connIDs {
-		_, err := mgr.StartGateway(context.Background(), id, upstream, nil)
+		_, err := mgr.StartGateway(context.Background(), id, core.GatewayStartSpec{Upstream: upstream})
 		if err != nil {
 			t.Fatalf("StartGateway %s: %v", id, err)
 		}
@@ -108,13 +108,13 @@ func TestGatewayManager_DoubleStart(t *testing.T) {
 	connID := core.ConnectionID("test-double")
 
 	// Start gateway first time.
-	_, err := mgr.StartGateway(context.Background(), connID, upstream, nil)
+	_, err := mgr.StartGateway(context.Background(), connID, core.GatewayStartSpec{Upstream: upstream})
 	if err != nil {
 		t.Fatalf("first StartGateway: %v", err)
 	}
 
 	// Start again — should succeed (replaces old one).
-	endpoint2, err := mgr.StartGateway(context.Background(), connID, upstream, nil)
+	endpoint2, err := mgr.StartGateway(context.Background(), connID, core.GatewayStartSpec{Upstream: upstream})
 	if err != nil {
 		t.Fatalf("second StartGateway: %v", err)
 	}

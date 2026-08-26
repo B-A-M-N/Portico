@@ -141,6 +141,15 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 		// process as auto whatever had been selected.
 		launch: config.LoadOperationalSettings().LaunchMode,
 	}
+	// The controller consults the gateway manager while planning, so a
+	// provider's plan carries the effective transport target (the gateway
+	// endpoint) instead of the raw origin when a gateway is running.
+	ctrl.SetGatewayEndpointResolver(func(connID core.ConnectionID) string {
+		if rt, ok := sup.gatewayMgr.Runtime(connID); ok {
+			return rt.Endpoint
+		}
+		return ""
+	})
 	procMgr.SetEventSink(sup.handleProcessEvent)
 	return sup, nil
 }
@@ -268,6 +277,51 @@ func (s *Supervisor) gatewayNeeded(p *core.ConnectionProfile, rt *core.Connectio
 		return true
 	}
 	return false
+}
+
+// gatewaySpecFor derives the gateway configuration from the profile's intent.
+//
+// The profile layer declares WHAT the gateway must do (front this origin,
+// require authentication, allow SSE); this method translates that into the
+// concrete start specification. The upstream is the connection's local
+// origin — the raw service — because the gateway IS the front; transports
+// receive the gateway endpoint, not this value.
+//
+// Generated credentials: when authentication is required and no token was
+// provisioned, the gateway generates one. Its lifecycle belongs to the
+// supervisor: it lives in gateway memory for the connection's lifetime,
+// never enters plans/events/logs/runtime DTOs, and a restart regenerates it.
+// (A durable encrypted credential surface is the next step once clients have
+// a way to receive it.)
+func (s *Supervisor) gatewaySpecFor(p *core.ConnectionProfile) (core.GatewayStartSpec, bool) {
+	if !s.gatewayNeeded(p, nil) {
+		return core.GatewayStartSpec{}, false
+	}
+	endpoint := s.profileOriginURL(p)
+	if endpoint == "" {
+		return core.GatewayStartSpec{}, false
+	}
+	spec := core.GatewayStartSpec{
+		Upstream: endpoint,
+		AllowSSE: p.EffectiveProfileKind() == core.ProfileOpenAICompatible ||
+			p.EffectiveProfileKind() == core.ProfileOpenAIMCP,
+	}
+	// Authentication intent comes from the profile binding contract:
+	// openai_compatible exposures are authenticated at the gateway. With no
+	// provisioned tokens the gateway implementation generates a credential;
+	// AuthRequired stays true so policy is never downgraded by absence.
+	spec.AuthRequired = p.EffectiveProfileKind() == core.ProfileOpenAICompatible
+	return spec, true
+}
+
+// profileOriginURL resolves the local origin a gateway should front.
+func (s *Supervisor) profileOriginURL(p *core.ConnectionProfile) string {
+	source := p.GetSource()
+	if source.Existing != nil && source.Existing.Address != "" {
+		protocol := connectionProtocol(p)
+		return endpointURL(source.Existing.Address, protocol)
+	}
+	return ""
 }
 
 // runHealthChecks performs three-state health checks (PROCESS, TRANSPORT, SERVICE)
@@ -1550,16 +1604,39 @@ func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string
 					ID:           string(existingOp.ID),
 					PlanID:       planID,
 					ConnectionID: string(existingOp.ConnectionID),
-					State:        string(existingOp.State),
+					State:        existingOp.State,
 					StartedAt:    existingOp.StartedAt,
 				}, nil
 			}
 		}
 	}
 
-	op, err := h.sup.controller.ApplyPlan(ctx, core.PlanID(planID))
-	if err != nil {
-		return nil, err
+	// Gateway lifecycle is supervisor-owned (audit R1). When the profile
+	// intent requires a gateway, it starts BEFORE the transport provider so
+	// the provider can be given the gateway endpoint as its effective target,
+	// and the provider never decides whether its workload needs a gateway.
+	var gatewayStarted bool
+	plan, planFound := h.sup.controller.GetPlan(core.PlanID(planID))
+	if planFound && plan != nil && plan.Intent == core.IntentOpen {
+		if profile, ok := h.sup.controller.GetProfile(plan.ConnectionID); ok {
+			if spec, needed := h.sup.gatewaySpecFor(profile); needed {
+				endpoint, startErr := h.sup.gatewayMgr.StartGateway(ctx, plan.ConnectionID, spec)
+				if startErr != nil {
+					return nil, fmt.Errorf("start gateway: %w", startErr)
+				}
+				gatewayStarted = true
+				slog.Info("gateway started for profile exposure", "connection", plan.ConnectionID, "endpoint", endpoint)
+			}
+		}
+	}
+
+	op, applyErr := h.sup.controller.ApplyPlan(ctx, core.PlanID(planID))
+	if applyErr != nil {
+		// A failed apply must not leave a supervisor-owned gateway running.
+		if gatewayStarted {
+			h.sup.gatewayMgr.StopGateway(plan.ConnectionID)
+		}
+		return nil, applyErr
 	}
 
 	// Record the idempotency key to operation mapping for future replays.

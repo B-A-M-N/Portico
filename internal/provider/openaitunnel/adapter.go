@@ -544,7 +544,15 @@ func (p *Provider) startClient(ctx context.Context, connectionID core.Connection
 	gatewayStarted := false
 	if p.gateways != nil && effectiveStep.Technical.Parameters["mcp_server_url"] != "" {
 		upstream := effectiveStep.Technical.Parameters["mcp_server_url"]
-		endpoint, err := p.gateways.StartGateway(ctx, connectionID, upstream, nil)
+		endpoint, err := p.gateways.StartGateway(ctx, connectionID, core.GatewayStartSpec{
+			Upstream: upstream,
+			// The client-mediated MCP transport has no independent client
+			// credential surface yet: the gateway fronts the local MCP server
+			// for the tunnel-client process on loopback only. Declared
+			// explicitly here rather than inferred from token absence.
+			AuthRequired: false,
+			AllowSSE:     true,
+		})
 		if err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("start Portico gateway: %w", err)}
 		}
