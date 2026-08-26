@@ -16,8 +16,9 @@ make validate
 ```
 
 That runs `gofmt -l`, `go build ./...`, `go vet ./...`, `staticcheck ./...`,
-`go test ./... -count=1` and `go test -race ./... -count=1`. Every row below
-passes under it as of `3f1a67b`.
+`go test ./... -count=1` and `go test -race ./... -count=1`. Rows marked
+`working tree` were added or corrected after the historical audit commits and
+must be run from the current checkout.
 
 Run a single row with the command in its Command column.
 
@@ -42,7 +43,7 @@ Run a single row with the command in its Command column.
 | Diagnostics never attach to another connection | `TestDiagnosticsNeverAttachToAnotherConnection` | Findings gathered for one connection are not shown against another. | `go test ./internal/tui/ -run DiagnosticsNeverAttach` | `8028b31` |
 | A failed check is not an empty result | `TestAFailedDiagnosticIsNotAnEmptyResult` | A check that could not run is recorded as failed, not as a healthy connection. | `go test ./internal/tui/ -run FailedDiagnosticIsNot` | `8028b31` |
 | Repair is verified by identity, not count | `TestRepairIsVerifiedByWhichFindingsChanged` | Resolved, remaining and newly appeared findings are distinguished. Fixing DNS while breaking the connector is not "unchanged". | `go test ./internal/tui/ -run RepairIsVerifiedBy` | `8028b31` |
-| A late plan cannot reopen a dismissed screen | `TestLeavingThePreviewWithQAbandonsThePlan` (`internal/tui/scroll_test.go`) | Both exits abandon the request, not just `esc`. | `go test ./internal/tui/ -run LeavingThePreviewWithQ` | `4b4f5a6` |
+| A late plan cannot reopen a dismissed screen | `TestLeavingThePreviewAbandonsThePlan` (`internal/tui/scroll_test.go`) | Both exits abandon the request, not just `esc`. | `go test ./internal/tui/ -run LeavingThePreviewAbandons` | `4b4f5a6` |
 | A late edit plan opens nothing | `TestALateEditPlanDoesNotOpenAPreview` (`internal/tui/edit_test.go`) | Same rule on the edit path. | `go test ./internal/tui/ -run ALateEditPlan` | `d58736b` |
 | A late removal reports against nothing | `TestALateRemovalReplyDoesNotReportAgainstAnotherAccount` (`internal/tui/accounts_test.go`) | Same rule on the account path. | `go test ./internal/tui/ -run ALateRemovalReply` | `115f058` |
 | A journal is not shown under another operation | `TestAJournalIsNotShownAgainstAnotherOperation` (`internal/tui/refresh_test.go`) | Same rule on the history path. | `go test ./internal/tui/ -run JournalIsNotShown` | `e95e2a4` |
@@ -162,6 +163,19 @@ Run a single row with the command in its Command column.
 | A fresh database is usable | `TestAFreshDatabaseIsImmediatelyUsable` | A chain that applies cleanly and leaves an unusable schema is still a broken release. | `go test ./internal/store/ -run FreshDatabaseIsImmediately` | `a8a57c7` |
 | The release gate is one command | — | `make validate` runs format, build, vet, staticcheck, tests and race tests. | `make validate` | `a8a57c7` |
 
+## 8a. Runtime and release corrections
+
+| Requirement | Test | Behaviour pinned | Command | Commit |
+|---|---|---|---|---|
+| A failed Access policy compensates the exact application | `TestAccessPolicyFailureCompensatesExactApplicationID` | The policy uses the application ID returned by creation, and failure removes that exact app. | `go test ./internal/controller/ -run AccessPolicyFailureCompensatesExactApplicationID` | working tree |
+| Failed compensation remains actionable | `TestFailedAccessCompensationRetainsCleanupObligation` | If deletion fails, the cleanup obligation is durable rather than silently discarded. | `go test ./internal/controller/ -run FailedAccessCompensationRetainsCleanupObligation` | working tree |
+| The OpenAI client uses the Portico gateway | `TestClientUsesGatewayAsMCPOrigin` | The client receives the gateway endpoint, not the raw MCP origin, and stopping closes the gateway. | `go test ./internal/provider/openaitunnel/ -run ClientUsesGatewayAsMCPOrigin` | working tree |
+| Protected HTTP responses are reachable | `TestDefaultServiceCheckTreatsProtectedResponsesAsReachable` | 401/403 are evidence of a reachable protected service; unrelated 4xx/5xx remain failures. | `go test ./internal/core/ -run DefaultServiceCheckTreatsProtected` | working tree |
+| MCP health performs a protocol probe | `TestMCPServiceCheckPerformsProtocolProbe` | MCP service health uses the transport's request shape rather than a generic GET. | `go test ./internal/core/ -run MCPServiceCheckPerformsProtocolProbe` | working tree |
+| Client tunnels have a repair path | `TestAClientTunnelCanBeRepaired` | A crashed client tunnel yields a repair plan replaying the provider's open steps (start + verify ready) without inventing remote resource work. | `go test ./internal/controller/ -run AClientTunnelCanBeRepaired` | working tree |
+| Installation-key rotation is operational | `TestRotateSecretKeyIsAnOperationalDurableAction` | Rotation is reachable through the supervisor and leaves an audit event without key material. | `go test ./internal/supervisor/ -run RotateSecretKeyIsAnOperationalDurableAction` | working tree |
+| Release verification executes the archive | — | `verify_release_artifact.sh` extracts the produced archive, runs the binary under isolated XDG paths, starts `list`/`doctor`, verifies the database mode, and restarts from a copied install. | `make artifact-check` | working tree |
+
 ## 9. Second review: composition, mutation safety, and the real path
 
 An independent review of the completed remediation found defects that unit
@@ -194,7 +208,7 @@ tests on each side could not see. These rows are the corrections.
 | A no-op plan says which intent it answers | `TestANoOpPlanSaysWhichIntentItAnswers` (`internal/tui/refresh_test.go`) | Every no-op said "No repair needed" and pushed the repair screen. | `go test ./internal/tui/ -run ANoOpPlanSays` | `be5f524` |
 | The route names what carries the traffic | `TestTheRouteStripNamesWhatCarriesTheTraffic` | A forward has no provider gateway. | `go test ./internal/tui/ -run TheRouteStripNames` | `be5f524` |
 | **Origin ownership says what closing stops** | `TestOriginOwnershipSaysWhatClosingDoes`, `TestAForwardSaysOnlyForwardingStops` (`internal/supervisor/describe_spec_test.go`) | Whether Portico started the local service, or connected to one already running. | `go test ./internal/supervisor/ -run OriginOwnershipSays && go test ./internal/supervisor/ -run AForwardSaysOnly` | `be5f524` |
-| The Access contract is pinned | `TestCreatingAnAppSendsTheHostnameAndAllowedIdentities`, `TestAProtectedAppIsNeverCreatedWithoutIdentities`, `TestAFailedPolicyRemovesTheApplication` (`internal/access/contract_test.go`) | The resource that decides who can reach a protected connection, previously covered only by a fake manager. | `go test ./internal/access/ -run CreatingAnAppSends && go test ./internal/access/ -run AProtectedAppIsNever && go test ./internal/access/ -run AFailedPolicyRemoves` | `959ec52` |
+| The Access contract is pinned | `TestCreatingAnAppSendsTheHostname`, `TestThePolicyCarriesTheAllowedIdentities`, `TestAProtectedPolicyIsNeverCreatedWithoutIdentities` (`internal/access/contract_test.go`) | The application and its allow policy are separate requests, with fail-closed identity validation before policy creation. | `go test ./internal/access/ -run CreatingAnAppSends && go test ./internal/access/ -run PolicyCarries && go test ./internal/access/ -run ProtectedPolicyIsNever` | `959ec52` |
 | A missing Access resource is an absence | `TestAMissingApplicationIsAnAbsenceNotAFailure`, `TestAMissingPolicyIsAnAbsenceNotAFailure`, `TestARejectedTokenIsNotAMissingApplication` | Same rule as the tunnel and DNS managers, both directions. | `go test ./internal/access/ -run AMissingApplicationIs && go test ./internal/access/ -run AMissingPolicyIs && go test ./internal/access/ -run ARejectedTokenIsNotAMissingApp` | `959ec52` |
 | **Overwriting a permissive file still ends private** | `TestOverwritingAPermissiveFileStillEndsPrivate` (`internal/cli/handler_test.go`) | os.WriteFile's mode applies only on create; the code claimed 0600 and produced 0644. Verified empirically before fixing. | `go test ./internal/cli/ -run OverwritingAPermissiveFile` | `959ec52` |
 | An existing report is not silently replaced | `TestAnExistingReportIsNotSilentlyReplaced`, `TestAFailedWriteLeavesNoPartialReport` | --force required; no half-report left behind. | `go test ./internal/cli/ -run AnExistingReportIsNot && go test ./internal/cli/ -run AFailedWriteLeaves` | `959ec52` |
@@ -243,9 +257,10 @@ none.
 - **Traffic telemetry is not implemented.** The activity view says Portico does
   not collect it. That is an honest report of an unbuilt feature, not a
   completed requirement.
-- **Private network connections are not implemented.** They are described
-  correctly wherever they appear and refused at creation with a reason. No
-  adapter can join or expose through one.
+- **Private-network lifecycle coverage is narrower than service exposure.**
+  Tailscale and client-mediated private connections are implemented and
+  described as membership-based, but not every private-network provider or
+  reconciliation path is claimed by this matrix.
 - **`AuthenticateProvider` and `UpdateConnection` have no client method.** Both
   are reachable over the transport. The TUI deliberately routes edits through
   plans instead of the PATCH path, so `UpdateConnection` is an API affordance

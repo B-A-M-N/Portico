@@ -2,9 +2,9 @@
 
 **Baseline:** `da0667e` (`feat: harden Portico connection lifecycle`)
 
-**Last reviewed against:** `a08db44`. Sections marked Done below were verified against
-the tests named in them at that commit; where a claim is only partly true, it says which
-part. Several entries were stale before that review — rotate-in-place and the
+**Last reviewed against:** working tree, 2026-08-25. Sections marked Done below were
+verified against the tests named in them at this review; where a claim is only partly
+true, it says which part. Several entries were stale before that review — rotate-in-place and the
 429/5xx/malformed/timeout coverage were both listed as open after they had landed — so
 treat any unqualified item as unverified rather than as an open gap, and check the named
 test before trusting a Done.
@@ -83,7 +83,9 @@ treated as an implementation defect.
 
 3. **Mostly done.** The providers screen selects a provider and an account,
    draws the cursor, and offers removal. Inspect shows the selected account.
-   **Still missing:** re-verify and replace-credential actions on that screen.
+   **Still missing:** nothing — re-verify (`v`) and replace-credential (`c`)
+   are rendered on the providers screen from the action registry, and the
+   rotation form presents identity as read-only context.
 
 4. **Not done.** The one-account config bootstrap has not been migrated into the
    account repository, and the old read path is still in place.
@@ -103,9 +105,8 @@ treated as an implementation defect.
   state — a closed connection generates no reopen steps, so nothing else
   consulted the provider.)*
 - Tests cover selection, restart reconstruction, wrong-account rejection, and
-  encryption-key rotation of every account credential. *(Selection, restart
-  reconstruction and wrong-account rejection hold. **Encryption-key rotation is
-  untested.**)*
+  encryption-key rotation of every account credential. *(Holds for the
+  supervisor-owned rotation action and its durable lifecycle events.)*
 
 ## P0 — provider contract and live Cloudflare confidence
 
@@ -217,13 +218,18 @@ MCP profiles. Command sources collect an executable, port, comma-separated
 arguments, and working directory. Directory sources collect static-site versus
 file-browser mode, upload/delete permissions, and SPA fallback. Endpoint MCP
 sources collect HTTP, streamable HTTP, or (for permanent Cloudflare exposure)
-SSE transport. The wizard also supports command-owned MCP servers. It still
-lacks environment references and shell-mode configuration.
+SSE transport. The wizard also supports command-owned MCP servers.
+Environment references (`env:NAME`) and shell-mode configuration are
+implemented: `WizardStepCommandShell` and `WizardStepCommandEnv` exist, with
+`ParseCommandEnv` accepting `env:` references and refusing secret literals.
 
 Since this was written, the wizard's question sequence became derived rather
 than hand-written: each step declares the condition under which it is asked, so
 going back is the inverse of going forward by construction. Text fields have a
-cursor, word motion and paste. **The wizard now supports port-forward creation.**
+cursor, word motion and paste. **The wizard now supports port-forward creation,
+and an "OpenAI-compatible API" outcome that probes the endpoint's protocol
+compatibility before review.** The never-applied client-profile question was
+removed: Portico is the single configuration authority for a client tunnel.
 
 **Implementation**
 
@@ -362,13 +368,17 @@ plaintext credential, re-saves it encrypted, and removes the original.
 **Current state**
 
 Installation-key rotation and tunnel/provider credential re-encryption exist,
-but there is no supported CLI/API command, status view, or operational runbook
-for rotation, backup, or recovery from a rejected key file.
+and rotation is now reachable through the supervisor API, CLI, and TUI. The
+backup/recovery runbook exists: `docs/KEY_RECOVERY_RUNBOOK.md` covers which
+file protects which secrets, mode expectations, backup/restore pairs, and
+post-rotation key disposal.
 
 **Implementation**
 
-1. Add a supervisor-owned rotate-key operation with durable event/audit output.
-2. Expose only status and rotation result, never key material or ciphertext.
+1. Done. The supervisor owns the rotate-key operation and records durable
+   started/completed/failed lifecycle events without key material.
+2. Done. Only status and rotation result are exposed, never key material or
+   ciphertext.
 3. Document backup/restore semantics, key-file ownership/mode checks, and the
    recovery procedure for a corrupt key.
 
@@ -386,8 +396,8 @@ for rotation, backup, or recovery from a rejected key file.
 
 Cloudflare and ngrok are real providers; mock is development-only. The ngrok
 adapter was rebuilt against the real agent and is verified end to end, though it
-applies no access protection. Tailscale and zrok remain architectural targets,
-not implementations.
+applies no access protection. Tailscale is implemented for private-network
+connections; zrok remains an architectural target.
 
 **Implementation**
 
@@ -408,8 +418,11 @@ Choose one of the following before a public release:
 **Current state**
 
 The supervisor-owned origin manager now runs directories, commands, and
-command-owned MCP sources. Older Docker and builtin origin packages remain,
-but are not represented by the current profile source union or wizard.
+command-owned MCP sources. Directory origins receive a durable loopback port
+allocation in the persisted profile, with deterministic fallback for legacy
+profiles and collision avoidance for new profiles. Older Docker and unused
+builtin origin packages remain, but are not represented by the current profile
+source union or wizard.
 
 **Implementation**
 
@@ -417,8 +430,9 @@ but are not represented by the current profile source union or wizard.
    contract and origin manager, with lifecycle persistence and diagnostics; or
 2. Remove unused implementations and claims until their source contract is
    designed.
-3. Decide whether deterministic directory ports should gain a user-configured
-   override or a safe reservation mechanism for collisions.
+3. Remove or quarantine the remaining unused origin implementations before
+   advertising them; the directory-port reservation gap is closed for new
+   profiles.
 
 **Acceptance**
 
@@ -475,13 +489,15 @@ The following audit findings have been addressed in recent commits:
 
 **Current state**
 
-CI and a release workflow exist, but release publishing, artifact signing, and
-an installed-binary smoke test are not yet proven in a tag build.
+CI and a release workflow exist. The produced archive is now checked by
+`scripts/verify_release_artifact.sh` before publication; release signing,
+publisher-authenticity verification, and a clean-account install smoke test
+remain unproven in a tag build.
 
 **Implementation**
 
 1. Exercise the release workflow on a prerelease tag and verify exact archive
-   names/checksums expected by `install.sh`.
+   names/checksums expected by `install.sh`; the local archive check is done.
 2. Sign artifacts/checksums or distribute a trusted public key separately from
    the release origin.
 3. Test fresh-install, upgrade, and supervisor migration on a clean Linux
