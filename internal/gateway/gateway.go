@@ -133,7 +133,10 @@ func New(cfg Config) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: generate token: %w", err)
 		}
 		validTokens[tok] = struct{}{}
-		slog.Info("gateway: auto-generated auth token", "token", tok[:8]+"...")
+		// No token fragment is logged: even a prefix narrows an attacker's
+		// search space. Correlation needs a non-reversible fingerprint, not
+		// credential material.
+		slog.Info("gateway authentication credential generated")
 	}
 
 	g := &Gateway{
