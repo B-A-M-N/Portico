@@ -3,6 +3,9 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -124,6 +127,47 @@ func TestDefaultServiceCheck(t *testing.T) {
 	err := DefaultServiceCheck(context.Background(), "http://127.0.0.1:1/nonexistent")
 	if err == nil {
 		t.Fatal("expected error for unreachable endpoint")
+	}
+}
+
+func TestDefaultServiceCheckTreatsProtectedResponsesAsReachable(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusFound, http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			if err := DefaultServiceCheck(context.Background(), server.URL); err != nil {
+				t.Fatalf("status %d reported unreachable: %v", status, err)
+			}
+		})
+	}
+	for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(fmt.Sprintf("failure-%d", status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			if err := DefaultServiceCheck(context.Background(), server.URL); err == nil {
+				t.Fatalf("status %d reported healthy", status)
+			}
+		})
+	}
+}
+
+func TestMCPServiceCheckPerformsProtocolProbe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("request = %s content-type %q", r.Method, r.Header.Get("Content-Type"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}`))
+	}))
+	defer server.Close()
+	if err := MCPServiceCheck(context.Background(), server.URL, MCPTransportStreamable); err != nil {
+		t.Fatalf("MCPServiceCheck: %v", err)
 	}
 }
 

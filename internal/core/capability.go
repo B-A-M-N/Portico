@@ -40,11 +40,15 @@ type Capabilities struct {
 	ManagedDNS         CapabilitySupport
 	BuiltInProtection  []ProtectionCapability
 	Protocols          map[Protocol]ProtocolCapability
-	Telemetry          TelemetryCapability
-	Redundancy         RedundancyCapability
-	RemoteConfig       CapabilitySupport
-	Expiration         ExpirationCapability
-	Constraints        []CapabilityConstraint
+	// Streaming describes whether the transport preserves long-lived HTTP
+	// response streams such as SSE. Profiles use this to reject transports
+	// that can carry a short request but would break streaming workloads.
+	Streaming    CapabilitySupport
+	Telemetry    TelemetryCapability
+	Redundancy   RedundancyCapability
+	RemoteConfig CapabilitySupport
+	Expiration   ExpirationCapability
+	Constraints  []CapabilityConstraint
 }
 
 // ProtectionCapability describes a protection capability.
