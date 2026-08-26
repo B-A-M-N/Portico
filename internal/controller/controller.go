@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -382,6 +383,14 @@ func (c *Controller) assignDirectoryPortLocked(profile *core.ConnectionProfile, 
 		if _, occupied := used[directory.ListenPort]; occupied {
 			return fmt.Errorf("directory origin port %d is already allocated", directory.ListenPort)
 		}
+		if err := probePortBindability(directory.ListenPort); err != nil {
+			// An externally-occupied allocation is rejected at creation, not
+			// discovered at activation (audit R7). The invariant is honest:
+			// Portico guarantees non-conflicting allocations among its own
+			// profiles, and rejects an externally occupied allocation here —
+			// it does not reserve the socket against later external races.
+			return fmt.Errorf("directory origin port %d cannot be bound: %w", directory.ListenPort, err)
+		}
 		return nil
 	}
 
@@ -391,10 +400,27 @@ func (c *Controller) assignDirectoryPortLocked(profile *core.ConnectionProfile, 
 		if _, occupied := used[port]; occupied {
 			continue
 		}
+		if err := probePortBindability(port); err != nil {
+			// Externally held: try the next candidate rather than persisting
+			// a port nothing will be able to listen on.
+			continue
+		}
 		directory.ListenPort = port
 		return nil
 	}
 	return fmt.Errorf("no durable directory origin port is available")
+}
+
+// probePortBindability checks that a loopback listener can actually bind the
+// candidate port and releases it immediately. The tiny race between this
+// probe and activation is inherent to not holding the socket; the invariant
+// is stated as rejection-at-creation, not reservation.
+func probePortBindability(port int) error {
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return err
+	}
+	return listener.Close()
 }
 
 func (c *Controller) assignDirectoryPort(profile, existing *core.ConnectionProfile) error {
