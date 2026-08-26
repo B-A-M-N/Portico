@@ -1,6 +1,7 @@
 package core
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/url"
 	"strings"
@@ -33,16 +34,22 @@ const (
 // public address, provider resource IDs, last error, traffic samples,
 // current health, or progress state.
 type ConnectionProfile struct {
-	ID        ConnectionID           `json:"id"`
-	Name      string                 `json:"name"`
-	Revision  uint64                 `json:"revision"`
-	Kind      ConnectionKind         `json:"kind"`
-	Spec      ConnectionSpec         `json:"spec"`
-	Driver    DriverSelection        `json:"driver"`
-	Lifecycle LifecycleSpec          `json:"lifecycle"`
-	Desired   DesiredConnectionState `json:"desired"`
-	CreatedAt time.Time              `json:"created_at"`
-	UpdatedAt time.Time              `json:"updated_at"`
+	ID       ConnectionID   `json:"id"`
+	Name     string         `json:"name"`
+	Revision uint64         `json:"revision"`
+	Kind     ConnectionKind `json:"kind"`
+	// ProfileKind describes the service intent carried by this connection.
+	// It is deliberately independent from Driver.ProviderID: the former says
+	// what the traffic is, while the latter says how it is transported.
+	// Empty is accepted when reading legacy profiles and is filled by
+	// NormalizeProfile from the connection kind/source.
+	ProfileKind string                 `json:"profile_kind,omitempty"`
+	Spec        ConnectionSpec         `json:"spec"`
+	Driver      DriverSelection        `json:"driver"`
+	Lifecycle   LifecycleSpec          `json:"lifecycle"`
+	Desired     DesiredConnectionState `json:"desired"`
+	CreatedAt   time.Time              `json:"created_at"`
+	UpdatedAt   time.Time              `json:"updated_at"`
 }
 
 // ConnectionSpec is a tagged union containing kind-specific specifications.
@@ -75,6 +82,18 @@ type ClientTunnelSpec struct {
 	// Profile names the local client profile to run.
 	Profile string `json:"profile,omitempty"`
 }
+
+// Service profile kinds are transport-neutral. A profile may be carried by
+// Cloudflare, ngrok, Tailscale, or a client-mediated transport without
+// changing its service intent. core owns the persisted vocabulary; the
+// internal/profile package aliases it rather than duplicating literals.
+type ProfileKind = string
+
+const (
+	ProfileWebService       ProfileKind = "web_service"
+	ProfileOpenAICompatible ProfileKind = "openai_compatible"
+	ProfileOpenAIMCP        ProfileKind = "openai_mcp"
+)
 
 // ServiceExposureSpec describes a service exposure connection.
 // This is the original connection type that exposes a local service through a tunnel.
@@ -193,6 +212,26 @@ func (p *ConnectionProfile) EffectiveKind() ConnectionKind {
 	return ConnectionServiceExposure
 }
 
+// EffectiveProfileKind returns the durable service intent, deriving the
+// historical value for profiles written before profile kinds were persisted.
+func (p *ConnectionProfile) EffectiveProfileKind() string {
+	if p == nil {
+		return ProfileWebService
+	}
+	if p.ProfileKind != "" {
+		return p.ProfileKind
+	}
+	switch p.EffectiveKind() {
+	case ConnectionClientTunnel:
+		return ProfileOpenAIMCP
+	case ConnectionServiceExposure:
+		if p.Spec.ServiceExposure != nil && p.Spec.ServiceExposure.Source.MCP != nil {
+			return ProfileOpenAIMCP
+		}
+	}
+	return ProfileWebService
+}
+
 // Backward compatibility accessors for the old flat profile structure.
 // These allow existing code to continue working while we migrate to the new structure.
 // Note: renamed to GetSource, GetExposure, etc. to avoid JSON serialization conflicts.
@@ -281,6 +320,22 @@ func (p *ConnectionProfile) ExpectsPublicAddress() bool {
 func NormalizeProfile(profile *ConnectionProfile, now time.Time) {
 	if profile == nil {
 		return
+	}
+	if profile.ProfileKind == "" {
+		switch profile.EffectiveKind() {
+		case ConnectionClientTunnel:
+			// The Secure MCP client is an OpenAI MCP workload carried over a
+			// client-mediated transport. It is not itself a provider choice.
+			profile.ProfileKind = ProfileOpenAIMCP
+		case ConnectionServiceExposure:
+			if profile.Spec.ServiceExposure != nil && profile.Spec.ServiceExposure.Source.MCP != nil {
+				profile.ProfileKind = ProfileOpenAIMCP
+			} else {
+				profile.ProfileKind = ProfileWebService
+			}
+		default:
+			profile.ProfileKind = ProfileWebService
+		}
 	}
 
 	// Default kind to service_exposure for backward compatibility.
@@ -568,6 +623,12 @@ func validateServiceExposureSpec(p *ConnectionProfile, spec *ServiceExposureSpec
 		}
 		if spec.Source.Directory.Path == "" {
 			return fmt.Errorf("directory path is required")
+		}
+		if spec.Source.Directory.ListenPort != 0 &&
+			(spec.Source.Directory.ListenPort < DirectoryPortStart ||
+				spec.Source.Directory.ListenPort >= DirectoryPortStart+DirectoryPortSpan) {
+			return fmt.Errorf("directory listen port must be between %d and %d",
+				DirectoryPortStart, DirectoryPortStart+DirectoryPortSpan-1)
 		}
 		switch spec.Source.Directory.Mode {
 		case DirectoryModeRead, DirectoryModeWrites, "":
@@ -933,6 +994,10 @@ type HealthCheckSpec struct {
 	Path     string
 	Timeout  time.Duration
 	Interval time.Duration
+	// Configured distinguishes an explicit disabled setting from the zero
+	// value used by profiles written before health configuration was exposed.
+	// Legacy profiles retain the historical default probe.
+	Configured bool
 }
 
 // DirectorySpec describes a directory to serve.
@@ -942,6 +1007,22 @@ type DirectorySpec struct {
 	SPAFallback bool
 	AllowUpload bool
 	AllowDelete bool
+	// ListenPort is the durable loopback allocation for this origin. Zero is
+	// accepted for profiles restored from before allocations were persisted;
+	// the controller assigns it before a new profile is committed.
+	ListenPort int
+}
+
+const (
+	DirectoryPortStart = 40000
+	DirectoryPortSpan  = 10000
+)
+
+// DirectoryPortForConnection returns the stable fallback allocation used by
+// legacy profiles that do not yet carry a persisted port.
+func DirectoryPortForConnection(connectionID ConnectionID) int {
+	digest := sha256.Sum256([]byte(connectionID))
+	return DirectoryPortStart + ((int(digest[0])<<8 | int(digest[1])) % DirectoryPortSpan)
 }
 
 // DirectoryMode defines how to serve a directory.
