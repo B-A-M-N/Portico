@@ -51,10 +51,7 @@ func (d Descriptor) Compatible(caps TransportCapabilities) bool {
 		(!required.PrivateExposure || caps.PrivateExposure) &&
 		(!required.StableHostname || caps.StableHostname) &&
 		(!required.Streaming || caps.Streaming) &&
-		(!required.Authentication || caps.Authentication) &&
-		(!required.RemoteForward || caps.RemoteForward) &&
-		(!required.DynamicForward || caps.DynamicForward) &&
-		(!required.NoAccount || caps.NoAccount)
+		(!required.Authentication || caps.Authentication)
 }
 
 // Registry stores profile definitions independently of transport providers.

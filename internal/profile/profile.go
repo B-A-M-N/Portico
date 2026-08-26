@@ -57,6 +57,10 @@ type GatewaySpec struct {
 }
 
 // TransportCapabilities are the provider properties a profile can filter on.
+// Every field must have an explicit mapping in the controller's
+// transportCapabilities; fields without a real provider signal are not
+// declared here (audit R6): advertised-but-unpopulated selection semantics
+// are worse than absent ones.
 type TransportCapabilities struct {
 	HTTP            bool
 	TCP             bool
@@ -64,8 +68,8 @@ type TransportCapabilities struct {
 	PrivateExposure bool
 	StableHostname  bool
 	Streaming       bool
-	Authentication  bool
-	RemoteForward   bool
-	DynamicForward  bool
-	NoAccount       bool
+	// Authentication describes EDGE ACCESS PROTECTION: whether the transport
+	// can sit behind an authentication boundary. It is deliberately not
+	// "provider account auth" or "gateway auth" — those are separate concerns.
+	Authentication bool
 }

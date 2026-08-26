@@ -143,6 +143,15 @@ func transportCapabilities(caps core.Capabilities) profilepkg.TransportCapabilit
 		result.PrivateExposure = result.PrivateExposure || capability.Private
 	}
 	result.StableHostname = caps.CustomHostnames.Supported
-	result.Authentication = len(caps.BuiltInProtection) > 1
+	// Authentication means a supported, non-none protection capability — not
+	// the length of the protection list (audit R6). Edge access protection is
+	// what this field describes: whether the transport can sit behind an
+	// authentication boundary.
+	for _, protection := range caps.BuiltInProtection {
+		if protection.Supported && protection.Kind != core.ProtectionNone {
+			result.Authentication = true
+			break
+		}
+	}
 	return result
 }
