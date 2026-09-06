@@ -329,3 +329,26 @@ func TestExplicitCredentialFDThatExceedsLimitIsRejectedAndClosed(t *testing.T) {
 	assertDescriptorClosed(t, fd)
 	_ = file.Close()
 }
+
+// TestTheProductionLoginCommandRegistersTheSecureCredentialFlags pins the
+// command-tree contract. The handler accepted --credential-stdin and
+// --credential-fd, and its error text told users those options existed — but
+// the production login command never registered them, so the documented
+// automation path failed with "unknown flag". This test walks the real
+// NewCLI() tree rather than a substitute Cobra command, so a flag that is not
+// registered cannot pass.
+func TestTheProductionLoginCommandRegistersTheSecureCredentialFlags(t *testing.T) {
+	root := NewCLI()
+	login, _, err := root.Find([]string{"provider", "login", "cloudflare"})
+	if err != nil {
+		t.Fatalf("find provider login in the real command tree: %v", err)
+	}
+	if login == nil || login.Name() != "login" {
+		t.Fatalf("provider login not found in the production command tree")
+	}
+	for _, flag := range []string{"credential-stdin", "credential-fd"} {
+		if login.Flags().Lookup(flag) == nil {
+			t.Errorf("production provider login does not register --%s; the handler's own error text advertises it", flag)
+		}
+	}
+}

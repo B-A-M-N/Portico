@@ -300,6 +300,12 @@ type ProviderAccountDTO struct {
 	Label          string `json:"label"`
 	Status         string `json:"status"`
 	UnusableReason string `json:"unusable_reason,omitempty"`
+	// ZoneID and ZoneName carry the zone bound to the account, when the
+	// provider records one. They are non-secret naming metadata: the wizard
+	// uses the name to propose a `<connection>.<zone>` hostname rather than
+	// asking the user to type a domain it can already see.
+	ZoneID   string `json:"zone_id,omitempty"`
+	ZoneName string `json:"zone_name,omitempty"`
 }
 
 // ConfigureProviderAccountRequest carries one provider credential over the

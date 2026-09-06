@@ -3249,32 +3249,42 @@ func (m *Model) renderProviders() string {
 	if len(m.snapshot.Providers) == 0 {
 		b.WriteString("No providers are catalogued.\n\n")
 	}
-	// The flattened row list is the selection authority for this screen: the
-	// move handlers index it, so the renderer marks the row it names. The
-	// cursor the arrows steer was previously drawn nowhere, leaving the user
-	// steering something they could not see.
+	// The flattened row list is the selection authority for this screen, and
+	// now the only one: the renderer walks the same rows the move handlers
+	// index, so the cursor can no longer disagree with the list. Previously a
+	// separate provider-only counter was compared against the flattened
+	// index, so a provider preceded by another provider's accounts sat at two
+	// different coordinates and its marker could never be drawn.
 	rows := m.buildScreenRows()
-	rowCursor := -1
-	if m.cursorIndex >= 0 && m.cursorIndex < len(rows) && rows[m.cursorIndex].Kind == rowKindProvider {
-		rowCursor = m.cursorIndex
-	}
-	providerRowIdx := -1
+	snapshotByID := make(map[string]ipc.ProviderDTO, len(m.snapshot.Providers))
 	for _, p := range m.snapshot.Providers {
-		providerRowIdx++
-		marker := "  "
-		if providerRowIdx == rowCursor {
-			if m.useASCII {
-				marker = m.theme.Style("active").Render("> ")
-			} else {
-				marker = m.theme.Style("active").Render("▸ ")
-			}
+		snapshotByID[p.ID] = p
+	}
+	for _, row := range rows {
+		p, ok := snapshotByID[row.Provider.ID]
+		if !ok {
+			continue
 		}
-		b.WriteString(marker)
-		label, style := providerStateLabel(p.Availability, p.Stability)
-		b.WriteString(fmt.Sprintf("%s  ", p.DisplayName))
-		b.WriteString(m.theme.Style(style).Render(label))
-		b.WriteString("\n")
+		if row.Kind == rowKindProvider {
+			// Emit each provider's header once, when its row is reached.
+			marker := "  "
+			if m.cursorIndex >= 0 && m.cursorIndex < len(rows) && rows[m.cursorIndex].Kind == rowKindProvider && rows[m.cursorIndex].Provider.ID == row.Provider.ID {
+				if m.useASCII {
+					marker = m.theme.Style("active").Render("> ")
+				} else {
+					marker = m.theme.Style("active").Render("▸ ")
+				}
+			}
+			b.WriteString(marker)
+			label, style := providerStateLabel(p.Availability, p.Stability)
+			b.WriteString(fmt.Sprintf("%s  ", p.DisplayName))
+			b.WriteString(m.theme.Style(style).Render(label))
+			b.WriteString("\n")
+		}
 
+		// Provider detail follows whether the cursor is on the provider row or
+		// one of its accounts: the detail belongs to the provider either way,
+		// and the flattened walk has already reached its section.
 		// A provider that cannot be used must say why and what to do about it,
 		// rather than being omitted or shown as merely unconfigured.
 		if p.LastError != "" {

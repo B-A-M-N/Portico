@@ -43,11 +43,15 @@ jobs:
         run: go test -race -count=3 ./...
 
       - name: vulnerability scan
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        # Same pinned version as `make release-check` so the scan means one
+        # thing everywhere; a floating @latest can flip a gate on a new release.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
       - name: staticcheck
+        # Same pinned version as the Makefile's staticcheck target and the
+        # release gate (staticcheck-action 2025.1.1).
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
           staticcheck ./...
 
       # The acceptance matrix cites test names and commands. Nothing checked

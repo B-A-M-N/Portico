@@ -221,6 +221,12 @@ func (m *WizardModel) handleDiscoveryKey(key string) tea.Cmd {
 			if svc.Protocol != "" {
 				m.state.SourceProtocol = svc.Protocol
 			}
+			// The whole service object is preserved, not just its address:
+			// the process name suggests a connection name, the confidence and
+			// evidence explain the choice in review, and the classification
+			// records which answers came from discovery rather than typing.
+			svc := svc
+			m.state.SelectedService = &svc
 		}
 		m.advanceFromSource()
 	}

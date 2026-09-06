@@ -290,3 +290,44 @@ func TestTheSelectedAccountIsVisible(t *testing.T) {
 		t.Fatal("moving the cursor did not change what is marked")
 	}
 }
+
+// TestProviderMarkerSurvivesPrecedingAccounts pins the coordinate mismatch the
+// renderer had: it compared the flattened selection index against a separate
+// provider-only counter, so a provider preceded by another provider's accounts
+// sat at two different positions and its cursor could never be drawn. The
+// flattened row list is now the sole authority for both moving and marking.
+func TestProviderMarkerSurvivesPrecedingAccounts(t *testing.T) {
+	snap := testSnapshot()
+	snap.Providers = []ipc.ProviderDTO{
+		{
+			ID: "provider-a", DisplayName: "Provider A", Authenticated: true,
+			Accounts: []ipc.ProviderAccountDTO{
+				{ID: "acct-a1", Label: "A1", Status: "authenticated"},
+				{ID: "acct-a2", Label: "A2", Status: "authenticated"},
+			},
+		},
+		{
+			ID: "provider-b", DisplayName: "Provider B", Authenticated: true,
+		},
+	}
+	m := readyModel(&fakeClient{}, snap)
+	m.transitionTo(ScreenProviders)
+
+	// Cursor starts on Provider A (flat index 0).
+	if view := m.renderProviders(); !strings.Contains(view, "▸ Provider A") {
+		t.Fatalf("initial cursor missing from Provider A:\\n%s", view)
+	}
+
+	// Walk to Provider B: down past A1, A2, then onto B's row (flat index 3).
+	for range 3 {
+		next, _ := m.Update(keyMsg("down"))
+		m = next.(Model)
+	}
+	view := m.renderProviders()
+	if !strings.Contains(view, "▸ Provider B") {
+		t.Fatalf("Provider B marker vanished when preceded by Provider A's accounts:\\n%s", view)
+	}
+	if strings.Contains(view, "▸ Provider A") {
+		t.Fatalf("Provider A kept the marker after the cursor moved to B:\\n%s", view)
+	}
+}

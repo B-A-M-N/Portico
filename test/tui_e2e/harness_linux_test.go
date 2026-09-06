@@ -450,14 +450,17 @@ func (s *session) writeArtifacts() {
 
 func runCLI(t *testing.T, f *fixture, args ...string) string {
 	t.Helper()
+	stdout, stderr := &strings.Builder{}, &strings.Builder{}
 	cmd := exec.Command(f.binary, args...)
 	cmd.Env = f.env
-	var output strings.Builder
-	cmd.Stdout, cmd.Stderr = &output, &output
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("portico %s: %v\n%s", strings.Join(args, " "), err, output.String())
+		t.Fatalf("portico %s: %v\n%s\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	return output.String()
+	// The CLI's slog diagnostics go to stderr; JSON and table output go to
+	// stdout. Mixing the two made `list --json` unparseable whenever the
+	// launcher logged ("supervisor already running") on the way through.
+	return stdout.String()
 }
 
 func freeTCPPort(t *testing.T) int {

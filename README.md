@@ -200,8 +200,10 @@ protection through a traffic policy that Portico does not generate yet, so an
 ngrok connection is reachable by anyone with its URL. The capability is declared
 unsupported rather than advertised.
 
-The agent authenticates from `NGROK_AUTHTOKEN`, a Portico-configured ngrok
-account, or its own `ngrok config add-authtoken` configuration.
+The agent authenticates using ngrok's own mechanisms: `NGROK_AUTHTOKEN` or the
+agent's `ngrok config add-authtoken` configuration. Portico has no ngrok setup
+flow and does not store ngrok credentials; it runs the agent with whatever
+authentication the machine already has.
 
 **OpenAI Secure MCP Tunnel is experimental and disabled by default.** It connects
 a local MCP server to ChatGPT over an outbound-only tunnel, with no public

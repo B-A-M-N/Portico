@@ -31,6 +31,7 @@ for connection failures.`,
 	root.AddCommand(newListCmd())
 	root.AddCommand(newCreateCmd())
 	root.AddCommand(newServeCmd())
+	root.AddCommand(newForwardCmd())
 	root.AddCommand(newInspectCmd())
 	root.AddCommand(newOpenCmd())
 	root.AddCommand(newCloseCmd())
@@ -155,6 +156,30 @@ func newServeCmd() *cobra.Command {
 	addSourceFlags(cmd)
 	cmd.Flags().String("provider", "cloudflare", "Provider to use")
 	cmd.Flags().Bool("yes", false, "Skip confirmation prompt")
+	return cmd
+}
+
+func newForwardCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "forward",
+		Short: "Manage local port forwards",
+		Long: "Create and manage local port forward connections. A forward relays traffic\n" +
+			"between a local listening port and a remote host:port without publishing\nanything publicly.",
+	}
+	createCmd := &cobra.Command{
+		Use:   "create <name>",
+		Short: "Create a local port forward connection",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return handleForwardCreate(cmd, args[0])
+		},
+	}
+	createCmd.Flags().Int("local-port", 0, "Local port to listen on (0 picks a free port)")
+	createCmd.Flags().String("remote-host", "127.0.0.1", "Remote host to forward to")
+	createCmd.Flags().Int("remote-port", 0, "Remote port to forward to (required)")
+	createCmd.Flags().String("protocol", "tcp", "Forward protocol: tcp or udp is refused; only tcp is supported")
+	createCmd.Flags().Bool("json", false, "Output JSON")
+	cmd.AddCommand(createCmd)
 	return cmd
 }
 
@@ -351,6 +376,14 @@ func newProviderCmd() *cobra.Command {
 	loginCmd.Flags().String("account-id", "", "Cloudflare account ID")
 	loginCmd.Flags().String("zone-id", "", "Cloudflare zone ID")
 	loginCmd.Flags().String("label", "", "Friendly account label")
+	// Secure credential acquisition. The handler already refused a secret on
+	// the command line and its error text pointed at these flags; not
+	// registering them made the documented automation path an unknown flag.
+	// The human default stays the hidden TTY prompt.
+	loginCmd.Flags().Bool("credential-stdin", false,
+		"Read the credential from stdin (for scripts; the value must not be an argument)")
+	loginCmd.Flags().Int("credential-fd", -1,
+		"Read the credential from this file descriptor (for scripts)")
 	cmd.AddCommand(loginCmd)
 
 	// Removal existed on the supervisor with no way to ask for it. An account

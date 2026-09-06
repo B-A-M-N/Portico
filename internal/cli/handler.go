@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,33 @@ func stdinIsTTY() bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// chooseFromList prints a numbered choice list and reads a selection. It is
+// the CLI's answer to the TUI's discovery questions: the user picks by
+// human-readable label and never has to know an opaque ID.
+func chooseFromList[T any](cmd *cobra.Command, heading string, options []T, label func(T) string) (T, error) {
+	var zero T
+	if len(options) == 0 {
+		return zero, fmt.Errorf("nothing to choose from")
+	}
+	fmt.Fprintln(cmd.ErrOrStderr(), heading)
+	for i, option := range options {
+		fmt.Fprintf(cmd.ErrOrStderr(), "  %d) %s\n", i+1, label(option))
+	}
+	for {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Select 1-%d: ", len(options))
+		var line string
+		if _, err := fmt.Scanln(&line); err != nil {
+			return zero, fmt.Errorf("read selection: %w", err)
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || n < 1 || n > len(options) {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Enter a number between 1 and %d.\n", len(options))
+			continue
+		}
+		return options[n-1], nil
+	}
 }
 
 // confirm prompts on stderr and reads a response from stdin.
@@ -668,6 +696,11 @@ func handleProviderList(cmd *cobra.Command) error {
 // provider's own declaration marks optional — so the CLI enforced a stricter
 // contract than the supervisor, and refused a tunnel-only setup the TUI accepts.
 // One provider contract, declared by the provider, read by both interfaces.
+//
+// The flow now matches the TUI's: validate the credential first, discover the
+// accounts and zones it can reach, ask only when the answer is ambiguous, and
+// confirm before saving. --account-id/--zone-id remain as noninteractive
+// overrides that skip the interactive questions.
 func handleProviderLogin(cmd *cobra.Command, id string) error {
 	client, err := getClient(cmd)
 	if err != nil {
@@ -708,6 +741,77 @@ func handleProviderLogin(cmd *cobra.Command, id string) error {
 	req.ZoneID = values["zone_id"]
 	req.Label = values["label"]
 	req.Credential = values["credential"]
+
+	// A provider whose declared identity field enables discovery validates
+	// before saving: the credential is checked, the reachable accounts and
+	// zones come back, and anything left ambiguous is asked here rather than
+	// stored wrong. Explicit --account-id/--zone-id keep the noninteractive
+	// path working for scripts and CI.
+	canDiscover := flow.IdentityField != "" && req.AccountID == ""
+	if canDiscover {
+		validated, err := client.ValidateProviderAccount(cmd.Context(), id, req)
+		if err != nil {
+			return describeProviderSetupFailure(id, err)
+		}
+		if validated.AccountSelectionRequired {
+			if !stdinIsTTY() {
+				return fmt.Errorf("the credential can reach %d accounts; re-run with --account-id <id> to choose one noninteractively",
+					len(validated.AccountChoices))
+			}
+			choice, err := chooseFromList(cmd, "Found accounts:", validated.AccountChoices,
+				func(c ipc.ProviderAccountDTO) string { return c.Label })
+			if err != nil {
+				return err
+			}
+			req.AccountID = choice.ID
+			if req.Label == "" {
+				req.Label = choice.Label
+			}
+			// Re-validate against the chosen account to reach its zones.
+			validated, err = client.ValidateProviderAccount(cmd.Context(), id, req)
+			if err != nil {
+				return describeProviderSetupFailure(id, err)
+			}
+		}
+		if req.ZoneID == "" && len(validated.Zones) > 0 && stdinIsTTY() {
+			zoneOptions := make([]ipc.ProviderAccountDTO, 0, len(validated.Zones)+1)
+			zoneOptions = append(zoneOptions, ipc.ProviderAccountDTO{ID: "", Label: "No zone — temporary addresses only"})
+			for _, zone := range validated.Zones {
+				zoneOptions = append(zoneOptions, ipc.ProviderAccountDTO{ID: zone.ID, Label: zone.Name})
+			}
+			choice, err := chooseFromList(cmd, "Zones:", zoneOptions,
+				func(c ipc.ProviderAccountDTO) string { return c.Label })
+			if err != nil {
+				return err
+			}
+			req.ZoneID = choice.ID
+		}
+		if req.ZoneID == "" && len(validated.Zones) == 0 {
+			fmt.Println("No zones visible to this credential; temporary addresses only.")
+		}
+	}
+
+	// Confirm what will be stored before anything is. Noninteractive callers
+	// (no TTY) skip this as with every other CLI mutation confirm.
+	if stdinIsTTY() {
+		summary := req.AccountID
+		if req.Label != "" {
+			summary = req.Label
+		}
+		zoneWord := req.ZoneID
+		if zoneWord == "" {
+			zoneWord = "no zone"
+		}
+		prompt := fmt.Sprintf("Save %s / %s? [y/N] ", summary, zoneWord)
+		ok, err := confirm(prompt)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("Cancelled; nothing was stored.")
+			return nil
+		}
+	}
 
 	response, err := client.ConfigureProviderAccount(cmd.Context(), id, req)
 	if err != nil {
@@ -1007,6 +1111,55 @@ func handleCreate(cmd *cobra.Command, name string) error {
 	}
 
 	fmt.Printf("Connection created: %s (%s)\n", conn.Name, conn.ID)
+	return nil
+}
+
+// handleForwardCreate creates a port-forward connection — a local listening
+// port relayed to a remote host:port without publishing anything publicly.
+// It is a scriptable surface over the same CreateConnectionRequest the TUI
+// sends, so the artifact verifier and automation exercise the real IPC path.
+func handleForwardCreate(cmd *cobra.Command, name string) error {
+	client, err := getClient(cmd)
+	if err != nil {
+		return err
+	}
+	localPort, _ := cmd.Flags().GetInt("local-port")
+	remoteHost, _ := cmd.Flags().GetString("remote-host")
+	remotePort, _ := cmd.Flags().GetInt("remote-port")
+	protocol, _ := cmd.Flags().GetString("protocol")
+	if protocol != "" && protocol != "tcp" {
+		return fmt.Errorf("port forwards carry tcp only; udp and remote forwards are refused")
+	}
+	if remotePort <= 0 {
+		return fmt.Errorf("--remote-port is required")
+	}
+	if remoteHost == "" {
+		return fmt.Errorf("--remote-host is required")
+	}
+
+	conn, err := client.CreateConnection(cmd.Context(), ipc.CreateConnectionRequest{
+		Version: 1,
+		Kind:    "port_forward",
+		Name:    name,
+		Provider: ipc.ProviderSelectionDTO{
+			ProviderID: "portforward",
+		},
+		PortForward: &ipc.PortForwardDTO{
+			LocalPort:  localPort,
+			RemoteHost: remoteHost,
+			RemotePort: remotePort,
+			Protocol:   "tcp",
+			Direction:  "local",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create forward: %w", err)
+	}
+
+	if jsonFlag, _ := cmd.Flags().GetBool("json"); jsonFlag {
+		return json.NewEncoder(os.Stdout).Encode(conn)
+	}
+	fmt.Printf("Forward created: %s (%s) — local port %d\n", conn.Name, conn.ID, localPort)
 	return nil
 }
 

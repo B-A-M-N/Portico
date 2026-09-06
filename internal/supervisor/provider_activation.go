@@ -278,6 +278,11 @@ func (s *Supervisor) activationAccounts(ctx context.Context, def provider.Defini
 		}
 		info := provider.AccountInfo{
 			ID: account.ID, Label: account.Label, Status: string(account.Status),
+			// Zone naming metadata rides along so clients can propose a
+			// hostname instead of asking the user to retype a domain the
+			// supervisor already knows.
+			ZoneID:   account.Metadata["zone_id"],
+			ZoneName: account.Metadata["zone_name"],
 		}
 		if !info.Usable() {
 			unusable = append(unusable, info)
@@ -310,7 +315,11 @@ func accountInfos(materials []provider.AccountMaterial) []provider.AccountInfo {
 	infos := make([]provider.AccountInfo, 0, len(materials))
 	for _, m := range materials {
 		infos = append(infos, provider.AccountInfo{
-			ID: m.Account.ID, Label: m.Account.Label, Status: string(m.Account.Status),
+			ID:       m.Account.ID,
+			Label:    m.Account.Label,
+			Status:   string(m.Account.Status),
+			ZoneID:   m.Account.Metadata["zone_id"],
+			ZoneName: m.Account.Metadata["zone_name"],
 		})
 	}
 	return infos

@@ -1,6 +1,7 @@
 package screens
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -268,5 +269,94 @@ func TestGoingBackKeepsTheAnswer(t *testing.T) {
 	// The cursor is on the option that was chosen, not reset to the first.
 	if m.SelectedIndex() != 1 {
 		t.Errorf("the mode cursor is at %d, want the chosen option", m.SelectedIndex())
+	}
+}
+
+// TestTabFillsTheAddressFromDiscovery pins the discovery-assisted address
+// question: when the scan has found listeners, Tab cycles the field through
+// them, and the filled address reaches the request like a typed one.
+func TestTabFillsTheAddressFromDiscovery(t *testing.T) {
+	m := wizardAtPrivateNetworkMode(t, "api")
+	m.HandleKey("down")
+	m.HandleKey("enter")
+	if m.Step() != WizardStepPrivateNetworkAddress {
+		t.Fatalf("step after choosing publish = %d, want the address question", m.Step())
+	}
+
+	m.HandleDiscovery(WizardDiscoveryMsg{
+		WizardID: m.id, Generation: m.generation,
+		Services: []ipc.DiscoveredServiceDTO{
+			{Address: "127.0.0.1:11434", Protocol: "http", Framework: "Ollama", Selectable: true},
+			{Address: "127.0.0.1:3000", Protocol: "http", Framework: "Next.js", Selectable: true},
+		},
+	})
+
+	// The prompt says what Tab offers, without claiming certainty about
+	// anything discovery did not find.
+	view := m.View()
+	if !strings.Contains(view, "Tab") {
+		t.Errorf("the prompt does not mention Tab:\\n%s", view)
+	}
+
+	if got := m.nextAddressSuggestion(); got != "127.0.0.1:11434" {
+		t.Fatalf("first suggestion = %q, want the first listener", got)
+	}
+	m.HandleKey("tab")
+	if got := m.inputValue(); got != "127.0.0.1:11434" {
+		t.Fatalf("Tab filled %q, want the first listener", got)
+	}
+	m.HandleKey("tab")
+	if got := m.inputValue(); got != "127.0.0.1:3000" {
+		t.Fatalf("second Tab filled %q, want the next listener", got)
+	}
+	m.HandleKey("tab")
+	if got := m.inputValue(); got != "127.0.0.1:11434" {
+		t.Fatalf("Tab did not cycle back to the start: %q", got)
+	}
+	m.HandleKey("tab")
+	if got := m.inputValue(); got != "127.0.0.1:3000" {
+		t.Fatalf("Tab did not continue cycling: %q", got)
+	}
+
+	// The filled answer is the answer.
+	m.HandleKey("enter")
+	if m.Step() != WizardStepReview {
+		t.Fatalf("step after a Tab-filled address = %d, want review: %v", m.Step(), m.Err())
+	}
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if req.PrivateNetwork.LocalAddress != "127.0.0.1:3000" {
+		t.Fatalf("the Tab-filled address did not reach the request: %q", req.PrivateNetwork.LocalAddress)
+	}
+}
+
+// TestScanFailureNeverClaimsTheMachineIsEmpty extends the no-false-emptiness
+// rule to the address question: a failed scan says so, and never asserts what
+// is or is not listening.
+func TestScanFailureNeverClaimsTheMachineIsEmpty(t *testing.T) {
+	m := wizardAtPrivateNetworkMode(t, "api")
+	m.HandleKey("down")
+	m.HandleKey("enter")
+
+	m.HandleDiscovery(WizardDiscoveryMsg{
+		WizardID: m.id, Generation: m.generation,
+		Err: context.DeadlineExceeded,
+	})
+
+	view := m.View()
+	if strings.Contains(view, "did not find anything") {
+		t.Errorf("a failed scan produced an empty-machine claim:\\n%s", view)
+	}
+	if !strings.Contains(view, "scan failed") {
+		t.Errorf("a failed scan is not disclosed:\\n%s", view)
+	}
+
+	// Manual entry still works after the failure.
+	typeInto(m, "127.0.0.1:3000")
+	m.HandleKey("enter")
+	if m.Step() != WizardStepReview {
+		t.Fatalf("manual entry after a failed scan went to step %d: %v", m.Step(), m.Err())
 	}
 }

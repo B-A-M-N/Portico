@@ -292,3 +292,50 @@ func TestTheWizardWritesTheCanonicalTransportIdentity(t *testing.T) {
 			req.Provider.ProviderID, core.ProviderIDClientTunnel)
 	}
 }
+
+// TestTunnelMCPTabFillsFromDiscovery pins the discovery-assisted MCP address:
+// the scan the wizard already ran is offered through Tab, and a Tab-filled
+// endpoint reaches the request like a typed one.
+func TestTunnelMCPTabFillsFromDiscovery(t *testing.T) {
+	m := wizardAtTunnelID(t)
+	m.setInput("tunnel_" + strings.Repeat("c", 32))
+	m.HandleKey("enter")
+	if m.Step() != WizardStepTunnelMCP {
+		t.Fatalf("step = %d, want the MCP question", m.Step())
+	}
+
+	m.HandleDiscovery(WizardDiscoveryMsg{
+		WizardID: m.id, Generation: m.generation,
+		Services: []ipc.DiscoveredServiceDTO{
+			{Address: "127.0.0.1:8000", Protocol: "http", Server: "fastmcp", Selectable: true},
+			{Address: "127.0.0.1:9000", Protocol: "http", Selectable: true},
+		},
+	})
+
+	// The prompt mentions the fill affordance.
+	if view := m.View(); !strings.Contains(view, "Tab") {
+		t.Errorf("the MCP prompt does not mention Tab:\\n%s", view)
+	}
+
+	m.HandleKey("tab")
+	if got := m.inputValue(); got != "127.0.0.1:8000" {
+		t.Fatalf("Tab filled %q, want the discovered listener", got)
+	}
+	m.HandleKey("tab")
+	if got := m.inputValue(); got != "127.0.0.1:9000" {
+		t.Fatalf("second Tab filled %q, want the next listener", got)
+	}
+	// Back to the first one and take it.
+	m.HandleKey("tab")
+	m.HandleKey("enter")
+	if m.Step() != WizardStepReview {
+		t.Fatalf("step after a Tab-filled endpoint = %d, want review: %v", m.Step(), m.err)
+	}
+	req, err := m.buildRequest()
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if req.ClientTunnel == nil || req.ClientTunnel.MCP.Endpoint != "127.0.0.1:8000" {
+		t.Fatalf("the Tab-filled endpoint did not reach the request: %+v", req.ClientTunnel)
+	}
+}

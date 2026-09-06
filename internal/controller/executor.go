@@ -747,6 +747,23 @@ func (c *Controller) execPlan(ctx context.Context, plan *core.OperationPlan, pro
 				rt.ActiveOperation = nil
 				rt.LastTransition = transition
 				rt.Error = nil
+				// The plan's Expected outcome is the provider's own declaration
+				// of what the endpoint looks like after this intent, and it was
+				// verified by observation before this commit ran. Leaving it
+				// out of the runtime made Inspect report "none yet" for a
+				// connection that was demonstrably listening — a local forward
+				// carried bytes while its details screen claimed no address.
+				if plan.Intent == core.IntentClose || plan.Intent == core.IntentDelete {
+					rt.Endpoint.PublicAddress = ""
+					rt.Endpoint.PrivateAddress = ""
+				} else {
+					if plan.Expected.PublicAddress != "" {
+						rt.Endpoint.PublicAddress = plan.Expected.PublicAddress
+					}
+					if plan.Expected.PrivateAddress != "" {
+						rt.Endpoint.PrivateAddress = plan.Expected.PrivateAddress
+					}
+				}
 			}
 			c.mu.Unlock()
 

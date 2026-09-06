@@ -125,7 +125,7 @@ archive_name=$(basename -- "$candidate_archive")
 PORTICO_RELEASE_ARCHIVE="$candidate_archive" \
 PORTICO_RELEASE_CHECKSUMS="$upgrade_tmp/checksums.txt" \
 PORTICO_RELEASE_ALLOW_UNSIGNED_LOCAL=1 \
-PORTICO_RELEASE_TAG="${PORTICO_RELEASE_TAG:-local}" \
+PORTICO_RELEASE_TAG="${PORTICO_RELEASE_TAG:-v0.0.0-local.1}" \
 INSTALL_DIR="$install_dir" \
     sh "$script_dir/../install.sh" >/dev/null
 test -x "$install_dir/portico"

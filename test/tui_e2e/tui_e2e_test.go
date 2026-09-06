@@ -3,13 +3,17 @@
 package tui_e2e
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFreshInstallTUIHomeHelpAndNavigation(t *testing.T) {
@@ -335,4 +339,184 @@ func TestTerminalParserRejectsImpossibleDimensions(t *testing.T) {
 	if strings.Contains(tm.debug(), fmt.Sprintf("%d,-", 0)) {
 		t.Fatal("terminal debug contained an impossible coordinate")
 	}
+}
+
+// canaryOrigin is an HTTP fixture with a fixed, unusual body so the proof is
+// that these exact bytes came back, not that any 200 did.
+func canaryOrigin(t *testing.T) (string, string) {
+	t.Helper()
+	body := "PORTICO-PROOF-" + strconv.FormatInt(int64(os.Getpid()), 10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, body
+}
+
+// dialUntil waits for the forward's listening socket to appear. The connector
+// starts asynchronously, so a fixed sleep would race the very state the test
+// is proving.
+func dialUntil(t *testing.T, port int) {
+	t.Helper()
+	deadline := time.Now().Add(defaultTimeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 250*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("the forward never opened a listening socket on 127.0.0.1:%d", port)
+}
+
+// dialGone proves the listening socket is closed. A forward that claims to be
+// closed but still accepts connections would be lying at the only layer that
+// matters.
+func dialGone(t *testing.T, port int) {
+	t.Helper()
+	deadline := time.Now().Add(defaultTimeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 250*time.Millisecond)
+		if err != nil {
+			return
+		}
+		conn.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("127.0.0.1:%d still accepts connections after the close plan completed", port)
+}
+
+// TestTUILocalForwardMovesRealBytes opens a local forward through the TUI's
+// normal-user path, then asserts the physical effect independently of
+// Portico's own reporting: bytes sent to the forward's listening port come
+// back from the origin, and closing through the TUI stops the transport.
+// "Status: Completed" alone is not evidence that anything was forwarded.
+func TestTUILocalForwardMovesRealBytes(t *testing.T) {
+	requireE2E(t)
+	originURL, body := canaryOrigin(t)
+	originHost, originPortStr, _ := net.SplitHostPort(strings.TrimPrefix(originURL, "http://"))
+	originPort, _ := strconv.Atoi(originPortStr)
+	localPort := freeTCPPort(t)
+
+	f := newFixture(t)
+	s := f.startTUI(100, 30)
+	s.waitFor("Nothing is published yet.")
+	s.send("n")
+	s.waitFor("NEW CONNECTION")
+	s.chooseOutcome("Forward a local port")
+	s.waitFor("Name this connection")
+	s.send("ctrl-u")
+	s.typeText("forward-proof")
+	s.send("enter")
+	s.waitFor("Local listening port:")
+	s.typeText(strconv.Itoa(localPort))
+	s.send("enter")
+	s.waitFor("Remote host:")
+	s.typeText(originHost)
+	s.send("enter")
+	s.waitFor("Remote port:")
+	s.typeText(strconv.Itoa(originPort))
+	s.send("enter")
+	s.waitFor("Protocol:")
+	s.send("enter")
+	s.waitFor("REVIEW")
+	s.page("pgdown")
+	s.waitFor("Save it, closed")
+	s.send("enter")
+	s.waitFor("CONNECTION CREATED")
+	s.send("enter")
+	s.waitFor("CONNECTIONS")
+	s.waitFor("forward-proof")
+
+	// Open it through the same screen a user uses.
+	s.send("enter")
+	s.waitFor("forward-proof")
+	s.send(" ")
+	s.waitFor("EXACTLY THESE STEPS")
+	s.send("enter")
+	s.waitFor("Status: Completed")
+	// The operation view stays up after completion; back to the details
+	// screen where the connection's own status is rendered.
+	s.send("esc")
+
+	// Independent effect #1: the forward's listening port exists and carries
+	// bytes to the origin. The exact canary body must come back.
+	dialUntil(t, localPort)
+	got := fetchWithRetry(t, localPort)
+	if got != body {
+		t.Fatalf("the forwarded port returned %q, want the canary body %q", got, body)
+	}
+
+	// The TUI agrees the connection is open — but the byte proof above is the
+	// authority, not this screen. The details screen must also name the
+	// listening address it told the connector to open: "none yet" next to a
+	// working forward is a lie by omission.
+	s.waitFor("State:      Open")
+	if screen := s.screen(); strings.Contains(screen, "Address:    none yet") {
+		t.Errorf("the connection is open and forwarding bytes, but Inspect shows no address:\n%s", screen)
+	}
+
+	// Independent effect #2: closing through the TUI stops the transport.
+	s.send(" ")
+	s.waitFor("EXACTLY THESE STEPS")
+	s.send("enter")
+	s.waitFor("Status: Completed")
+	dialGone(t, localPort)
+	s.send("esc")
+	s.waitFor("State:      Closed")
+
+	s.send("esc")
+	s.waitFor("CONNECTIONS")
+	s.assertNoOverflow()
+
+	// Clean up through the CLI so the fixture leaves nothing behind.
+	runCLI(t, f, "delete", "--yes", findConnectionID(t, f, "forward-proof"))
+	s.send("q")
+	s.waitExit()
+}
+
+// fetchWithRetry sends one HTTP request through the forward and returns the
+// body, retrying briefly while the proxy accepts but the origin side warms up.
+func fetchWithRetry(t *testing.T, port int) string {
+	t.Helper()
+	deadline := time.Now().Add(defaultTimeout)
+	var lastErr string
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+		if err == nil {
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			if err == nil {
+				return string(b)
+			}
+			lastErr = err.Error()
+		} else {
+			lastErr = err.Error()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no HTTP response through the forward: %s", lastErr)
+	return ""
+}
+
+// findConnectionID resolves a connection name to its ID through the CLI, the
+// same JSON surface an operator would use.
+func findConnectionID(t *testing.T, f *fixture, name string) string {
+	t.Helper()
+	out := runCLI(t, f, "list", "--json")
+	var ids []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(out), &ids); err != nil {
+		t.Fatalf("list --json did not parse: %v\n%s", err, out)
+	}
+	for _, c := range ids {
+		if c.Name == name {
+			return c.ID
+		}
+	}
+	t.Fatalf("connection %q not found in list output: %s", name, out)
+	return ""
 }

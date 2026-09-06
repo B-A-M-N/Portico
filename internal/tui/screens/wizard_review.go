@@ -101,6 +101,12 @@ func (m *WizardModel) serviceExposureReview() []reviewSection {
 	if extra := m.sourceDetailLines(); len(extra) > 0 {
 		sections = append(sections, reviewSection{title: "Details", lines: extra})
 	}
+	// The usability record: where each answer came from. A user should be able
+	// to see, before approving, which facts Portico found and which they had
+	// to supply — and why.
+	if lines := m.usabilitySourceLines(); len(lines) > 0 {
+		sections = append(sections, reviewSection{title: "Where each answer came from", lines: lines})
+	}
 	return sections
 }
 

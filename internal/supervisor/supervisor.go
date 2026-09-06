@@ -1041,6 +1041,8 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 				Label:          account.Label,
 				Status:         account.Status,
 				UnusableReason: account.UnusableReason,
+				ZoneID:         account.ZoneID,
+				ZoneName:       account.ZoneName,
 			})
 		}
 		// Kept separate from Accounts so nothing offers them for selection or

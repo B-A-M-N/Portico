@@ -8,7 +8,7 @@ LDFLAGS  = -s -w \
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e tui-e2e tui-e2e-live vet staticcheck fmt-check validate acceptance release-check artifact-check clean
+.PHONY: build build-race install test test-race test-e2e tui-e2e tui-e2e-live vet staticcheck fmt-check validate acceptance release-check artifact-check installer-contract release-tag-contract qualify-local qualify-cloudflare qualify-tailscale qualify-ngrok run-qual clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -59,8 +59,13 @@ tui-e2e-live: build
 vet:
 	go vet ./...
 
+# staticcheck is pinned to the same version release CI uses (staticcheck-action
+# 2025.1.1) so "staticcheck passes" means one thing locally, in CI, and in the
+# release gate. go run caches the tool in the module cache after the first
+# download.
+STATICCHECK_VERSION := 2025.1.1
 staticcheck:
-	staticcheck ./...
+	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
 
 lint: vet staticcheck
 
@@ -92,12 +97,47 @@ acceptance:
 artifact-check: build
 	@set -eu; tmp="$$(mktemp -d .release-artifact-check.XXXXXX)"; trap 'rm -rf "$$tmp"' EXIT; tar -czf "$$tmp/portico.tar.gz" portico; ./scripts/verify_release_artifact.sh "$$tmp/portico.tar.gz"
 
+# installer-contract and release-tag-contract run the release-engineering
+# contract tests: install.sh must implement what its tests pin (env-var mirror
+# mode, checksum verification, failure atomicity) and the tag must validate.
+installer-contract:
+	./scripts/install_test.sh
+
+release-tag-contract:
+	./scripts/release_tag_test.sh
+
+# qualify-* run the provider qualification scripts (scripts/qualification/).
+# Every one is opt-in so a plain `make` never touches a live provider.
+# Local-forward is deterministic and needs no accounts; the others need
+# provider credentials passed through the environment (never the command
+# line). See scripts/qualification/README.md for the exact contract.
+qualify-local:
+	PORTICO_QUAL_LIVE=1 $(MAKE) -s run-qual SCRIPT=local_forward.sh
+
+qualify-cloudflare:
+	PORTICO_QUAL_LIVE=1 $(MAKE) -s run-qual SCRIPT=cloudflare.sh
+
+qualify-tailscale:
+	PORTICO_QUAL_LIVE=1 $(MAKE) -s run-qual SCRIPT=tailscale.sh
+
+qualify-ngrok:
+	PORTICO_QUAL_LIVE=1 $(MAKE) -s run-qual SCRIPT=ngrok.sh
+
+# Internal: pass env through to the script; make does not forward the
+# environment by default for overridden variables.
+run-qual: build
+	@env PORTICO_QUAL_LIVE=$$PORTICO_QUAL_LIVE CLOUDFLARE_API_TOKEN=$$CLOUDFLARE_API_TOKEN \
+		CLOUDFLARE_ACCOUNT_ID=$$CLOUDFLARE_ACCOUNT_ID PORTICO_CF_ZONE_NAME=$$PORTICO_CF_ZONE_NAME \
+		PORTICO_TS_PEER=$$PORTICO_TS_PEER PORTICO_NGROK_LIVE=$$PORTICO_NGROK_LIVE NGROK_AUTHTOKEN=$$NGROK_AUTHTOKEN \
+		./scripts/qualification/$(SCRIPT)
+
 # release-check is the canonical complete release gate. It runs everything
 # that tag publishing requires: format, build, vet, staticcheck, tests,
-# race, vulnerability scan, module-tidy diff, and acceptance. CI and
-# release should call this single target so "all release gates passed"
-# means the same thing everywhere.
-release-check: validate acceptance
+# race, packaged-artifact verification, deterministic PTY e2e, installer and
+# release-tag contracts, vulnerability scan, module-tidy diff, and the
+# acceptance matrix. CI and release call this single target so "all release
+# gates passed" means the same thing everywhere.
+release-check: validate acceptance artifact-check tui-e2e installer-contract release-tag-contract
 	GOVULNCHECK_VERSION=v1.1.4; \
 	go run golang.org/x/vuln/cmd/govulncheck@$$GOVULNCHECK_VERSION ./...
 	go mod tidy -diff

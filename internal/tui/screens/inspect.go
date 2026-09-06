@@ -151,7 +151,16 @@ func (m *InspectModel) renderOverview() []string {
 		lines = append(lines, fmt.Sprintf("%-11s %s", PrivateAddressLabel(conn.Kind)+":", conn.PrivateAddress))
 	}
 	if conn.PublicAddress == "" && conn.PrivateAddress == "" {
-		lines = append(lines, "Address:    none yet")
+		if conn.Kind == string(core.ConnectionPortForward) && m.Detail != nil &&
+			m.Detail.DesiredSpec.PortForward != nil && m.Detail.DesiredSpec.PortForward.LocalPort > 0 {
+			// A port forward's listening address is derivable from its spec:
+			// it is what the plan told the connector to bind. Runtime state
+			// on this path may briefly omit it, but "none yet" beside an
+			// open forward was an untruth, so show the configured listener.
+			lines = append(lines, fmt.Sprintf("Listening:  127.0.0.1:%d", m.Detail.DesiredSpec.PortForward.LocalPort))
+		} else {
+			lines = append(lines, "Address:    none yet")
+		}
 	}
 	if conn.ProviderAccountID != "" {
 		lines = append(lines, fmt.Sprintf("Account:    %s", m.accountLabel()))

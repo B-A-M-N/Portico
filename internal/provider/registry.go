@@ -172,6 +172,12 @@ type AccountInfo struct {
 	Label string
 	// Status is the durable account status.
 	Status string
+	// ZoneID and ZoneName are the zone bound to the account, when the
+	// provider records one. They are non-secret naming metadata, carried so
+	// clients can propose a hostname instead of asking the user to retype a
+	// domain the supervisor already knows.
+	ZoneID   string
+	ZoneName string
 	// UnusableReason explains why an account cannot currently be used, when
 	// that is not already implied by its status.
 	//

@@ -218,6 +218,138 @@ type WizardState struct {
 	SelectedService    *ipc.DiscoveredServiceDTO
 }
 
+// discoveredProtocol returns the protocol a chosen discovered service
+// already answered, or empty when the source was typed and the question
+// belongs to the user.
+func (s *WizardState) discoveredProtocol() string {
+	if s.SelectedService != nil {
+		return s.SelectedService.Protocol
+	}
+	return ""
+}
+
+// suggestedName proposes a connection name from what Portico discovered.
+// A user still confirms it, but they confirm rather than invent it.
+func (s *WizardState) suggestedName() string {
+	if s.Name != "" {
+		return s.Name
+	}
+	if s.SelectedService != nil && s.SelectedService.SuggestedName != "" {
+		return s.SelectedService.SuggestedName
+	}
+	if s.SelectedService != nil && s.SelectedService.Framework != "" {
+		return strings.ToLower(s.SelectedService.Framework)
+	}
+	if s.SelectedService != nil && s.SelectedService.Process != "" {
+		return strings.ToLower(s.SelectedService.Process)
+	}
+	return ""
+}
+
+// usabilityFields classifies the wizard's answers by where each came from.
+// This is the contract docs/USABILITY_INVARIANTS.md describes: a value
+// Portico discovered is DISCOVERED, one the user confirmed from a list is
+// SELECTED, one Portico proposed and the user edited is SUGGESTED, and a
+// value the user had to know outside Portico is MANUAL_REQUIRED with the
+// reason the question could not be answered for them.
+func (s *WizardState) usabilityFields() []core.UsabilityField {
+	fields := []core.UsabilityField{
+		{ID: "connection_name", Kind: core.UsabilityID, Source: core.UsabilitySuggested},
+	}
+	switch s.SourceType {
+	case "existing_service":
+		if s.SelectedService != nil {
+			fields = append(fields,
+				core.UsabilityField{ID: "service_address", Kind: core.UsabilityLocalEndpoint, Source: core.UsabilityDiscovered},
+				core.UsabilityField{ID: "service_protocol", Kind: core.UsabilityEnum, Source: core.UsabilityDiscovered},
+			)
+		} else {
+			fields = append(fields,
+				core.UsabilityField{ID: "service_address", Kind: core.UsabilityLocalEndpoint, Source: core.UsabilityManualRequired,
+					ManualReason: "the scan did not find it, or you chose to type the address"},
+				core.UsabilityField{ID: "service_protocol", Kind: core.UsabilityEnum, Source: core.UsabilitySelected},
+			)
+		}
+	case "directory":
+		fields = append(fields,
+			core.UsabilityField{ID: "directory_path", Kind: core.UsabilityFilesystemPath, Source: core.UsabilityManualRequired,
+				ManualReason: "a folder on your machine is yours to name; Portico does not scan your files"})
+	case "command":
+		fields = append(fields,
+			core.UsabilityField{ID: "command_executable", Kind: core.UsabilityExecutable, Source: core.UsabilityManualRequired,
+				ManualReason: "the command to run is your decision"})
+	case "mcp_server":
+		if s.MCPCommand {
+			fields = append(fields,
+				core.UsabilityField{ID: "command_executable", Kind: core.UsabilityExecutable, Source: core.UsabilityManualRequired,
+					ManualReason: "the command that runs the server is your decision"})
+		} else {
+			fields = append(fields,
+				core.UsabilityField{ID: "mcp_endpoint", Kind: core.UsabilityLocalEndpoint, Source: core.UsabilityManualRequired,
+					ManualReason: "an MCP endpoint is not distinguishable from any other HTTP listener by scan"})
+		}
+	}
+	if s.ExposureMode == "permanent_public" {
+		fields = append(fields,
+			core.UsabilityField{ID: "hostname", Kind: core.UsabilityProviderResource, Source: core.UsabilityManualRequired,
+				ManualReason: "the name is yours to choose; Portico cannot guess what your app should be called on the internet"})
+	}
+	return fields
+}
+
+// usabilitySourceLines renders the usability record as review lines: where
+// each answer came from, and why anything the user had to supply by hand was
+// not supplied for them. This is the docs/USABILITY_INVARIANTS.md contract
+// made visible on the approval screen instead of living only in the type
+// system.
+func (m *WizardModel) usabilitySourceLines() []string {
+	fields := m.state.usabilityFields()
+	lines := make([]string, 0, len(fields))
+	for _, f := range fields {
+		switch f.Source {
+		case core.UsabilityDiscovered:
+			lines = append(lines, usabilitySentence(f.ID, "found by Portico's scan"))
+		case core.UsabilitySelected:
+			lines = append(lines, usabilitySentence(f.ID, "chosen from the options"))
+		case core.UsabilitySuggested:
+			lines = append(lines, usabilitySentence(f.ID, "proposed by Portico"))
+		case core.UsabilityInferred:
+			lines = append(lines, usabilitySentence(f.ID, "inferred from your other answers"))
+		case core.UsabilityManualRequired:
+			lines = append(lines, usabilitySentence(f.ID, "yours to enter — "+f.ManualReason))
+		}
+	}
+	// The hostname's origin is the model's to know, not the state's: the same
+	// state value reads differently depending on whether it came from a
+	// suggestion row or the keyboard.
+	if m.state.ExposureMode == "permanent_public" && !m.hostnameManual && m.state.Hostname != "" {
+		for i, line := range lines {
+			if strings.HasPrefix(line, "Hostname:") {
+				lines[i] = "Hostname: proposed by Portico (you can edit it)"
+			}
+		}
+	}
+	return lines
+}
+
+// usabilitySentence labels a field with a human name for the review section.
+func usabilitySentence(id, phrase string) string {
+	names := map[string]string{
+		"connection_name":    "Name",
+		"service_address":    "Address",
+		"service_protocol":   "Protocol",
+		"directory_path":     "Directory",
+		"command_executable": "Command",
+		"mcp_endpoint":       "MCP endpoint",
+		"hostname":           "Hostname",
+	}
+	label := id
+	if name, ok := names[id]; ok {
+		label = name
+	}
+	return label + ": " + phrase
+}
+
 // Wizard step constants
 const (
 	// WizardStepOutcome asks what the user is trying to achieve before asking
@@ -587,6 +719,11 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.selected = 0
 				m.setInput(m.state.Name)
 			}
+			// A discovery result already knows what this is; confirming a
+			// suggested name is faster than inventing one.
+			if m.state.Name == "" {
+				m.setInput(m.state.suggestedName())
+			}
 		}
 
 	case WizardStepPortForwardLocalPort:
@@ -697,6 +834,11 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.state.Step = WizardStepName
 			m.selected = 0
 			m.setInput(m.state.Name)
+			// Confirm rather than invent: a discovered service proposes its own
+			// name from the process/framework Portico found.
+			if m.state.Name == "" {
+				m.setInput(m.state.suggestedName())
+			}
 		}
 
 	case WizardStepName:
@@ -1090,7 +1232,13 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			m.discardProtectionIfUnavailable()
 			if m.state.ExposureMode == "permanent_public" {
 				m.state.Step = WizardStepHostname
-				m.setInput(m.state.Hostname)
+				m.hostnameManual = false
+				m.selected = 0
+				if zoneSuggestions(m.hostnameChoiceRows()) > 0 {
+					m.setInput("")
+				} else {
+					m.setInput(m.state.Hostname)
+				}
 			} else {
 				m.state.Hostname = ""
 				m.state.Step = WizardStepProtection
@@ -1101,20 +1249,80 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 		}
 
 	case WizardStepHostname:
+		// No zone suggestions (or the user asked to type): a plain text field.
+		// The menu path only exists when there is something to choose from —
+		// otherwise Enter on a lone "type it yourself" row would be a mode
+		// switch the user did not ask for.
+		if !m.hostnameManual && len(m.hostnameChoiceRows()) <= 1 {
+			switch key {
+			case "esc":
+				m.goBack()
+			case "enter":
+				if strings.TrimSpace(m.inputValue()) == "" {
+					m.err = fmt.Errorf("permanent exposure requires a hostname")
+					return nil
+				}
+				m.err = nil
+				m.state.Hostname = strings.TrimSpace(m.inputValue())
+				m.state.Step = WizardStepProtection
+				m.selected = firstAvailable(m.protectionChoices())
+			default:
+				m.setInput(editInput(m.inputValue(), key))
+			}
+			return nil
+		}
 		switch key {
 		case "esc":
 			m.goBack()
+		case "tab":
+			if m.hostnameManual {
+				return nil
+			}
+			m.hostnameManual = true
+			m.setInput("")
 		case "enter":
-			if strings.TrimSpace(m.inputValue()) == "" {
-				m.err = fmt.Errorf("permanent exposure requires a hostname")
+			if m.hostnameManual {
+				if strings.TrimSpace(m.inputValue()) == "" {
+					m.err = fmt.Errorf("permanent exposure requires a hostname")
+					return nil
+				}
+				m.err = nil
+				m.state.Hostname = strings.TrimSpace(m.inputValue())
+				m.state.Step = WizardStepProtection
+				m.selected = firstAvailable(m.protectionChoices())
+				return nil
+			}
+			rows := m.hostnameChoiceRows()
+			if m.selected < 0 || m.selected >= len(rows) {
+				return nil
+			}
+			value, ok := m.hostnameRowValue(rows[m.selected])
+			if !ok {
+				// The manual row: switch to typing with the suggestion as a
+				// starting point so editing is cheaper than retyping.
+				m.hostnameManual = true
+				m.setInput("")
 				return nil
 			}
 			m.err = nil
-			m.state.Hostname = strings.TrimSpace(m.inputValue())
+			m.state.Hostname = value
 			m.state.Step = WizardStepProtection
 			m.selected = firstAvailable(m.protectionChoices())
+		case "up", "k":
+			if !m.hostnameManual && m.selected > 0 {
+				m.selected--
+			}
+		case "down", "j":
+			if !m.hostnameManual {
+				rows := m.hostnameChoiceRows()
+				if m.selected < len(rows)-1 {
+					m.selected++
+				}
+			}
 		default:
-			m.setInput(editInput(m.inputValue(), key))
+			if m.hostnameManual {
+				m.setInput(editInput(m.inputValue(), key))
+			}
 		}
 
 	case WizardStepProtection:
@@ -1782,7 +1990,8 @@ func (m *WizardModel) View() string {
 	case WizardStepPrivateNetworkAddress:
 		return m.withError(m.renderField(
 			"Which service should the network be able to reach?\n" +
-				"The address it is listening on, such as 127.0.0.1:3000."))
+				"The address it is listening on, such as 127.0.0.1:3000.\n" +
+				m.addressSuggestionHint()))
 	case WizardStepTunnelID:
 		return m.withError(m.renderField(
 			"Which tunnel should Portico manage?\n" +
@@ -1791,7 +2000,8 @@ func (m *WizardModel) View() string {
 	case WizardStepTunnelMCP:
 		return m.withError(m.renderField(
 			"Where is the MCP server the tunnel should reach?\n" +
-				"The address it listens on, such as http://127.0.0.1:8000."))
+				"The address it listens on, such as http://127.0.0.1:8000.\n" +
+				m.addressSuggestionHint()))
 	case WizardStepTunnelProfile:
 		return m.withError(m.renderField(
 			"Which client profile should Portico run? (empty to use the default)"))
@@ -1823,7 +2033,10 @@ func (m *WizardModel) View() string {
 	case WizardStepExposure:
 		return m.renderExposure()
 	case WizardStepHostname:
-		return m.withError(m.renderField("Enter the hostname to use:"))
+		if m.hostnameManual || len(m.hostnameChoiceRows()) <= 1 {
+			return m.withError(m.renderField("Enter the hostname to use:"))
+		}
+		return m.withError(m.renderMenu("Choose the hostname — <connection>.<zone> is proposed from your account:", m.hostnameChoiceRows(), m.selected, m.contentWidth()))
 	case WizardStepProtection:
 		return m.renderProtection()
 	case WizardStepProtectionRules:
@@ -2369,9 +2582,45 @@ func (m *WizardModel) outcomeMenuLength() int {
 	return count
 }
 
-// hostnameChoiceRows returns the available hostname selection rows.
+// hostnameChoiceRows returns the hostname suggestions: one per account zone
+// bound to the selected provider, spelled `<connection>.<zone>`, plus the
+// manual-entry row. When the provider has no zone, the wizard falls back to
+// the text field alone.
 func (m *WizardModel) hostnameChoiceRows() []string {
-	return nil
+	rows := make([]string, 0)
+	name := m.state.Name
+	if name == "" {
+		name = "app"
+	}
+	for _, account := range m.accountsFor(m.state.Provider) {
+		if account.ZoneName == "" {
+			continue
+		}
+		rows = append(rows, name+"."+account.ZoneName)
+	}
+	rows = append(rows, "Type a different hostname")
+	return rows
+}
+
+// hostnameRowValue maps a choice row back to the hostname it stores; the
+// manual row has none, deferring to the text field.
+func (m *WizardModel) hostnameRowValue(row string) (string, bool) {
+	if row == "Type a different hostname" {
+		return "", false
+	}
+	return row, true
+}
+
+// zoneSuggestions counts the rows that are actual `<name>.<zone>` proposals,
+// i.e. everything except the manual-entry row.
+func zoneSuggestions(rows []string) int {
+	count := 0
+	for _, row := range rows {
+		if row != "Type a different hostname" {
+			count++
+		}
+	}
+	return count
 }
 
 // ProgressLine returns the current operation progress line, or empty when idle.

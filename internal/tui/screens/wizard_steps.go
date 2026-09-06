@@ -54,8 +54,14 @@ var wizardStepOrder = []stepRule{
 	// Service-exposure steps: only for service_exposure kind.
 	{WizardStepSource, func(m *WizardModel) bool { return m.state.ConnectionKind == "service_exposure" }},
 	{WizardStepPort, func(m *WizardModel) bool { return m.hasPortStep() && m.state.ConnectionKind == "service_exposure" }},
+	// The protocol question is asked only when discovery did not already
+	// answer it. A service identified by its scan carries its protocol; asking
+	// the user to reconfirm what Portico just measured is a question about
+	// Portico's uncertainty, not about their connection. A manually typed
+	// address still answers it here.
 	{WizardStepProtocol, func(m *WizardModel) bool {
-		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure"
+		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure" &&
+			m.state.discoveredProtocol() == ""
 	}},
 	{WizardStepHealth, func(m *WizardModel) bool {
 		return m.state.SourceType == "existing_service" && m.state.ConnectionKind == "service_exposure"

@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
 // Making something reachable on a private network.
@@ -43,7 +45,10 @@ func (m *WizardModel) handlePrivateNetworkModeKey(key string) tea.Cmd {
 		if m.state.PrivateNetworkMode == "expose" {
 			m.state.Step = WizardStepPrivateNetworkAddress
 			m.setInput(m.state.SourceAddress)
-			return nil
+			// The service being published is on this machine, so whatever the
+			// scan has already found is a candidate answer. Offering it saves
+			// the user from knowing an address Portico can see.
+			return m.discoverCmd()
 		}
 		// A join publishes nothing, so there is no address to ask for.
 		m.state.Provider = "tailscale"
@@ -76,10 +81,67 @@ func (m *WizardModel) handlePrivateNetworkAddressKey(key string) tea.Cmd {
 		m.state.Provider = "tailscale"
 		m.state.Step = WizardStepReview
 		m.selected = 0
+	case "tab":
+		// Discovery offered a listener; tab fills the field with the next one.
+		if next := m.nextAddressSuggestion(); next != "" {
+			m.setInput(next)
+		}
 	default:
 		m.setInput(editInput(m.inputValue(), key))
 	}
 	return nil
+}
+
+// addressSuggestions lists discovered listeners as answers for an address
+// question. The service being published is on this machine, so whatever the
+// scan has found is a candidate; typing manually remains possible for anything
+// discovery did not identify.
+func (m *WizardModel) addressSuggestions() []ipc.DiscoveredServiceDTO {
+	services := m.discovered
+	if services == nil {
+		return nil
+	}
+	result := make([]ipc.DiscoveredServiceDTO, 0, len(services))
+	for _, svc := range services {
+		if strings.Contains(svc.Address, ":") {
+			result = append(result, svc)
+		}
+	}
+	return result
+}
+
+// nextAddressSuggestion cycles the field through discovery's listeners.
+func (m *WizardModel) nextAddressSuggestion() string {
+	suggestions := m.addressSuggestions()
+	if len(suggestions) == 0 {
+		return ""
+	}
+	current := strings.TrimSpace(m.inputValue())
+	for i, svc := range suggestions {
+		if svc.Address == current {
+			return suggestions[(i+1)%len(suggestions)].Address
+		}
+	}
+	return suggestions[0].Address
+}
+
+// addressSuggestionHint tells the user what tab offers, or what happened to
+// the scan. A scan failure must not claim the machine has nothing on it — it
+// says the scan failed and leaves manual entry as the answer.
+func (m *WizardModel) addressSuggestionHint() string {
+	if m.discoverPending {
+		return "Looking for local services… (Tab fills in a found one)"
+	}
+	if m.discoverErr != nil {
+		return "The scan failed — type the address instead."
+	}
+	if n := len(m.addressSuggestions()); n > 0 {
+		if n == 1 {
+			return "1 local service found — Tab fills it in, or type the address."
+		}
+		return fmt.Sprintf("%d local services found — Tab fills one in, or type the address.", n)
+	}
+	return ""
 }
 
 // privateNetworkModeChoices are the two things Portico can do with a private network.

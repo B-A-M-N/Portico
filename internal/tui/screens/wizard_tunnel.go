@@ -69,6 +69,13 @@ func (m *WizardModel) handleTunnelMCPKey(key string) tea.Cmd {
 		m.state.Step = WizardStepReview
 		m.selected = 0
 		return nil
+	case "tab":
+		// Discovery may have already found the local MCP server; tab cycles
+		// through its listeners instead of requiring the user to know the
+		// address. Typing is still the fallback for anything unlisted.
+		if next := m.nextAddressSuggestion(); next != "" {
+			m.setInput(next)
+		}
 	default:
 		m.setInput(editInput(m.inputValue(), key))
 	}
