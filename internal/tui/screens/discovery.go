@@ -20,7 +20,24 @@ import (
 // what the supervisor found.
 
 // DiscoveryChoiceLabel names one discovered service in a single line.
+//
+// When the discovery authority supplies a DisplayName, that leads — it is what
+// a person recognises — followed by the address and protocol that make it
+// actionable. Without one, the address leads and the process or framework
+// follows. The two shapes never repeat the same fact twice: a label like
+// "Next.js · 127.0.0.1:3000 over http — Next.js · http" said everything two
+// times and fit on no terminal.
 func DiscoveryChoiceLabel(svc ipc.DiscoveredServiceDTO) string {
+	if svc.DisplayName != "" {
+		label := svc.DisplayName + " · " + svc.Address
+		if label == "" && svc.Port > 0 {
+			label = fmt.Sprintf("port %d", svc.Port)
+		}
+		if svc.Protocol != "" {
+			label += " · " + svc.Protocol
+		}
+		return label
+	}
 	label := svc.Address
 	if label == "" && svc.Port > 0 {
 		label = fmt.Sprintf("port %d", svc.Port)
@@ -47,11 +64,15 @@ func serviceName(svc ipc.DiscoveredServiceDTO) string {
 
 // ConfidenceSentence says how sure Portico is, in words rather than a label.
 //
-// "likely" and "possible" are Portico's internal grades. What a user needs to
-// know is whether to trust the identification, and what to do if it is wrong.
+// The grades are the discovery engine's own (internal/discovery): very_likely
+// means the probe succeeded and a process was identified; likely means the
+// probe succeeded alone; possible means something is listening and Portico
+// could not identify it. This mapping is the only translation — a second list
+// of grades beside it drifted, and "high" (a grade the engine never emits)
+// ended up described as confirmed.
 func ConfidenceSentence(confidence string) string {
 	switch strings.ToLower(strings.TrimSpace(confidence)) {
-	case "confirmed", "certain", "high":
+	case "very_likely", "confirmed", "certain", "high":
 		return "Portico confirmed this by connecting to it."
 	case "likely":
 		return "Probably right: this matches a service Portico recognises, but it was not confirmed."
@@ -98,13 +119,18 @@ func DiscoveryEvidenceLines(svc ipc.DiscoveredServiceDTO) []string {
 // discoveryChoices turns discovered services into the same choice type every
 // other wizard menu uses, so the service question behaves like the rest of the
 // wizard and its details expand the same way.
+//
+// Availability is the discovery authority's verdict, not this package's guess:
+// the supervisor marks what cannot be published and says why, and the list
+// shows the mark rather than hiding the row.
 func discoveryChoices(services []ipc.DiscoveredServiceDTO) []wizardChoice {
 	choices := make([]wizardChoice, 0, len(services)+1)
 	for _, svc := range services {
 		choices = append(choices, wizardChoice{
 			Value:     svc.Address,
 			Label:     DiscoveryChoiceLabel(svc),
-			Available: true,
+			Available: svc.Selectable,
+			Reason:    svc.DisabledReason,
 			Detail:    DiscoveryEvidenceLines(svc),
 		})
 	}
@@ -125,3 +151,21 @@ func discoveryChoices(services []ipc.DiscoveredServiceDTO) []wizardChoice {
 // manualAddressChoice is the sentinel for the manual-entry option. It is not an
 // address, so it cannot collide with one.
 const manualAddressChoice = "\x00manual"
+
+// VisibleDiscoveryServices filters a scan result for the default view.
+//
+// Only a known guess is hidden. A grade this package does not recognise is
+// shown, because a filter that silently drops what it cannot classify is how
+// a new confidence grade would have made services vanish from the list.
+func VisibleDiscoveryServices(services []ipc.DiscoveredServiceDTO, showAll bool) []ipc.DiscoveredServiceDTO {
+	if showAll {
+		return services
+	}
+	result := make([]ipc.DiscoveredServiceDTO, 0, len(services))
+	for _, s := range services {
+		if !strings.EqualFold(strings.TrimSpace(s.Confidence), "possible") {
+			result = append(result, s)
+		}
+	}
+	return result
+}

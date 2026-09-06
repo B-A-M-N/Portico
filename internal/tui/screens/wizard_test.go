@@ -698,6 +698,29 @@ func TestWizardUsesEventStreamRatherThanTightPolling(t *testing.T) {
 	}
 }
 
+func TestWizardStreamDisconnectedByDefaultAndLiveOnlyWhenTold(t *testing.T) {
+	m := NewWizard(nil, fullCloudflareSnapshot())
+	m.operation = &ipc.OperationDTO{ID: "op-1", State: "running"}
+
+	cmd := m.pollOperationCmd()
+	if cmd == nil {
+		t.Fatal("no fallback poll command")
+	}
+	msg := cmd()
+	loaded, ok := msg.(WizardOperationLoadedMsg)
+	if !ok {
+		t.Fatalf("poll returned %T, want WizardOperationLoadedMsg", msg)
+	}
+	if loaded.Err == nil || !strings.Contains(loaded.Err.Error(), "no supervisor connection") {
+		t.Fatalf("poll error = %v, want no operation identity before ready stream", loaded.Err)
+	}
+
+	m.SetStreamConnected(true)
+	if !m.streamConnected {
+		t.Fatal("SetStreamConnected(true) did not mark the stream live")
+	}
+}
+
 // TestWizardExposesItsOperationForEventRouting ensures the root model can match
 // incoming events to the wizard's operation.
 func TestWizardExposesItsOperationForEventRouting(t *testing.T) {

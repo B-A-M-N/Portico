@@ -63,6 +63,15 @@ func (p *Provider) Capabilities(ctx context.Context) (core.Capabilities, error) 
 			core.ProtocolHTTP:  {Supported: true, Public: true},
 			core.ProtocolHTTPS: {Supported: true, Public: true},
 		},
+		// The mock emulates a managed tunnel: its connector proxies HTTP(S)
+		// in-process and never truncates long-lived responses, so MCP and
+		// other streaming workloads are carried honestly. Omitting this made
+		// the wizard offer Mock for an MCP connection the controller then
+		// refused with PTO-CORE-009 (profile requires streaming).
+		Streaming: core.CapabilitySupport{
+			Supported: true,
+			Stability: core.StabilityStable,
+		},
 		Telemetry: core.TelemetryCapability{
 			Supported:     false,
 			RequestCounts: false,

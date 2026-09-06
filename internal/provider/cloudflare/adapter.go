@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -38,6 +37,9 @@ type Provider struct {
 	logDir         string
 	connectorProc  core.ConnectorProcessService
 	credStore      CredentialStore
+	clock          probeClock
+	resolver       dnsResolver
+	httpClient     *http.Client
 
 	connections map[core.ConnectionID]*cfConnection
 }
@@ -697,53 +699,6 @@ func (p *Provider) verifyLocalOrigin(ctx context.Context, originURL string) erro
 		return fmt.Errorf("origin returned status %d", resp.StatusCode)
 	}
 	return nil
-}
-
-// verifyDNSResolution performs a DNS lookup for the hostname to confirm
-// that the record has propagated and the hostname resolves.
-func (p *Provider) verifyDNSResolution(ctx context.Context, hostname string) error {
-	resolver := &net.Resolver{}
-	addrs, err := resolver.LookupHost(ctx, hostname)
-	if err != nil {
-		return err
-	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("no addresses resolved for %s", hostname)
-	}
-	return nil
-}
-
-// verifyPublicEndpoint performs an HTTP probe against the public endpoint to
-// confirm the tunnel is serving traffic end-to-end.
-// Acceptable status codes: 2xx (success), 3xx (redirect), 401/403 (auth required = reachable).
-func (p *Provider) verifyPublicEndpoint(ctx context.Context, publicURL string) error {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
-			},
-		},
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicURL, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	// Accept 2xx (success), 3xx (redirect), 401/403 (auth required = reachable)
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		return nil
-	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil
-	}
-	return fmt.Errorf("public endpoint returned status %d", resp.StatusCode)
 }
 
 // Observe returns the observed connection state using resources known
@@ -1503,6 +1458,10 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		return core.StepResult{StepID: step.ID, Succeeded: true}, nil
 
 	case core.StepVerifyEndpoint:
+		verification := endpointVerificationFromParameters(step.Technical.Parameters)
+		if verification.configurationErr != nil {
+			return core.StepResult{StepID: step.ID, Succeeded: false, Error: verification.configurationErr}, nil
+		}
 		p.mu.RLock()
 		pid := conn.connectorPID
 		hostname := conn.hostname
@@ -1523,13 +1482,13 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 
 		originURL := step.Technical.Parameters["origin_url"]
 		if originURL != "" {
-			if err := p.verifyLocalOrigin(ctx, originURL); err != nil {
+			if err := p.verifyLocalOriginWithVerification(ctx, originURL, verification); err != nil {
 				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("endpoint not reachable: origin probe failed: %w", err)}, nil
 			}
 		}
 
 		if hostname != "" && p.zoneID != "" {
-			if err := p.verifyDNSResolution(ctx, hostname); err != nil {
+			if err := p.verifyDNSResolutionWithRetry(ctx, hostname); err != nil {
 				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("endpoint not reachable: DNS verification failed: %w", err)}, nil
 			}
 		}
@@ -1541,9 +1500,11 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			probeURL = fmt.Sprintf("https://%s", hostname)
 		}
 		if probeURL != "" {
-			if err := p.verifyPublicEndpoint(ctx, probeURL); err != nil {
+			notes, err := p.verifyPublicEndpointWithVerification(ctx, probeURL, verification)
+			if err != nil {
 				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("endpoint not reachable: public probe failed: %w", err)}, nil
 			}
+			return core.StepResult{StepID: step.ID, Succeeded: true, Notes: notes}, nil
 		}
 
 		// Truthfulness for Access-protected endpoints (audit item 22): a 2xx
@@ -1709,26 +1670,10 @@ func cloudflareSetupFlow() core.SetupFlow {
 		IdentityField: "account_id",
 		SecretField:   "credential",
 		Summary:       "Configure a Cloudflare account so Portico can create managed tunnels for you.",
+		// The credential leads. Validation against the real API discovers the
+		// accounts and zones the token can reach, so asking for the identity
+		// first made the user copy an ID the credential was about to reveal.
 		Fields: []core.SetupField{
-			{
-				ID:          "account_id",
-				Label:       "Account ID",
-				Description: "Found on the Cloudflare dashboard overview page.",
-				Required:    true,
-				EnvVars:     []string{"PORTICO_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"},
-			},
-			{
-				ID:          "label",
-				Label:       "Label",
-				Description: "A name for this account inside Portico. Defaults to the account ID.",
-			},
-			{
-				ID:      "zone_id",
-				Label:   "Zone ID",
-				EnvVars: []string{"PORTICO_CLOUDFLARE_ZONE_ID", "CLOUDFLARE_ZONE_ID"},
-				Description: "Only needed for permanent hostnames and DNS. " +
-					"Leave blank to use tunnels with temporary addresses.",
-			},
 			{
 				ID:          "credential",
 				Label:       "API token",
@@ -1739,6 +1684,25 @@ func cloudflareSetupFlow() core.SetupFlow {
 				// argument is in the shell history and visible in the process
 				// list to every user on the machine.
 				EnvVars: []string{"PORTICO_CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN"},
+			},
+			{
+				ID:          "account_id",
+				Label:       "Account",
+				Description: "Discovered from the token. Chosen by name when the token can reach more than one.",
+				InputKind:   "provider_identity",
+				EnvVars:     []string{"PORTICO_CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"},
+			},
+			{
+				ID:          "label",
+				Label:       "Label",
+				Description: "A name for this account inside Portico. Defaults to the account name.",
+			},
+			{
+				ID:      "zone_id",
+				Label:   "Zone",
+				EnvVars: []string{"PORTICO_CLOUDFLARE_ZONE_ID", "CLOUDFLARE_ZONE_ID"},
+				Description: "Discovered after the account. Only needed for permanent hostnames and DNS. " +
+					"Leave blank to use tunnels with temporary addresses.",
 			},
 		},
 		CapabilityNotes: []string{

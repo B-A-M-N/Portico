@@ -72,3 +72,34 @@ func TestDiffProfilesClassifiesMCPTransportChange(t *testing.T) {
 		t.Fatalf("an MCP transport change was not treated as restart-worthy: %+v restart=%v", delta.Changes, delta.RestartConnector)
 	}
 }
+
+// TestDiffProfilesIgnoresLegacyClientProfile pins that the persisted native
+// client profile is read-compatible history, not an effective tunnel setting.
+func TestDiffProfilesIgnoresLegacyClientProfile(t *testing.T) {
+	current := tunnelEditDiffProfile()
+	proposed := current.DeepCopy()
+	proposed.Spec.ClientTunnel.Profile = "native-profile"
+
+	delta, err := DiffProfiles(current, proposed)
+	if err != nil {
+		t.Fatalf("DiffProfiles: %v", err)
+	}
+	if !delta.Empty() {
+		t.Fatalf("a legacy client-profile change became an effective edit: %+v", delta)
+	}
+}
+
+// tunnelEditDiffProfile returns a minimal client tunnel profile used for
+// DiffProfiles regression tests.
+func tunnelEditDiffProfile() *core.ConnectionProfile {
+	return &core.ConnectionProfile{
+		ID: "ct-edit", Name: "tunnel", Kind: core.ConnectionClientTunnel,
+		Desired: core.DesiredOpen,
+		Spec: core.ConnectionSpec{ClientTunnel: &core.ClientTunnelSpec{
+			Client:   core.ClientOpenAISecureMCPTunnel,
+			TunnelID: "tunnel_0123456789abcdef0123456789abcdef",
+			Profile:  "legacy-native",
+			MCP:      core.MCPServiceSpec{Transport: core.MCPTransportStreamable, Endpoint: "http://127.0.0.1:8000/mcp"},
+		}},
+	}
+}

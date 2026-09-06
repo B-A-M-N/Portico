@@ -3,6 +3,7 @@ package tui
 import (
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/tui/screens"
 )
 
@@ -45,6 +46,12 @@ func (m Model) handleAction(id ActionID, act Action) (Model, tea.Cmd, bool) {
 		return m, nil, true
 
 	case ActionBack:
+		if m.screen == ScreenSettings && m.settings != nil && m.settings.confirmingRotate {
+			// Esc while confirming is the refusal: no key material moves, and
+			// the prompt simply goes away.
+			m.settings.confirmingRotate = false
+			return m, nil, true
+		}
 		return m.goBack()
 
 	case ActionUp:
@@ -55,20 +62,24 @@ func (m Model) handleAction(id ActionID, act Action) (Model, tea.Cmd, bool) {
 		m.moveSelection(1)
 		return m, m.selectionChangedCmd(), true
 
-	case ActionPageUp:
-		m.scroll.scrollBy(-m.scroll.page())
-		return m, nil, true
-
-	case ActionPageDown:
-		m.scroll.scrollBy(m.scroll.page())
-		return m, nil, true
-
-	case ActionTop:
-		m.scroll.toTop()
-		return m, nil, true
-
-	case ActionBottom:
-		m.scroll.toBottom()
+	case ActionPageUp, ActionPageDown, ActionTop, ActionBottom:
+		// A screen that steers a selection moves the selection with these
+		// keys; the view follows it. Free-scrolling the viewport away from the
+		// cursor left the user paging content they could no longer act on.
+		if m.screenHasSelection() {
+			m.moveSelectionByPage(id)
+			return m, m.selectionChangedCmd(), true
+		}
+		switch id {
+		case ActionPageUp:
+			m.scroll.scrollBy(-m.scroll.page())
+		case ActionPageDown:
+			m.scroll.scrollBy(m.scroll.page())
+		case ActionTop:
+			m.scroll.toTop()
+		case ActionBottom:
+			m.scroll.toBottom()
+		}
 		return m, nil, true
 
 	case ActionInspect:
@@ -86,7 +97,7 @@ func (m Model) handleAction(id ActionID, act Action) (Model, tea.Cmd, bool) {
 
 	case ActionNew:
 		m.wizard = screens.NewWizard(m.client, m.providerSnapshot()).
-			WithContext(m.rootCtx).WithDefaults(m.lifecycleDefaults())
+			WithContext(m.rootCtx).WithDefaults(m.lifecycleDefaults()).WithASCII(m.useASCII)
 		m.status = ""
 		m.pushScreen(ScreenNewConnection)
 		return m, nil, true
@@ -144,6 +155,10 @@ func (m Model) handleAction(id ActionID, act Action) (Model, tea.Cmd, bool) {
 		return m, m.loadSettingsCmd(), true
 
 	case ActionRotateSecretKey:
+		if m.settings != nil && !m.settings.confirmingRotate {
+			m.settings.confirmingRotate = true
+			return m, nil, true
+		}
 		return m, m.rotateSecretKeyCmd(), true
 
 	case ActionRetry:
@@ -176,6 +191,16 @@ func (m Model) goBack() (Model, tea.Cmd, bool) {
 		// collect.
 		m.edit.confirmingDiscard = true
 		return m, nil, true
+	}
+	// Applying a plan clears its preview before entering operation progress.
+	// If the completed operation is later closed, do not navigate back into
+	// that now-empty preview; remove the stale frame and return to the screen
+	// from which the plan was opened.
+	if m.screen == ScreenOperationProgress && m.plan == nil &&
+		m.operation != nil && ipc.OperationTerminal(m.operation.State) {
+		for len(m.navStack) > 0 && m.navStack[len(m.navStack)-1] == ScreenPlanPreview {
+			m.navStack = m.navStack[:len(m.navStack)-1]
+		}
 	}
 	m.abandonScreenWork()
 	if !m.popScreen() {

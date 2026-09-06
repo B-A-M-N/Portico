@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net"
 	"net/mail"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -131,6 +132,18 @@ type WizardModel struct {
 	plan            *ipc.PlanDTO
 	operation       *ipc.OperationDTO
 	openAfterCreate bool // true if user chose "Review and open"
+	// Terminal size and viewport for menu rendering.
+	width           int
+	height          int
+	useASCII        bool
+	outcomeExpanded bool
+	menuViewport    wizardMenuViewport
+	// Discovery filter and show-all toggle.
+	discoveryFilter      string
+	discoveryFilterField textinput.Model
+	discoveryShowAll     bool
+	// hostnameManual tracks whether the hostname is user-entered vs chosen.
+	hostnameManual bool
 }
 
 // WizardState holds the state for the new connection wizard.
@@ -177,11 +190,18 @@ type WizardState struct {
 	PortForwardRemoteHost string
 	PortForwardRemotePort string
 	PortForwardProtocol   string
+	// PortAsked records that the port question belongs to this wizard run: an
+	// accepted address that already carried a port skips the question, while an
+	// address that did not keeps it for the rest of the run — including when the
+	// user steps back through it. Without the flag the answer erased the
+	// question from the sequence, so back-navigation jumped from the protocol
+	// straight past the port it had just asked for.
+	PortAsked bool
 	// TunnelID and TunnelProfile are used when ConnectionKind is
 	// "client_tunnel". The tunnel already exists: Portico manages a client
 	// against a tunnel created in the platform's own settings, and cannot create
 	// one — so the ID is collected rather than generated.
-	TunnelID      string
+	TunnelID string
 	// ProfileKind carries the provider-neutral service intent chosen by the
 	// recipe into the create request. Internal vocabulary; never displayed.
 	ProfileKind string
@@ -195,6 +215,7 @@ type WizardState struct {
 	// "private_network". The two answer different questions and carry different
 	// fields, so the wizard asks which before asking anything else.
 	PrivateNetworkMode string
+	SelectedService    *ipc.DiscoveredServiceDTO
 }
 
 // Wizard step constants
@@ -211,6 +232,8 @@ const (
 	// scan, rather than requiring the user to have found an address elsewhere
 	// first.
 	WizardStepDiscovery
+	WizardStepAdvancedSettings
+	WizardStepDiscoveryFilter
 	WizardStepSource
 	WizardStepPort
 	WizardStepProtocol
@@ -284,9 +307,9 @@ type wizardRecipe struct {
 	// checked for OpenAI compatibility before review: models detected, whether
 	// auth is required, and whether streaming is available.
 	ProbeOpenAICompatibility bool
-	SourceType  string
-	Exposure    string
-	Protection  string
+	SourceType               string
+	Exposure                 string
+	Protection               string
 	// Advanced sends the user to the original source-type question instead of
 	// presetting anything.
 	Advanced bool
@@ -391,13 +414,14 @@ var nextWizardID WizardID
 func NewWizard(client ConnectionCreator, providers []ipc.ProviderDTO) *WizardModel {
 	nextWizardID++
 	return &WizardModel{
-		id:         nextWizardID,
-		generation: 0,
-		client:     client,
-		ctx:        context.Background(), // default; root model should call WithContext
-		caps:       providerCapabilities{providers: providers},
-		state:      WizardState{Step: WizardStepOutcome, HealthEnabled: true},
-		field:      NewField(),
+		id:               nextWizardID,
+		generation:       0,
+		client:           client,
+		ctx:              context.Background(), // default; root model should call WithContext
+		caps:             providerCapabilities{providers: providers},
+		state:            WizardState{Step: WizardStepOutcome, HealthEnabled: true},
+		discoveryShowAll: true,
+		field:            NewField(),
 	}
 }
 
@@ -407,6 +431,14 @@ func (m *WizardModel) WithContext(ctx context.Context) *WizardModel {
 	if ctx != nil {
 		m.ctx = ctx
 	}
+	return m
+}
+
+// WithASCII renders the wizard with ASCII-only fallbacks (selection marker,
+// unavailable marks). Every other screen inherits this from the root model;
+// the wizard is constructed fresh per session and must be told explicitly.
+func (m *WizardModel) WithASCII(useASCII bool) *WizardModel {
+	m.useASCII = useASCII
 	return m
 }
 
@@ -485,8 +517,16 @@ func (m *WizardModel) SelectedIndex() int { return m.selected }
 func WizardRecipeCount() int { return len(wizardRecipes) }
 
 // hasPortStep reports whether the port step applies to the chosen source.
+// A command source always needs a local port — nothing else can supply it.
+// For an existing service the question is asked only when the accepted
+// address did not carry one, and once asked it stays in the sequence: the
+// question's membership must not depend on the answer it collects, or
+// back-navigation stops revisiting it.
 func (m *WizardModel) hasPortStep() bool {
-	return m.state.SourceType == "existing_service" || m.isCommandOrigin()
+	if m.isCommandOrigin() {
+		return true
+	}
+	return m.state.SourceType == "existing_service" && m.state.PortAsked
 }
 
 func (m *WizardModel) isCommandOrigin() bool {
@@ -726,6 +766,23 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 
 	case WizardStepDiscovery:
 		return m.handleDiscoveryKey(key)
+	case WizardStepDiscoveryFilter:
+		switch key {
+		case "esc":
+			m.state.Step = WizardStepDiscovery
+			m.menuViewport.Cursor = m.selected
+			m.menuViewport.ensureVisible(m.menuChoiceCount())
+			return nil
+		case "enter":
+			m.discoveryFilter = strings.TrimSpace(m.inputValue())
+			m.state.Step = WizardStepDiscovery
+			m.menuViewport.Cursor = 0
+			m.menuViewport.Offset = 0
+			return nil
+		default:
+			m.setInput(editInput(m.inputValue(), key))
+			return nil
+		}
 
 	case WizardStepCommandShell:
 		return m.handleCommandShellKey(key)
@@ -758,7 +815,39 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				return nil
 			}
 			m.err = nil
-			m.state.SourceAddress = strings.TrimSpace(m.inputValue())
+			address := strings.TrimSpace(m.inputValue())
+			// A pasted URL is normalized here, at acceptance, rather than stored
+			// raw and reinterpreted later: protocol and port the address already
+			// carries are derived, so the user is only asked what it did not say.
+			// An empty answer is left alone — the port question follows, and
+			// "127.0.0.1" + port is assembled there.
+			// The port question belongs to this run whenever the acceptance
+			// left the port unknown: an empty address is completed by port
+			// alone, and an address without one still needs it. A re-accepted
+			// address can change the answer, so the flag follows the latest
+			// acceptance.
+			if m.state.SourceType == "existing_service" && address != "" {
+				normalized, protocol, port, err := normalizeServiceEndpoint(address)
+				if err != nil {
+					m.err = err
+					return nil
+				}
+				// The port travels with the address: re-deriving on every
+				// accepted address means an address that carries one never
+				// re-asks for it, and a changed address never keeps a port
+				// that belonged to the previous one.
+				if normalized != m.state.SourceAddress || port != "" {
+					m.state.Port = port
+				}
+				m.state.PortAsked = port == ""
+				address = normalized
+				if protocol != "" {
+					m.state.SourceProtocol = protocol
+				}
+			} else if m.state.SourceType == "existing_service" {
+				m.state.PortAsked = true
+			}
+			m.state.SourceAddress = address
 			m.advanceFromSource()
 		default:
 			m.setInput(editInput(m.inputValue(), key))
@@ -1329,7 +1418,6 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 		}
 		src.Existing = &ipc.ExistingSourceDTO{
 			Address: addr, Protocol: protocol,
-			Health: &ipc.HealthCheckSpecDTO{Enabled: s.HealthEnabled, Path: s.HealthPath},
 		}
 	case "directory":
 		src.Directory = &ipc.DirectorySourceDTO{
@@ -1675,11 +1763,13 @@ func (m *WizardModel) View() string {
 	case WizardStepPortForwardRemotePort:
 		return m.withError(m.renderField("Remote port:"))
 	case WizardStepPortForwardProtocol:
-		return m.withError(renderChoices("Protocol:", portForwardProtocolChoices(), m.selected))
+		return m.withError(m.renderChoices("Protocol:", portForwardProtocolChoices(), m.selected))
 	case WizardStepMCPMode:
-		return renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected)
+		return m.renderMenu("How does the MCP server run?", []string{"Already running at an HTTP endpoint", "A command Portico should run"}, m.selected, m.contentWidth())
 	case WizardStepDiscovery:
 		return m.withError(m.renderDiscovery())
+	case WizardStepDiscoveryFilter:
+		return m.withError(m.renderField("Filter services by name or address:"))
 	case WizardStepCommandShell:
 		return m.withError(m.renderCommandShell())
 	case WizardStepCommandEnv:
@@ -1715,7 +1805,7 @@ func (m *WizardModel) View() string {
 	case WizardStepProtocol:
 		return m.renderProtocol()
 	case WizardStepHealth:
-		return renderMenu("Probe the existing service after connecting?", []string{"No", "Yes"}, m.selected)
+		return m.renderMenu("Probe the existing service after connecting?", []string{"No", "Yes"}, m.selected, m.contentWidth())
 	case WizardStepHealthPath:
 		return m.withError(m.renderField("Optional health path (empty to probe the service root):"))
 	case WizardStepCommandArgs:
@@ -1727,7 +1817,7 @@ func (m *WizardModel) View() string {
 	case WizardStepDirectoryMode:
 		return m.renderDirectoryMode()
 	case WizardStepDirectorySPA:
-		return renderMenu("Enable SPA fallback for unknown paths?", []string{"No", "Yes"}, m.selected)
+		return m.renderMenu("Enable SPA fallback for unknown paths?", []string{"No", "Yes"}, m.selected, m.contentWidth())
 	case WizardStepMCPTransport:
 		return m.renderMCPTransport()
 	case WizardStepExposure:
@@ -1782,6 +1872,15 @@ func (m *WizardModel) advanceFromSource() {
 	case m.state.SourceType == "mcp_server":
 		m.state.Step = WizardStepMCPTransport
 		m.selected = mcpTransportIndex(m.mcpTransports(), m.state.MCPTransport)
+	case m.state.SourceType == "existing_service":
+		// The accepted address already carried the port, which is why the
+		// port step was skipped; the next question is the protocol.
+		m.state.Step = WizardStepProtocol
+		if idx := indexOfString([]string{"http", "https"}, m.state.SourceProtocol); idx >= 0 {
+			m.selected = idx
+		} else {
+			m.selected = 0
+		}
 	default:
 		m.state.Step = WizardStepExposure
 		m.selected = firstAvailable(m.exposureChoices())
@@ -1813,7 +1912,7 @@ func (m *WizardModel) sourcePrompt() string {
 		}
 		return "Enter the MCP server endpoint:"
 	default:
-		return "Enter the address of your service (host or host:port):"
+		return "Enter the service address (host or host:port):"
 	}
 }
 
@@ -1828,15 +1927,17 @@ func (m *WizardModel) renderOutcome() string {
 		}
 		options = append(options, label)
 	}
-	view := renderMenu("What are you trying to do?", options, m.selected)
+	view := m.renderMenu("What are you trying to do?", options, m.selected, m.contentWidth())
 
 	// Show the consequence of the highlighted choice before it is made, and what
-	// stands in the way when something does.
+	// stands in the way when something does. Both are wrapped: an explanation
+	// longer than the terminal wrapped in the PTY onto rows the next frame did
+	// not clear, which is how two screens came to share one display.
 	if m.selected >= 0 && m.selected < len(wizardRecipes) {
 		recipe := wizardRecipes[m.selected]
-		view += "\n\n" + recipe.Explanation + "\n"
+		view += "\n\n" + strings.Join(WrapText(recipe.Explanation, m.contentWidth()), "\n") + "\n"
 		if reason := m.recipeUnavailable(recipe); reason != "" {
-			view += "\nThis is not available yet: " + reason + "\n"
+			view += "\n" + strings.Join(WrapText("This is not available yet: "+reason, m.contentWidth()), "\n") + "\n"
 		}
 	}
 	return view
@@ -1849,20 +1950,20 @@ func (m *WizardModel) renderIntent() string {
 		"An HTTP command Portico should run",
 		"An HTTP MCP server",
 	}
-	return renderMenu("What should be reachable?", options, m.selected)
+	return m.renderMenu("What should be reachable?", options, m.selected, m.contentWidth())
 }
 
 func (m *WizardModel) renderProtocol() string {
 	options := []string{"HTTP", "HTTPS"}
-	return renderMenu("What protocol does your service use?", options, m.selected)
+	return m.renderMenu("What protocol does your service use?", options, m.selected, m.contentWidth())
 }
 
 func (m *WizardModel) renderExposure() string {
-	return renderChoices("How should it be reachable?", m.exposureChoices(), m.selected)
+	return m.renderChoices("How should it be reachable?", m.exposureChoices(), m.selected)
 }
 
 func (m *WizardModel) renderProtection() string {
-	return renderChoices("Who should be able to reach it?", m.protectionChoices(), m.selected)
+	return m.renderChoices("Who should be able to reach it?", m.protectionChoices(), m.selected)
 }
 
 func (m *WizardModel) renderDirectoryMode() string {
@@ -1870,7 +1971,7 @@ func (m *WizardModel) renderDirectoryMode() string {
 	for _, choice := range m.directoryModeChoices() {
 		options = append(options, choice.label)
 	}
-	return renderMenu("How should Portico serve this directory?", options, m.selected)
+	return m.renderMenu("How should Portico serve this directory?", options, m.selected, m.contentWidth())
 }
 
 // directoryModeChoices returns the directory mode options filtered by
@@ -1902,7 +2003,7 @@ func (m *WizardModel) renderMCPTransport() string {
 			options = append(options, "Server-Sent Events (requires permanent exposure)")
 		}
 	}
-	return renderMenu("Which MCP transport does the server use?", options, m.selected)
+	return m.renderMenu("Which MCP transport does the server use?", options, m.selected, m.contentWidth())
 }
 
 func (m *WizardModel) renderAccount() string {
@@ -1928,7 +2029,7 @@ func (m *WizardModel) renderAccount() string {
 	if name == "" {
 		name = "provider"
 	}
-	return renderMenu("Which "+name+" account should own this connection?", options, m.selected)
+	return m.renderMenu("Which "+name+" account should own this connection?", options, m.selected, m.contentWidth())
 }
 
 // renderPlanPreview shows the plan through the shared presentation, so the
@@ -1945,6 +2046,15 @@ func (m *WizardModel) renderPlanPreview() string {
 	return out
 }
 
+// OperationStatusLabel renders an operation state as the capitalized status
+// word the operation screens show the user ("completed" -> "Completed").
+func OperationStatusLabel(state string) string {
+	if state == "" {
+		return state
+	}
+	return strings.ToUpper(state[:1]) + state[1:]
+}
+
 func (m *WizardModel) renderOperationWait() string {
 	lines := []string{"OPENING CONNECTION", ""}
 
@@ -1953,7 +2063,7 @@ func (m *WizardModel) renderOperationWait() string {
 		return strings.Join(lines, "\n")
 	}
 
-	lines = append(lines, fmt.Sprintf("State: %s", m.operation.State))
+	lines = append(lines, fmt.Sprintf("Status: %s", OperationStatusLabel(m.operation.State)))
 
 	if len(m.operation.Steps) > 0 {
 		lines = append(lines, "", "Progress:")
@@ -2004,16 +2114,19 @@ func (m *WizardModel) accountLabel(id string) string {
 	return id
 }
 
-func renderMenu(title string, options []string, selected int) string {
-	lines := []string{title, ""}
+func (m *WizardModel) renderMenu(title string, options []string, selected int, width int) string {
+	lines := []string{wizardOneLine(title, width), ""}
 	for i, opt := range options {
 		prefix := "  "
 		if i == selected {
 			prefix = "▸ "
+			if m.useASCII {
+				prefix = "> "
+			}
 		}
-		lines = append(lines, prefix+opt)
+		lines = append(lines, wizardOneLine(prefix+opt, width))
 	}
-	lines = append(lines, "", "↑↓ Navigate  Enter Select  Esc Back")
+	lines = append(lines, "", wizardOneLine("↑↓ Navigate  Enter Select  Esc Back", width))
 	return strings.Join(lines, "\n")
 }
 
@@ -2245,4 +2358,84 @@ func ProtectionRulesInput(emails, domains []string) string {
 	values := append([]string(nil), emails...)
 	values = append(values, domains...)
 	return strings.Join(values, ", ")
+}
+
+// outcomeMenuLength reports how many prepared outcomes exist (including hidden ones).
+func (m *WizardModel) outcomeMenuLength() int {
+	count := len(wizardRecipes)
+	if !m.outcomeExpanded {
+		return 5
+	}
+	return count
+}
+
+// hostnameChoiceRows returns the available hostname selection rows.
+func (m *WizardModel) hostnameChoiceRows() []string {
+	return nil
+}
+
+// ProgressLine returns the current operation progress line, or empty when idle.
+func (m *WizardModel) ProgressLine() string {
+	if m.operation == nil {
+		return ""
+	}
+	return m.operation.State
+}
+
+// normalizeServiceEndpoint turns the common URL spelling into the fields the
+// service source actually needs. This happens as soon as the address is
+// accepted, so a user is only asked for protocol or port information that the
+// address did not already provide.
+func normalizeServiceEndpoint(address string) (normalized, protocol, port string, err error) {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return "", "", "", fmt.Errorf("enter a service address")
+	}
+	if parsed, parseErr := url.Parse(address); parseErr == nil && parsed.Scheme != "" {
+		protocol = strings.ToLower(parsed.Scheme)
+		if protocol == "http" || protocol == "https" {
+			if parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" {
+				return "", "", "", fmt.Errorf("enter a service host or host:port, without a path or query")
+			}
+			normalized = parsed.Hostname()
+			port = parsed.Port()
+			if normalized == "" {
+				return "", "", "", fmt.Errorf("the service URL has no host")
+			}
+			if port != "" && !validServicePort(port) {
+				return "", "", "", fmt.Errorf("port must be a number between 1 and 65535")
+			}
+			return normalized, protocol, port, nil
+		}
+		if strings.Contains(address, "://") {
+			return "", "", "", fmt.Errorf("service URLs must use http:// or https://")
+		}
+		if parsed.Opaque != "" {
+			if _, _, splitErr := net.SplitHostPort(address); splitErr != nil {
+				return "", "", "", fmt.Errorf("enter a service host or host:port")
+			}
+		}
+	}
+	if _, parsedPort, splitErr := net.SplitHostPort(address); splitErr == nil {
+		host, _, _ := net.SplitHostPort(address)
+		if host == "" || parsedPort == "" {
+			return "", "", "", fmt.Errorf("enter a service host or host:port")
+		}
+		if !validServicePort(parsedPort) {
+			return "", "", "", fmt.Errorf("port must be a number between 1 and 65535")
+		}
+		return host, "", parsedPort, nil
+	}
+	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
+		address = strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
+	}
+	if net.ParseIP(address) != nil || !strings.Contains(address, ":") {
+		return address, "", "", nil
+	}
+	return "", "", "", fmt.Errorf("enter a service host or host:port; IPv6 addresses need brackets when a port is included")
+}
+
+func validServicePort(port string) bool {
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535
 }

@@ -59,7 +59,10 @@ func TestOnlyTheDeletedAccessResourceClassifiesMissing(t *testing.T) {
 	// The deleted Access pair must NOT read as present (the fake answers 404),
 	// and must not read as transient either: an authoritative absence is missing,
 	// which is the only state that may drive recreation.
-	for _, want := range []struct{ kind core.ResourceType; id string }{
+	for _, want := range []struct {
+		kind core.ResourceType
+		id   string
+	}{
 		{core.ResourceAccessApp, ownedAccessAppID},
 	} {
 		assertResourceStatus(t, obs, want.kind, want.id, core.ObservationMissing)

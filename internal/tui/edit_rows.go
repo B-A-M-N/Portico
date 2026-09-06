@@ -150,6 +150,30 @@ func (s *editState) portForwardRows() []editRow {
 	}
 }
 
+// clientTunnelRows are the properties of a client-mediated tunnel. The legacy
+// native client-profile field is deliberately absent: Portico never passed it
+// to the client, and offering it as an effective setting would keep two
+// configuration authorities alive.
+func (s *editState) clientTunnelRows() []editRow {
+	tunnel := s.detail.DesiredSpec.ClientTunnel
+	currentMCP := tunnel.MCP.Endpoint
+	if currentMCP == "" && tunnel.MCP.Command != nil {
+		currentMCP = tunnel.MCP.Command.Executable
+	}
+	return []editRow{
+		{
+			field: editTunnelID, label: "Tunnel ID", current: tunnel.TunnelID,
+			pending: derefString(s.tunnelID), editable: true,
+			explain: "The tunnel created in the platform's own settings that this connection adopts.",
+		},
+		{
+			field: editTunnelMCP, label: "Forwards to",
+			current: currentMCP, pending: derefString(s.tunnelMCP), editable: true,
+			explain: "The local MCP endpoint, or the executable that starts one.",
+		},
+	}
+}
+
 // accountRow is the account selector, offered only where accounts apply.
 func (s *editState) accountRow() editRow {
 	summary := s.detail.Summary

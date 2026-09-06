@@ -45,6 +45,12 @@ func (m Model) confirmOnScreen() (Model, tea.Cmd, bool) {
 		return m.useDiscoveredService()
 
 	case ScreenSettings:
+		// While a rotation is awaiting confirmation, enter is its answer, not
+		// the highlighted setting's. The rotation command itself re-checks the
+		// flag, so the two cannot disagree.
+		if m.settings != nil && m.settings.confirmingRotate {
+			return m, m.rotateSecretKeyCmd(), true
+		}
 		return m.changeSelectedSetting()
 	}
 	return m, nil, true
@@ -81,7 +87,7 @@ func (m Model) useDiscoveredService() (Model, tea.Cmd, bool) {
 	}
 	svc := m.discovery[m.discoverySelected]
 	m.wizard = screens.NewWizardForService(m.client, m.providerSnapshot(), svc.Address, svc.Protocol).
-		WithContext(m.rootCtx).WithDefaults(m.lifecycleDefaults())
+		WithContext(m.rootCtx).WithASCII(m.useASCII).WithDefaults(m.lifecycleDefaults())
 	m.status = ""
 	m.pushScreen(ScreenNewConnection)
 	return m, nil, true

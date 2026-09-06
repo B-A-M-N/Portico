@@ -127,6 +127,10 @@ type GatewayStartSpec struct {
 	// AuthTokens are accepted credentials when AuthRequired is true. When
 	// empty and AuthRequired is true, the implementation generates one.
 	AuthTokens []string
+	// CredentialRef is the opaque durable reference projected to clients. It
+	// is metadata only; plaintext credentials remain in AuthTokens and never
+	// cross a runtime DTO boundary.
+	CredentialRef string
 	// AllowSSE declares that long-lived event-stream responses must pass
 	// through unbuffered.
 	AllowSSE bool
@@ -144,6 +148,12 @@ type GatewayService interface {
 	StopGateway(connectionID ConnectionID) error
 }
 
+// GatewayTargetRef is the symbolic effective-origin reference a provider plan
+// carries when the profile requires a gateway but no gateway endpoint exists
+// during preview. The executor resolves it against the supervisor-owned
+// gateway at apply time and fails closed when none is running.
+const GatewayTargetRef = "portico://gateway"
+
 // DesiredConnection describes the desired connection state
 type DesiredConnection struct {
 	Profile *ConnectionProfile
@@ -155,6 +165,11 @@ type DesiredConnection struct {
 	// know why the target is a gateway rather than the raw service, only that
 	// this is where traffic goes. Empty means transport directly.
 	GatewayEndpoint string
+	// GatewayRequired states that the profile requires a gateway in the traffic
+	// path. Providers must never fall back to Origin.URL when this is true and
+	// GatewayEndpoint is empty; the symbolic GatewayTargetRef is resolved at
+	// apply time instead.
+	GatewayRequired bool
 }
 
 // AuthRequest describes an authentication request

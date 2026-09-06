@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	profilepkg "github.com/B-A-M-N/portico/internal/profile"
 	"github.com/B-A-M-N/portico/internal/provider"
 )
 
@@ -25,6 +26,10 @@ type RecommendationInput struct {
 	ProtectionKind    core.ProtectionKind
 	RequestedAddress  string
 	PreferredAccount  core.ProviderAccountID
+	// ProfileKind is the workload the connection carries ("openai_mcp",
+	// "openai_compatible", "web_service"). Empty derives from SourceKind,
+	// matching how the create path derives it.
+	ProfileKind core.ProfileKind
 }
 
 // ProviderEvaluation is the verdict for one provider against the requirements.
@@ -67,7 +72,7 @@ func (c *Controller) Recommend(ctx context.Context, input RecommendationInput) (
 
 	var eligible, ineligible []ProviderEvaluation
 	for _, prov := range snapshots {
-		eval := evaluateProvider(prov, input)
+		eval := evaluateProvider(prov, input, c.profileRegistry)
 		if eval.Eligible {
 			eligible = append(eligible, eval)
 		} else {
@@ -101,7 +106,10 @@ func (c *Controller) Recommend(ctx context.Context, input RecommendationInput) (
 }
 
 // evaluateProvider applies hard constraints, then scores what survives.
-func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput) ProviderEvaluation {
+//
+// profileRegistry may be nil: callers without one skip the workload-profile
+// constraint, exactly as validateProfileTransport does.
+func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput, reg *profilepkg.Registry) ProviderEvaluation {
 	eval := ProviderEvaluation{
 		ProviderID:   prov.ID,
 		DisplayName:  prov.DisplayName,
@@ -164,6 +172,18 @@ func evaluateProvider(prov provider.ProviderSnapshot, input RecommendationInput)
 		if pc, ok := caps.Protocols[input.Protocol]; !ok || !pc.Supported {
 			eval.BlockingReasons = append(eval.BlockingReasons,
 				fmt.Sprintf("does not support the %s protocol", input.Protocol))
+		}
+	}
+
+	// Constraint: workload profile. The create path refuses a transport that
+	// cannot carry the connection's profile (validateProfileTransport, surface
+	// code PTO-CORE-009). Evaluating the same compatibility here is what keeps
+	// the wizard from offering that provider: a refusal the user first meets
+	// after answering every question is a refusal shown too late.
+	if kind := requiredProfileKind(input); kind != "" && reg != nil {
+		if def, ok := reg.Lookup(kind); ok && !def.Compatible(transportCapabilities(caps)) {
+			eval.BlockingReasons = append(eval.BlockingReasons,
+				profileBlockingReason(kind))
 		}
 	}
 
@@ -300,4 +320,28 @@ func summariseNoCandidate(input RecommendationInput, ineligible []ProviderEvalua
 		}
 	}
 	return b.String()
+}
+
+// requiredProfileKind names the workload profile a recommendation input
+// implies. It mirrors derivedProfileKind for the pre-create inputs the
+// wizard evaluates: an MCP source is carried by the openai_mcp profile, and
+// every other input implies the web-service default. An explicit profile on
+// the request wins when one is given. The empty result means no profile
+// constraint applies.
+func requiredProfileKind(input RecommendationInput) profilepkg.ProfileKind {
+	if input.ProfileKind != "" {
+		return profilepkg.ProfileKind(input.ProfileKind)
+	}
+	if input.SourceKind == core.SourceMCP {
+		return profilepkg.ProfileOpenAIMCP
+	}
+	return ""
+}
+
+// profileBlockingReason states the refusal in the user's own terms.
+func profileBlockingReason(kind profilepkg.ProfileKind) string {
+	if kind == profilepkg.ProfileOpenAIMCP {
+		return "cannot carry an MCP workload, which needs streaming"
+	}
+	return fmt.Sprintf("cannot carry the %s workload", kind)
 }

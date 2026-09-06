@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	cf "github.com/cloudflare/cloudflare-go"
+
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider"
 )
@@ -15,6 +17,9 @@ import (
 type DefinitionConfig struct {
 	// Bin is the cloudflared executable name or path.
 	Bin string
+	// APIBaseURL is an optional Cloudflare API endpoint override used by tests
+	// and controlled deployments.
+	APIBaseURL string
 }
 
 // Definition describes Cloudflare to Portico before any adapter exists.
@@ -119,8 +124,12 @@ func (d *Definition) Activate(_ context.Context, req provider.ActivationRequest)
 	for _, material := range req.Accounts {
 		account := material.Account
 		zone := strings.TrimSpace(account.Metadata["zone_id"])
-		child, err := New(string(material.Secret), string(account.ID), zone,
-			d.cfg.Bin, req.Services.ConnectorDir, req.Services.Processes)
+		var options []cf.Option
+		if d.cfg.APIBaseURL != "" {
+			options = append(options, cf.BaseURL(d.cfg.APIBaseURL))
+		}
+		child, err := newWithOptions(string(material.Secret), string(account.ID), zone,
+			d.cfg.Bin, req.Services.ConnectorDir, req.Services.Processes, options...)
 		if err != nil {
 			// One unusable account must not cost the others their adapter.
 			infos = append(infos, provider.AccountInfo{

@@ -37,10 +37,12 @@ is what ships; treat the disagreement as a defect in one of them and say which.
 | Port forward (local) | yes | enabled |
 | ngrok | yes | disabled — experimental opt-in |
 | OpenAI Secure MCP Tunnel | yes | disabled — experimental opt-in |
-| Tailscale, zrok | none | catalog entries only, so the UI can explain the gap |
+| Tailscale | beta | compiled in; publishes through Serve using the machine's existing tailnet membership; signs nothing in |
+| zrok | none | catalog entry only, so the UI can explain the gap |
 
-Sections below describing Tailscale or zrok behaviour are design, not
-implementation.
+Sections below describing zrok behaviour are design, not implementation.
+Tailscale sections describe the shipped beta adapter: machine-membership
+detection, Serve publishing, and no machine sign-in.
 
 ---
 

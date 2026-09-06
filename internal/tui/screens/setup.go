@@ -33,6 +33,16 @@ func (m *SetupModel) rows() []ipc.ProviderReadinessDTO {
 	return m.Readiness.Providers
 }
 
+// Rows, SelectedRow and SetSelectedRow expose the setup screen's cursor to the
+// shared selection machinery. Without them, page and jump keys free-scrolled
+// the viewport instead of moving the cursor — the setup screen steers a
+// selection like every other list, so it participates in the same contract.
+func (m *SetupModel) Rows() int { return len(m.rows()) }
+
+func (m *SetupModel) SelectedRow() int { return m.selected }
+
+func (m *SetupModel) SetSelectedRow(index int) { m.selected = index }
+
 // HandleKey moves the selection.
 func (m *SetupModel) HandleKey(key string) {
 	switch key {
@@ -71,6 +81,10 @@ func (m *SetupModel) View() string {
 		return b.String()
 	}
 
+	// The screen is identified like every other one. It previously began
+	// directly with the readiness summary, so nothing on it named the screen —
+	// and nothing distinguished it from a Providers render at a glance.
+	b.WriteString("SETUP\n\n")
 	// The first line answers "can I use this yet?".
 	b.WriteString(m.Readiness.Summary)
 	b.WriteString("\n\n")
@@ -144,7 +158,10 @@ func (m *SetupModel) View() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString("[↑↓] select   [enter] set up   [l] launch mode   [r] refresh   [esc] back\n")
+	// The action bar is drawn by the root model from the screen's own action
+	// set, so a key advertised there is a key this screen accepts. A second
+	// hardcoded copy here drifted from it — one listed actions the other did
+	// not — which is exactly the two-answers problem.
 	return b.String()
 }
 

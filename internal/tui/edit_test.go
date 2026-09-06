@@ -49,6 +49,31 @@ func forwardDetail() *ipc.ConnectionDetailDTO {
 	}
 }
 
+func clientTunnelDetail() *ipc.ConnectionDetailDTO {
+	return &ipc.ConnectionDetailDTO{
+		Summary: ipc.ConnectionDTO{
+			ID: "ct-1", Name: "secure mcp", Kind: "client_tunnel",
+			DesiredState: "closed", UserState: "Closed", ProviderID: "client_tunnel",
+		},
+		Revision: 9,
+		Driver:   ipc.DriverSelectionDTO{ProviderID: "client_tunnel"},
+		DesiredSpec: ipc.ConnectionSpecDTO{
+			Kind: "client_tunnel",
+			ClientTunnel: &ipc.ClientTunnelSpecDTO{
+				Client:   "openai_secure_mcp_tunnel",
+				TunnelID: "tunnel_0123456789abcdef0123456789abcdef",
+				// A persisted legacy value must remain readable without being
+				// presented or re-sent by a normal edit.
+				Profile: "legacy-native",
+				MCP: ipc.MCPSourceDTO{
+					Transport: "http", Endpoint: "http://127.0.0.1:9000/mcp",
+				},
+			},
+		},
+		Lifecycle: ipc.LifecycleDTO{OnDisconnect: "keep_alive"},
+	}
+}
+
 func editingModel(t *testing.T, client *fakeClient, detail *ipc.ConnectionDetailDTO) Model {
 	t.Helper()
 	m := readyModel(client, twoConnectionSnapshot())

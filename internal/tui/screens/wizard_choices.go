@@ -23,7 +23,8 @@ type wizardChoice struct {
 	// Available reports whether this can be picked now.
 	Available bool
 	// Reason says why it cannot be picked, in the user's terms.
-	Reason string
+	Reason  string
+	Section string // group label for multi-section menus
 	// Detail expands under the highlighted choice: what it does, and for an
 	// unavailable one, what would make it work.
 	Detail []string
@@ -67,7 +68,7 @@ func firstAvailable(choices []wizardChoice) int {
 //
 // The footer describes only the keys that do something here: a one-item menu
 // used to advertise navigation that had nowhere to go.
-func renderChoices(title string, choices []wizardChoice, selected int) string {
+func (m *WizardModel) renderChoices(title string, choices []wizardChoice, selected int) string {
 	var b strings.Builder
 	b.WriteString(title)
 	b.WriteString("\n\n")
@@ -75,7 +76,10 @@ func renderChoices(title string, choices []wizardChoice, selected int) string {
 	for i, choice := range choices {
 		prefix := "  "
 		if i == selected {
-			prefix = "▸ "
+			prefix = "\u25b8 "
+			if m.useASCII {
+				prefix = "> "
+			}
 		}
 		mark := ""
 		if !choice.Available {

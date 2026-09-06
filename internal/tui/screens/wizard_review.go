@@ -25,6 +25,14 @@ func (m *WizardModel) renderReview() string {
 	b.WriteString("REVIEW\n\n")
 	b.WriteString(m.state.Name + " — " + strings.ToLower(ConnectionKindLabel(m.state.ConnectionKind)) + "\n\n")
 
+	// A refused creation is the one fact this screen must not hide. The error
+	// used to render below the save choices — off-screen at every terminal
+	// size this screen has — so Enter appeared to do nothing while the create
+	// failed silently. Errors lead, consequences follow.
+	if m.err != nil {
+		b.WriteString("Error: " + m.err.Error() + "\n\n")
+	}
+
 	for _, section := range m.reviewSections() {
 		b.WriteString(section.title + "\n")
 		for _, line := range section.lines {
@@ -43,14 +51,10 @@ func (m *WizardModel) renderReview() string {
 	}
 
 	b.WriteString("What should Portico do?\n")
-	b.WriteString(renderMenu("", []string{
+	b.WriteString(m.renderMenu("", []string{
 		"Save it, closed — you can open it whenever you want",
 		"Save it and open it now — you will see the plan first",
-	}, m.selected))
-
-	if m.err != nil {
-		b.WriteString("\n\nError: " + m.err.Error())
-	}
+	}, m.selected, m.contentWidth()))
 	return b.String()
 }
 
@@ -85,10 +89,50 @@ func (m *WizardModel) serviceExposureReview() []reviewSection {
 		{title: "When you close it", lines: []string{ClosingSentence(m.state)}},
 		{title: "Startup and quitting", lines: m.lifecycleLines()},
 	}
+	// SPEC §29.4: a publicly reachable directory anyone can change must be
+	// named as the risk it is before approval, not described in neutral field
+	// words. The consequences are distinct because they are distinct: upload
+	// means strangers can add content under your hostname, delete means they
+	// can remove files Portico will never bring back. Stating both together is
+	// the point — upload-only sounded benign next to a delete-only warning.
+	if warning := m.mutableDirectoryWarning(); len(warning) > 0 {
+		sections = append(sections, reviewSection{title: "Security warning", lines: warning})
+	}
 	if extra := m.sourceDetailLines(); len(extra) > 0 {
 		sections = append(sections, reviewSection{title: "Details", lines: extra})
 	}
 	return sections
+}
+
+// mutableDirectoryWarning states what a public, write-enabled directory
+// exposes, when upload and/or delete is enabled. It is a review section so it
+// is conspicuous on the approval screen itself rather than buried in Details.
+func (m *WizardModel) mutableDirectoryWarning() []string {
+	if m.state.SourceType != "directory" {
+		return nil
+	}
+	// Private exposure carries the same mechanics with no strangers on the
+	// path; the warning is about public reachability.
+	if m.state.ExposureMode != "permanent_public" && m.state.ExposureMode != "temporary_public" {
+		return nil
+	}
+	var lines []string
+	if m.state.AllowUpload {
+		lines = append(lines,
+			"UPLOAD is enabled: anyone who can reach this address can add or replace "+
+				"files in this directory, under your hostname, with no sign-in.")
+	}
+	if m.state.AllowDelete {
+		lines = append(lines,
+			"DELETE is enabled: anyone who can reach this address can remove files. "+
+				"Deleted files are NOT restored — removal is permanent.")
+	}
+	if len(lines) > 0 {
+		lines = append(lines,
+			"Protect it with email sign-in (press Esc and change Protection), or serve "+
+				"the directory read-only.")
+	}
+	return lines
 }
 
 // portForwardReview describes a local forward, which has no public address, no

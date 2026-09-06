@@ -49,10 +49,41 @@ func (m *APIManager) CreateCNAME(ctx context.Context, zoneID, hostname, tunnelID
 		Comment: "Created by Portico",
 	})
 	if err != nil {
+		if cloudflareHasCode(err, 81057) {
+			records, _, lookupErr := m.client.ListDNSRecords(ctx, rc, cf.ListDNSRecordsParams{
+				Name: hostname,
+				Type: "CNAME",
+			})
+			if lookupErr == nil {
+				for _, existing := range records {
+					if existing.ID != "" && existing.Name == hostname && existing.Type == "CNAME" {
+						return existing.ID, nil
+					}
+				}
+			}
+		}
 		return "", fmt.Errorf("creating CNAME record: %w", err)
 	}
 
 	return record.ID, nil
+}
+
+func cloudflareHasCode(err error, code int) bool {
+	var cfErr *cf.Error
+	if !errors.As(err, &cfErr) {
+		return false
+	}
+	for _, got := range cfErr.ErrorCodes {
+		if got == code {
+			return true
+		}
+	}
+	for _, detail := range cfErr.Errors {
+		if detail.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateCNAME retargets one exact managed CNAME record without deleting and

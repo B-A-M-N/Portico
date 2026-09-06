@@ -760,8 +760,19 @@ func readBounded(r io.Reader, limit int64) ([]byte, error) {
 
 func collectSetupValues(cmd *cobra.Command, flow *ipc.SetupFlowDTO) (map[string]string, error) {
 	values := map[string]string{}
-	readStdin, _ := cmd.Flags().GetBool("credential-stdin")
-	credentialFD, _ := cmd.Flags().GetInt("credential-fd")
+	readStdin := false
+	if flag := cmd.Flags().Lookup("credential-stdin"); flag != nil {
+		readStdin, _ = cmd.Flags().GetBool("credential-stdin")
+	}
+	credentialFD := -1
+	credentialFDSet := false
+	if flag := cmd.Flags().Lookup("credential-fd"); flag != nil {
+		credentialFDSet = flag.Changed
+		credentialFD, _ = cmd.Flags().GetInt("credential-fd")
+		if credentialFDSet && credentialFD < 0 {
+			return nil, fmt.Errorf("credential file descriptor must be non-negative")
+		}
+	}
 	if readStdin && credentialFD >= 0 {
 		return nil, fmt.Errorf("choose only one of --credential-stdin and --credential-fd")
 	}
@@ -792,7 +803,7 @@ func collectSetupValues(cmd *cobra.Command, flow *ipc.SetupFlowDTO) (map[string]
 				var data []byte
 				data, readErr = readBounded(cmd.InOrStdin(), maxCredentialBytes)
 				secret = strings.TrimSpace(string(data))
-			case credentialFD >= 0:
+			case credentialFDSet:
 				file := os.NewFile(uintptr(credentialFD), "credential-fd")
 				if file == nil {
 					readErr = fmt.Errorf("invalid credential file descriptor %d", credentialFD)
@@ -886,198 +897,6 @@ func handleDiscover(cmd *cobra.Command) error {
 //
 // It used to make its own health judgements: a switch over provider availability
 // strings, reaching verdicts the readiness screen reached differently from the same
-// data. Two interpretations of one field is one too many, and the one that drifted
-// was whichever nobody was reading.
-//
-// So doctor now prints the supervisor's checks. It adds only what the supervisor
-// cannot answer — the state of files on this machine, which doctor can see without
-// a supervisor running — and stays read-only: everything below observes and nothing
-// changes state.
-func handleDoctor(cmd *cobra.Command) error {
-	fmt.Println("Portico Doctor")
-	fmt.Println("==============")
-	launcher := app.NewLauncher()
-	paths := launcher.GetPaths()
-
-	// Local files first, because these are answerable whether or not a supervisor
-	// is running — and when one is not, they are all a user gets.
-	doctorFileStatus("Database", paths.DatabasePath, 0600)
-	doctorSecretKeyStatus(filepath.Dir(paths.DatabasePath))
-
-	// Doctor is observational by default. In particular, it must not call
-	// getClient because that helper starts a supervisor when none is running.
-	client := launcher.ConnectToSupervisor()
-	if err := client.Health(cmd.Context()); err != nil {
-		fmt.Printf("\n✗ Supervisor: not running (%v)\n", err)
-		fmt.Println("  Everything below needs a running supervisor. Start one with:")
-		fmt.Println("    portico supervisor run")
-		return fmt.Errorf("supervisor is not running: %w", err)
-	}
-
-	snap, err := client.Snapshot(cmd.Context())
-	if err != nil {
-		return fmt.Errorf("read supervisor snapshot: %w", err)
-	}
-	running := 0
-	for _, c := range snap.Connections {
-		if c.RuntimeState == "open" {
-			running++
-		}
-	}
-	fmt.Printf("\n✓ Supervisor reachable (seq: %d)\n", snap.LastSeq)
-	fmt.Printf("✓ Connections: %d, of which %d open\n", len(snap.Connections), running)
-
-	// The supervisor's own checks. Readiness carries them, so this is the same
-	// interpretation the setup screen shows rather than a second one.
-	readiness, err := client.Readiness(cmd.Context())
-	if err != nil {
-		fmt.Printf("\n⚠ Could not read the supervisor's health checks: %v\n", err)
-		return nil
-	}
-
-	fmt.Println()
-	if readiness.Summary != "" {
-		fmt.Println(readiness.Summary)
-		fmt.Println()
-	}
-
-	problems := 0
-	for _, check := range readiness.Checks {
-		fmt.Printf("%s %s\n", doctorCheckMark(check.State), doctorCheckTitle(check))
-		if check.Summary != "" {
-			fmt.Printf("    %s\n", check.Summary)
-		}
-		if check.Detail != "" {
-			fmt.Printf("    %s\n", check.Detail)
-		}
-		if check.NextAction != "" {
-			fmt.Printf("    → %s\n", check.NextAction)
-		}
-		// Technical detail is secondary and printed last, so a reader who does not
-		// need it does not have to read past it to find what to do.
-		if check.Technical != "" {
-			fmt.Printf("    (%s)\n", check.Technical)
-		}
-		if check.State == "problem" {
-			problems++
-		}
-	}
-
-	// Connections that cannot open, with the reason. The supervisor computed these
-	// blockers; doctor reports them rather than working them out again.
-	var blocked []ipc.ConnectionReadinessDTO
-	for _, conn := range readiness.Connections {
-		if !conn.Ready {
-			blocked = append(blocked, conn)
-		}
-	}
-	if len(blocked) > 0 {
-		fmt.Printf("\n%d connection(s) cannot open:\n", len(blocked))
-		for _, conn := range blocked {
-			fmt.Printf("  ✗ %s\n", conn.Name)
-			for _, blocker := range conn.Blockers {
-				fmt.Printf("      %s\n", blocker)
-			}
-		}
-	}
-
-	if problems > 0 {
-		// A non-zero exit is how a script learns something is wrong. The message
-		// says what it means, because "exit 1" on its own does not.
-		fmt.Printf("\n%d problem(s) will stop Portico working.\n", problems)
-		return fmt.Errorf("%d health problem(s) found", problems)
-	}
-	fmt.Println("\nNothing is wrong that Portico can see.")
-	return nil
-}
-
-// doctorCheckMark is the leading glyph for a check's state.
-func doctorCheckMark(state string) string {
-	switch state {
-	case "ok":
-		return "✓"
-	case "attention":
-		return "~"
-	case "problem":
-		return "✗"
-	default:
-		// Unknown is not a pass. Printing a tick for a check that could not run is
-		// how a broken machine reads as a healthy one.
-		return "?"
-	}
-}
-
-// doctorCheckTitle names the check, falling back to its ID.
-func doctorCheckTitle(check ipc.HealthCheckDTO) string {
-	if check.Title != "" {
-		return check.Title
-	}
-	return check.ID
-}
-
-// doctorSecretKeyStatus reports the status of the secret store installation key.
-// It lists all versioned key files rather than hardcoding "portico-key.bin".
-func doctorSecretKeyStatus(dataDir string) {
-	entries, err := os.ReadDir(dataDir)
-	if err != nil {
-		fmt.Printf("~ Secret store: cannot read %s: %v\n", dataDir, err)
-		return
-	}
-	var keyFiles []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if name == "portico-key.bin" || strings.HasPrefix(name, "portico-key-v") && strings.HasSuffix(name, ".bin") {
-			keyFiles = append(keyFiles, name)
-		}
-	}
-	if len(keyFiles) == 0 {
-		fmt.Printf("~ Installation key: not created yet\n")
-		return
-	}
-	for _, name := range keyFiles {
-		path := filepath.Join(dataDir, name)
-		info, err := os.Stat(path)
-		if err != nil {
-			fmt.Printf("✗ Installation key: %s: %v\n", name, err)
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			fmt.Printf("✗ Installation key: %s: not a regular file\n", name)
-			continue
-		}
-		if info.Mode().Perm() != 0600 {
-			fmt.Printf("✗ Installation key: %s: permissions %o, expected 600\n", name, info.Mode().Perm())
-			continue
-		}
-		fmt.Printf("✓ Installation key: %s\n", path)
-	}
-}
-
-func doctorFileStatus(label, path string, expectedMode os.FileMode) {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		fmt.Printf("~ %s: not created yet\n", label)
-		return
-	}
-	if err != nil {
-		fmt.Printf("✗ %s: %v\n", label, err)
-		return
-	}
-	if !info.Mode().IsRegular() {
-		fmt.Printf("✗ %s: not a regular file\n", label)
-		return
-	}
-	if info.Mode().Perm() != expectedMode {
-		fmt.Printf("✗ %s: permissions %o, expected %o\n", label, info.Mode().Perm(), expectedMode)
-		return
-	}
-	fmt.Printf("✓ %s: %s\n", label, path)
-}
-
-// createConnection creates a connection from the command flags.
 func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, error) {
 	client, err := getClient(cmd)
 	if err != nil {

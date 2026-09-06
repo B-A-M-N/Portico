@@ -8,7 +8,7 @@ LDFLAGS  = -s -w \
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e vet staticcheck fmt-check validate acceptance release-check artifact-check clean
+.PHONY: build build-race install test test-race test-e2e tui-e2e tui-e2e-live vet staticcheck fmt-check validate acceptance release-check artifact-check clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -30,6 +30,31 @@ test-race:
 
 test-e2e:
 	go test ./test/... -count=1 -v
+
+# tui-e2e is the deterministic compiled-binary TUI gate documented in
+# docs/TUI_E2E.md. It exists as a target because an opt-in suite nobody has a
+# command for is a suite that never runs; it builds the real binary first so
+# the test exercises what ships, not whatever ./portico happens to be lying
+# around from.
+tui-e2e: build
+	PORTICO_TUI_E2E=1 PORTICO_TUI_E2E_ARTIFACT_DIR=artifacts/tui-e2e \
+		go test ./test/tui_e2e/ -count=1 -v
+
+# tui-e2e-live is the live-provider gate: same PTY harness, real provider
+# traffic. It refuses to run without the explicit PORTICO_E2E_LIVE=1 opt-in so
+# no routine gate ever bills a provider account or publishes a tunnel.
+#
+# Usage:
+#   PORTICO_E2E_LIVE=1 PORTICO_TUI_E2E_LIVE_PROVIDER=cloudflare \
+#   PORTICO_TUI_E2E_LIVE_SOURCE=127.0.0.1:8080 make tui-e2e-live
+tui-e2e-live: build
+	@if [ "$(PORTICO_E2E_LIVE)" != "1" ]; then \
+		echo "tui-e2e-live is opt-in: it drives real provider traffic."; \
+		echo "Re-run with PORTICO_E2E_LIVE=1 and PORTICO_TUI_E2E_LIVE_PROVIDER=<provider> set."; \
+		exit 1; \
+	fi
+	PORTICO_TUI_E2E=1 PORTICO_E2E_LIVE=1 PORTICO_TUI_E2E_ARTIFACT_DIR=artifacts/tui-e2e-live \
+		go test ./test/tui_e2e/ -run TestLiveTUIExternalProviderRequiresExplicitOptIn -count=1 -v
 
 vet:
 	go vet ./...

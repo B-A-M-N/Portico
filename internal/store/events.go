@@ -69,7 +69,14 @@ func (s *Store) AppendEvent(ctx context.Context, operationID core.OperationID, c
 	defer s.mu.Unlock()
 
 	if occurredAt.IsZero() {
-		occurredAt = time.Now().UTC()
+		occurredAt = s.now()
+	}
+	// Prune before inserting so an event explicitly timestamped at the edge of
+	// the retention window is not deleted immediately after it is accepted.
+	// The next append still removes it once it is genuinely older than the
+	// injected wall clock.
+	if err := s.pruneEventsLocked(ctx); err != nil {
+		return 0, fmt.Errorf("prune events: %w", err)
 	}
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO events (operation_id, connection_id, occurred_at, event_type, stage, payload_json)
@@ -78,16 +85,13 @@ func (s *Store) AppendEvent(ctx context.Context, operationID core.OperationID, c
 	if err != nil {
 		return 0, fmt.Errorf("append event: %w", err)
 	}
-	if err := s.pruneEventsLocked(ctx); err != nil {
-		return 0, fmt.Errorf("prune events: %w", err)
-	}
 	return result.LastInsertId()
 }
 
 // pruneEventsLocked enforces the bounded event journal required for SSE
 // replay. The caller must hold s.mu.
 func (s *Store) pruneEventsLocked(ctx context.Context) error {
-	cutoff := time.Now().UTC().Add(-eventRetentionAge).Format(time.RFC3339)
+	cutoff := s.now().Add(-eventRetentionAge).Format(time.RFC3339)
 	if _, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE occurred_at < ?", cutoff); err != nil {
 		return err
 	}

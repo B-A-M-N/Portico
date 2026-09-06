@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -67,14 +66,11 @@ func (m *Model) rotateSecretKeyCmd() tea.Cmd {
 	}
 	m.settings.rotating = true
 	client := m.client
-	ctx := m.rootCtx
 	return func() tea.Msg {
 		if client == nil {
 			return secretKeyRotatedMsg{Err: fmt.Errorf("no supervisor connection")}
 		}
-		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		result, err := client.RotateSecretKey(reqCtx)
+		result, err := client.RotateSecretKey(context.Background())
 		return secretKeyRotatedMsg{Result: result, Err: err}
 	}
 }

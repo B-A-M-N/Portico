@@ -61,6 +61,9 @@ func (nullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (nullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return &ConfigureProviderAccountResponse{}, nil
 }
+func (nullHandler) HandleValidateProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
+	return &ConfigureProviderAccountResponse{}, nil
+}
 func (nullHandler) HandleReverifyProviderAccount(string, string, ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error) {
 	return &ReverifyProviderAccountResponse{}, nil
 }

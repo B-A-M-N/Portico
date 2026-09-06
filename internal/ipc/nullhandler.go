@@ -36,6 +36,9 @@ func (NullHandler) HandleAuthenticateProvider(string) error { return nil }
 func (NullHandler) HandleConfigureProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
 	return nil, nil
 }
+func (NullHandler) HandleValidateProviderAccount(string, ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
+	return nil, nil
+}
 func (NullHandler) HandleReverifyProviderAccount(string, string, ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error) {
 	return nil, nil
 }
@@ -62,5 +65,6 @@ func (NullHandler) HandleReadiness() (*ReadinessDTO, error)                     
 func (NullHandler) HandleSetLaunchMode(string) (*LaunchModeDTO, error)            { return nil, nil }
 func (NullHandler) HandleSettings() (*SettingsDTO, error)                         { return nil, nil }
 func (NullHandler) HandleUpdateSettings(SettingsRequest) (*SettingsDTO, error)    { return nil, nil }
+func (NullHandler) HandleRotateSecretKey() (*RotateSecretKeyDTO, error)           { return nil, nil }
 func (NullHandler) HandleSupportExport() (*SupportExportDTO, error)               { return nil, nil }
 func (NullHandler) HandleSupervisorStop(context.Context) error                    { return nil }

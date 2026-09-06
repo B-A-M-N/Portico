@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -26,12 +27,134 @@ type OperationalSettings struct {
 
 // LoadOperationalSettings reads the stored settings, falling back to the
 // defaults for anything absent.
-func LoadOperationalSettings() OperationalSettings {
-	return OperationalSettings{
-		LaunchMode:          normalizeLaunchMode(viper.GetString(KeyLaunchMode)),
-		DefaultAutoStart:    viper.GetBool(KeyDefaultAutoStart),
-		DefaultOnDisconnect: normalizeOnDisconnect(viper.GetString(KeyDefaultOnDisconnect)),
+func LoadOperationalSettings() (OperationalSettings, error) {
+	launchMode, err := readSettingString(KeyLaunchMode, "auto")
+	if err != nil {
+		return OperationalSettings{}, err
 	}
+	launchMode = strings.ToLower(strings.TrimSpace(launchMode))
+	if launchMode != "manual" && launchMode != "auto" {
+		return OperationalSettings{}, fmt.Errorf("invalid launch mode %q", launchMode)
+	}
+
+	autoStart, err := readSettingBool(KeyDefaultAutoStart, true)
+	if err != nil {
+		return OperationalSettings{}, err
+	}
+	disconnect, err := readSettingString(KeyDefaultOnDisconnect, "keep_alive")
+	if err != nil {
+		return OperationalSettings{}, err
+	}
+	disconnect = strings.ToLower(strings.TrimSpace(disconnect))
+	if disconnect != "keep_alive" && disconnect != "close" {
+		return OperationalSettings{}, fmt.Errorf("invalid disconnect policy %q", disconnect)
+	}
+	return OperationalSettings{
+		LaunchMode:          launchMode,
+		DefaultAutoStart:    autoStart,
+		DefaultOnDisconnect: disconnect,
+	}, nil
+}
+
+// SettingsPatch updates only the fields supplied by the caller.
+type SettingsPatch struct {
+	LaunchMode          *string
+	DefaultAutoStart    *bool
+	DefaultOnDisconnect *string
+}
+
+// UpdateOperationalSettings validates and persists a complete merged settings
+// value in one write, so a partial update cannot leave the installation split
+// across multiple SaveConfig calls.
+func UpdateOperationalSettings(patch SettingsPatch) (OperationalSettings, error) {
+	current, err := LoadOperationalSettings()
+	if err != nil {
+		return OperationalSettings{}, err
+	}
+	if patch.LaunchMode != nil {
+		current.LaunchMode = *patch.LaunchMode
+	}
+	if patch.DefaultAutoStart != nil {
+		current.DefaultAutoStart = *patch.DefaultAutoStart
+	}
+	if patch.DefaultOnDisconnect != nil {
+		current.DefaultOnDisconnect = *patch.DefaultOnDisconnect
+	}
+	if err := SaveOperationalSettings(current); err != nil {
+		return OperationalSettings{}, err
+	}
+	return current, nil
+}
+
+// SaveOperationalSettings persists all operational settings atomically from
+// the caller's perspective. A failed disk write restores the previous in
+// memory values before returning the error.
+func SaveOperationalSettings(settings OperationalSettings) error {
+	previous, err := LoadOperationalSettings()
+	if err != nil {
+		return err
+	}
+	if err := validateOperationalSettings(settings); err != nil {
+		return err
+	}
+	applyOperationalSettings(settings)
+	if err := SaveConfig(); err != nil {
+		applyOperationalSettings(previous)
+		return err
+	}
+	return nil
+}
+
+func validateOperationalSettings(settings OperationalSettings) error {
+	mode := strings.ToLower(strings.TrimSpace(settings.LaunchMode))
+	if mode != "manual" && mode != "auto" {
+		return fmt.Errorf("launch mode must be \"manual\" or \"auto\", got %q", settings.LaunchMode)
+	}
+	policy := strings.ToLower(strings.TrimSpace(settings.DefaultOnDisconnect))
+	if policy != "keep_alive" && policy != "close" {
+		return fmt.Errorf("disconnect policy must be \"keep_alive\" or \"close\", got %q", settings.DefaultOnDisconnect)
+	}
+	return nil
+}
+
+func applyOperationalSettings(settings OperationalSettings) {
+	viper.Set(KeyLaunchMode, strings.ToLower(strings.TrimSpace(settings.LaunchMode)))
+	viper.Set(KeyDefaultAutoStart, settings.DefaultAutoStart)
+	viper.Set(KeyDefaultOnDisconnect, strings.ToLower(strings.TrimSpace(settings.DefaultOnDisconnect)))
+}
+
+func readSettingString(key, fallback string) (string, error) {
+	if !viper.IsSet(key) {
+		return fallback, nil
+	}
+	value := viper.Get(key)
+	s, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("setting %s must be a string, got %T", key, value)
+	}
+	if strings.TrimSpace(s) == "" {
+		return "", errors.New("setting " + key + " cannot be empty")
+	}
+	return s, nil
+}
+
+func readSettingBool(key string, fallback bool) (bool, error) {
+	if !viper.IsSet(key) {
+		return fallback, nil
+	}
+	value := viper.Get(key)
+	switch typed := value.(type) {
+	case bool:
+		return typed, nil
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("setting %s must be a boolean, got %T", key, value)
 }
 
 // SaveLaunchMode persists the startup gate.
@@ -43,14 +166,22 @@ func SaveLaunchMode(mode string) error {
 	if normalized != "manual" && normalized != "auto" {
 		return fmt.Errorf("launch mode must be \"manual\" or \"auto\", got %q", mode)
 	}
-	viper.Set(KeyLaunchMode, normalized)
-	return SaveConfig()
+	current, err := LoadOperationalSettings()
+	if err != nil {
+		return err
+	}
+	current.LaunchMode = normalized
+	return SaveOperationalSettings(current)
 }
 
 // SaveDefaultAutoStart persists whether a new connection is created armed.
 func SaveDefaultAutoStart(enabled bool) error {
-	viper.Set(KeyDefaultAutoStart, enabled)
-	return SaveConfig()
+	current, err := LoadOperationalSettings()
+	if err != nil {
+		return err
+	}
+	current.DefaultAutoStart = enabled
+	return SaveOperationalSettings(current)
 }
 
 // SaveDefaultOnDisconnect persists what a new connection does when the client
@@ -60,24 +191,10 @@ func SaveDefaultOnDisconnect(policy string) error {
 	if normalized != "keep_alive" && normalized != "close" {
 		return fmt.Errorf("disconnect policy must be \"keep_alive\" or \"close\", got %q", policy)
 	}
-	viper.Set(KeyDefaultOnDisconnect, normalized)
-	return SaveConfig()
-}
-
-// normalizeLaunchMode maps anything unrecognised to auto, which is the
-// behaviour an installation had before the setting existed.
-func normalizeLaunchMode(mode string) string {
-	if strings.EqualFold(strings.TrimSpace(mode), "manual") {
-		return "manual"
+	current, err := LoadOperationalSettings()
+	if err != nil {
+		return err
 	}
-	return "auto"
-}
-
-// normalizeOnDisconnect maps anything unrecognised to keep_alive, which is what
-// the wizard hardcoded before the setting existed.
-func normalizeOnDisconnect(policy string) string {
-	if strings.EqualFold(strings.TrimSpace(policy), "close") {
-		return "close"
-	}
-	return "keep_alive"
+	current.DefaultOnDisconnect = normalized
+	return SaveOperationalSettings(current)
 }

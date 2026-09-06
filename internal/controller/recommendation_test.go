@@ -53,7 +53,10 @@ func capableProvider(id core.ProviderID, authenticated bool) provider.ProviderSn
 
 func recommendWith(t *testing.T, snaps []provider.ProviderSnapshot, input RecommendationInput) *Recommendation {
 	t.Helper()
-	c := &Controller{registry: &snapshotRegistry{snaps: snaps}}
+	// The production controller always carries the workload-profile registry;
+	// building one the same way here is what makes the profile-compatibility
+	// constraint a real part of this test rather than a skipped branch.
+	c := &Controller{registry: &snapshotRegistry{snaps: snaps}, profileRegistry: defaultProfileRegistry()}
 	rec, err := c.Recommend(context.Background(), input)
 	if err != nil {
 		t.Fatalf("Recommend: %v", err)
@@ -402,5 +405,58 @@ func TestAReadyAccountlessProviderIsEligible(t *testing.T) {
 		if strings.Contains(tradeoff, "needs account setup") {
 			t.Fatal("a provider that needs no account was said to need one")
 		}
+	}
+}
+
+// TestRecommendationAppliesWorkloadProfileCompatibility pins the boundary the
+// MCP wizard path failed at: a provider whose transport cannot carry the
+// connection's workload profile must be refused by the recommendation engine
+// with the same rule validateProfileTransport applies at create time. The
+// wizard used to offer Mock — availability-ready, every stated requirement
+// satisfied — for an MCP connection, and the controller then refused the
+// create with PTO-CORE-009, an error the user met only after answering every
+// question.
+func TestRecommendationAppliesWorkloadProfileCompatibility(t *testing.T) {
+	notStreaming := capableProvider("mock", true)
+	notStreaming.Capabilities.Streaming = core.CapabilitySupport{Supported: false}
+
+	rec := recommendWith(t, []provider.ProviderSnapshot{notStreaming},
+		RecommendationInput{
+			Kind:        core.ConnectionServiceExposure,
+			SourceKind:  core.SourceMCP,
+			ProfileKind: core.ProfileOpenAIMCP,
+		})
+
+	if rec.Recommended != nil {
+		t.Fatalf("recommended a non-streaming transport for an MCP workload: %+v", rec.Recommended)
+	}
+	if len(rec.Ineligible) != 1 || len(rec.Ineligible[0].BlockingReasons) == 0 {
+		t.Fatal("the provider vanished instead of being explained")
+	}
+	joined := strings.Join(rec.Ineligible[0].BlockingReasons, "; ")
+	if !strings.Contains(joined, "MCP") {
+		t.Fatalf("refusal did not name the MCP workload: %q", joined)
+	}
+
+	// The derived path: an MCP source with no explicit profile implies
+	// openai_mcp, so the same transport is refused there too. Drift between
+	// the two lookups is exactly what produced the wizard/create disagreement.
+	rec = recommendWith(t, []provider.ProviderSnapshot{notStreaming},
+		RecommendationInput{Kind: core.ConnectionServiceExposure, SourceKind: core.SourceMCP})
+	if rec.Recommended != nil {
+		t.Fatal("a derived MCP profile did not gate the transport")
+	}
+
+	// A streaming transport is eligible for the same workload.
+	streaming := capableProvider("cloudflare-managed", true)
+	streaming.Capabilities.Streaming = core.CapabilitySupport{Supported: true, Stability: core.StabilityStable}
+	rec = recommendWith(t, []provider.ProviderSnapshot{streaming},
+		RecommendationInput{
+			Kind:        core.ConnectionServiceExposure,
+			SourceKind:  core.SourceMCP,
+			ProfileKind: core.ProfileOpenAIMCP,
+		})
+	if rec.Recommended == nil {
+		t.Fatalf("a streaming transport was refused for an MCP workload; summary=%q", rec.Summary)
 	}
 }

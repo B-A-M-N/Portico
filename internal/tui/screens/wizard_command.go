@@ -170,7 +170,7 @@ func CommandEnvSummary(env map[string]string) []string {
 
 // renderCommandShell draws the shell-mode question.
 func (m *WizardModel) renderCommandShell() string {
-	return renderChoices("How should Portico run this command?", []wizardChoice{
+	return m.renderChoices("How should Portico run this command?", []wizardChoice{
 		{
 			Value: "direct", Label: "Run it directly", Available: true,
 			Detail: []string{

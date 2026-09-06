@@ -109,7 +109,7 @@ func privateNetworkModeChoices() []wizardChoice {
 
 // renderPrivateNetworkMode draws the mode question.
 func (m *WizardModel) renderPrivateNetworkMode() string {
-	return renderChoices("What should the private network do?",
+	return m.renderChoices("What should the private network do?",
 		privateNetworkModeChoices(), m.selected)
 }
 

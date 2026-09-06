@@ -42,6 +42,7 @@ type Supervisor struct {
 	lock         *SupervisorLock
 	ready        bool
 	mutating     bool // true while accepting mutations; set false at shutdown start
+	mutation     *mutationGate
 	stopCh       chan struct{}
 	serveWG      sync.WaitGroup // tracks the IPC serve goroutine
 	shutdownOnce sync.Once      // guards idempotent shutdown
@@ -139,7 +140,11 @@ func New(paths app.Paths, registry provider.Registry, procMgr *process.Manager, 
 		// user's explicit choice is in force from the first startup after they
 		// made it. It was previously runtime-only state that began every
 		// process as auto whatever had been selected.
-		launch: config.LoadOperationalSettings().LaunchMode,
+		launch: loadLaunchMode(),
+		// Development opt-in: the hermetic gate walks the real setup path
+		// without a live Cloudflare credential. Production keeps the real
+		// validator; this substitution never happens without PORTICO_DEV.
+		accountValidator: devValidatorIfDevMode(),
 	}
 	// The controller consults the gateway manager while planning, so a
 	// provider's plan carries the effective transport target (the gateway
@@ -312,6 +317,30 @@ func (s *Supervisor) gatewaySpecFor(p *core.ConnectionProfile) (core.GatewayStar
 	// AuthRequired stays true so policy is never downgraded by absence.
 	spec.AuthRequired = p.EffectiveProfileKind() == core.ProfileOpenAICompatible
 	return spec, true
+}
+
+// planNeedsGateway detects the symbolic boundary in any plan step, including
+// compensation steps. This keeps repair and edit plans subject to the same
+// apply-time gateway admission as a fresh open.
+func planNeedsGateway(plan *core.OperationPlan) bool {
+	if plan == nil {
+		return false
+	}
+	for _, step := range plan.Steps {
+		for _, value := range step.Technical.Parameters {
+			if value == core.GatewayTargetRef {
+				return true
+			}
+		}
+		if step.Compensation != nil {
+			for _, value := range step.Compensation.Technical.Parameters {
+				if value == core.GatewayTargetRef {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // profileOriginURL resolves the local origin a gateway should front.
@@ -1175,6 +1204,7 @@ func (h *supervisorHandler) HandleProviderRecommendation(req ipc.ProviderRecomme
 		RequestedAddress:  req.RequestedAddress,
 		PreferredAccount:  core.ProviderAccountID(req.PreferredAccount),
 		PreferredProvider: core.ProviderID(req.PreferredProvider),
+		ProfileKind:       req.ProfileKind,
 	}
 
 	rec, err := h.sup.controller.Recommend(ctx, input)
@@ -1590,24 +1620,29 @@ func (h *supervisorHandler) HandlePlanClose(id string) (*ipc.PlanDTO, error) {
 func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string) (*ipc.OperationDTO, error) {
 	ctx := context.Background()
 
-	// Idempotency: if a key was provided and we already recorded an operation
-	// for it, return the cached result without re-executing.
+	// Claim the idempotency key before starting any gateway or provider work.
+	// This closes the old lookup-then-record race where two callers could both
+	// pass the lookup and execute the same external mutation.
 	if idempotencyKey != "" {
-		existingOpID, err := h.sup.store.LookupIdempotentKey(ctx, idempotencyKey)
+		reserved, existingOpID, err := h.sup.store.ReserveIdempotentKey(ctx, idempotencyKey, core.PlanID(planID))
 		if err != nil {
-			return nil, fmt.Errorf("idempotency lookup: %w", err)
+			return nil, fmt.Errorf("idempotency reservation: %w", err)
 		}
-		if existingOpID != "" {
+		if !reserved && existingOpID != "" {
 			existingOp, err := h.sup.store.GetOperation(ctx, existingOpID)
-			if err == nil && existingOp != nil {
-				return &ipc.OperationDTO{
-					ID:           string(existingOp.ID),
-					PlanID:       planID,
-					ConnectionID: string(existingOp.ConnectionID),
-					State:        existingOp.State,
-					StartedAt:    existingOp.StartedAt,
-				}, nil
+			if err != nil {
+				return nil, fmt.Errorf("idempotency replay: %w", err)
 			}
+			if existingOp == nil {
+				return nil, fmt.Errorf("idempotency replay operation %q is missing", existingOpID)
+			}
+			return &ipc.OperationDTO{
+				ID:           string(existingOp.ID),
+				PlanID:       planID,
+				ConnectionID: string(existingOp.ConnectionID),
+				State:        existingOp.State,
+				StartedAt:    existingOp.StartedAt,
+			}, nil
 		}
 	}
 
@@ -1617,9 +1652,16 @@ func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string
 	// and the provider never decides whether its workload needs a gateway.
 	var gatewayStarted bool
 	plan, planFound := h.sup.controller.GetPlan(core.PlanID(planID))
-	if planFound && plan != nil && plan.Intent == core.IntentOpen {
+	if planFound && plan != nil && (plan.Intent == core.IntentOpen || planNeedsGateway(plan)) {
 		if profile, ok := h.sup.controller.GetProfile(plan.ConnectionID); ok {
 			if spec, needed := h.sup.gatewaySpecFor(profile); needed {
+				if spec.AuthRequired {
+					tokens, ref, credentialErr := h.sup.provisionGatewayCredential(ctx, plan.ConnectionID)
+					if credentialErr != nil {
+						return nil, fmt.Errorf("provision gateway credential: %w", credentialErr)
+					}
+					spec.AuthTokens, spec.CredentialRef = tokens, ref
+				}
 				endpoint, startErr := h.sup.gatewayMgr.StartGateway(ctx, plan.ConnectionID, spec)
 				if startErr != nil {
 					return nil, fmt.Errorf("start gateway: %w", startErr)
@@ -1637,6 +1679,12 @@ func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string
 			h.sup.gatewayMgr.StopGateway(plan.ConnectionID)
 		}
 		return nil, applyErr
+	}
+	if gatewayStarted {
+		// Apply runs asynchronously. A provider failure therefore arrives after
+		// this handler returns, so synchronous cleanup alone would leave the
+		// supervisor-owned gateway listening indefinitely.
+		go h.sup.stopGatewayAfterFailedOperation(plan.ConnectionID, op.ID)
 	}
 
 	// Record the idempotency key to operation mapping for future replays.
@@ -1660,6 +1708,31 @@ func (h *supervisorHandler) HandleApplyPlan(planID string, idempotencyKey string
 		StartedAt:    op.StartedAt.Format(time.RFC3339),
 	}
 	return dto, nil
+}
+
+func (s *Supervisor) stopGatewayAfterFailedOperation(connID core.ConnectionID, opID core.OperationID) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(10 * time.Minute)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			snapshot, ok := s.controller.GetOperation(opID)
+			if !ok {
+				return
+			}
+			switch snapshot.State {
+			case controller.OperationStateFailed:
+				_ = s.gatewayMgr.StopGateway(connID)
+				return
+			case controller.OperationStateCompleted:
+				return
+			}
+		case <-timeout.C:
+			return
+		}
+	}
 }
 
 func (h *supervisorHandler) HandleListProviders() ([]ipc.ProviderDTO, error) {
@@ -2114,6 +2187,22 @@ func (h *supervisorHandler) HandlePlanEdit(id string, req ipc.UpdateConnectionRe
 func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionRequest) (*core.ConnectionProfile, error) {
 	proposed := current.DeepCopy()
 
+	if req.ProfileKind != nil {
+		if proposed.EffectiveKind() != core.ConnectionServiceExposure {
+			return nil, core.ErrValidation("profile kind applies only to service exposure connections")
+		}
+		kind := strings.TrimSpace(*req.ProfileKind)
+		if kind == "" {
+			return nil, core.ErrValidation("profile kind cannot be empty")
+		}
+		switch core.ProfileKind(kind) {
+		case core.ProfileWebService, core.ProfileOpenAICompatible, core.ProfileOpenAIMCP:
+			proposed.ProfileKind = kind
+		default:
+			return nil, core.ErrValidation(fmt.Sprintf("profile kind %q is not registered", kind))
+		}
+	}
+
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
 		if name == "" {
@@ -2224,6 +2313,35 @@ func applyEditRequest(current *core.ConnectionProfile, req ipc.UpdateConnectionR
 		}
 		if req.PortForward.Direction != "" {
 			spec.Direction = core.PortForwardDirection(req.PortForward.Direction)
+		}
+	}
+	if req.ClientTunnel != nil {
+		if proposed.EffectiveKind() != core.ConnectionClientTunnel || proposed.Spec.ClientTunnel == nil {
+			return nil, core.ErrValidation("this connection is not a client tunnel, so it has no client-tunnel settings to change")
+		}
+		spec := proposed.Spec.ClientTunnel
+		if req.ClientTunnel.TunnelID != "" {
+			spec.TunnelID = strings.TrimSpace(req.ClientTunnel.TunnelID)
+		}
+		if req.ClientTunnel.MCP.Endpoint != "" {
+			spec.MCP.Endpoint = strings.TrimSpace(req.ClientTunnel.MCP.Endpoint)
+			spec.MCP.Command = nil
+		}
+		if req.ClientTunnel.MCP.Command != nil {
+			command := req.ClientTunnel.MCP.Command
+			spec.MCP.Endpoint = ""
+			spec.MCP.Command = &core.CommandSpec{
+				Executable: command.Executable,
+				Args:       append([]string(nil), command.Args...),
+				WorkingDir: command.WorkingDir,
+				Env:        command.Env,
+				Port:       command.Port,
+				Protocol:   core.Protocol(command.Protocol),
+				UseShell:   command.UseShell,
+			}
+		}
+		if req.ClientTunnel.MCP.Transport != "" {
+			spec.MCP.Transport = core.MCPTransport(req.ClientTunnel.MCP.Transport)
 		}
 	}
 	return proposed, nil
@@ -2444,7 +2562,10 @@ func (h *supervisorHandler) HandleAuthenticateProvider(id string) error {
 // config file, so an environment override is visible as the mode actually in
 // force together with the fact that it is pinned.
 func (h *supervisorHandler) HandleSettings() (*ipc.SettingsDTO, error) {
-	stored := config.LoadOperationalSettings()
+	stored, err := config.LoadOperationalSettings()
+	if err != nil {
+		return nil, fmt.Errorf("could not load operational settings: %w", err)
+	}
 	dto := &ipc.SettingsDTO{
 		LaunchMode:          h.sup.launchMode(),
 		DefaultAutoStart:    stored.DefaultAutoStart,
@@ -2455,6 +2576,14 @@ func (h *supervisorHandler) HandleSettings() (*ipc.SettingsDTO, error) {
 		dto.LaunchModePinnedBy = launchModeEnv
 	}
 	return dto, nil
+}
+
+func loadLaunchMode() string {
+	settings, err := config.LoadOperationalSettings()
+	if err != nil {
+		return LaunchAuto
+	}
+	return settings.LaunchMode
 }
 
 // HandleUpdateSettings changes operational settings and reports what is in
@@ -2546,6 +2675,8 @@ func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDT
 		Kind:            string(flow.Kind),
 		Summary:         flow.Summary,
 		CapabilityNotes: flow.CapabilityNotes,
+		IdentityField:   flow.IdentityField,
+		SecretField:     flow.SecretField,
 	}
 	if dto.Kind == "" {
 		dto.Kind = string(core.SetupAccount)
@@ -2565,6 +2696,7 @@ func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDT
 			Secret:      field.Secret,
 			Required:    field.Required,
 			Placeholder: field.Placeholder,
+			InputKind:   field.InputKind,
 			EnvVars:     field.EnvVars,
 		})
 	}
@@ -2730,8 +2862,17 @@ func (h *supervisorHandler) HandleRemoveProviderAccount(providerID, accountID st
 	if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(providerID)); activateErr != nil {
 		slog.Warn("could not reactivate the provider in place", "provider", providerID, "err", activateErr)
 		restartRequired = true
+		if activationUnavailable(activateErr) {
+			return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired}, nil
+		}
+		return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired},
+			fmt.Errorf("activate provider %q after account removal: %w", providerID, activateErr)
 	}
 	return &ipc.RemoveProviderAccountResponse{Removed: true, RestartRequired: restartRequired}, nil
+}
+
+func activationUnavailable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "provider activation is unavailable")
 }
 
 // describeAccountDependencies says what is in the way, in terms of what the
@@ -2760,6 +2901,102 @@ func describeAccountDependencies(deps store.AccountDependencies) string {
 			"%d connection(s) still use this account; reassign or delete them before removing it",
 			connections)
 	}
+}
+
+// HandleValidateProviderAccount verifies a credential without persisting it.
+// When the credential can reach multiple accounts, it returns non-secret
+// account choices and leaves the final validation to a request naming one.
+func (h *supervisorHandler) HandleValidateProviderAccount(id string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
+	if id != "cloudflare" {
+		return nil, core.ErrValidation(fmt.Sprintf("provider %q does not support account validation here", id))
+	}
+	credential := strings.TrimSpace(req.Credential)
+	if credential == "" {
+		return nil, core.ErrValidation("a Cloudflare API token is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	validator := h.sup.accountValidator
+	if validator == nil {
+		validator = cloudflareAccountValidator{}
+	}
+	accountID := strings.TrimSpace(req.AccountID)
+	discoveredLabel := ""
+	if accountID == "" {
+		lister, ok := validator.(accountLister)
+		if !ok {
+			return nil, core.ErrValidation("a Cloudflare account ID is required")
+		}
+		accounts, err := lister.ListAccounts(ctx, credential)
+		if err != nil {
+			return nil, core.ErrValidation(err.Error())
+		}
+		if len(accounts) == 0 {
+			return nil, core.ErrValidation("the credential cannot access a Cloudflare account")
+		}
+		if len(accounts) > 1 {
+			resp := &ipc.ConfigureProviderAccountResponse{AccountSelectionRequired: true}
+			for _, account := range accounts {
+				label := account.Name
+				if label == "" {
+					label = account.ID
+				}
+				resp.AccountChoices = append(resp.AccountChoices, ipc.ProviderAccountDTO{
+					ID: account.ID, Label: label,
+				})
+			}
+			return resp, nil
+		}
+		accountID = accounts[0].ID
+		discoveredLabel = accounts[0].Name
+	}
+	validation, err := validator.Validate(ctx, id, accountID, credential)
+	resp := &ipc.ConfigureProviderAccountResponse{AccountID: accountID}
+	if validation != nil {
+		resp.MissingPermissions = validation.MissingPermissions
+		for _, zone := range validation.Zones {
+			resp.Zones = append(resp.Zones, ipc.ZoneDTO{ID: zone.ID, Name: zone.Name})
+		}
+	}
+	if err != nil {
+		return resp, core.ErrValidation(err.Error())
+	}
+	if validation == nil || !validation.AccountAccessible {
+		return resp, core.ErrValidation("the credential could not be confirmed against that Cloudflare account")
+	}
+	if zoneID := strings.TrimSpace(req.ZoneID); zoneID != "" {
+		zones, err := validator.VerifyZone(ctx, credential, zoneID)
+		if err != nil {
+			return resp, core.ErrValidation(err.Error())
+		}
+		found := false
+		for _, zone := range zones {
+			if zone.ID == zoneID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return resp, core.ErrValidation(fmt.Sprintf("zone %s could not be verified against this account", zoneID))
+		}
+	}
+	resp.AccountLabel = strings.TrimSpace(req.Label)
+	if resp.AccountLabel == "" {
+		resp.AccountLabel = discoveredLabel
+	}
+	if resp.AccountLabel == "" {
+		for _, choice := range resp.AccountChoices {
+			if choice.ID == accountID {
+				resp.AccountLabel = choice.Label
+				break
+			}
+		}
+	}
+	if resp.AccountLabel == "" {
+		resp.AccountLabel = accountID
+	}
+	resp.Validated = true
+	return resp, nil
 }
 
 // HandleConfigureProviderAccount configures any provider that declares a setup
@@ -2901,6 +3138,8 @@ func (h *supervisorHandler) configureDeclaredAccount(
 	if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(id)); activateErr != nil {
 		slog.Warn("could not activate the provider in place", "provider", id, "err", activateErr)
 		resp.RestartRequired = true
+		resp.Status = string(account.Status)
+		return resp, fmt.Errorf("activate provider %q: %w", id, activateErr)
 	}
 	resp.Status = string(account.Status)
 	return resp, nil
@@ -3004,8 +3243,12 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 	}
 
 	resp := &ipc.ConfigureProviderAccountResponse{
+		AccountID:          accountID,
+		AccountLabel:       label,
+		Committed:          true,
 		RestartRequired:    restartRequired,
 		Validated:          true,
+		Status:             string(account.Status),
 		MissingPermissions: validation.MissingPermissions,
 	}
 	for _, z := range validation.Zones {
@@ -3015,6 +3258,9 @@ func (h *supervisorHandler) configureCloudflareAccount(values map[string]string)
 		resp.CapabilityLevel = "tunnels_without_dns"
 	} else {
 		resp.CapabilityLevel = "tunnels_with_dns"
+	}
+	if restartRequired {
+		return resp, fmt.Errorf("activate provider %q after configuration: provider activation failed", "cloudflare")
 	}
 	return resp, nil
 }
@@ -3228,15 +3474,34 @@ func (h *supervisorHandler) runDiscovery(refresh bool) (*ipc.DiscoveryDTO, error
 
 	dto := &ipc.DiscoveryDTO{Services: make([]ipc.DiscoveredServiceDTO, 0, len(result.Services))}
 	for _, svc := range result.Services {
+		// Presentation semantics are derived once here, by the discovery
+		// authority, and carried over IPC. Clients that each re-derived them
+		// produced different service identities on the same screen.
+		selectable := true
+		disabledReason := ""
+		if svc.Protocol == "udp" || svc.Protocol == "unknown-tcp" {
+			// Portico can only publish HTTP(S). Refusing with a reason keeps the
+			// row visible — hiding it would tell the user their service does
+			// not exist.
+			selectable = false
+			disabledReason = "Portico publishes HTTP and HTTPS only"
+		}
+		displayName := svc.Framework
+		if displayName == "" {
+			displayName = svc.Process
+		}
 		dto.Services = append(dto.Services, ipc.DiscoveredServiceDTO{
-			Address:    svc.Address,
-			Port:       svc.Port,
-			Protocol:   svc.Protocol,
-			Framework:  svc.Framework,
-			Confidence: string(svc.Confidence),
-			PID:        svc.PID,
-			Process:    svc.Process,
-			Evidence:   strings.Join(svc.Evidence, "; "),
+			Address:        svc.Address,
+			Port:           svc.Port,
+			Protocol:       svc.Protocol,
+			Framework:      svc.Framework,
+			Confidence:     string(svc.Confidence),
+			PID:            svc.PID,
+			Process:        svc.Process,
+			Evidence:       strings.Join(svc.Evidence, "; "),
+			DisplayName:    displayName,
+			Selectable:     selectable,
+			DisabledReason: disabledReason,
 		})
 	}
 	return dto, nil

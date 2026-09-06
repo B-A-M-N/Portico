@@ -39,6 +39,14 @@ const (
 	KeyDefaultAutoStart    = "operations.default_auto_start"
 	KeyDefaultOnDisconnect = "operations.default_on_disconnect"
 
+	// Client-tunnel settings. The OpenAI names are retained as read-only
+	// migration aliases for installations that used the experimental transport
+	// before it became a canonical client-tunnel provider.
+	KeyClientTunnelEnabled = "client_tunnel.enabled"
+	KeyClientTunnelBin     = "paths.client_tunnel_bin"
+	KeyOpenAITunnelEnabled = "openai_tunnel.enabled"
+	KeyOpenAITunnelBin     = "paths.openai_tunnel_bin"
+
 	// Ngrok config keys
 	KeyNgrokAPITokenEnv = "ngrok.api_token_env"
 	KeyNgrokAccountID   = "ngrok.account_id"
@@ -90,6 +98,46 @@ func Init() error {
 	}
 
 	return nil
+}
+
+// ClientTunnelEnabled reports whether the client-tunnel provider is opted in.
+// The canonical environment variable wins whenever it is non-empty; the
+// legacy variable remains a migration fallback.
+func ClientTunnelEnabled() bool {
+	if raw := strings.TrimSpace(os.Getenv("PORTICO_ENABLE_CLIENT_TUNNEL")); raw != "" {
+		return isTruthy(raw)
+	}
+	if raw := strings.TrimSpace(os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL")); raw != "" {
+		return isTruthy(raw)
+	}
+	if viper.IsSet(KeyClientTunnelEnabled) {
+		return viper.GetBool(KeyClientTunnelEnabled)
+	}
+	return viper.GetBool(KeyOpenAITunnelEnabled)
+}
+
+// ClientTunnelBin returns the configured tunnel-client executable, honoring
+// canonical names before the legacy OpenAI names.
+func ClientTunnelBin() string {
+	if value := strings.TrimSpace(os.Getenv("PORTICO_CLIENT_TUNNEL_BIN")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(os.Getenv("PORTICO_OPENAI_TUNNEL_BIN")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(viper.GetString(KeyClientTunnelBin)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(viper.GetString(KeyOpenAITunnelBin))
+}
+
+func isTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func setDefaults(stateDir string) {
@@ -359,6 +407,13 @@ func CredentialPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "cloudflare-token.enc"), nil
+}
+
+// LegacyCredentialPath returns the one-time plaintext credential location used
+// by older Portico/Flare installations. It is exposed for read-only diagnostics
+// so doctor can report failed cleanup without reading the secret.
+func LegacyCredentialPath() string {
+	return filepath.Join(legacyDir(), "credentials")
 }
 
 const credentialContext = "portico:cloudflare-api-token:v1"

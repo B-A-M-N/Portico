@@ -123,17 +123,18 @@ func (c *CapabilityConstraint) Matches(profile *ConnectionProfile) bool {
 	// Check MCP transports
 	if len(c.MCPTransports) > 0 {
 		source := profile.GetSource()
-		if source.MCP != nil {
-			matchesMCP := false
-			for _, mt := range c.MCPTransports {
-				if source.MCP.Transport == mt {
-					matchesMCP = true
-					break
-				}
+		if source.MCP == nil {
+			return false
+		}
+		matchesMCP := false
+		for _, mt := range c.MCPTransports {
+			if source.MCP.Transport == mt {
+				matchesMCP = true
+				break
 			}
-			if !matchesMCP {
-				return false
-			}
+		}
+		if !matchesMCP {
+			return false
 		}
 	}
 

@@ -66,6 +66,10 @@ type RequestHandler interface {
 	HandleProviderRecommendation(req ProviderRecommendationRequest) (*ProviderRecommendationResponse, error)
 	HandleAuthenticateProvider(id string) error
 	HandleConfigureProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
+	// HandleValidateProviderAccount checks a credential and discovers accounts
+	// and zones without persisting anything, so the UI can offer discovery and
+	// selection before any account is saved.
+	HandleValidateProviderAccount(id string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error)
 	HandleReverifyProviderAccount(providerID, accountID string, req ReverifyProviderAccountRequest) (*ReverifyProviderAccountResponse, error)
 	// HandleReplaceProviderAccountCredential rotates the secret behind an
 	// existing account, keeping its identity so every connection using it keeps
@@ -144,9 +148,35 @@ func NewServer(socketPath string, handler RequestHandler, st *store.Store) (*Ser
 	mux.HandleFunc("/v1/readiness", s.handleReadiness)
 	mux.HandleFunc("/v1/launch-mode", s.handleLaunchMode)
 	mux.HandleFunc("/v1/settings", s.handleSettings)
+	mux.HandleFunc("/v1/settings/key/rotate", s.handleRotateSecretKey)
 	s.mux = mux
 
 	return s, nil
+}
+
+// handleRotateSecretKey performs the supervisor-owned installation-key
+// rotation. The request carries no secret material; the supervisor reads and
+// rewrites its encrypted store transactionally.
+func (s *Server) handleRotateSecretKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "PTO-KEY-ROTATE-METHOD", "method not allowed")
+		return
+	}
+	rotator, ok := s.handler.(interface {
+		HandleRotateSecretKey() (*RotateSecretKeyDTO, error)
+	})
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "PTO-KEY-ROTATE-UNSUPPORTED", "secret-key rotation is unavailable")
+		return
+	}
+	result, err := rotator.HandleRotateSecretKey()
+	if err != nil {
+		writeHandlerError(w, "PTO-KEY-ROTATE", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 // ensureSafeRuntimeDir verifies that the runtime directory is safe to use:
@@ -694,6 +724,23 @@ func (s *Server) handleConnectionByID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(telemetry)
 
+	case len(parts) == 3 && parts[1] == "gateway" && parts[2] == "credential" && r.Method == http.MethodPost:
+		revealer, ok := s.handler.(interface {
+			HandleRevealGatewayCredential(string) (*GatewayCredentialDTO, error)
+		})
+		if !ok {
+			writeError(w, http.StatusNotImplemented, "PTO-GATEWAY-CREDENTIAL", "gateway credential reveal is unavailable")
+			return
+		}
+		credential, err := revealer.HandleRevealGatewayCredential(id)
+		if err != nil {
+			writeHandlerError(w, "PTO-GATEWAY-CREDENTIAL", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(credential)
+
 	case len(parts) == 2 && parts[1] == "detail" && r.Method == http.MethodGet:
 		detail, err := s.handler.HandleGetConnectionDetail(id)
 		if err != nil {
@@ -903,6 +950,49 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 3 {
 		if action != "accounts" || parts[2] == "" {
 			writeError(w, http.StatusNotFound, "PROV-006", "unknown provider endpoint")
+			return
+		}
+		// POST /v1/providers/{id}/accounts/validate checks a credential and
+		// discovers accounts and zones without persisting anything. It sits
+		// before the account-ID routes, because "validate" would otherwise be
+		// taken as an account ID and deleted.
+		if parts[2] == "validate" {
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+			defer r.Body.Close()
+			var req ConfigureProviderAccountRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, "PROV-008", "invalid account validation request")
+				return
+			}
+			response, err := s.handler.HandleValidateProviderAccount(id, req)
+			if err != nil {
+				// Validation failures carry the same actionable detail as configure
+				// failures: a token that works but lacks permissions must say which.
+				if response != nil && (len(response.MissingPermissions) > 0 || len(response.Zones) > 0 || len(response.AccountChoices) > 0) {
+					apiErr := APIError{
+						Version: 1, Code: "PROV-009", Summary: err.Error(), ProviderID: id,
+						ProviderValidation: &ProviderValidationDetails{
+							MissingPermissions: response.MissingPermissions,
+							AvailableZones:     response.Zones,
+							AccountAccessible:  response.Validated,
+							VerificationState:  response.Status,
+						},
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_ = json.NewEncoder(w).Encode(apiErr)
+					return
+				}
+				writeHandlerError(w, "PROV-009", err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(response)
 			return
 		}
 		if r.Method != http.MethodDelete {

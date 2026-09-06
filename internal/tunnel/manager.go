@@ -79,6 +79,11 @@ func (m *APIManager) CreateTunnel(ctx context.Context, accountID, name string) (
 	if err != nil {
 		var cfErr *cf.Error
 		if errors.As(err, &cfErr) {
+			if cloudflareHasCode(cfErr, 81053) {
+				if existing, lookupErr := m.LookupTunnelByName(ctx, accountID, name); lookupErr == nil && existing != nil {
+					return existing, nil
+				}
+			}
 			switch {
 			case cfErr.StatusCode == http.StatusUnauthorized || cfErr.StatusCode == http.StatusForbidden:
 				return nil, fmt.Errorf("unauthorized: %w", err)
@@ -90,6 +95,24 @@ func (m *APIManager) CreateTunnel(ctx context.Context, accountID, name string) (
 	}
 
 	return &TunnelInfo{ID: tunnel.ID, Name: tunnel.Name}, nil
+}
+
+func cloudflareHasCode(err error, code int) bool {
+	var cfErr *cf.Error
+	if !errors.As(err, &cfErr) {
+		return false
+	}
+	for _, got := range cfErr.ErrorCodes {
+		if got == code {
+			return true
+		}
+	}
+	for _, detail := range cfErr.Errors {
+		if detail.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 // Create creates a tunnel and retrieves its token atomically. It is retained

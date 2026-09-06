@@ -530,6 +530,30 @@ func (c *Client) ListProviders(ctx context.Context) ([]ProviderDTO, error) {
 	return providers, nil
 }
 
+// ValidateProviderAccount checks a credential and discovers the accounts and
+// zones it can reach, without persisting anything. The response never contains
+// the supplied credential. An ambiguous credential answers with account
+// choices rather than an error, so the caller can ask the user to pick one.
+func (c *Client) ValidateProviderAccount(ctx context.Context, providerID string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal provider account validation: %w", err)
+	}
+	resp, err := c.doRequest(ctx, "POST", "/v1/providers/"+url.PathEscape(providerID)+"/accounts/validate", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result ConfigureProviderAccountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // ConfigureProviderAccount persists a provider account through the local
 // supervisor. The response never contains the supplied credential.
 func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string, req ConfigureProviderAccountRequest) (*ConfigureProviderAccountResponse, error) {
@@ -546,6 +570,24 @@ func (c *Client) ConfigureProviderAccount(ctx context.Context, providerID string
 		return nil, err
 	}
 	var result ConfigureProviderAccountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// RotateSecretKey asks the supervisor to re-encrypt every stored secret under
+// a new installation-key version. The request has no secret-bearing payload.
+func (c *Client) RotateSecretKey(ctx context.Context) (*RotateSecretKeyDTO, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/settings/key/rotate", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result RotateSecretKeyDTO
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
@@ -802,7 +844,7 @@ func (c *Client) ConnectEventStream(ctx context.Context, lastSeq int64) (*EventS
 
 	// Build proper HTTP request
 	path := "/v1/events"
-	if lastSeq > 0 {
+	if lastSeq >= 0 {
 		path += fmt.Sprintf("?last_seq=%d", lastSeq)
 	}
 
@@ -896,11 +938,17 @@ func (es *EventStream) Next() (*EventDTO, error) {
 
 // Close closes the event stream connection.
 func (es *EventStream) Close() error {
+	if es == nil || es.conn == nil {
+		return nil
+	}
 	return es.conn.Close()
 }
 
 // CloseWithContext closes the event stream connection and cancels the context.
 func (es *EventStream) CloseWithContext() error {
+	if es == nil || es.conn == nil {
+		return nil
+	}
 	return es.conn.Close()
 }
 

@@ -131,9 +131,13 @@ type Model struct {
 
 	// diagnosticSelected is the finding under the cursor on the repair screen.
 	diagnosticSelected int
-	// discoveryEvidence shows why Portico classified the selected service as it
-	// did. The evidence was gathered, carried in the DTO, and never displayed.
+	// discoveryEvidence shows why Portico classified the selected service as
+	// it did. The evidence was gathered, carried in the DTO, and never
+	// displayed: [i] toggled a field no renderer consulted.
 	discoveryEvidence bool
+	// discoveryErr holds why the last scan failed, so the Discovery screen can
+	// say so instead of claiming the machine is empty.
+	discoveryErr error
 
 	// Telemetry for the connection on screen. It is requested when a surface
 	// that shows it is opened, and correlated by connection so a reply for one
@@ -211,15 +215,29 @@ type Model struct {
 	// providerSetupRequest increments per flow load, so a late reply to a
 	// cancelled load cannot reset a form already being filled in.
 	providerSetupRequest int
+	// Discovery during setup. When the credential can reach multiple accounts
+	// the supervisor answers a validation with account choices, and when one
+	// account can see zones it answers with those. Both are rendered as
+	// selections over the provider's own answers instead of text boxes asking
+	// for opaque IDs the user would have to copy from another dashboard.
+	// providerSetupValidating stops a second Enter sending the credential to
+	// discovery while the first is in flight.
+	providerSetupChoices      *ipc.ConfigureProviderAccountResponse
+	providerSetupChoiceCursor int
+	providerSetupValidating   bool
+	// providerSetupValidateRequest correlates validation replies with the
+	// submission that asked, so a late answer to an abandoned attempt cannot
+	// alter the form the user is now filling in.
+	providerSetupValidateRequests requestTracker
 	// resumeWizardAfterSetup names the provider the wizard asked to configure.
 	// When it is set, finishing setup returns to the wizard rather than to the
 	// providers screen, with every answer the user had given still in place.
 	resumeWizardAfterSetup string
 
-	lastEventSeq    int64
-	stream          *ipc.EventStream
-	streamCancel    context.CancelFunc
-	streamConnected bool
+	lastEventSeq int64
+	stream       *ipc.EventStream
+	streamCancel context.CancelFunc
+	eventStreams eventStreamStates
 
 	theme    Theme
 	useASCII bool
@@ -278,6 +296,7 @@ func newModel(client SupervisorClient, bootstrapper Bootstrapper) Model {
 		bootstrapper: bootstrapper,
 		rootCtx:      ctx,
 		rootCancel:   cancel,
+		eventStreams: eventStreamStates{state: eventStreamConnecting},
 	}
 }
 
@@ -570,9 +589,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.readinessForEmptyHome() {
 			readinessCmd = m.readinessCmd()
 		}
-		// On first boot, connect the event stream now that the cursor is set.
-		if !m.streamConnected {
-			m.streamConnected = true
+		// Start the first stream attempt now that the cursor is set. Live is
+		// declared only when the attempt's ready result returns.
+		if m.eventStreams.begin(1) || m.eventStreams.beginResyncRecovery() {
 			return m, tea.Batch(wizardCmd, readinessCmd, m.connectEventStream())
 		}
 		return m, tea.Batch(wizardCmd, readinessCmd)
@@ -849,13 +868,20 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case discoveryMsg:
 		if msg.Err != nil {
-			m.status = statusLine("discovery failed", msg.Err)
-			m.transitionTo(ScreenHome)
-			m.clearNav()
+			// A failed scan is shown on the Discovery screen with the reason,
+			// not bounced to Home with a status line: the user asked what is
+			// running, and the answer "I could not look" belongs where the
+			// question was asked. It must never read as "nothing is running".
+			m.discovery = nil
+			m.discoveryErr = msg.Err
+			m.discoverySelected = 0
+			m.pushScreen(ScreenDiscovery)
 			return m, nil
 		}
 		m.discovery = msg.Services
+		m.discoveryErr = nil
 		m.discoverySelected = 0
+		m.discoveryEvidence = false
 		m.pushScreen(ScreenDiscovery)
 		return m, nil
 
@@ -897,6 +923,67 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.opsSelectedIdx = 0
 		}
 		return m, m.operationEventsForSelection()
+
+	case providerAccountValidatedMsg:
+		// A discovery answer for an attempt the user has left must not reshape
+		// the form they are now in.
+		if !m.providerSetupValidateRequests.accepts(msg.Generation) {
+			return m, nil
+		}
+		m.providerSetupValidating = false
+		if msg.Err != nil {
+			m.providerSetupError = msg.Err.Error()
+			if missing := missingPermissions(msg.Err, msg.Response); len(missing) > 0 {
+				m.providerSetupError += "\n\nThe token is missing:\n  • " +
+					strings.Join(missing, "\n  • ")
+			}
+			// The rejected secret must not stay in memory while the user
+			// retypes it. Return to the credential step, keeping the answers
+			// that were accepted.
+			m.clearProviderSetupSecret()
+			m.providerSetupIndex = m.providerSetupSecretIndex()
+			m.focusProviderSetupField()
+			return m, nil
+		}
+		resp := msg.Response
+		if resp == nil {
+			m.providerSetupError = "the provider returned no validation result"
+			return m, nil
+		}
+		if resp.AccountSelectionRequired {
+			// The credential is good but ambiguous. Record the choices and put
+			// the user on the account question; the credential stays in memory
+			// so confirming a choice completes the setup without retyping it.
+			m.providerSetupChoices = resp
+			m.providerSetupChoiceCursor = 0
+			m.providerSetupIndex = m.providerSetupIndexForField(m.providerSetupFlow.IdentityField)
+			m.providerSetupError = ""
+			return m, nil
+		}
+		// A resolved validation is itself answers: carry the discovered
+		// identity, label and zones into the form so the confirmation step
+		// shows what was actually discovered rather than what the user typed.
+		if resp.AccountID != "" {
+			m.setProviderSetupValue("account_id", resp.AccountID)
+			if resp.AccountLabel != "" {
+				m.setProviderSetupValue("label", resp.AccountLabel)
+			}
+			if identity := m.providerSetupFlow.IdentityField; identity != "" && identity != "account_id" {
+				m.setProviderSetupValue(identity, resp.AccountID)
+			}
+		}
+		m.providerSetupChoices = resp
+		m.providerSetupChoiceCursor = 0
+		// Discovery replaced the identity question. Land the user on the zone
+		// question, which is the next decision the discovery answer leaves.
+		if zone := m.providerSetupIndexForField("zone_id"); zone >= 0 {
+			m.providerSetupIndex = zone
+		} else {
+			m.providerSetupIndex = len(m.providerSetupFields()) // confirm
+		}
+		m.focusProviderSetupField()
+		m.providerSetupError = ""
+		return m, nil
 
 	case providerAccountConfiguredMsg:
 		// A result from a setup the user abandoned must not clear or alter the
@@ -1026,11 +1113,17 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case eventMsg:
+		if msg.Generation != m.eventStreams.generation {
+			return m, nil
+		}
 		if msg.Event.Type == "resync_required" {
 			// Close the old stream and request a fresh snapshot.
 			// The snapshot handler will set lastEventSeq and reconnect SSE.
 			m.closeEventStream()
-			m.streamConnected = false
+			m.eventStreams.resync(m.eventStreams.generation)
+			if m.wizard != nil {
+				m.wizard.SetStreamConnected(false)
+			}
 			return m, m.requestSnapshot()
 		}
 		// Deduplicate events by sequence monotonicity.
@@ -1047,19 +1140,38 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamErrorMsg:
+		if msg.Generation != m.eventStreams.generation || contextDone(msg.Err) {
+			return m, nil
+		}
 		if m.wizard != nil {
 			m.wizard.SetStreamConnected(false)
 		}
 		m.closeEventStream()
 		m.status = fmt.Sprintf("event stream interrupted: %v; reconnecting", msg.Err)
-		return m, m.reconnectEventStream()
+		if m.eventStreams.reconnect(m.eventStreams.generation) {
+			return m, m.reconnectEventStream()
+		}
+		return m, nil
 
 	case reconnectEventStreamMsg:
+		if msg.Generation != m.eventStreams.generation {
+			return m, nil
+		}
 		return m, m.connectEventStream()
 
 	case eventStreamReadyMsg:
+		if !m.eventStreams.ready(msg.Generation) {
+			if msg.Cancel != nil {
+				msg.Cancel()
+			}
+			if msg.Stream != nil {
+				_ = msg.Stream.Close()
+			}
+			return m, nil
+		}
 		m.stream = msg.Stream
 		m.streamCancel = msg.Cancel
+		m.status = ""
 		if m.wizard != nil {
 			m.wizard.SetStreamConnected(true)
 		}
@@ -1145,7 +1257,25 @@ func (m Model) renderScreen() string {
 		return m.renderClone()
 	case ScreenSetup:
 		if m.setup != nil {
-			return m.setup.View()
+			// Status and error share the wrapper every other screen uses. The
+			// report action sets m.status, and a status the screen never draws
+			// made "Wrote <path>" invisible — the export happened, but the only
+			// record of where was unreachable.
+			var b strings.Builder
+			b.WriteString(m.setup.View())
+			if m.status != "" {
+				b.WriteString("\n\n")
+				b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
+			}
+			if m.err != nil {
+				b.WriteString("\n\n")
+				b.WriteString(m.renderUserFacingError())
+			}
+			// The footer is the screen's own action set, so the advertised E
+			// is visible here and cannot drift from what the screen accepts.
+			b.WriteString("\n")
+			b.WriteString(m.actionsFor(ScreenSetup).footer(m.theme, m.width))
+			return b.String()
 		}
 		return "Checking what Portico needs..."
 	case ScreenSettings:
@@ -1249,12 +1379,14 @@ type errorMsg struct {
 }
 
 type eventMsg struct {
-	Event ipc.EventDTO
+	Generation uint64
+	Event      ipc.EventDTO
 }
 
 type eventStreamReadyMsg struct {
-	Stream *ipc.EventStream
-	Cancel context.CancelFunc
+	Stream     *ipc.EventStream
+	Cancel     context.CancelFunc
+	Generation uint64
 }
 
 type resyncMsg struct {
@@ -1280,6 +1412,16 @@ type discoveryMsg struct {
 type providerAccountConfiguredMsg struct {
 	// Generation and ProviderID identify the submission this answers, so a
 	// result from a setup the user abandoned cannot alter a newer one.
+	Generation requestGeneration
+	ProviderID string
+	Response   *ipc.ConfigureProviderAccountResponse
+	Err        error
+}
+
+// providerAccountValidatedMsg carries the answer to a validate-before-configure
+// request: whether the credential works, which accounts it can reach, and which
+// zones those accounts can see. Nothing has been persisted by it.
+type providerAccountValidatedMsg struct {
 	Generation requestGeneration
 	ProviderID string
 	Response   *ipc.ConfigureProviderAccountResponse
@@ -1318,7 +1460,10 @@ type connectionDetailMsg struct {
 	Err          error
 }
 
-type streamErrorMsg struct{ Err error }
+type streamErrorMsg struct {
+	Generation uint64
+	Err        error
+}
 
 // --------------- commands ---------------
 //
@@ -1527,6 +1672,27 @@ func (m *Model) configureProviderAccountCmd(providerID string, req ipc.Configure
 	}
 }
 
+// validateProviderAccountCmd asks the supervisor to check the credential and
+// discover the accounts and zones it can reach, without persisting anything.
+// The form uses the answer to offer selections instead of opaque-ID text boxes.
+func (m *Model) validateProviderAccountCmd(providerID string, req ipc.ConfigureProviderAccountRequest) tea.Cmd {
+	client := m.client
+	ctx := m.rootCtx
+	generation := m.providerSetupValidateRequests.next()
+	m.providerSetupValidating = true
+	return func() tea.Msg {
+		reply := providerAccountValidatedMsg{Generation: generation, ProviderID: providerID}
+		if client == nil {
+			reply.Err = fmt.Errorf("no supervisor connection")
+			return reply
+		}
+		validateCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		reply.Response, reply.Err = client.ValidateProviderAccount(validateCtx, providerID, req)
+		return reply
+	}
+}
+
 func (m *Model) requestSnapshot() tea.Cmd {
 	client := m.client
 	ctx := m.rootCtx
@@ -1679,9 +1845,10 @@ func (m *Model) connectEventStream() tea.Cmd {
 	client := m.client
 	lastSeq := m.lastEventSeq
 	ctx := m.rootCtx
+	generation := m.eventStreams.generation
 	return func() tea.Msg {
 		if client == nil {
-			return streamErrorMsg{Err: fmt.Errorf("no supervisor connection")}
+			return streamErrorMsg{Generation: generation, Err: fmt.Errorf("no supervisor connection")}
 		}
 		// The event stream lives for the application lifetime — use rootCtx
 		// directly so it is cancelled when the TUI exits.
@@ -1689,37 +1856,45 @@ func (m *Model) connectEventStream() tea.Cmd {
 		stream, err := client.ConnectEventStream(streamCtx, lastSeq)
 		if err != nil {
 			cancel()
-			return streamErrorMsg{Err: fmt.Errorf("event stream: %w", err)}
+			return streamErrorMsg{Generation: generation, Err: fmt.Errorf("event stream: %w", err)}
 		}
-		return eventStreamReadyMsg{Stream: stream, Cancel: cancel}
+		return eventStreamReadyMsg{Stream: stream, Cancel: cancel, Generation: generation}
 	}
 }
 
 func (m *Model) waitForEvent() tea.Cmd {
 	stream := m.stream
+	generation := m.eventStreams.generation
 	return func() tea.Msg {
 		if stream == nil {
 			return nil
 		}
 		evt, err := stream.Next()
 		if err != nil {
-			return streamErrorMsg{Err: fmt.Errorf("event read: %w", err)}
+			return streamErrorMsg{Generation: generation, Err: fmt.Errorf("event read: %w", err)}
 		}
-		return eventMsg{Event: *evt}
+		return eventMsg{Generation: generation, Event: *evt}
 	}
 }
 
 func (m *Model) reconnectEventStream() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return reconnectEventStreamMsg{} })
+	generation := m.eventStreams.generation
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return reconnectEventStreamMsg{Generation: generation}
+	})
 }
 
-type reconnectEventStreamMsg struct{}
+type reconnectEventStreamMsg struct {
+	Generation uint64
+}
 
 func (m *Model) closeEventStream() {
 	if m.streamCancel != nil {
 		m.streamCancel()
 	}
 	if m.stream != nil {
+		// Reconnect transitions may temporarily retain an empty stream. Close
+		// treats its absent connection as an already-closed stream.
 		_ = m.stream.Close()
 	}
 	m.stream = nil
@@ -1851,8 +2026,15 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleCloneKey(key)
 	}
 
-	// While provider setup is active, handle it specially.
+	// While provider setup is active, handle it specially. Help still reaches
+	// the screen from here: a guidance form is exactly where a user needs
+	// explaining, and the form never treats ? as input.
 	if m.providerSetupStep > 0 {
+		if key == "?" {
+			m.prevScreen = m.screen
+			m.transitionTo(ScreenHelp)
+			return m, nil
+		}
 		return m.handleProviderSetupKey(key)
 	}
 
@@ -1950,6 +2132,34 @@ func (m Model) handleWizardKey(key string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Help is global navigation. Every other screen answers ?, and a wizard
+	// question that hides it left users guessing at keys with no way out but
+	// back. Escape from help returns to the wizard with every answer intact.
+	if key == "?" && m.screen != ScreenHelp {
+		m.prevScreen = m.screen
+		m.transitionTo(ScreenHelp)
+		return m, nil
+	}
+
+	// The wizard screen scrolls with the shared viewport mechanism, and its
+	// footer advertises paging on every long question. The wizard handled
+	// neither, so a review taller than the terminal could not show the save
+	// choices it asks the user to choose between.
+	switch key {
+	case "pgup":
+		m.scroll.scrollBy(-m.scroll.page())
+		return m, nil
+	case "pgdown":
+		m.scroll.scrollBy(m.scroll.page())
+		return m, nil
+	case "home":
+		m.scroll.toTop()
+		return m, nil
+	case "end":
+		m.scroll.toBottom()
+		return m, nil
+	}
+
 	cmd := m.wizard.HandleKey(key)
 	// The wizard may have asked for a provider to be configured. Setup is a child
 	// of the wizard rather than a replacement for it, so every answer survives.
@@ -2003,7 +2213,11 @@ func (m *Model) clearProviderSetupSecret() {
 // clearProviderSetup resets the whole setup flow, secret included.
 func (m *Model) clearProviderSetup() {
 	m.providerSetupRequests.cancel()
+	m.providerSetupValidateRequests.cancel()
 	m.providerSetupSubmitting = false
+	m.providerSetupValidating = false
+	m.providerSetupChoices = nil
+	m.providerSetupChoiceCursor = 0
 	m.clearProviderSetupSecret()
 	m.providerSetupStep = 0
 	m.providerSetupIndex = 0
@@ -2111,6 +2325,62 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 	}
 
 	field := fields[m.providerSetupIndex]
+
+	// A discovery question is answered from the choices the provider's own
+	// validation returned, not typed. Up and down move through them; enter
+	// commits the one under the cursor.
+	if choice := m.providerSetupChoiceFor(field.ID); choice != nil {
+		switch key {
+		case "esc":
+			if m.providerSetupIndex == 0 {
+				resume := m.resumeWizardAfterSetup
+				m.clearProviderSetup()
+				if resume != "" && m.wizard != nil {
+					m.resumeWizardAfterSetup = ""
+					m.transitionTo(ScreenNewConnection)
+					return m, m.wizard.ResumeAfterSetup(resume, m.providerSnapshot())
+				}
+				m.resumeWizardAfterSetup = ""
+				return m, nil
+			}
+			// Leaving a discovery question rewinds to the credential step and
+			// clears the discovery answers: a choice made from a validation of
+			// the old credential says nothing about a new one.
+			m.providerSetupChoices = nil
+			m.providerSetupChoiceCursor = 0
+			m.providerSetupIndex = m.providerSetupSecretIndex()
+			m.focusProviderSetupField()
+			m.providerSetupError = ""
+			return m, nil
+		case "up", "k":
+			if m.providerSetupChoiceCursor > 0 {
+				m.providerSetupChoiceCursor--
+			}
+			return m, nil
+		case "down", "j":
+			if m.providerSetupChoiceCursor < len(choice)-1 {
+				m.providerSetupChoiceCursor++
+			}
+			return m, nil
+		case "enter":
+			selected := choice[m.providerSetupChoiceCursor]
+			m.setProviderSetupValue(field.ID, selected.ID)
+			if field.ID == "account_id" || field.ID == m.providerSetupFlow.IdentityField {
+				m.setProviderSetupValue("account_id", selected.ID)
+				if selected.Label != "" {
+					m.setProviderSetupValue("label", selected.Label)
+				}
+			}
+			m.providerSetupChoiceCursor = 0
+			m.providerSetupIndex++
+			m.focusProviderSetupField()
+			m.providerSetupError = ""
+			return m, nil
+		}
+		// Any other key is not input here: the question is a list.
+		return m, nil
+	}
+
 	switch key {
 	case "esc":
 		if m.providerSetupIndex == 0 {
@@ -2145,6 +2415,21 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 			m.providerSetupError = field.Label + " cannot be empty"
 			return m, nil
 		}
+		// The credential step on a provider that can discover its own accounts
+		// validates before anything else: the answer either resolves the
+		// identity question entirely or returns the accounts to choose from.
+		// Confirming an unchecked credential is what produced accounts that
+		// were recorded as working and were not.
+		if field.Secret && m.providerSetupCanDiscover() {
+			if m.providerSetupValidating {
+				return m, nil
+			}
+			req := ipc.ConfigureProviderAccountRequest{
+				Credential: m.providerSetupValue(field.ID),
+				Fields:     map[string]string{"credential": m.providerSetupValue(field.ID)},
+			}
+			return m, m.validateProviderAccountCmd(m.providerSetupProviderID, req)
+		}
 		m.providerSetupIndex++
 		m.focusProviderSetupField()
 		m.providerSetupError = ""
@@ -2153,6 +2438,82 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 
 	// Typing is handled by the field itself, routed before key handling.
 	return m, nil
+}
+
+// providerSetupCanDiscover reports whether the provider's own validation can
+// resolve the identity question. A provider without an identity field has a
+// single implicit account, so there is nothing to discover.
+func (m Model) providerSetupCanDiscover() bool {
+	return m.providerSetupFlow != nil && m.providerSetupFlow.IdentityField != ""
+}
+
+// providerSetupIndexForField is the form position of one declared field, or
+// -1 when the flow does not declare it.
+func (m Model) providerSetupIndexForField(id string) int {
+	for i, field := range m.providerSetupFields() {
+		if field.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// providerSetupChoiceFor is the choice list for the field under the cursor,
+// derived from the provider's validation answer. The identity question lists
+// accounts; the zone question lists zones plus the no-zone option.
+func (m Model) providerSetupChoiceFor(fieldID string) []ipc.ProviderAccountDTO {
+	if m.providerSetupChoices == nil {
+		return nil
+	}
+	identity := m.providerSetupFlow.IdentityField
+	if identity != "" && fieldID == identity {
+		return m.providerSetupChoices.AccountChoices
+	}
+	if fieldID == "account_id" && identity == "" {
+		return m.providerSetupChoices.AccountChoices
+	}
+	if fieldID == "zone_id" {
+		// "No zone" is a real answer, not a gap: tunnels with temporary
+		// addresses are valid without one, and the option must say what it
+		// gives up so skipping it is a decision rather than a dead end.
+		options := make([]ipc.ProviderAccountDTO, 0, len(m.providerSetupChoices.Zones)+1)
+		options = append(options, ipc.ProviderAccountDTO{
+			ID:    "",
+			Label: "No zone — temporary addresses only",
+		})
+		for _, zone := range m.providerSetupChoices.Zones {
+			options = append(options, ipc.ProviderAccountDTO{ID: zone.ID, Label: zone.Name})
+		}
+		return options
+	}
+	return nil
+}
+
+// providerSetupDiscoveredLabel is the human-readable name the provider's
+// validation returned for a collected value, or empty when the value was not
+// one discovery answered. The confirmation shows the name the user picked;
+// without it a chosen account reads as a hex string and the user is asked to
+// confirm a decision they cannot recognise.
+func (m Model) providerSetupDiscoveredLabel(fieldID, value string) string {
+	if m.providerSetupChoices == nil {
+		return ""
+	}
+	identity := m.providerSetupFlow.IdentityField
+	if (identity != "" && fieldID == identity) || (identity == "" && fieldID == "account_id") {
+		for _, choice := range m.providerSetupChoices.AccountChoices {
+			if choice.ID == value {
+				return choice.Label
+			}
+		}
+	}
+	if fieldID == "zone_id" {
+		for _, zone := range m.providerSetupChoices.Zones {
+			if zone.ID == value {
+				return zone.Name
+			}
+		}
+	}
+	return ""
 }
 
 // focusProviderSetupField loads the stored answer for the current field into
@@ -2182,7 +2543,13 @@ func (m *Model) updateProviderSetupField(msg tea.Msg) (tea.Cmd, bool) {
 	if m.providerSetupIndex < 0 || m.providerSetupIndex >= len(fields) {
 		return nil, false
 	}
-	if m.providerSetupSubmitting || m.providerSetupFlow == nil || !m.providerSetupFlow.StoresAccount() {
+	if m.providerSetupSubmitting || m.providerSetupValidating || m.providerSetupFlow == nil || !m.providerSetupFlow.StoresAccount() {
+		return nil, false
+	}
+	// A question the provider answered with choices is not a text field. Once
+	// discovery has returned accounts or zones, typing there would overwrite
+	// the selected ID with whatever the user pressed.
+	if m.providerSetupChoiceFor(fields[m.providerSetupIndex].ID) != nil {
 		return nil, false
 	}
 	if !screens.FieldAccepts(msg) {
@@ -2764,6 +3131,10 @@ func (m *Model) renderPlanPreview() string {
 	return b.String()
 }
 
+func operationStatusLabel(state string) string {
+	return screens.OperationStatusLabel(state)
+}
+
 func (m *Model) renderOperationProgress() string {
 	if m.operation == nil {
 		return "No operation in progress"
@@ -2828,7 +3199,7 @@ func (m *Model) renderOperationProgress() string {
 		}
 	}
 
-	b.WriteString(fmt.Sprintf("\nState: %s\n", m.operation.State))
+	b.WriteString(fmt.Sprintf("\nStatus: %s\n", operationStatusLabel(m.operation.State)))
 	if m.operation.Error != "" {
 		b.WriteString(m.theme.Style("intervention").Render(fmt.Sprintf("Error: %s\n", m.operation.Error)))
 	}
@@ -2878,9 +3249,29 @@ func (m *Model) renderProviders() string {
 	if len(m.snapshot.Providers) == 0 {
 		b.WriteString("No providers are catalogued.\n\n")
 	}
+	// The flattened row list is the selection authority for this screen: the
+	// move handlers index it, so the renderer marks the row it names. The
+	// cursor the arrows steer was previously drawn nowhere, leaving the user
+	// steering something they could not see.
+	rows := m.buildScreenRows()
+	rowCursor := -1
+	if m.cursorIndex >= 0 && m.cursorIndex < len(rows) && rows[m.cursorIndex].Kind == rowKindProvider {
+		rowCursor = m.cursorIndex
+	}
+	providerRowIdx := -1
 	for _, p := range m.snapshot.Providers {
+		providerRowIdx++
+		marker := "  "
+		if providerRowIdx == rowCursor {
+			if m.useASCII {
+				marker = m.theme.Style("active").Render("> ")
+			} else {
+				marker = m.theme.Style("active").Render("▸ ")
+			}
+		}
+		b.WriteString(marker)
 		label, style := providerStateLabel(p.Availability, p.Stability)
-		b.WriteString(fmt.Sprintf("  %s  ", p.DisplayName))
+		b.WriteString(fmt.Sprintf("%s  ", p.DisplayName))
 		b.WriteString(m.theme.Style(style).Render(label))
 		b.WriteString("\n")
 
@@ -2956,6 +3347,13 @@ func (m *Model) renderProviders() string {
 		}
 		b.WriteString("\n")
 	}
+	if m.status != "" {
+		// A blocked action says why, in the same place its key was pressed. The
+		// status was set by the handler but never drawn on this screen, so a
+		// dimmed action looked inert rather than blocked.
+		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
+		b.WriteString("\n\n")
+	}
 	if len(m.buildScreenRows()) > 0 {
 		b.WriteString("[↑↓] select account    [a] add account    [x] remove account    [esc] back\n")
 	} else {
@@ -3022,6 +3420,12 @@ func (m *Model) renderProviderSetup() string {
 	case len(fields) == 0:
 		b.WriteString("This provider declares no fields to fill in.\n")
 
+	case m.providerSetupValidating:
+		b.WriteString("Checking the credential and asking " + m.providerSetupProviderID +
+			" which accounts it can reach...\n\n")
+		b.WriteString("  Please wait; pressing enter again will not send it twice.\n")
+		return b.String()
+
 	case m.providerSetupIndex >= len(fields):
 		if m.providerSetupSubmitting {
 			b.WriteString("Checking the credential and saving the account...\n\n")
@@ -3035,6 +3439,14 @@ func (m *Model) renderProviderSetup() string {
 				// A collected secret is shown as present, never rendered.
 				if value != "" {
 					value = "••••••••"
+				}
+			}
+			// An answer resolved by discovery is shown by its human name, with
+			// the opaque ID it will store alongside it — the user confirmed the
+			// name, and the ID is what the provider will actually receive.
+			if value != "" && !field.Secret {
+				if human := m.providerSetupDiscoveredLabel(field.ID, value); human != "" {
+					value = human + " (" + value + ")"
 				}
 			}
 			if value == "" {
@@ -3051,6 +3463,32 @@ func (m *Model) renderProviderSetup() string {
 		if field.Description != "" {
 			b.WriteString(field.Description + "\n")
 		}
+
+		// A question the provider's own validation answered is a list to move
+		// through, not a text box. Rendering it as a box invited the user to
+		// type an opaque ID they would have to go and find somewhere else.
+		if choices := m.providerSetupChoiceFor(field.ID); choices != nil {
+			for i, choice := range choices {
+				marker := "  "
+				if i == m.providerSetupChoiceCursor {
+					marker = "> "
+				}
+				label := choice.Label
+				if choice.ID != "" && choice.ID != choice.Label {
+					label += m.theme.Style("muted").Render("  (" + choice.ID + ")")
+				}
+				b.WriteString(marker + " " + label + "\n")
+			}
+			b.WriteString("\n↑/↓ to choose, enter to select, esc to re-enter the credential.\n")
+			if m.providerSetupError != "" {
+				b.WriteString("\n")
+				b.WriteString(m.theme.Style("intervention").Render("Error: " + m.providerSetupError))
+				b.WriteString("\n")
+			}
+			b.WriteString("\n[esc] back    [enter] select\n")
+			return b.String()
+		}
+
 		if !field.Required {
 			b.WriteString(m.theme.Style("muted").Render("Optional — press enter to skip.") + "\n")
 		}
@@ -3180,25 +3618,41 @@ func (m *Model) renderDiscovery() string {
 	b.WriteString(m.theme.Style("header").Render(" DISCOVER LOCAL SERVICES "))
 	b.WriteString("\n\n")
 	if len(m.discovery) == 0 {
-		b.WriteString("No local listeners found.\n")
+		// A failed scan must not claim the machine is empty. The discovery
+		// error is stored with the results it belongs to; when it is present
+		// the screen says so and makes no claim either way.
+		if m.discoveryErr != nil {
+			b.WriteString(m.theme.Style("intervention").Render(
+				"The scan itself failed, so Portico does not know what is listening."))
+			b.WriteString("\n")
+			b.WriteString("It did not establish that nothing is running.\n")
+			b.WriteString("\nReason: " + m.discoveryErr.Error() + "\n")
+		} else {
+			b.WriteString("No local listeners found.\n")
+		}
 	} else {
+		// The wizard's service question and this screen render the same
+		// descriptions from the same functions: labels name the service the
+		// way a person would, and [i] expands the evidence behind the
+		// classification. Two implementations had already drifted — this one
+		// printed raw confidence grades and never showed evidence at all.
 		for i, svc := range m.discovery {
 			prefix := "  "
 			if i == m.discoverySelected {
 				prefix = "> "
 			}
-			label := svc.Address
-			if svc.Process != "" {
-				separator := " — "
-				if m.useASCII {
-					separator = " - "
+			b.WriteString(m.clipToWidth(prefix + screens.DiscoveryChoiceLabel(svc)))
+			b.WriteString("\n")
+			if i == m.discoverySelected && m.discoveryEvidence {
+				for _, line := range screens.DiscoveryEvidenceLines(svc) {
+					b.WriteString(m.theme.Style("muted").Render(
+						m.clipToWidth("      " + line)))
+					b.WriteString("\n")
 				}
-				label += separator + svc.Process
 			}
-			b.WriteString(fmt.Sprintf("%s%s (%s, %s)\n", prefix, label, svc.Protocol, svc.Confidence))
 		}
 	}
-	b.WriteString("\n[enter] use selected service    [esc] back    [q] quit\n")
+	b.WriteString("\n[enter] use selected service    [i] why this?    [esc] back    [q] quit\n")
 	return b.String()
 }
 

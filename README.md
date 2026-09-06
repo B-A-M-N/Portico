@@ -61,9 +61,12 @@ Portico follows a strict layered architecture:
    (cloudflared)   (agent)     (in-process)  (tunnel-client)
 ```
 
-Tailscale and zrok appear in the provider list as catalog entries with no
-adapter, so the interface can explain the gap rather than omit them. A mock
-provider exists for controller tests.
+Tailscale is compiled in with a beta adapter: Portico joins the tailnet the
+machine is already signed in to and publishes through Serve; it does not sign
+the machine in and does not expose anything to the internet. zrok appears in
+the provider list as a catalog entry with no adapter, so the interface can
+explain the gap rather than omit it. A mock provider exists for controller
+tests.
 
 ## Current Features (Implemented)
 
@@ -171,14 +174,15 @@ portico serve tools --source-type mcp_server --source http://127.0.0.1:3000/mcp 
 | Cloudflare | ✅ Implemented, enabled | Temporary; Permanent when a zone is configured | Email OTP with explicit allow rules, in the TUI and the API |
 | ngrok | ✅ Implemented, disabled by default | Temporary; custom hostname with a reserved domain | Not applied — see below |
 | Port forward | ✅ Implemented, enabled | Local only — binds loopback, no public address | Not applicable; reachable only from this machine |
-| Tailscale | ❌ Not implemented — catalog entry, no adapter | — | — |
+| Tailscale | ✅ Implemented (beta) — uses the machine's own tailnet membership | Private only — published through Serve to your tailnet | Not applied; reachability is governed by your tailnet's ACLs |
 | zrok | ❌ Not implemented — catalog entry, no adapter | — | — |
 | OpenAI Secure MCP Tunnel | ⚠️ Experimental — not usable | Private only (no public address) | Mediated by OpenAI; Portico applies none |
 
 > Cloudflare and local port forwards are usable out of the box. ngrok and the
-> OpenAI tunnel are compiled in and disabled by default. Tailscale and zrok
-> appear in the provider list so the interface can say Portico does not
-> implement them — a catalog entry is not an implementation.
+> OpenAI tunnel are compiled in and disabled by default. Tailscale is compiled
+> in and works with the machine's existing tailnet membership. zrok appears in
+> the provider list so the interface can say Portico does not implement it — a
+> catalog entry is not an implementation.
 >
 > Only local port forwards are supported. A remote forward is refused with the
 > reason rather than accepted and left inert.

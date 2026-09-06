@@ -232,6 +232,26 @@ func (p *ConnectionProfile) EffectiveProfileKind() string {
 	return ProfileWebService
 }
 
+// RequiresGateway reports whether this profile's service intent requires a
+// gateway in the traffic path. This is the single authority for the decision;
+// controller and providers consume the result rather than reinterpreting
+// profile kind independently.
+func (p *ConnectionProfile) RequiresGateway() bool {
+	if p == nil {
+		return false
+	}
+	switch p.EffectiveProfileKind() {
+	case ProfileOpenAICompatible:
+		return p.EffectiveKind() == ConnectionServiceExposure
+	case ProfileOpenAIMCP:
+		return p.EffectiveKind() == ConnectionClientTunnel &&
+			p.Spec.ClientTunnel != nil &&
+			p.Spec.ClientTunnel.Client == ClientOpenAISecureMCPTunnel
+	default:
+		return false
+	}
+}
+
 // Backward compatibility accessors for the old flat profile structure.
 // These allow existing code to continue working while we migrate to the new structure.
 // Note: renamed to GetSource, GetExposure, etc. to avoid JSON serialization conflicts.

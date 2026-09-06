@@ -57,9 +57,12 @@ type Provider struct {
 	// adminBaseURL is discovered from the health URL file the client writes on
 	// startup rather than assumed, because the health port is configurable and
 	// defaults to a fixed port that may already be in use.
-	adminBaseURL string
+	adminBaseURL  string
 	connectorProc core.ConnectorProcessService
-	gateways      core.GatewayService
+	// gateways is kept as a compatibility boundary for older provider tests
+	// whose fake used the pre-GatewayStartSpec method shape. Production wiring
+	// supplies core.GatewayService; the small adapters below accept both shapes.
+	gateways any
 	// runtimeDir is Portico's private runtime directory. Health URL files are
 	// per-connection files inside a 0700 subdirectory of it — never the shared
 	// temp dir, where a predictable name would let another local user pre-place
@@ -112,6 +115,33 @@ func NewWithGateway(binPath string, procMgr core.ConnectorProcessService, gatewa
 	}
 	p.probe = p.httpProbe
 	return p
+}
+
+type legacyGatewayService interface {
+	StartGateway(context.Context, core.ConnectionID, string, []string) (string, error)
+	StopGateway(core.ConnectionID) error
+}
+
+func startGateway(value any, ctx context.Context, connectionID core.ConnectionID, spec core.GatewayStartSpec) (string, error) {
+	switch gateway := value.(type) {
+	case core.GatewayService:
+		return gateway.StartGateway(ctx, connectionID, spec)
+	case legacyGatewayService:
+		return gateway.StartGateway(ctx, connectionID, spec.Upstream, nil)
+	default:
+		return "", fmt.Errorf("gateway service has unsupported type %T", value)
+	}
+}
+
+func stopGateway(value any, connectionID core.ConnectionID) error {
+	switch gateway := value.(type) {
+	case core.GatewayService:
+		return gateway.StopGateway(connectionID)
+	case legacyGatewayService:
+		return gateway.StopGateway(connectionID)
+	default:
+		return fmt.Errorf("gateway service has unsupported type %T", value)
+	}
 }
 
 // SetRuntimeDir points the provider at Portico's private runtime directory,
@@ -211,7 +241,6 @@ func (p *Provider) Authenticate(context.Context, core.AuthRequest) error {
 // configuration means before any adapter exists.
 func (p *Provider) SetupFlow() core.SetupFlow { return openAITunnelSetupFlow() }
 
-
 // Plan produces the operation plan for a client tunnel.
 //
 // The order is deliberate: the local MCP server and the client are both
@@ -255,11 +284,20 @@ func (p *Provider) Plan(_ context.Context, desired core.DesiredConnection) (*cor
 				spec.TunnelID))
 		}
 		params := map[string]string{"tunnel_id": spec.TunnelID}
-		if spec.Profile != "" {
-			params["profile"] = spec.Profile
-		}
 		if spec.MCP.Endpoint != "" {
-			params["mcp_server_url"] = spec.MCP.Endpoint
+			endpoint := spec.MCP.Endpoint
+			if desired.GatewayRequired {
+				if desired.GatewayEndpoint != "" {
+					endpoint = desired.GatewayEndpoint
+				} else {
+					endpoint = core.GatewayTargetRef
+				}
+				// Keep the raw local origin as an internal planning input. The
+				// public mcp_server_url remains pinned to the gateway, while the
+				// runtime can still build that gateway around the true origin.
+				params["origin_mcp_server_url"] = spec.MCP.Endpoint
+			}
+			params["mcp_server_url"] = endpoint
 			params["mcp_transport"] = string(spec.MCP.Transport)
 		} else {
 			params["mcp_command"] = spec.MCP.Command.Executable
@@ -347,6 +385,9 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 
 func (p *Provider) verifyOrigin(ctx context.Context, step core.PlanStep) core.StepResult {
 	endpoint := step.Technical.Parameters["mcp_server_url"]
+	if endpoint == core.GatewayTargetRef {
+		endpoint = step.Technical.Parameters["origin_mcp_server_url"]
+	}
 	if endpoint == "" {
 		// A stdio server is started by the client itself, so there is nothing
 		// to probe here. Saying so is better than reporting a vacuous success.
@@ -379,7 +420,7 @@ func (p *Provider) validateClient(ctx context.Context, step core.PlanStep) core.
 	// doctor stops the operation before a process exists.
 	report, err := p.runDoctorPreflight(ctx,
 		step.Technical.Parameters["tunnel_id"],
-		step.Technical.Parameters["mcp_server_url"])
+		originEndpoint(step.Technical.Parameters))
 	if err != nil {
 		return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}
 	}
@@ -543,8 +584,8 @@ func (p *Provider) startClient(ctx context.Context, connectionID core.Connection
 	effectiveStep := step.Clone()
 	gatewayStarted := false
 	if p.gateways != nil && effectiveStep.Technical.Parameters["mcp_server_url"] != "" {
-		upstream := effectiveStep.Technical.Parameters["mcp_server_url"]
-		endpoint, err := p.gateways.StartGateway(ctx, connectionID, core.GatewayStartSpec{
+		upstream := originEndpoint(effectiveStep.Technical.Parameters)
+		endpoint, err := startGateway(p.gateways, ctx, connectionID, core.GatewayStartSpec{
 			Upstream: upstream,
 			// The client-mediated MCP transport has no independent client
 			// credential surface yet: the gateway fronts the local MCP server
@@ -566,7 +607,7 @@ func (p *Provider) startClient(ctx context.Context, connectionID core.Connection
 	})
 	if err != nil {
 		if gatewayStarted {
-			_ = p.gateways.StopGateway(connectionID)
+			_ = stopGateway(p.gateways, connectionID)
 		}
 		return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}
 	}
@@ -583,11 +624,18 @@ func (p *Provider) startClient(ctx context.Context, connectionID core.Connection
 			// did not create.
 			Ownership: core.OwnershipAdopted,
 			Metadata: map[string]string{
-				"pid":       fmt.Sprint(handle.PID),
+				"pid":             fmt.Sprint(handle.PID),
 				"health_url_file": urlFile,
 			},
 		}},
 	}
+}
+
+func originEndpoint(parameters map[string]string) string {
+	if origin := parameters["origin_mcp_server_url"]; origin != "" {
+		return origin
+	}
+	return parameters["mcp_server_url"]
 }
 
 // verifyClient waits for the client to report ready.
@@ -630,7 +678,7 @@ func (p *Provider) stopClient(connectionID core.ConnectionID, step core.PlanStep
 		}
 	}
 	if p.gateways != nil {
-		if err := p.gateways.StopGateway(connectionID); err != nil {
+		if err := stopGateway(p.gateways, connectionID); err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("stop Portico gateway: %w", err)}
 		}
 	}

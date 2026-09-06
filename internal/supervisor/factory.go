@@ -98,17 +98,32 @@ func RunSupervisor(ctx context.Context) error {
 		CloudflaredBin:      config.CloudflaredBin(),
 		NgrokBin:            config.NgrokBin(),
 		NgrokEnabled:        os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_NGROK") == "1",
-		OpenAITunnelEnabled: os.Getenv("PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL") == "1",
+		OpenAITunnelBin:     config.ClientTunnelBin(),
+		OpenAITunnelEnabled: config.ClientTunnelEnabled(),
 		TailscaleBin:        config.TailscaleBin(),
 	})
 	// The mock provider is never a silent fallback: it appears only on an
 	// explicit development opt-in, because reporting fake success to a
 	// production user is worse than reporting no provider at all.
 	if isDevMode() {
-		if err := reg.Add(mock.New()); err != nil {
+		// Registered through its definition, not as a bare adapter: the wizard
+		// refuses every provider the catalog does not declare ready, and the
+		// mock is genuinely usable with no account at all. A bare registration
+		// left it "unconfigured", so the TUI could not create the connections
+		// the CLI could.
+		mp := mock.New()
+		if err := reg.Add(mp); err != nil {
 			slog.Warn("mock provider register failed", "err", err)
 		} else {
 			slog.Info("mock provider registered (PORTICO_DEV=true)")
+			reg.Install(provider.Installation{
+				Provider: mp,
+				Catalog: provider.CatalogEntry{
+					ID: "mock", Name: "mock", DisplayName: "Mock Provider",
+					Availability: provider.AvailabilityReady,
+					Stability:    core.StabilityStable,
+				},
+			})
 		}
 	}
 	sup.SetProviderDefinitions(definitions, services)
@@ -138,9 +153,12 @@ func seedBootstrapAccounts(ctx context.Context, st *store.Store, verify bootstra
 	if zoneID == "" {
 		zoneID = config.ZoneID()
 	}
-	if apiToken != "" && accountID != "" && zoneID != "" {
-		seedBootstrapAccount(ctx, st, "cloudflare", accountID, apiToken,
-			map[string]string{"zone_id": zoneID}, verify)
+	if apiToken != "" && accountID != "" {
+		metadata := map[string]string{}
+		if zoneID != "" {
+			metadata["zone_id"] = zoneID
+		}
+		seedBootstrapAccount(ctx, st, "cloudflare", accountID, apiToken, metadata, verify)
 	}
 
 	// ngrok is deliberately absent. Its agent reads NGROK_AUTHTOKEN from the
@@ -150,8 +168,31 @@ func seedBootstrapAccounts(ctx context.Context, st *store.Store, verify bootstra
 	// not. The definition activates from the environment instead.
 }
 
+// migrateLegacyEnvironmentAccounts is the explicit compatibility entry point
+// used by older startup paths and tests. It intentionally shares the same
+// one-time, verified importer as production startup.
+func migrateLegacyEnvironmentAccounts(ctx context.Context, st *store.Store, verify bootstrapVerifier) {
+	seedBootstrapAccounts(ctx, st, verify)
+}
+
+func importLegacyEnvironmentAccount(ctx context.Context, st *store.Store, providerID, accountID, token string,
+	metadata map[string]string, verify bootstrapVerifier) {
+	seedBootstrapAccount(ctx, st, core.ProviderID(providerID), accountID, token, metadata, verify)
+}
+
 // isDevMode returns true when PORTICO_DEV=true is set.
 func isDevMode() bool {
 	v, _ := strconv.ParseBool(os.Getenv("PORTICO_DEV"))
 	return v
+}
+
+// devValidatorIfDevMode selects the credential validator for this process.
+// Development mode substitutes the canned validator so the setup path is
+// exercisable without a live Cloudflare credential; production gets the real
+// one. The nil return lets the handler keep its existing default.
+func devValidatorIfDevMode() AccountValidator {
+	if isDevMode() {
+		return devAccountValidator{}
+	}
+	return nil
 }

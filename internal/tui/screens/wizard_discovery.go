@@ -2,7 +2,8 @@ package screens
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -10,23 +11,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
-// Finding the service, inside the wizard.
-//
-// Publishing something already running required knowing that Home had a separate
-// discovery shortcut, using it first, and choosing from there — otherwise the
-// wizard asked for an address and the user had to go and find one. The wizard is
-// where someone says what they want reachable, so that is where the question
-// belongs.
-//
-// This calls the same discovery the Home screen calls, through the same DTOs.
-// There is no second implementation: the supervisor scans, and both surfaces
-// render what it found.
-
 // ServiceDiscoverer is the discovery half of the wizard's client.
-//
-// It is separate from ConnectionCreator so a test can supply one without the
-// other, and so the dependency the wizard has on discovery is visible in its
-// type rather than hidden inside a method.
 type ServiceDiscoverer interface {
 	Discovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
 	RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
@@ -41,10 +26,6 @@ type WizardDiscoveryMsg struct {
 }
 
 // discoverCmd scans for local services.
-//
-// RefreshDiscovery is the explicit, user-initiated scan: a service started since
-// the last cached scan must be found, because the user is looking at the wizard
-// precisely because they just started something.
 func (m *WizardModel) discoverCmd() tea.Cmd {
 	discoverer, ok := m.client.(ServiceDiscoverer)
 	if !ok {
@@ -70,86 +51,170 @@ func (m *WizardModel) discoverCmd() tea.Cmd {
 	}
 }
 
-// HandleDiscovery applies a scan result, discarding a reply for a wizard the user
-// has abandoned or an answer to a question they have moved past.
+// HandleDiscovery applies a scan result.
 func (m *WizardModel) HandleDiscovery(msg WizardDiscoveryMsg) {
 	if msg.WizardID != m.id || msg.Generation != m.generation {
 		return
 	}
 	m.discoverPending = false
 	if msg.Err != nil {
-		// A failed scan is a failed scan. Rendering it as an empty list would
-		// tell the user nothing is running, which Portico did not establish.
 		m.discoverErr = msg.Err
+		// The list is cleared but nil, not empty: nil plus a set discoverErr
+		// is "the scan failed", whereas an empty list means "scanned, found
+		// nothing". Only the second may produce an empty-machine claim.
 		m.discovered = nil
 		return
 	}
 	m.discoverErr = nil
 	m.discovered = msg.Services
 	m.selected = 0
+	m.menuViewport.Cursor = 0
+	m.menuViewport.Offset = 0
+	m.menuViewport.ensureVisible(m.menuChoiceCount())
 }
 
-// discoveryChoiceList is the current options for the service question.
+// discoveryChoiceList returns filtered choices for the service question.
+//
+// It is discoveryChoices with the wizard's filter and show-all state applied —
+// the established contract, not a second implementation. Labels are the
+// canonical one-liners; the evidence already identifies protocol and process,
+// so a label that repeated them said everything twice.
 func (m *WizardModel) discoveryChoiceList() []wizardChoice {
-	return discoveryChoices(m.discovered)
+	services := m.discovered
+	if services == nil {
+		services = []ipc.DiscoveredServiceDTO{}
+	}
+	if !m.discoveryShowAll {
+		services = VisibleDiscoveryServices(services, false)
+	}
+	if m.discoveryFilter != "" {
+		filtered := make([]ipc.DiscoveredServiceDTO, 0, len(services))
+		f := strings.ToLower(m.discoveryFilter)
+		for _, svc := range services {
+			label := DiscoveryChoiceLabel(svc)
+			if strings.Contains(strings.ToLower(label), f) {
+				filtered = append(filtered, svc)
+			}
+		}
+		services = filtered
+	}
+	return discoveryChoices(services)
 }
 
-// renderDiscovery draws the service question.
+// renderDiscovery draws the service question through the one menu renderer.
 func (m *WizardModel) renderDiscovery() string {
 	if m.discoverPending {
-		return "Looking for services running on this machine..."
+		width := m.contentWidth()
+		return strings.Join(WrapText("Looking for services running on this machine...", width), "\n")
 	}
+	return m.renderDiscoveryReady()
+}
 
+// renderDiscoveryReady renders the scan result.
+//
+// A failed scan says the scan failed and stops there. Basing "did not find
+// anything listening" on an empty list made a timeout claim the machine was
+// idle — something the scan never established — while the error line below
+// contradicted it.
+func (m *WizardModel) renderDiscoveryReady() string {
+	width := m.contentWidth()
+	choices := m.discoveryChoiceList()
 	title := "Which service should be reachable?"
-	if len(m.discovered) == 0 {
+	if m.discoverErr != nil {
+		// Branch on the failure first: an error must never share a screen
+		// with, let alone be overridden by, an empty-machine claim.
+		title = "The scan itself failed, so Portico does not know what is listening. " +
+			"It did not establish that nothing is running."
+	} else if len(m.discovered) == 0 {
 		title = "Portico did not find anything listening."
 	}
 
-	out := renderChoices(title, m.discoveryChoiceList(), m.selected)
+	// One renderer owns the menu: clipping, selection visibility, section
+	// headers, the above/below indicator and detail budgeting all live in
+	// renderChoiceWindow. Discovery carried a second, hand-rolled copy of
+	// that logic, and the copies had already drifted.
+	body := m.renderChoiceWindow(title, choices, m.selected)
+
+	var trailer []string
 	if m.discoverErr != nil {
-		out += "\n" + "The scan itself failed, so this is not a statement that nothing is running: " +
-			m.discoverErr.Error() + "\n"
+		trailer = []string{
+			"",
+			wizardOneLine("Scan failed: "+m.discoverErr.Error(), width),
+			wizardOneLine("Scan again with r, or enter the address yourself.", width),
+		}
 	} else if len(m.discovered) == 0 {
-		out += "\nA service Portico cannot see is still a service — it may be listening only on " +
-			"an interface the scan does not cover, or it may not be started yet. " +
-			"Scan again with r, or enter the address yourself.\n"
+		trailer = []string{"", wizardOneLine("Scan again with r, or enter the address yourself.", width)}
 	}
-	return out
+	trailer = append(trailer, wizardOneLine(m.discoveryFooter(choices), width))
+	return body + "\n" + strings.Join(trailer, "\n")
 }
 
-// handleDiscoveryKey answers the service question.
+// handleDiscoveryKey answers the service question with viewport navigation.
+// Enter enforces the same availability the display shows: a choice marked
+// unavailable is refused with its reason, never silently substituted.
 func (m *WizardModel) handleDiscoveryKey(key string) tea.Cmd {
 	choices := m.discoveryChoiceList()
 	switch key {
 	case "esc":
 		m.goBack()
 	case "r":
-		// Scanning again is offered whether or not anything was found: the user
-		// may have started the service after the first scan.
 		return m.discoverCmd()
 	case "up", "k":
-		if m.selected > 0 {
-			m.selected--
-		}
+		m.menuViewport.Move(-1, len(choices))
+		m.selected = m.menuViewport.Cursor
 	case "down", "j":
-		if m.selected < len(choices)-1 {
-			m.selected++
-		}
+		m.menuViewport.Move(1, len(choices))
+		m.selected = m.menuViewport.Cursor
+	case "pgup":
+		m.menuViewport.Page(-1, len(choices))
+		m.selected = m.menuViewport.Cursor
+	case "pgdown":
+		m.menuViewport.Page(1, len(choices))
+		m.selected = m.menuViewport.Cursor
+	case "home":
+		m.menuViewport.First(len(choices))
+		m.selected = m.menuViewport.Cursor
+	case "end":
+		m.menuViewport.Last(len(choices))
+		m.selected = m.menuViewport.Cursor
+	case "m":
+		m.err = nil
+		m.state.SourceAddress = ""
+		m.state.Step = WizardStepSource
+		m.setInput("")
+		return nil
+	case "f":
+		m.discoveryFilter = ""
+		m.discoveryFilterField.Focus()
+		m.state.Step = WizardStepDiscoveryFilter
+		m.setInput("")
+		return nil
+	case "a":
+		m.discoveryShowAll = !m.discoveryShowAll
+		choices = m.discoveryChoiceList()
+		m.menuViewport.Cursor = m.selected
+		m.menuViewport.ensureVisible(len(choices))
+		m.selected = m.menuViewport.Cursor
 	case "enter":
 		choice, ok := choiceAt(choices, m.selected)
 		if !ok {
 			return nil
 		}
+		if !choice.Available {
+			// Display state and behaviour agree: the reason the row shows is
+			// the reason the press is refused.
+			if choice.Reason != "" {
+				m.err = errors.New(choice.Reason)
+			}
+			return nil
+		}
 		if choice.Value == manualAddressChoice {
-			// The address question, with nothing filled in.
 			m.err = nil
 			m.state.SourceAddress = ""
 			m.state.Step = WizardStepSource
 			m.setInput("")
 			return nil
 		}
-		// The discovered address and protocol are taken exactly as found, so a
-		// scanned host:port is never rewritten.
 		m.err = nil
 		m.state.SourceAddress = choice.Value
 		if svc, found := m.discoveredByAddress(choice.Value); found {
@@ -172,39 +237,14 @@ func (m *WizardModel) discoveredByAddress(address string) (ipc.DiscoveredService
 	return ipc.DiscoveredServiceDTO{}, false
 }
 
-// discoveryActions describes the service question.
-func (m *WizardModel) discoveryActions() WizardActions {
-	has := len(m.discovered) > 0
-	return WizardActions{
-		{
-			Keys: []string{"up", "k"}, Label: "Up", Enabled: has,
-			DisabledReason: "nothing was found to choose between",
-			Help:           "Move up the list of services.",
-		},
-		{
-			Keys: []string{"down", "j"}, Label: "Down", Enabled: true,
-			Help: "Move down the list. Entering an address yourself is the last option.",
-		},
-		{
-			Keys: []string{"enter"}, Label: "Use this one", Enabled: true, Primary: true,
-			Help: "Publish the highlighted service, or open the address field if you chose " +
-				"to enter one yourself.",
-		},
-		{
-			Keys: []string{"r"}, Label: "Scan again", Enabled: !m.discoverPending,
-			DisabledReason: "a scan is already running", Primary: true,
-			Help: "Look again. Something started since the last scan will be found now.",
-		},
-		{
-			Keys: []string{"esc"}, Label: "Back", Enabled: true, Primary: true,
-			Help: "Return to the previous question. Your answers are kept.",
-		},
-		{
-			Label: "Why this one?", Enabled: true,
-			Help: "The highlighted service expands to show what Portico probed and what " +
-				"answered, so you can judge the identification yourself.",
-		},
+// discoveryFooter renders a concise footer.
+func (m *WizardModel) discoveryFooter(choices []wizardChoice) string {
+	keys := []string{}
+	if len(choices) > 1 {
+		keys = append(keys, "↑↓ Navigate")
 	}
+	keys = append(keys, "Enter Select", "Esc Back", "PgUp/PgDn Page", "Home/End First/Last", "m Manual", "f Filter", "a Show all")
+	return strings.Join(keys, "  ")
 }
 
 // ensureDiscoveryStarted asks for a scan the first time the question is reached.
@@ -215,4 +255,20 @@ func (m *WizardModel) ensureDiscoveryStarted() tea.Cmd {
 	return m.discoverCmd()
 }
 
-var _ = fmt.Sprintf
+func (m *WizardModel) discoveryActions() WizardActions {
+	has := len(m.discovered) > 0
+	return WizardActions{
+		{Keys: []string{"up", "k"}, Label: "Up", Enabled: has,
+			DisabledReason: "nothing was found to choose between",
+			Help:           "Move up the list of services."},
+		{Keys: []string{"down", "j"}, Label: "Down", Enabled: true,
+			Help: "Move down the list."},
+		{Keys: []string{"enter"}, Label: "Use this one", Enabled: true, Primary: true,
+			Help: "Publish the highlighted service."},
+		{Keys: []string{"r"}, Label: "Scan again", Enabled: !m.discoverPending,
+			DisabledReason: "a scan is already running", Primary: true,
+			Help: "Look again for services."},
+		{Keys: []string{"esc"}, Label: "Back", Enabled: true, Primary: true,
+			Help: "Return to the previous question. Your answers are kept."},
+	}
+}

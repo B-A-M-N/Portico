@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,45 +26,61 @@ func TestController_OwnedCommandOriginLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is required for command-origin lifecycle test")
 	}
-	port := freeLoopbackPort(t)
+	// The reserved port is released before the child binds it. Under a loaded
+	// -race run another process can take it in that window and the open
+	// operation fails with "exited immediately" — a lost race, not a product
+	// failure. Retry with a fresh port; fail only when every attempt loses.
+	const attempts = 5
+	var controller *Controller
+	var profile *core.ConnectionProfile
+	var port int
+	for attempt := 0; attempt < attempts; attempt++ {
+		port = freeLoopbackPort(t)
 
-	controller := New(newTestRegistry(mock.New()), newTestJournal())
-	controller.SetOriginManager(origin.NewManager())
-	profile := &core.ConnectionProfile{
-		Name: "owned-command",
-		Kind: core.ConnectionServiceExposure,
-		Spec: core.ConnectionSpec{
-			ServiceExposure: &core.ServiceExposureSpec{
-				Source: core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
-					Executable: "python3",
-					Args:       []string{"-m", "http.server", strconv.Itoa(port)},
-					Port:       port,
-				}},
-				Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
-				Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+		controller = New(newTestRegistry(mock.New()), newTestJournal())
+		controller.SetOriginManager(origin.NewManager())
+		profile = &core.ConnectionProfile{
+			Name: "owned-command",
+			Kind: core.ConnectionServiceExposure,
+			Spec: core.ConnectionSpec{
+				ServiceExposure: &core.ServiceExposureSpec{
+					Source: core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
+						Executable: "python3",
+						Args:       []string{"-m", "http.server", strconv.Itoa(port)},
+						Port:       port,
+					}},
+					Exposure:   core.ExposureSpec{Mode: core.ExposureTemporary},
+					Protection: core.ProtectionSpec{Kind: core.ProtectionNone},
+				},
 			},
-		},
-		Driver:  core.DriverSelection{ProviderID: "mock"},
-		Desired: core.DesiredClosed,
-	}
-	if _, _, err := controller.CreateProfile(context.Background(), profile); err != nil {
-		t.Fatalf("CreateProfile: %v", err)
-	}
+			Driver:  core.DriverSelection{ProviderID: "mock"},
+			Desired: core.DesiredClosed,
+		}
+		if _, _, err := controller.CreateProfile(context.Background(), profile); err != nil {
+			t.Fatalf("CreateProfile: %v", err)
+		}
 
-	openPlan, err := controller.PlanOpen(context.Background(), profile.ID)
-	if err != nil {
-		t.Fatalf("PlanOpen: %v", err)
-	}
-	if err := controller.SavePlan(openPlan); err != nil {
-		t.Fatalf("SavePlan(open): %v", err)
-	}
-	operation, err := controller.ApplyPlan(context.Background(), openPlan.ID)
-	if err != nil {
-		t.Fatalf("ApplyPlan(open): %v", err)
-	}
-	result := awaitOperationTerminal(t, controller, operation.ID)
-	if result.State != OperationStateCompleted {
-		t.Fatalf("open state = %s: %v", result.State, result.Error)
+		openPlan, err := controller.PlanOpen(context.Background(), profile.ID)
+		if err != nil {
+			t.Fatalf("PlanOpen: %v", err)
+		}
+		if err := controller.SavePlan(openPlan); err != nil {
+			t.Fatalf("SavePlan(open): %v", err)
+		}
+		operation, err := controller.ApplyPlan(context.Background(), openPlan.ID)
+		if err != nil {
+			t.Fatalf("ApplyPlan(open): %v", err)
+		}
+		result := awaitOperationTerminal(t, controller, operation.ID)
+		if result.State == OperationStateFailed &&
+			strings.Contains(result.Error.Error(), "exited immediately") && attempt < attempts-1 {
+			// Lost the port race; try again with a new port.
+			continue
+		}
+		if result.State != OperationStateCompleted {
+			t.Fatalf("open state = %s: %v", result.State, result.Error)
+		}
+		break
 	}
 
 	originURL := "http://127.0.0.1:" + strconv.Itoa(port)
@@ -91,11 +108,11 @@ func TestController_OwnedCommandOriginLifecycle(t *testing.T) {
 	if err := controller.SavePlan(closePlan); err != nil {
 		t.Fatalf("SavePlan(close): %v", err)
 	}
-	operation, err = controller.ApplyPlan(context.Background(), closePlan.ID)
+	closeOperation, err := controller.ApplyPlan(context.Background(), closePlan.ID)
 	if err != nil {
 		t.Fatalf("ApplyPlan(close): %v", err)
 	}
-	if result := awaitOperationTerminal(t, controller, operation.ID); result.State != OperationStateCompleted {
+	if result := awaitOperationTerminal(t, controller, closeOperation.ID); result.State != OperationStateCompleted {
 		t.Fatalf("close state = %s: %v", result.State, result.Error)
 	}
 	if response, err := client.Get(originURL); err == nil {

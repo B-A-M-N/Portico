@@ -36,7 +36,9 @@ func (p *connectorCompensationProvider) Capabilities(context.Context) (core.Capa
 	}, nil
 }
 
-func (*connectorCompensationProvider) Authenticate(context.Context, core.AuthRequest) error { return nil }
+func (*connectorCompensationProvider) Authenticate(context.Context, core.AuthRequest) error {
+	return nil
+}
 
 func (p *connectorCompensationProvider) Plan(_ context.Context, desired core.DesiredConnection) (*core.OperationPlan, error) {
 	plan := &core.OperationPlan{

@@ -66,6 +66,11 @@ type fakeClient struct {
 	setupFlowErr   error
 	setupFlowAsked []string
 
+	// Credential validation / discovery during setup.
+	validateResponse *ipc.ConfigureProviderAccountResponse
+	validateErr      error
+	validateRequests []ipc.ConfigureProviderAccountRequest
+
 	launchMode    *ipc.LaunchModeDTO
 	launchModeErr error
 
@@ -289,6 +294,21 @@ func (f *fakeClient) RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, e
 
 func (f *fakeClient) ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
 	return &ipc.ConfigureProviderAccountResponse{RestartRequired: false}, nil
+}
+
+// ValidateProviderAccount answers with the configured discovery result, or a
+// validated single-account response when none is set.
+func (f *fakeClient) ValidateProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validateRequests = append(f.validateRequests, req)
+	if f.validateErr != nil {
+		return nil, f.validateErr
+	}
+	if f.validateResponse != nil {
+		return f.validateResponse, nil
+	}
+	return &ipc.ConfigureProviderAccountResponse{Validated: true}, nil
 }
 
 func (f *fakeClient) GetOperationHistoryLimit(ctx context.Context, limit int) (*ipc.OperationHistoryDTO, error) {
@@ -881,8 +901,8 @@ func TestSnapshotSetsEventCursorAndConnectsSSE(t *testing.T) {
 	if m.lastEventSeq != 42 {
 		t.Fatalf("lastEventSeq = %d, want 42", m.lastEventSeq)
 	}
-	if !m.streamConnected {
-		t.Fatal("streamConnected should be true after first snapshot")
+	if m.eventStreams.state != eventStreamConnecting {
+		t.Fatalf("event stream state = %q, want connecting before ready result", m.eventStreams.state)
 	}
 	if cmd == nil {
 		t.Fatal("expected SSE connect command after first snapshot")
@@ -910,17 +930,136 @@ func TestSnapshotDoesNotReconnectSSEOnRefresh(t *testing.T) {
 	}
 }
 
+func TestEventStreamInitialFailureEntersReconnecting(t *testing.T) {
+	m := newModel(&fakeClient{}, nil)
+	m.Update(snapshotMsg{Snapshot: ipc.SnapshotDTO{LastSeq: 1}})
+
+	next, cmd := m.Update(streamErrorMsg{
+		Generation: m.eventStreams.generation,
+		Err:        errors.New("socket unavailable"),
+	})
+	m = next.(Model)
+
+	if m.eventStreams.state != eventStreamReconnecting {
+		t.Fatalf("event stream state = %q, want reconnecting", m.eventStreams.state)
+	}
+	if cmd == nil {
+		t.Fatal("expected reconnect command after initial connection failure")
+	}
+	if m.wizard != nil {
+		t.Fatal("unexpected wizard while testing root-only state")
+	}
+}
+
+func TestEventStreamReadyClearsReconnectStatusAndMarksLive(t *testing.T) {
+	m := newModel(&fakeClient{}, nil)
+	m.Update(snapshotMsg{Snapshot: ipc.SnapshotDTO{LastSeq: 1}})
+	m.Update(streamErrorMsg{
+		Generation: m.eventStreams.generation,
+		Err:        errors.New("socket unavailable"),
+	})
+	m.status = "event stream interrupted: socket unavailable; reconnecting"
+
+	next, cmd := m.Update(eventStreamReadyMsg{
+		Generation: m.eventStreams.generation,
+		Stream:     &ipc.EventStream{},
+		Cancel:     func() {},
+	})
+	m = next.(Model)
+
+	if !m.eventStreams.live() {
+		t.Fatalf("event stream state = %q, want live", m.eventStreams.state)
+	}
+	if m.status != "" {
+		t.Fatalf("status = %q, want reconnect warning cleared", m.status)
+	}
+	if cmd == nil {
+		t.Fatal("expected event read command after stream becomes live")
+	}
+	m.closeEventStream()
+}
+
+func TestEventStreamResyncTransitionsAndSuccessfulSnapshotReconnects(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.eventStreams.generation = 1
+	m.eventStreams.state = eventStreamLive
+	m.lastEventSeq = 10
+
+	next, _ := m.Update(eventMsg{Generation: 1, Event: ipc.EventDTO{Type: "resync_required"}})
+	m = next.(Model)
+	if m.eventStreams.state != eventStreamResyncing {
+		t.Fatalf("event stream state = %q after resync, want resyncing", m.eventStreams.state)
+	}
+
+	next, cmd := m.Update(snapshotMsg{Snapshot: ipc.SnapshotDTO{LastSeq: 11}})
+	m = next.(Model)
+	if m.eventStreams.state != eventStreamConnecting {
+		t.Fatalf("event stream state = %q after snapshot, want connecting", m.eventStreams.state)
+	}
+	if m.eventStreams.generation != 2 {
+		t.Fatalf("event stream generation = %d after snapshot, want 2", m.eventStreams.generation)
+	}
+	if cmd == nil {
+		t.Fatal("expected reconnect command after successful resync snapshot")
+	}
+}
+
+func TestStaleEventStreamResultsCannotSupersedeNewerState(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.eventStreams.generation = 2
+	m.eventStreams.state = eventStreamReconnecting
+
+	next, _ := m.Update(streamErrorMsg{Generation: 1, Err: errors.New("old attempt")})
+	if next.(Model).eventStreams.state != eventStreamReconnecting {
+		t.Fatal("stale error changed current state")
+	}
+	next, cmd := m.Update(eventMsg{Generation: 1, Event: ipc.EventDTO{Type: "connection.updated"}})
+	_ = next
+	if cmd != nil {
+		t.Fatal("stale event scheduled follow-up work")
+	}
+
+	next, _ = m.Update(eventStreamReadyMsg{Generation: 1, Stream: &ipc.EventStream{}, Cancel: func() {}})
+	m = next.(Model)
+	if m.eventStreams.live() {
+		t.Fatal("stale ready result resurrected superseded stream state")
+	}
+	if m.stream != nil {
+		t.Fatal("stale ready result installed stream transport")
+	}
+}
+
+func TestEventStreamShutdownCancellationDoesNotScheduleReconnect(t *testing.T) {
+	m := readyModel(&fakeClient{}, testSnapshot())
+	m.eventStreams.generation = 1
+	m.eventStreams.state = eventStreamReconnecting
+
+	next, cmd := m.Update(streamErrorMsg{
+		Generation: 1,
+		Err:        fmt.Errorf("event read: %w", context.Canceled),
+	})
+	m = next.(Model)
+
+	if m.eventStreams.state != eventStreamReconnecting {
+		t.Fatalf("event stream state = %q after exit, want unchanged reconnecting", m.eventStreams.state)
+	}
+	if cmd != nil {
+		t.Fatal("shutdown cancellation scheduled a reconnect after exit")
+	}
+}
+
 func TestResyncClosesStreamAndRequestsSnapshot(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
 	m.lastEventSeq = 10
-	m.streamConnected = true
+	m.eventStreams.generation = 1
+	m.eventStreams.state = eventStreamLive
 
 	evt := ipc.EventDTO{Type: "resync_required", Sequence: 0}
-	next, cmd := m.Update(eventMsg{Event: evt})
+	next, cmd := m.Update(eventMsg{Generation: 1, Event: evt})
 	m = next.(Model)
 
-	if m.streamConnected {
-		t.Fatal("streamConnected should be false after resync")
+	if m.eventStreams.live() {
+		t.Fatal("event stream should not be live after resync")
 	}
 	if cmd == nil {
 		t.Fatal("expected snapshot request command after resync")
@@ -936,7 +1075,7 @@ func TestEventDeduplicationBySequence(t *testing.T) {
 		Sequence: 5,
 		Data:     map[string]interface{}{"summary": "old event"},
 	}
-	next, _ := m.Update(eventMsg{Event: evt})
+	next, _ := m.Update(eventMsg{Generation: 1, Event: evt})
 	m = next.(Model)
 
 	if len(m.opEvents) != 0 {
@@ -954,7 +1093,7 @@ func TestOperationEventsFilteredByID(t *testing.T) {
 		OperationID: "op-other",
 		Data:        map[string]interface{}{"summary": "other op step"},
 	}
-	next, _ := m.Update(eventMsg{Event: evt})
+	next, _ := m.Update(eventMsg{Generation: 1, Event: evt})
 	m = next.(Model)
 
 	if len(m.opEvents) != 0 {
@@ -967,7 +1106,7 @@ func TestOperationEventsFilteredByID(t *testing.T) {
 		OperationID: "op-1",
 		Data:        map[string]interface{}{"summary": "our op step"},
 	}
-	next, _ = m.Update(eventMsg{Event: evt2})
+	next, _ = m.Update(eventMsg{Generation: 1, Event: evt2})
 	m = next.(Model)
 
 	if len(m.opEvents) != 1 || m.opEvents[0] != "our op step" {
@@ -1075,8 +1214,8 @@ func TestInitOnlyRequestsSnapshot(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("Init returned nil command")
 	}
-	if m.streamConnected {
-		t.Fatal("streamConnected should be false before first snapshot")
+	if m.eventStreams.live() {
+		t.Fatal("event stream should not be live before first snapshot")
 	}
 }
 

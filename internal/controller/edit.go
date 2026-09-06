@@ -66,6 +66,13 @@ func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, erro
 	if current.Name != proposed.Name {
 		delta.Changes = append(delta.Changes, "name")
 	}
+	if current.EffectiveProfileKind() != proposed.EffectiveProfileKind() {
+		delta.Changes = append(delta.Changes, "profile kind")
+		delta.RestartConnector = true
+		// A workload-kind change can alter the provider-side access shape;
+		// invalidate resources whose configuration is derived from that shape.
+		delta.invalidate(core.ResourceDNSRecord, core.ResourceAccessApp, core.ResourceAccessPolicy)
+	}
 
 	if current.Driver.ProviderID != proposed.Driver.ProviderID {
 		delta.Changes = append(delta.Changes, "provider")
@@ -173,6 +180,10 @@ func DiffProfiles(current, proposed *core.ConnectionProfile) (ProfileDelta, erro
 			}
 			if cur.MCP.Transport != prop.MCP.Transport {
 				delta.Changes = append(delta.Changes, "MCP transport")
+				delta.RestartConnector = true
+			}
+			if !sameCommand(cur.MCP.Command, prop.MCP.Command) {
+				delta.Changes = append(delta.Changes, "MCP command")
 				delta.RestartConnector = true
 			}
 		}
@@ -485,55 +496,4 @@ func safeResourceID(id string) string {
 		return id[:12]
 	}
 	return id
-}
-
-// planOpenSteps produces the steps that would open a connection under the
-// given profile, without touching the stored profile.
-//
-// It exists so an edit can append the reopen to its own plan, and so repair can
-// ask the provider to plan the desired state rather than manufacturing
-// provider-specific technical parameters in controller code. The profile is
-// passed explicitly rather than read from the controller, because during an
-// edit the stored profile is still the previous one.
-//
-// The current runtime is passed so a provider can distinguish a frontend Portico
-// owns from one the user configured manually. It is deep-copied: the provider
-// must not be able to mutate controller state through it.
-func (c *Controller) planOpenSteps(ctx context.Context, profile *core.ConnectionProfile) ([]core.PlanStep, error) {
-	prov, err := c.providerForProfile(profile)
-	if err != nil {
-		return nil, err
-	}
-
-	openProfile := profile.DeepCopy()
-	openProfile.Desired = core.DesiredOpen
-
-	c.mu.RLock()
-	runtimeCopy := c.runtimes[profile.ID].DeepCopy()
-	c.mu.RUnlock()
-
-	// Only service-exposure connections have a local origin model. Port forwards,
-	// client tunnels, and private networks have no service origin — pass nil.
-	var resolvedOrigin *core.ResolvedOrigin
-	if openProfile.Kind == core.ConnectionServiceExposure {
-		sourceSpec := openProfile.GetSource()
-		var err error
-		resolvedOrigin, err = c.prepareOriginForConnection(ctx, profile.ID, sourceSpec)
-		if err != nil {
-			return nil, fmt.Errorf("origin preparation: %w", err)
-		}
-	}
-
-	plan, err := prov.Plan(ctx, core.DesiredConnection{
-		Profile: openProfile,
-		Runtime: runtimeCopy,
-		Origin:  resolvedOrigin,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if resolvedOrigin != nil && resolvedOrigin.Owned {
-		insertStartOriginStep(plan, resolvedOrigin.URL)
-	}
-	return plan.Steps, nil
 }

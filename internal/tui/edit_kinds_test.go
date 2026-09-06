@@ -96,6 +96,52 @@ func TestAPortForwardsFieldsCanBeEdited(t *testing.T) {
 	}
 }
 
+// TestAClientTunnelEditsItsEffectiveProperties pins the P0-03 correction: the
+// tunnel's ID and MCP origin are editable, while the legacy native client
+// profile never appears as a field.
+func TestAClientTunnelEditsItsEffectiveProperties(t *testing.T) {
+	m := editingModel(t, &fakeClient{}, clientTunnelDetail())
+
+	row := rowFor(t, m, editTunnelID)
+	if !row.editable {
+		t.Fatal("a tunnel ID cannot be changed")
+	}
+	for _, row := range m.edit.rows() {
+		if strings.EqualFold(row.label, "Client profile") ||
+			strings.Contains(strings.ToLower(row.label), "native profile") {
+			t.Fatalf("the legacy client profile is exposed as an effective field: %q", row.label)
+		}
+	}
+
+	m = selectRow(t, m, editTunnelID)
+	next, _ := m.Update(keyMsg("enter"))
+	m = next.(Model)
+	m.edit.field.SetValue("tunnel_" + strings.Repeat("f", 32))
+	next, _ = m.Update(keyMsg("enter"))
+	m = next.(Model)
+
+	m = selectRow(t, m, editTunnelMCP)
+	next, _ = m.Update(keyMsg("enter"))
+	m = next.(Model)
+	m.edit.field.SetValue("http://127.0.0.1:9100/mcp")
+	next, _ = m.Update(keyMsg("enter"))
+	m = next.(Model)
+
+	req := m.edit.request()
+	if req.ClientTunnel == nil {
+		t.Fatal("the request carries no client-tunnel arm")
+	}
+	if req.ClientTunnel.TunnelID != "tunnel_"+strings.Repeat("f", 32) {
+		t.Fatalf("tunnel ID = %q", req.ClientTunnel.TunnelID)
+	}
+	if req.ClientTunnel.MCP.Endpoint != "http://127.0.0.1:9100/mcp" {
+		t.Fatalf("MCP endpoint = %q", req.ClientTunnel.MCP.Endpoint)
+	}
+	if req.ClientTunnel.Profile != "" {
+		t.Fatalf("a normal edit re-sent the legacy profile: %q", req.ClientTunnel.Profile)
+	}
+}
+
 // TestAnInvalidPortIsRefusedOnScreen pins that validation happens where the value
 // is still editable.
 func TestAnInvalidPortIsRefusedOnScreen(t *testing.T) {

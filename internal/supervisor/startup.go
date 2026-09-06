@@ -1294,9 +1294,9 @@ func (s *Supervisor) shutdown(ctx context.Context) error {
 func (s *Supervisor) shutdownOnce_(ctx context.Context) error {
 	slog.Info("supervisor shutting down")
 
+	s.beginShutdown()
 	s.mu.Lock()
 	s.ready = false
-	s.mutating = false
 	s.mu.Unlock()
 
 	// Signal stop to all goroutines

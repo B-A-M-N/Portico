@@ -38,6 +38,11 @@ type settingsState struct {
 	loadErr  string
 	rotating bool
 	rotation string
+	// confirmingRotate gates key rotation behind an explicit confirmation.
+	// Re-encrypting every credential is a destructive operation, so pressing
+	// K previews what will happen and enter — only enter — starts it. The
+	// CLI asks the same question before its own rotation.
+	confirmingRotate bool
 }
 
 // settingRow is one line on the settings screen.
@@ -237,6 +242,19 @@ func (m *Model) renderSettings() string {
 	if m.settings.err != "" {
 		b.WriteString("\n")
 		b.WriteString(m.theme.Style("intervention").Render(m.settings.err))
+		b.WriteString("\n")
+	}
+	if m.settings.confirmingRotate {
+		// The warning names the consequence before the key material moves.
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("intervention").Render(
+			"Rotate the installation encryption key?"))
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("muted").Render(
+			"Existing credentials are re-encrypted under the new key."))
+		b.WriteString("\n")
+		b.WriteString(m.theme.Style("attention").Render(
+			"enter: rotate    esc: cancel"))
 		b.WriteString("\n")
 	}
 	if m.settings.rotation != "" {

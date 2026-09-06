@@ -41,12 +41,12 @@ func (p *AccountsProvider) Identity() core.ProviderIdentity {
 	return core.ProviderIdentity{ID: "cloudflare", Name: "cloudflare", DisplayName: "Cloudflare"}
 }
 
+// Capabilities answers from the provider's static contract, not from any one
+// child. The first-sorted child used to answer, which made the capability
+// claim for a multi-account installation depend on map ordering rather than
+// on what Cloudflare support actually is.
 func (p *AccountsProvider) Capabilities(ctx context.Context) (core.Capabilities, error) {
-	child, err := p.defaultProvider()
-	if err != nil {
-		return core.Capabilities{}, err
-	}
-	return child.Capabilities(ctx)
+	return cloudflareIntrinsicCapabilities(ctx)
 }
 
 func (p *AccountsProvider) Authenticate(ctx context.Context, req core.AuthRequest) error {
@@ -96,9 +96,30 @@ func (p *AccountsProvider) ProviderForAccount(accountID core.ProviderAccountID) 
 	return child, nil
 }
 
-func (p *AccountsProvider) defaultProvider() (*Provider, error) {
-	if len(p.ordered) == 0 {
-		return nil, fmt.Errorf("no Cloudflare accounts configured")
+// ReadinessSnapshots returns deterministic account-scoped readiness facts for
+// setup and readiness views. The provider map is copied and sorted at
+// construction, so this method has no map-order-dependent output.
+func (p *AccountsProvider) ReadinessSnapshots(ctx context.Context) []ReadinessSnapshot {
+	if p == nil {
+		return nil
 	}
-	return p.accounts[p.ordered[0]], nil
+	result := make([]ReadinessSnapshot, 0, len(p.ordered))
+	for _, id := range p.ordered {
+		snapshot, err := p.accounts[id].ReadinessSnapshot(ctx)
+		if err != nil {
+			snapshot = ReadinessSnapshot{AccountID: id, Notes: []string{err.Error()}}
+		}
+		result = append(result, snapshot)
+	}
+	return result
+}
+
+// ReadinessSnapshot returns readiness for one account, accepting an empty ID
+// only when this router has exactly one account.
+func (p *AccountsProvider) ReadinessSnapshot(ctx context.Context, accountID core.ProviderAccountID) (ReadinessSnapshot, error) {
+	child, err := p.ProviderForAccount(accountID)
+	if err != nil {
+		return ReadinessSnapshot{}, err
+	}
+	return child.(*Provider).ReadinessSnapshot(ctx)
 }

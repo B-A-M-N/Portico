@@ -18,9 +18,9 @@ import (
 func gatewayVerticalProfile() *core.ConnectionProfile {
 	return &core.ConnectionProfile{
 		ID: "gw-vertical", Name: "llama-box",
-		Kind:       core.ConnectionServiceExposure,
+		Kind:        core.ConnectionServiceExposure,
 		ProfileKind: core.ProfileOpenAICompatible,
-		Desired:    core.DesiredOpen,
+		Desired:     core.DesiredOpen,
 		Spec: core.ConnectionSpec{ServiceExposure: &core.ServiceExposureSpec{
 			Source: core.SourceSpec{Kind: core.SourceExisting, Existing: &core.ExistingServiceSpec{
 				Address: "127.0.0.1:8080", Protocol: core.ProtocolHTTP,

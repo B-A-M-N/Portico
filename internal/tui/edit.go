@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/tui/screens"
 )
@@ -51,6 +53,8 @@ const (
 	editRemoteHost
 	editRemotePort
 	editForwardProtocol
+	editTunnelID
+	editTunnelMCP
 	// Private-network fields. The controller has classified changes to the network and
 	// the mode since the kind existed, and to the published address since it became
 	// deliverable.
@@ -103,6 +107,8 @@ type editState struct {
 	remoteHost      *string
 	remotePort      *string
 	forwardProtocol *string
+	tunnelID        *string
+	tunnelMCP       *string
 
 	// Private-network properties.
 	networkMode    *string
@@ -164,6 +170,8 @@ func (s *editState) rows() []editRow {
 		rows = append(rows, s.portForwardRows()...)
 	case s.detail.DesiredSpec.PrivateNetwork != nil:
 		rows = append(rows, s.privateNetworkRows()...)
+	case s.detail.DesiredSpec.ClientTunnel != nil:
+		rows = append(rows, s.clientTunnelRows()...)
 	default:
 		rows = append(rows, editRow{
 			field: editHostname, label: "Address", editable: false,
@@ -350,6 +358,35 @@ func (s *editState) request() ipc.UpdateConnectionRequest {
 			network.LocalAddress = *s.networkAddress
 		}
 		req.PrivateNetwork = &network
+	}
+	if s.detail.DesiredSpec.ClientTunnel != nil &&
+		(s.tunnelID != nil || s.tunnelMCP != nil) {
+		tunnel := *s.detail.DesiredSpec.ClientTunnel
+		tunnel.Profile = ""
+		if s.tunnelID != nil {
+			tunnel.TunnelID = *s.tunnelID
+		}
+		if s.tunnelMCP != nil {
+			if strings.HasPrefix(*s.tunnelMCP, "http://") ||
+				strings.HasPrefix(*s.tunnelMCP, "https://") {
+				transport := tunnel.MCP.Transport
+				if tunnel.MCP.Command != nil || transport == "" {
+					transport = "streamable_http"
+				}
+				tunnel.MCP = ipc.MCPSourceDTO{
+					Transport: transport,
+					Endpoint:  *s.tunnelMCP,
+				}
+			} else {
+				tunnel.MCP = ipc.MCPSourceDTO{
+					Transport: tunnel.MCP.Transport,
+					Command: &ipc.CommandSourceDTO{
+						Executable: *s.tunnelMCP,
+					},
+				}
+			}
+		}
+		req.ClientTunnel = &tunnel
 	}
 	return req
 }
@@ -806,6 +843,25 @@ func (m *Model) commitEditField(value string) {
 			return
 		}
 		m.edit.networkAddress = &value
+	case editTunnelID:
+		if err := core.ValidateTunnelID(value); err != nil {
+			m.edit.err = err.Error()
+			return
+		}
+		m.edit.tunnelID = &value
+	case editTunnelMCP:
+		if value == "" {
+			m.edit.err = "the tunnel needs somewhere to forward to"
+			return
+		}
+		if validTunnelMCPEndpoint(value) {
+			m.edit.tunnelMCP = &value
+		} else if looksLikeURL(value) {
+			m.edit.err = "the tunnel forwards to an absolute http:// or https:// address"
+			return
+		} else {
+			m.edit.tunnelMCP = &value
+		}
 	}
 	m.edit.err = ""
 }
@@ -884,4 +940,23 @@ func (s *editState) effectiveAccount() string {
 		return s.detail.Summary.ProviderAccountID
 	}
 	return ""
+}
+
+// validTunnelMCPEndpoint refuses an endpoint the client-tunnel spec cannot
+// carry. The supervisor checks again; keeping the same rule here catches a typo
+// while it is still on screen.
+func validTunnelMCPEndpoint(value string) bool {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.User != nil {
+		return false
+	}
+	return parsed.IsAbs() && parsed.Host != "" &&
+		(parsed.Scheme == "http" || parsed.Scheme == "https")
+}
+
+// looksLikeURL distinguishes a malformed endpoint from an executable name. Both
+// are editable values, but only the malformed endpoint can be diagnosed here.
+func looksLikeURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && (parsed.IsAbs() || parsed.Scheme != "" || strings.Contains(value, "://"))
 }

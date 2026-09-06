@@ -62,17 +62,22 @@ func (nullCreator) GetOperation(context.Context, string) (*ipc.OperationDTO, err
 	return &ipc.OperationDTO{ID: "op-1", State: "succeeded"}, nil
 }
 
-// discoveredServices are two plausible scan results, one identified and one not.
+// discoveredServices are two plausible scan results, one identified and one
+// not. The grades are the discovery engine's own (internal/discovery); a test
+// fixture using a grade production never emits proved only the behaviour of an
+// impossible input.
 func discoveredServices() []ipc.DiscoveredServiceDTO {
 	return []ipc.DiscoveredServiceDTO{
 		{
 			Address: "127.0.0.1:3000", Port: 3000, Protocol: "http",
 			Framework: "Next.js", Confidence: "likely", Process: "node", PID: 4242,
-			Evidence: "responded to GET / with x-powered-by: Next.js",
+			Evidence:   "responded to GET / with x-powered-by: Next.js",
+			Selectable: true,
 		},
 		{
 			Address: "127.0.0.1:5432", Port: 5432, Protocol: "tcp",
 			Confidence: "possible", Process: "postgres", PID: 900,
+			Selectable: true,
 		},
 	}
 }

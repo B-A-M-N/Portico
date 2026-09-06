@@ -59,9 +59,29 @@ func (rd *rootedDir) openRelative(rel string, flags int) (int, string, error) {
 		return 0, "", fmt.Errorf("path traversal rejected")
 	}
 
-	fd, err := unix.Openat(rd.rootFd, rel, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return 0, "", fmt.Errorf("opening path: %w", err)
+	base := rd.rootFd
+	ownedBase := false
+	parts := strings.Split(rel, string(filepath.Separator))
+	var fd int
+	var err error
+	for i, part := range parts {
+		componentFlags := flags | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		if i < len(parts)-1 {
+			// Every intermediate component must be a real directory. This
+			// prevents openat from following a symlink into another tree.
+			componentFlags = unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		}
+		fd, err = unix.Openat(base, part, componentFlags, 0)
+		if err != nil {
+			if ownedBase {
+				unix.Close(base)
+			}
+			return 0, "", fmt.Errorf("opening path: %w", err)
+		}
+		if ownedBase {
+			unix.Close(base)
+		}
+		base, ownedBase = fd, true
 	}
 
 	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
@@ -71,12 +91,21 @@ func (rd *rootedDir) openRelative(rel string, flags int) (int, string, error) {
 		return 0, "", fmt.Errorf("reading fd link: %w", err)
 	}
 
-	if !strings.HasPrefix(resolvedPath, rd.canonicalRoot+string(filepath.Separator)) && resolvedPath != rd.canonicalRoot {
+	rootPath := rd.currentRootPath()
+	if !strings.HasPrefix(resolvedPath, rootPath+string(filepath.Separator)) && resolvedPath != rootPath {
 		unix.Close(fd)
 		return 0, "", fmt.Errorf("path outside root")
 	}
 
 	return fd, resolvedPath, nil
+}
+
+func (rd *rootedDir) currentRootPath() string {
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", rd.rootFd))
+	if err != nil {
+		return rd.canonicalRoot
+	}
+	return path
 }
 
 // openFile opens a file relative to root for reading.
@@ -85,6 +114,42 @@ func (rd *rootedDir) openFile(rel string) (*os.File, error) {
 	fd, _, err := rd.openRelative(rel, unix.O_RDONLY)
 	if err != nil {
 		return nil, err
+	}
+	if strings.Trim(rel, "/") == "" || filepath.Clean(rel) == "." {
+		// openRelative returns the borrowed root descriptor for ".". Never
+		// hand that descriptor to a caller that owns and closes its result.
+		fd, err = unix.Dup(rd.rootFd)
+		if err != nil {
+			return nil, fmt.Errorf("duplicate root descriptor: %w", err)
+		}
+		unix.CloseOnExec(fd)
+	}
+	return os.NewFile(uintptr(fd), ""), nil
+}
+
+// openDir opens a directory relative to the root and returns an owned
+// descriptor. The root itself is duplicated so closing the returned file never
+// invalidates rootedDir's borrowed descriptor.
+func (rd *rootedDir) openDir(rel string) (*os.File, error) {
+	fd, _, err := rd.openRelative(rel, unix.O_PATH|unix.O_DIRECTORY)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Trim(rel, "/") == "" || filepath.Clean(rel) == "." {
+		fd, err = unix.Dup(rd.rootFd)
+		if err != nil {
+			return nil, fmt.Errorf("duplicate root descriptor: %w", err)
+		}
+		unix.CloseOnExec(fd)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("stat rooted directory: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		unix.Close(fd)
+		return nil, fmt.Errorf("rooted path is not a directory")
 	}
 	return os.NewFile(uintptr(fd), ""), nil
 }

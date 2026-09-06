@@ -106,7 +106,10 @@ func newFailureTestProfile() *core.ConnectionProfile {
 
 func awaitOperationTerminal(t *testing.T, ctrl *Controller, opID core.OperationID) *Operation {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Fifteen seconds, not five: under the full-suite race gate the machine is
+	// loaded enough that a healthy operation that finishes in half a second
+	// otherwise outruns the poll and the test reports a false failure.
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		snap, ok := ctrl.GetOperation(opID)
 		if !ok {

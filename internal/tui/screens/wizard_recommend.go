@@ -47,6 +47,7 @@ func (m *WizardModel) recommendationRequest() ipc.ProviderRecommendationRequest 
 		// If we can't build the request, return a minimal recommendation request.
 		return ipc.ProviderRecommendationRequest{
 			ConnectionKind: m.state.ConnectionKind,
+			ProfileKind:    m.state.ProfileKind,
 		}
 	}
 	return recommendationFromCreateRequest(req)
@@ -67,6 +68,7 @@ func recommendationFromCreateRequest(req ipc.CreateConnectionRequest) ipc.Provid
 		RequestedAddress:  req.Exposure.RequestedAddress,
 		PreferredProvider: req.Provider.ProviderID,
 		PreferredAccount:  req.Provider.AccountID,
+		ProfileKind:       req.ProfileKind,
 	}
 
 	switch req.Kind {
@@ -125,7 +127,7 @@ func requirementFingerprint(req ipc.ProviderRecommendationRequest) string {
 	return strings.Join([]string{
 		req.ConnectionKind, req.SourceKind, req.MCPTransport, req.ExposureMode,
 		req.Protocol, req.ProtectionKind, req.RequestedAddress,
-		req.PreferredProvider, req.PreferredAccount,
+		req.ProfileKind, req.PreferredProvider, req.PreferredAccount,
 	}, "|")
 }
 
@@ -317,7 +319,7 @@ func (m *WizardModel) renderProvider() string {
 	}
 
 	choices := m.providerChoices()
-	view := renderChoices(title, choices, m.selected)
+	view := m.renderChoices(title, choices, m.selected)
 
 	// A provider that is eligible but has only unusable accounts is a distinct
 	// state from having none: the user configured something and it did not take

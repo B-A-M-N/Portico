@@ -30,7 +30,16 @@ type Store struct {
 	mu          sync.RWMutex
 	secretStore *SecretStore
 	path        string
+	now         func() time.Time
 }
+
+type clock interface {
+	Now() time.Time
+}
+
+type wallClock struct{}
+
+func (wallClock) Now() time.Time { return time.Now().UTC() }
 
 // migration defines a schema migration.
 type migration struct {
@@ -546,6 +555,20 @@ CREATE TABLE IF NOT EXISTS provider_account_removals (
 			return addColumnIfNotExists(tx, "operation_plans", "provider_account_id", "TEXT NOT NULL DEFAULT ''")
 		},
 	},
+	{
+		version: 23,
+		onApply: func(tx *sql.Tx) error {
+			if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    operation_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(operation_id) REFERENCES operations(id)
+)`); err != nil {
+				return err
+			}
+			return addColumnIfNotExists(tx, "idempotency_keys", "plan_id", "TEXT NOT NULL DEFAULT ''")
+		},
+	},
 }
 
 // migrateCleanupItemsRecordTheirAccount adds the account that can discharge a
@@ -763,6 +786,15 @@ func migrateProfilesToVersionedSpec(tx *sql.Tx) error {
 
 // Open opens the SQLite database at path, runs migrations, and returns a Store.
 func Open(path string) (*Store, error) {
+	return OpenWithClock(path, wallClock{})
+}
+
+// OpenWithClock opens a store with an injected clock. Production callers use
+// Open; the seam keeps time-based retention deterministic in tests.
+func OpenWithClock(path string, clk clock) (*Store, error) {
+	if clk == nil {
+		clk = wallClock{}
+	}
 	// SQLite creates the database file, but not its parent directory. Create
 	// the Portico data directory before opening so a first-run XDG location is
 	// usable without any external bootstrap step.
@@ -778,7 +810,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store ping: %w", err)
 	}
 
-	s := &Store{db: db, path: path}
+	s := &Store{db: db, path: path, now: func() time.Time { return clk.Now().UTC() }}
 
 	// Initialize the secret store with a random installation key.
 	// The key is stored alongside the database in a 0600-protected file.
@@ -5168,10 +5200,20 @@ func (s *Store) LookupIdempotentKey(ctx context.Context, key string) (core.Opera
 func (s *Store) RecordIdempotentKey(ctx context.Context, key string, opID core.OperationID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.ExecContext(ctx,
-		"INSERT OR IGNORE INTO idempotency_keys (key, operation_id, created_at) VALUES (?, ?, ?)",
-		key, string(opID), time.Now().UTC().Format(time.RFC3339),
+	result, err := s.db.ExecContext(ctx,
+		"UPDATE idempotency_keys SET operation_id = ? WHERE key = ? AND (operation_id IS NULL OR operation_id = '')",
+		string(opID), key,
 	)
+	if err == nil {
+		var updated int64
+		updated, err = result.RowsAffected()
+		if err == nil && updated == 0 {
+			_, err = s.db.ExecContext(ctx,
+				"INSERT OR IGNORE INTO idempotency_keys (key, operation_id, created_at) VALUES (?, ?, ?)",
+				key, string(opID), time.Now().UTC().Format(time.RFC3339),
+			)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("record idempotency key: %w", err)
 	}

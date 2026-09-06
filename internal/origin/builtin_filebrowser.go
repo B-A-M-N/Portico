@@ -47,23 +47,24 @@ func (fb *BuiltinFileBrowser) safePath(rel string) (string, error) {
 		return "", fmt.Errorf("path traversal rejected")
 	}
 
-	// Use openat to open the path relative to rootFd
-	// O_PATH allows us to get a fd without actually opening the file for I/O
-	fd, err := unix.Openat(fb.rootFd, rel, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	// Walk each component relative to the pinned descriptor. Intermediate
+	// symlinks are rejected rather than resolved into another tree.
+	fd, resolvedPath, err := fb.rooted.openRelative(rel, unix.O_PATH)
 	if err != nil {
-		return "", fmt.Errorf("opening path: %w", err)
+		return "", err
 	}
 	defer unix.Close(fd)
-
-	// Get the actual path via /proc/self/fd/N
-	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
-	resolvedPath, err := os.Readlink(procPath)
-	if err != nil {
-		return "", fmt.Errorf("reading fd link: %w", err)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return "", fmt.Errorf("stat path: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return "", fmt.Errorf("symlink path rejected")
 	}
 
 	// Verify the resolved path is still within the canonical root
-	if !strings.HasPrefix(resolvedPath, fb.canonicalRoot+string(filepath.Separator)) && resolvedPath != fb.canonicalRoot {
+	rootPath := fb.rooted.currentRootPath()
+	if !strings.HasPrefix(resolvedPath, rootPath+string(filepath.Separator)) && resolvedPath != rootPath {
 		return "", fmt.Errorf("path outside root")
 	}
 
@@ -537,7 +538,7 @@ func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	absPath, err := fb.safePath(relPath)
+	_, err := fb.safePath(relPath)
 	if err != nil {
 		// A file that does not exist is not a forbidden one. safePath opens the
 		// path in order to resolve it, so an absent file and a traversal attempt
@@ -564,11 +565,10 @@ func (fb *BuiltinFileBrowser) handleDownload(w http.ResponseWriter, r *http.Requ
 	//
 	// openFile and serveFile were written for this and never called: the browser
 	// constructed the primitives at startup and served by pathname anyway.
-	rel, relErr := filepath.Rel(fb.canonicalRoot, absPath)
-	if relErr != nil || strings.HasPrefix(rel, "..") {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
+	// Keep the caller-supplied relative name. The configured path may have
+	// been renamed after startup, while the pinned root descriptor remains the
+	// authority for what that name means.
+	rel := filepath.Clean(strings.TrimPrefix(relPath, "/"))
 	file, err := fb.rooted.openFile(rel)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {

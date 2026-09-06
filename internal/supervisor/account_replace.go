@@ -84,6 +84,10 @@ func (h *supervisorHandler) HandleReplaceProviderAccountCredential(
 	// rotated a token should not have to restart the supervisor from a shell.
 	if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(providerID)); activateErr != nil {
 		resp.RestartRequired = true
+		if activationUnavailable(activateErr) {
+			return resp, nil
+		}
+		return resp, fmt.Errorf("activate provider %q after credential replacement: %w", providerID, activateErr)
 	}
 	return resp, nil
 }

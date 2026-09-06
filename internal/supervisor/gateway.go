@@ -18,8 +18,10 @@ type gatewayManager struct {
 }
 
 type gatewayHandle struct {
-	gateway *gateway.Gateway
-	cancel  context.CancelFunc
+	gateway       *gateway.Gateway
+	cancel        context.CancelFunc
+	authEnabled   bool
+	credentialRef string
 }
 
 func newGatewayManager() *gatewayManager {
@@ -68,7 +70,10 @@ func (m *gatewayManager) StartGateway(ctx context.Context, connID core.Connectio
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if gw.State() == gateway.GatewayStateReady && gw.Addr() != "" {
-			m.gateways[connID] = &gatewayHandle{gateway: gw, cancel: cancel}
+			m.gateways[connID] = &gatewayHandle{
+				gateway: gw, cancel: cancel, authEnabled: spec.AuthRequired,
+				credentialRef: spec.CredentialRef,
+			}
 			endpoint := gw.URL()
 			slog.Info("gateway started", "connection", connID, "endpoint", endpoint, "upstream", spec.Upstream, "auth_required", spec.AuthRequired)
 			return endpoint, nil
@@ -108,9 +113,11 @@ func (m *gatewayManager) Runtime(connID core.ConnectionID) (core.GatewayRuntime,
 		return core.GatewayRuntime{}, false
 	}
 	return core.GatewayRuntime{
-		Endpoint:  h.gateway.URL(),
-		Upstream:  h.gateway.UpstreamURL(),
-		StartedAt: h.gateway.StartedAt(),
+		Endpoint:      h.gateway.URL(),
+		Upstream:      h.gateway.UpstreamURL(),
+		StartedAt:     h.gateway.StartedAt(),
+		AuthEnabled:   h.authEnabled,
+		CredentialRef: h.credentialRef,
 	}, true
 }
 

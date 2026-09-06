@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	cf "github.com/cloudflare/cloudflare-go"
@@ -34,6 +35,17 @@ type ZoneSummary struct {
 	Name string
 }
 
+// AccountSummary is the non-secret identity returned when a credential can
+// access more than one provider account.
+type AccountSummary struct {
+	ID   string
+	Name string
+}
+
+type accountLister interface {
+	ListAccounts(context.Context, string) ([]AccountSummary, error)
+}
+
 // AccountValidator verifies a provider credential before it is persisted.
 //
 // Recording an account as authenticated without checking is how Portico came to
@@ -48,18 +60,63 @@ type AccountValidator interface {
 }
 
 // cloudflareAccountValidator validates against the real Cloudflare API using
-// least-privilege requests.
-//
-// The account check is an exact, non-mutating, account-scoped tunnel read —
-// NOT Accounts(list). Listing accounts requires Account Settings: Read, which
-// the published tunnel setup does not ask for when the caller already knows
-// its account ID; demanding it here forced users to grant broad read access to
-// every account on the token purely for Portico's convenience. A token with
-// only Cloudflare Tunnel Edit must pass.
-// cloudflareAccountValidator validates against the real Cloudflare API using
 // least-privilege requests: an exact account-scoped tunnel read instead of a
 // broad account listing, and mandatory exact-zone verification for DNS.
 type cloudflareAccountValidator struct{}
+
+func (cloudflareAccountValidator) ListAccounts(ctx context.Context, credential string) ([]AccountSummary, error) {
+	api, err := cf.NewWithAPIToken(credential)
+	if err != nil {
+		return nil, fmt.Errorf("the API token was rejected: %w", err)
+	}
+	accounts, _, err := api.Accounts(ctx, cf.AccountsListParams{})
+	if err != nil {
+		return nil, fmt.Errorf("could not discover Cloudflare accounts: %w", err)
+	}
+	result := make([]AccountSummary, 0, len(accounts))
+	for _, account := range accounts {
+		result = append(result, AccountSummary{ID: account.ID, Name: account.Name})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+// devAccountValidator answers credential validation with canned results.
+//
+// It exists for the same reason the mock provider does: the hermetic TUI gate
+// must be able to walk the real setup path — field → IPC → supervisor →
+// validator → discovered choices — without a live Cloudflare credential, and
+// a developer without one must still be able to exercise the form. It is
+// wired only under an explicit development opt-in and never in production,
+// where cloudflareAccountValidator keeps checking the real API.
+type devAccountValidator struct{}
+
+func (devAccountValidator) ListAccounts(_ context.Context, credential string) ([]AccountSummary, error) {
+	if strings.TrimSpace(credential) == "" {
+		return nil, errors.New("a Cloudflare API token is required")
+	}
+	return []AccountSummary{{ID: "acct-dev-1", Name: "Dev Account"}}, nil
+}
+
+func (devAccountValidator) Validate(_ context.Context, _ string, accountID, credential string) (*AccountValidation, error) {
+	if strings.TrimSpace(credential) == "" {
+		return nil, errors.New("a Cloudflare API token is required")
+	}
+	if strings.TrimSpace(accountID) == "" {
+		return nil, errors.New("a Cloudflare account ID is required")
+	}
+	return &AccountValidation{AccountAccessible: true}, nil
+}
+
+func (devAccountValidator) VerifyZone(_ context.Context, credential, zoneID string) ([]ZoneSummary, error) {
+	if strings.TrimSpace(credential) == "" {
+		return nil, errors.New("a Cloudflare API token is required")
+	}
+	if strings.TrimSpace(zoneID) == "" {
+		return nil, errors.New("a zone ID is required")
+	}
+	return []ZoneSummary{{ID: zoneID, Name: "dev.example"}}, nil
+}
 
 func (cloudflareAccountValidator) Validate(ctx context.Context, providerID, accountID, credential string) (*AccountValidation, error) {
 	if providerID != "cloudflare" {

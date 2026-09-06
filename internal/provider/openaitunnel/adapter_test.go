@@ -189,6 +189,32 @@ func TestCredentialNeverEntersArgv(t *testing.T) {
 	}
 }
 
+// TestLegacyClientProfileNeverReachesPlansOrArgv pins the P0-03 correction:
+// persisted Profile remains readable for compatibility, but it is not an
+// effective setting and no native profile reaches the launched client.
+func TestLegacyClientProfileNeverReachesPlansOrArgv(t *testing.T) {
+	p, _ := testProvider(t)
+	plan, err := p.Plan(context.Background(), core.DesiredConnection{Profile: tunnelProfile(core.DesiredOpen)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	var start core.PlanStep
+	for _, step := range plan.Steps {
+		if step.Kind == core.StepStartConnector {
+			start = step
+		}
+	}
+	if _, ok := start.Technical.Parameters["profile"]; ok {
+		t.Fatal("a native client profile reached plan parameters")
+	}
+	for _, arg := range p.clientProcessSpec(start).Args {
+		if arg == "profile" || strings.Contains(arg, "profile=") {
+			t.Fatalf("a native client profile reached argv: %q", arg)
+		}
+	}
+}
+
 func TestClientUsesGatewayAsMCPOrigin(t *testing.T) {
 	t.Setenv(CredentialEnvVar, "sk-control-plane")
 	p, proc := testProvider(t)

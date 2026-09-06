@@ -55,6 +55,10 @@ type SupervisorClient interface {
 	Discovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
 	RefreshDiscovery(ctx context.Context) (*ipc.DiscoveryDTO, error)
 	ConfigureProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error)
+	// ValidateProviderAccount checks a credential and discovers accounts and
+	// zones without persisting anything, so the form can offer discovery and
+	// selection before the user commits.
+	ValidateProviderAccount(ctx context.Context, providerID string, req ipc.ConfigureProviderAccountRequest) (*ipc.ConfigureProviderAccountResponse, error)
 	RemoveProviderAccount(ctx context.Context, providerID, accountID, fingerprint string) (*ipc.RemoveProviderAccountResponse, error)
 	PreviewProviderAccountRemoval(ctx context.Context, providerID, accountID string) (*ipc.AccountRemovalPreviewDTO, error)
 }

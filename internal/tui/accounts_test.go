@@ -278,14 +278,14 @@ func TestTheSelectedAccountIsVisible(t *testing.T) {
 	m := readyModel(&fakeClient{}, accountSnapshot())
 	m.transitionTo(ScreenProviders)
 
-	view := m.renderProvidersScreen()
+	view := m.renderProviders()
 	if !strings.Contains(view, "▸") {
 		t.Fatalf("no account is marked as selected:\n%s", view)
 	}
 
 	next, _ := m.Update(keyMsg("down"))
 	m = next.(Model)
-	moved := m.renderProvidersScreen()
+	moved := m.renderProviders()
 	if moved == view {
 		t.Fatal("moving the cursor did not change what is marked")
 	}

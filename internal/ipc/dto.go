@@ -21,6 +21,7 @@ type ConnectionDTO struct {
 	// a port forward from a published service, and every list and detail screen
 	// has to guess — which they did, always guessing "exposed to the internet".
 	Kind              string `json:"kind,omitempty"`
+	ProfileKind       string `json:"profile_kind,omitempty"`
 	DesiredState      string `json:"desired_state"`
 	RuntimeState      string `json:"runtime_state"`
 	UserState         string `json:"user_state"`
@@ -182,6 +183,13 @@ type GatewayDTO struct {
 	StartedAt     string `json:"started_at,omitempty"`
 }
 
+// GatewayCredentialDTO is returned only by the explicit local reveal action.
+// It must never be embedded in snapshots, runtime state, events, or exports.
+type GatewayCredentialDTO struct {
+	ConnectionID string `json:"connection_id"`
+	Credential   string `json:"credential"`
+}
+
 // HealthDTO describes the three-state health assessment for a connection.
 // Health is evaluated relative to the connection's desired state and kind.
 type HealthDTO struct {
@@ -315,7 +323,19 @@ type ConfigureProviderAccountRequest struct {
 // ConfigureProviderAccountResponse tells clients whether a supervisor restart
 // is needed before newly persisted account adapters become available.
 type ConfigureProviderAccountResponse struct {
-	RestartRequired bool `json:"restart_required"`
+	AccountID    string `json:"account_id,omitempty"`
+	AccountLabel string `json:"account_label,omitempty"`
+	// AccountSelectionRequired means the credential can see multiple accounts
+	// and the caller must choose one before validation can be completed.
+	AccountSelectionRequired bool                 `json:"account_selection_required,omitempty"`
+	AccountChoices           []ProviderAccountDTO `json:"account_choices,omitempty"`
+	RestartRequired          bool                 `json:"restart_required"`
+	// Committed reports that the requested account change was durably stored.
+	Committed bool `json:"committed,omitempty"`
+	// Degraded reports that durable setup succeeded but provider activation did
+	// not, so a supervisor restart or retry is still required.
+	Degraded        bool   `json:"degraded,omitempty"`
+	ActivationError string `json:"activation_error,omitempty"`
 	// Validated reports that the credential was confirmed against the provider
 	// before the account was saved, rather than accepted on faith.
 	Validated bool `json:"validated,omitempty"`
@@ -342,6 +362,12 @@ type ConfigureProviderAccountResponse struct {
 type ZoneDTO struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// SelectProviderAccountZoneRequest selects a verified provider zone for an
+// account without carrying the account credential again.
+type SelectProviderAccountZoneRequest struct {
+	ZoneID string `json:"zone_id"`
 }
 
 // ReverifyProviderAccountRequest re-verifies an existing account's credential
@@ -577,6 +603,9 @@ type CreateConnectionRequest struct {
 	// Kind selects the connection kind. It defaults to service exposure, so
 	// existing callers are unaffected.
 	Kind string `json:"kind,omitempty"`
+	// ProfileKind selects the provider-neutral service intent. It is separate
+	// from Provider, which selects the transport carrying that intent.
+	ProfileKind string `json:"profile_kind,omitempty"`
 	// ServiceExposure is the only kind that carries flat source/exposure/protection
 	// fields for backward compatibility. Use the corresponding spec arm for
 	// other kinds.
@@ -615,9 +644,18 @@ type SourceDTO struct {
 
 // ExistingSourceDTO describes an already running service.
 type ExistingSourceDTO struct {
-	Network  string `json:"network,omitempty"` // "tcp" or "udp"
-	Address  string `json:"address"`
-	Protocol string `json:"protocol,omitempty"` // "http", "https", "tcp", "udp"
+	Network  string              `json:"network,omitempty"` // "tcp" or "udp"
+	Address  string              `json:"address"`
+	Protocol string              `json:"protocol,omitempty"` // "http", "https", "tcp", "udp"
+	Health   *HealthCheckSpecDTO `json:"health,omitempty"`
+}
+
+// HealthCheckSpecDTO configures a health check for an existing service.
+type HealthCheckSpecDTO struct {
+	Enabled  bool   `json:"enabled"`
+	Path     string `json:"path,omitempty"`
+	Timeout  string `json:"timeout,omitempty"`
+	Interval string `json:"interval,omitempty"`
 }
 
 // DirectorySourceDTO describes a directory to serve.
@@ -679,6 +717,7 @@ type LifecycleDTO struct {
 type UpdateConnectionRequest struct {
 	ExpectedRevision uint64                  `json:"expected_revision,omitempty"`
 	Name             *string                 `json:"name,omitempty"`
+	ProfileKind      *string                 `json:"profile_kind,omitempty"`
 	Spec             *ServiceExposureSpecDTO `json:"spec,omitempty"`
 	// PortForward carries a forward's own editable fields. The controller has
 	// classified changes to the local port, the remote target, the protocol and
@@ -696,6 +735,12 @@ type UpdateConnectionRequest struct {
 	PrivateNetwork *PrivateNetworkSpecDTO `json:"private_network,omitempty"`
 	Driver         *DriverSelectionDTO    `json:"driver,omitempty"`
 	Lifecycle      *LifecycleDTO          `json:"lifecycle,omitempty"`
+	// ClientTunnel carries a client tunnel's own editable fields: the tunnel ID and MCP
+	// origin. The legacy profile field is carried for round-trip compat but is
+	// never treated as an effective editable capability: the client tunnel
+	// transport does not accept profile argv, and the profile name is opaque to
+	// the consuming platform.
+	ClientTunnel *ClientTunnelSpecDTO `json:"client_tunnel,omitempty"`
 }
 
 // ProviderRecommendationRequest asks the supervisor to recommend a driver.
@@ -708,6 +753,12 @@ type ProviderRecommendationRequest struct {
 	ProtectionKind   string `json:"protection_kind,omitempty"`
 	RequestedAddress string `json:"requested_address,omitempty"`
 	PreferredAccount string `json:"preferred_account,omitempty"`
+	// ProfileKind names the workload the connection carries. Empty lets the
+	// controller derive it from the source, and the workload gates which
+	// transports are offered: an MCP workload requires a streaming transport,
+	// and offering one that cannot carry it produced refusals at create time
+	// the user had no way to see coming.
+	ProfileKind string `json:"profile_kind,omitempty"`
 	// PreferredProvider owns PreferredAccount. Account identity is the pair, so
 	// a preference carrying only the account ID matches any provider that
 	// happens to have an account of that name.
@@ -778,19 +829,37 @@ type DiscoveryDTO struct {
 
 // DiscoveredServiceDTO describes a discovered local service.
 type DiscoveredServiceDTO struct {
-	Address    string `json:"address"`
-	Port       int    `json:"port"`
-	Protocol   string `json:"protocol"`
-	Framework  string `json:"framework,omitempty"`
-	Confidence string `json:"confidence"`
-	PID        int    `json:"pid,omitempty"`
-	Process    string `json:"process,omitempty"`
-	Evidence   string `json:"evidence,omitempty"`
+	Address     string `json:"address"`
+	Port        int    `json:"port"`
+	Protocol    string `json:"protocol"`
+	Framework   string `json:"framework,omitempty"`
+	Confidence  string `json:"confidence"`
+	PID         int    `json:"pid,omitempty"`
+	Process     string `json:"process,omitempty"`
+	Evidence    string `json:"evidence,omitempty"`
+	Executable  string `json:"executable,omitempty"`
+	Server      string `json:"server,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Title       string `json:"title,omitempty"`
+	// Presentation semantics are derived by the discovery authority and carried
+	// over IPC so clients do not each invent a different service identity.
+	DisplayName    string `json:"display_name,omitempty"`
+	Description    string `json:"description,omitempty"`
+	SuggestedName  string `json:"suggested_name,omitempty"`
+	Category       string `json:"category,omitempty"`
+	Selectable     bool   `json:"selectable"`
+	DisabledReason string `json:"disabled_reason,omitempty"`
 }
 
 // --------------- diagnostics ---------------
 
 // DiagnosticDTO is a diagnostic finding sent over IPC.
+// RotateSecretKeyDTO carries the result of a secret-key rotation.
+type RotateSecretKeyDTO struct {
+	Version   int    `json:"version"`
+	RotatedAt string `json:"rotated_at"`
+}
+
 type DiagnosticDTO struct {
 	ID          string `json:"id"`
 	Segment     string `json:"segment"`
@@ -824,6 +893,11 @@ type SetupFlowDTO struct {
 	// GuidanceReason states why Portico cannot store the credential, so a
 	// read-only flow does not look like a missing feature.
 	GuidanceReason string `json:"guidance_reason,omitempty"`
+	// IdentityField and SecretField name which declared fields carry the
+	// account identity and the credential, so a generic UI can route discovery
+	// and masking without hardcoding provider field IDs.
+	IdentityField string `json:"identity_field,omitempty"`
+	SecretField   string `json:"secret_field,omitempty"`
 }
 
 // StoresAccount reports whether submitting this flow persists anything.
@@ -839,6 +913,11 @@ type SetupFieldDTO struct {
 	Secret      bool   `json:"secret,omitempty"`
 	Required    bool   `json:"required,omitempty"`
 	Placeholder string `json:"placeholder,omitempty"`
+	// InputKind tells a generic UI what control to render. Empty is an
+	// ordinary text field; "provider_identity" is resolved from the provider's
+	// own account discovery, so the user picks a friendly name instead of
+	// copying an opaque ID from another dashboard.
+	InputKind string `json:"input_kind,omitempty"`
 	// EnvVars name the environment variables a non-interactive caller may
 	// supply this field through. Portico never accepts a secret as a command
 	// argument — it would be in the shell history and in the process list — so

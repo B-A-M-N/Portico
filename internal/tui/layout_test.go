@@ -205,3 +205,26 @@ func TestConnectionListWidthMatchesTheLayout(t *testing.T) {
 		}
 	}
 }
+
+// TestListDetailLayoutCompact60x18ExposesFullBudget verifies the compact
+// breakpoint at 60 columns budgets the full height-10 row count (8 items at
+// height 18), matching what selectionRowsForAt returns for Discovery and
+// Providers screens.
+func TestListDetailLayoutCompact60x18ExposesFullBudget(t *testing.T) {
+	l := NewListDetailLayout(60, 18)
+	if l.Breakpoint != LayoutCompact {
+		t.Fatalf("width 60 breakpoint = %s, want compact", l.Breakpoint)
+	}
+	want := 8 // 18 - 10 (compact budget)
+	if l.ListRows != want {
+		t.Errorf("compact 60x18 ListRows = %d, want %d", l.ListRows, want)
+	}
+
+	for _, screen := range []ScreenID{ScreenDiscovery, ScreenProviders, ScreenOperations} {
+		l2 := NewListDetailLayout(60, 18)
+		got := l2.ListRows
+		if got != want {
+			t.Errorf("%s at 60x18 rows = %d, want %d (ListRows)", screen, got, want)
+		}
+	}
+}

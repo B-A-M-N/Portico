@@ -132,9 +132,9 @@ func (p *failingApplyProvider) Plan(_ context.Context, desired core.DesiredConne
 		ProfileRevision: desired.Profile.Revision,
 		Provider:        "gw-target",
 		Intent:          core.IntentOpen,
-		Steps: []core.PlanStep{{ID: "boom", Kind: core.StepStartConnector, Summary: "Fails on purpose"}},
-		CreatedAt: time.Now().UTC(),
-		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Steps:           []core.PlanStep{{ID: "boom", Kind: core.StepStartConnector, Summary: "Fails on purpose"}},
+		CreatedAt:       time.Now().UTC(),
+		ExpiresAt:       time.Now().UTC().Add(time.Hour),
 	}
 	if err := plan.ComputeFingerprint(); err != nil {
 		return nil, err

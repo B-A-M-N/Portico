@@ -184,3 +184,42 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// ListDetailLayout is the compact-layout subset used by Discovery, Providers,
+// and Operations screens. It reuses the same row budgeting so the selection
+// viewport and the renderer always agree.
+type ListDetailLayout struct {
+	Breakpoint  LayoutBreakpoint
+	ListWidth   int
+	DetailWidth int
+	ListRows    int
+	SideBySide  bool
+}
+
+// NewListDetailLayout computes what fits for Discovery-style screens.
+func NewListDetailLayout(width, height int) ListDetailLayout {
+	l := ListDetailLayout{
+		Breakpoint: Breakpoint(width),
+		ListWidth:  width,
+	}
+
+	// Compact layout: 8 list rows at 60+ cols, same as selectionRowsForAt.
+	if l.Breakpoint == LayoutCompact {
+		l.DetailWidth = 0                 // stacked
+		l.ListRows = maxInt(height-10, 3) // height-10 mirrors reservedRows + compact bonus
+	} else if l.Breakpoint == LayoutStandard {
+		l.DetailWidth = 0 // still stacked at standard
+		l.ListRows = maxInt(height-8, 3)
+	} else {
+		// Wide: split columns.
+		l.SideBySide = true
+		l.DetailWidth = width - 36 - gutter // 34 list + 2 gutter
+		if l.DetailWidth < 10 {
+			l.DetailWidth = 10
+		}
+		l.ListWidth = 34
+		l.ListRows = maxInt(height-8, 3)
+	}
+
+	return l
+}

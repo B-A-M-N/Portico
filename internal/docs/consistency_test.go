@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/builtin"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/ngrok"
 )
@@ -72,8 +74,14 @@ func derivedStatus(caps core.Capabilities) releaseStatus {
 	return statusImplemented
 }
 
-// providerDescriptors returns the live capability descriptors. Providers with
-// no adapter are absent, which is itself the claim being verified.
+// providerDescriptors returns the live capability descriptors.
+//
+// It walks the same composition root the binary is built from, so a provider
+// added to builtin.Definitions must be described in the documentation too —
+// including one whose stability the catalog declares rather than whose
+// capabilities all say experimental. Tailscale was hardcoded here as "not
+// implemented" while a full adapter shipped, so this table passed while being
+// wrong; deriving from the definitions is what stops that recurring.
 func providerDescriptors(t *testing.T) map[string]releaseStatus {
 	t.Helper()
 	ctx := context.Background()
@@ -87,18 +95,51 @@ func providerDescriptors(t *testing.T) map[string]releaseStatus {
 		t.Fatalf("ngrok capabilities: %v", err)
 	}
 
-	return map[string]releaseStatus{
+	descriptors := map[string]releaseStatus{
 		"cloudflare": derivedStatus(cfCaps),
 		"ngrok":      derivedStatus(ngrokCaps),
-		// Both have full adapters. Port forwards are enabled by default; the
-		// OpenAI tunnel is an experimental opt-in. They were absent from this
-		// map, so the README could have said anything about them.
+		// Port forwards are enabled by default; the OpenAI tunnel is an
+		// experimental opt-in. They were absent from this map once, so the
+		// README could have said anything about them.
 		"port forward":             statusImplemented,
 		"openai secure mcp tunnel": statusExperimental,
-		// No adapter package exists for these.
-		"tailscale": statusNotImplemented,
-		"zrok":      statusNotImplemented,
+		// The composition root still ships no zrok adapter — an explicit
+		// unimplemented entry, which is itself the claim being verified.
+		"zrok": statusNotImplemented,
 	}
+
+	// A definition may be known to the README under a different display name;
+	// these aliases map adapter identity onto the rows the README actually
+	// carries, so the check is about truth, not about spelling.
+	nameAliases := map[string]string{
+		"local port forward":            "port forward",
+		"client-mediated mcp transport": "openai secure mcp tunnel",
+	}
+
+	// Everything else comes from the real provider list. A definition whose
+	// catalog entry declares a stability derives its status from that; one
+	// without a stability falls back to its capabilities.
+	for _, def := range builtin.Definitions(builtin.Config{}) {
+		name := strings.ToLower(def.Identity().DisplayName)
+		if alias, ok := nameAliases[name]; ok {
+			name = alias
+		}
+		if _, seen := descriptors[name]; seen {
+			continue
+		}
+		entry := def.CatalogEntry()
+		switch entry.Stability {
+		case core.StabilityStable, core.StabilityBeta:
+			descriptors[name] = statusImplemented
+		case core.StabilityExperimental:
+			descriptors[name] = statusExperimental
+		default:
+			// A definition without a declared stability and without a usable
+			// capability set (the not-implemented stub) is exactly what it says.
+			descriptors[name] = statusNotImplemented
+		}
+	}
+	return descriptors
 }
 
 // documentedStatus maps the README's status column onto the vocabulary.
@@ -113,6 +154,26 @@ func documentedStatus(cell string) (releaseStatus, bool) {
 		return statusImplemented, true
 	}
 	return "", false
+}
+
+// UnimplementedProviderIsNotDroppedFromTheReadme guards the explicit gap: a
+// provider the composition root marks not-implemented must still be described
+// in the README, so the interface's honesty about it is not silently undone by
+// the documentation.
+func TestUnimplementedProviderIsNotDroppedFromTheReadme(t *testing.T) {
+	readme, err := os.ReadFile(filepath.Join(repoRoot(t), "README.md"))
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	for _, def := range builtin.Definitions(builtin.Config{}) {
+		if def.CatalogEntry().Availability != provider.AvailabilityNotImplemented {
+			continue
+		}
+		name := strings.ToLower(def.Identity().DisplayName)
+		if !strings.Contains(strings.ToLower(string(readme)), name) {
+			t.Errorf("README omits the not-implemented provider %q entirely", name)
+		}
+	}
 }
 
 func repoRoot(t *testing.T) string {

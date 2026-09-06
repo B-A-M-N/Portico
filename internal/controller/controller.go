@@ -47,7 +47,7 @@ type Controller struct {
 	cleanupRecorder  CleanupRecorder
 	eventDispatcher  CommittedEventDispatcher
 	originManager    OriginManager
-	gatewayEndpoint GatewayEndpointResolver
+	gatewayEndpoint  GatewayEndpointResolver
 	operationMu      sync.Mutex
 	operationWG      sync.WaitGroup
 	acceptingOps     bool
@@ -115,21 +115,29 @@ type StepEvent struct {
 }
 
 // New creates a new controller.
+// defaultProfileRegistry is the workload-profile registry every production
+// controller carries. It is one shared wiring point so the recommendation
+// engine and the create-time transport check (validateProfileTransport)
+// cannot drift apart: both consult the same definitions.
+func defaultProfileRegistry() *profilepkg.Registry {
+	return profilepkg.NewRegistry(
+		openai.Definition{},
+		openai.MCPDefinition{},
+		profilepkg.Descriptor{ProfileKind: profilepkg.ProfileWebService, DisplayName: "Web service"},
+	)
+}
+
 func New(registry provider.Registry, journal Journal) *Controller {
 	return &Controller{
-		profiles:   make(map[core.ConnectionID]*core.ConnectionProfile),
-		runtimes:   make(map[core.ConnectionID]*core.ConnectionRuntime),
-		operations: make(map[core.OperationID]*operationRecord),
-		plans:      make(map[core.PlanID]*core.OperationPlan),
-		registry:   registry,
-		profileRegistry: profilepkg.NewRegistry(
-			openai.Definition{},
-			openai.MCPDefinition{},
-			profilepkg.Descriptor{ProfileKind: profilepkg.ProfileWebService, DisplayName: "Web service"},
-		),
-		accounts:     nil,
-		journal:      journal,
-		acceptingOps: true,
+		profiles:        make(map[core.ConnectionID]*core.ConnectionProfile),
+		runtimes:        make(map[core.ConnectionID]*core.ConnectionRuntime),
+		operations:      make(map[core.OperationID]*operationRecord),
+		plans:           make(map[core.PlanID]*core.OperationPlan),
+		registry:        registry,
+		profileRegistry: defaultProfileRegistry(),
+		accounts:        nil,
+		journal:         journal,
+		acceptingOps:    true,
 	}
 }
 
@@ -833,6 +841,33 @@ func (c *Controller) PlanOpen(ctx context.Context, connID core.ConnectionID) (*c
 		insertStartOriginStep(plan, resolvedOrigin.URL)
 	}
 
+	// A publicly reachable directory that anyone can change is a severe risk.
+	// The warning is carried by the immutable plan, not only drawn by the TUI,
+	// so a CLI or API consumer approving the same plan cannot miss what the
+	// interface shows. Core validation refuses unprotected write-enabled
+	// directories; protection can still be defeated by a removed policy, so
+	// the consequence travels with every open plan rather than being checked
+	// once at creation.
+	if se := openProfile.Spec.ServiceExposure; se != nil && se.Source.Directory != nil &&
+		se.Source.Directory.Mode == core.DirectoryModeWrites &&
+		(se.Source.Directory.AllowUpload || se.Source.Directory.AllowDelete) &&
+		se.Exposure.Mode == core.ExposurePermanent {
+		consequences := ""
+		switch {
+		case se.Source.Directory.AllowUpload && se.Source.Directory.AllowDelete:
+			consequences = "add or replace files, and remove files permanently (deleted files are NOT restored)"
+		case se.Source.Directory.AllowUpload:
+			consequences = "add or replace files"
+		default:
+			consequences = "remove files permanently (deleted files are NOT restored)"
+		}
+		plan.Warnings = append(plan.Warnings, core.PlanWarning{
+			Code: "PTO-OPEN-PUBLIC-MUTABLE-DIRECTORY",
+			Message: "This plan exposes a directory that visitors can change: " +
+				"anyone who can reach the public address can " + consequences + ".",
+		})
+	}
+
 	// Providers compute their own fingerprint, but controller-owned origin
 	// steps are part of what will execute and therefore must be rehashed.
 	if err := plan.ComputeFingerprint(); err != nil {
@@ -1320,16 +1355,7 @@ func (c *Controller) PlanRepair(ctx context.Context, connID core.ConnectionID) (
 				}
 			}
 			if connectorDown {
-				steps = append(steps, core.PlanStep{
-					ID:      "repair-restart-connector",
-					Kind:    core.StepStartConnector,
-					Summary: "Restart connector",
-					Technical: core.TechnicalOperation{
-						Provider:   profile.GetProvider().ProviderID,
-						Type:       "start_connector",
-						Parameters: map[string]string{"mode": mode, "origin_url": resolvedOrigin.URL},
-					},
-				})
+				steps = append(steps, c.restartConnectorStep(profile, mode, resolvedOrigin.URL))
 			}
 		}
 	}
@@ -1491,6 +1517,13 @@ func (c *Controller) ApplyPlan(ctx context.Context, planID core.PlanID) (Operati
 			return Operation{}, core.ErrProviderNotFound(plan.Provider)
 		}
 	}
+	if planHasGatewayTarget(plan) {
+		bound, err := c.bindGatewayTargets(ctx, plan)
+		if err != nil {
+			return Operation{}, err
+		}
+		plan = bound
+	}
 
 	// Validate preconditions
 	if err := c.validatePlan(ctx, plan); err != nil {
@@ -1643,6 +1676,9 @@ func (c *Controller) verifyOperationOutcome(ctx context.Context, intent core.Ope
 		if observed.Connector == nil || observed.Connector.Status != "running" {
 			return fmt.Errorf("expected connector running, got %q", connectorStatus(observed.Connector))
 		}
+		if err := validateObservedResources(observed); err != nil {
+			return err
+		}
 	case core.IntentClose:
 		// For a close operation, the connector must be stopped.
 		if observed.Connector == nil || observed.Connector.Status != "stopped" {
@@ -1652,6 +1688,9 @@ func (c *Controller) verifyOperationOutcome(ctx context.Context, intent core.Ope
 		// For a repair operation, the connector must be running.
 		if observed.Connector == nil || observed.Connector.Status != "running" {
 			return fmt.Errorf("expected connector running after repair, got %q", connectorStatus(observed.Connector))
+		}
+		if err := validateObservedResources(observed); err != nil {
+			return err
 		}
 	case core.IntentDelete:
 		// For a delete operation, all managed resources must be removed.
@@ -1673,6 +1712,20 @@ func (c *Controller) verifyOperationOutcome(ctx context.Context, intent core.Ope
 		}
 	}
 
+	return nil
+}
+
+// validateObservedResources refuses terminal success when an exact tracked
+// resource was not confirmed present and matching by the provider.
+func validateObservedResources(observed *core.ObservedConnection) error {
+	for _, resource := range observed.ResourceStatuses {
+		if resource.Status != core.ObservationPresent {
+			if resource.Detail != "" {
+				return fmt.Errorf("resource %s %s is %s: %s", resource.Type, resource.ExternalID, resource.Status, resource.Detail)
+			}
+			return fmt.Errorf("resource %s %s is %s", resource.Type, resource.ExternalID, resource.Status)
+		}
+	}
 	return nil
 }
 
@@ -1738,6 +1791,9 @@ func (c *Controller) Reconcile(ctx context.Context, connID core.ConnectionID) (s
 	// Desired open and runtime open, but connector unhealthy → repair
 	if desired == core.DesiredOpen && rt.State == core.RuntimeOpen {
 		if rt.Connector.Status != core.ConnectorStatusRunning {
+			return "repair", nil
+		}
+		if profile.RequiresGateway() && rt.Gateway == nil {
 			return "repair", nil
 		}
 	}

@@ -13,6 +13,11 @@ type SetupField struct {
 	ID          string
 	Label       string
 	Description string
+	// InputKind lets a generic setup surface render provider-specific identity
+	// controls without hardcoding provider names. Empty means an ordinary text
+	// input; provider_identity is resolved from the provider's own account
+	// discovery when available.
+	InputKind string
 	// Secret marks a value that must be masked on screen, kept out of logs and
 	// errors, and cleared from memory when the flow ends.
 	Secret bool

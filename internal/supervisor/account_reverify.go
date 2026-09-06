@@ -89,8 +89,12 @@ func (h *supervisorHandler) HandleReverifyProviderAccount(
 		// A credential that works again should be usable again in this process,
 		// without a restart.
 		if activateErr := h.sup.ActivateProvider(ctx, core.ProviderID(providerID)); activateErr != nil {
-			resp.VerificationUnavailable = fmt.Sprintf(
-				"the credential is valid, but the provider could not be reloaded: %v", activateErr)
+			resp.VerificationUnavailable =
+				"the credential is valid, but the provider could not be reloaded"
+			if activationUnavailable(activateErr) {
+				return resp, nil
+			}
+			return resp, fmt.Errorf("activate provider %q after re-verification: %w", providerID, activateErr)
 		}
 	}
 	return resp, nil

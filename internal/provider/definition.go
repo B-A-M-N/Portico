@@ -84,6 +84,10 @@ type ActivationRequest struct {
 // of an impossibility.
 type RuntimeServices struct {
 	Processes core.ConnectorProcessService
+	// Gateways is the supervisor-owned gateway lifecycle service used by
+	// gateway-fronted transports. It is optional for providers that do not use
+	// a gateway.
+	Gateways core.GatewayService
 	// TunnelCredentials persists per-connection tunnel tokens. It is a narrow
 	// capability rather than the store, so a definition can save the tokens it
 	// creates without being able to touch provider accounts.

@@ -116,7 +116,7 @@ func (s *Supervisor) activateAll(ctx context.Context) {
 		return
 	}
 	for _, def := range s.activation.definitions {
-		s.activateDefinition(ctx, def)
+		_ = s.activateDefinition(ctx, def)
 	}
 }
 
@@ -133,8 +133,7 @@ func (s *Supervisor) ActivateProvider(ctx context.Context, id core.ProviderID) e
 	if def == nil {
 		return core.ErrProviderNotFound(id)
 	}
-	s.activateDefinition(ctx, def)
-	return nil
+	return s.activateDefinition(ctx, def)
 }
 
 // activateDefinition runs the fixed per-provider sequence.
@@ -143,7 +142,7 @@ func (s *Supervisor) ActivateProvider(ctx context.Context, id core.ProviderID) e
 // provider is visible before anything can fail, and the runtime is built fully
 // before anything is installed so a failure cannot leave a half-installed
 // provider.
-func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Definition) {
+func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Definition) error {
 	c := s.activation
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -162,18 +161,28 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 	// it. Omitting them made a user's accounts vanish from the provider screen
 	// the moment its client was uninstalled, and made the same durable state
 	// project differently at startup than after a live change.
-	accounts, unusable := s.activationAccounts(ctx, def)
+	accounts, unusable, accountsErr := s.activationAccounts(ctx, def)
 	defer func() {
 		for i := range accounts {
 			zeroBytes(accounts[i].Secret)
 		}
 	}()
 	knownAccounts := append(accountInfos(accounts), unusable...)
+	if accountsErr != nil {
+		failed := entry
+		failed.Availability = provider.AvailabilityDegraded
+		failed.Reason = "provider activation failed"
+		slog.Warn("provider activation failed", "provider", id, "err", accountsErr)
+		s.registry.Install(provider.Installation{
+			Provider: s.registry.Get(id), Catalog: failed, Accounts: knownAccounts,
+		})
+		return accountsErr
+	}
 
 	// 2. Explicit opt-in.
 	if gated, ok := def.(gatedDefinition); ok && !gated.Enabled() {
 		s.registry.Install(provider.Installation{Catalog: entry, Accounts: knownAccounts})
-		return
+		return nil
 	}
 
 	// 3. Client binary.
@@ -188,7 +197,7 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 				s.registry.Install(provider.Installation{
 					Catalog: req.MissingBinaryEntry(), Accounts: knownAccounts,
 				})
-				return
+				return nil
 			}
 		}
 	}
@@ -205,14 +214,14 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 		// for connections that are currently open.
 		failed := entry
 		failed.Availability = provider.AvailabilityDegraded
-		failed.Reason = "this provider could not be started: " + err.Error()
+		failed.Reason = "provider activation failed"
 		slog.Warn("provider activation failed", "provider", id, "err", err)
 		// The account projection is the same either way: a failure must not
 		// change which accounts exist, only whether a runtime does.
 		s.registry.Install(provider.Installation{
 			Provider: s.registry.Get(id), Catalog: failed, Accounts: knownAccounts,
 		})
-		return
+		return err
 	}
 
 	// 6. Install. Unusable accounts are carried through so they can be
@@ -223,6 +232,7 @@ func (s *Supervisor) activateDefinition(ctx context.Context, def provider.Defini
 		inst.Catalog = entry
 	}
 	s.registry.Install(inst)
+	return nil
 }
 
 // activateSafely converts a panic in provider construction into an error.
@@ -231,7 +241,9 @@ func activateSafely(ctx context.Context, def provider.Definition, req provider.A
 ) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("provider panicked while starting: %v", r)
+			// Panic values can contain credentials or provider response bodies;
+			// preserve only the safe classification at this boundary.
+			err = fmt.Errorf("provider panicked while starting")
 		}
 	}()
 	return def.Activate(ctx, req)
@@ -244,18 +256,18 @@ func activateSafely(ctx context.Context, def provider.Definition, req provider.A
 // rather than skipped. Skipping it is what made an authenticated account
 // indistinguishable from one that was never configured.
 func (s *Supervisor) activationAccounts(ctx context.Context, def provider.Definition) (
-	[]provider.AccountMaterial, []provider.AccountInfo,
+	[]provider.AccountMaterial, []provider.AccountInfo, error,
 ) {
 	id := def.Identity().ID
 	// A provider that stores no accounts is never handed any.
 	if flow, ok := def.(accountlessDefinition); ok && !flow.SetupFlow().StoresAccount() {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	stored, err := s.store.ListProviderAccounts(ctx)
 	if err != nil {
 		slog.Warn("list provider accounts", "provider", id, "err", err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("list provider accounts: %w", err)
 	}
 
 	var usable []provider.AccountMaterial
@@ -282,12 +294,15 @@ func (s *Supervisor) activationAccounts(ctx context.Context, def provider.Defini
 			// verified, and the user has to be told which.
 			info.UnusableReason = "its stored credential could not be read"
 			unusable = append(unusable, info)
+			if loadErr != nil {
+				return usable, unusable, fmt.Errorf("load credential for account %s: %w", account.ID, loadErr)
+			}
 			continue
 		}
 		usable = append(usable, provider.AccountMaterial{Account: account, Secret: []byte(token)})
 	}
 	sort.Slice(usable, func(i, j int) bool { return usable[i].Account.ID < usable[j].Account.ID })
-	return usable, unusable
+	return usable, unusable, nil
 }
 
 // accountInfos projects account material for display.

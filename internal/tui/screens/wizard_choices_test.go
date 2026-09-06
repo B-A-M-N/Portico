@@ -67,7 +67,7 @@ func TestUnavailableOptionsAreShownWithWhatTheyNeed(t *testing.T) {
 	}
 
 	// The rendered menu must show it, and must not claim navigation it lacks.
-	view := renderChoices("How should it be reachable?", choices, 0)
+	view := (&WizardModel{}).renderChoices("How should it be reachable?", choices, 0)
 	if !strings.Contains(view, "Permanently") {
 		t.Fatalf("the unavailable option is hidden:\n%s", view)
 	}
@@ -76,7 +76,7 @@ func TestUnavailableOptionsAreShownWithWhatTheyNeed(t *testing.T) {
 	}
 
 	single := []wizardChoice{{Label: "Only one", Available: true}}
-	if strings.Contains(renderChoices("t", single, 0), "↑↓") {
+	if strings.Contains((&WizardModel{}).renderChoices("t", single, 0), "↑↓") {
 		t.Fatal("a one-item menu advertises navigation with nowhere to go")
 	}
 	if !strings.Contains(view, "↑↓") {

@@ -58,19 +58,38 @@ func TestManager_CommandLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is required for command-origin lifecycle test")
 	}
-	port := reservablePort(t)
-
-	manager := NewManager()
-	connectionID := core.ConnectionID("command-lifecycle")
-	source := core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
-		Executable: "python3", Args: []string{"-m", "http.server", strconv.Itoa(port)}, Port: port,
-	}}
-	resolved, err := manager.Plan(connectionID, source)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
+	// The port is reserved, then released for the child to bind. Nothing can
+	// close that hand-over window, so under a loaded -race run another process
+	// occasionally takes the port and the child exits before binding. That is
+	// a lost race, not a product failure: retry with a fresh port, and fail
+	// only when every attempt loses.
+	var manager *Manager
+	var source core.SourceSpec
+	var resolved *core.ResolvedOrigin
+	var connectionID core.ConnectionID
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		port := reservablePort(t)
+		manager = NewManager()
+		connectionID = core.ConnectionID("command-lifecycle")
+		source = core.SourceSpec{Kind: core.SourceCommand, Command: &core.CommandSpec{
+			Executable: "python3", Args: []string{"-m", "http.server", strconv.Itoa(port)}, Port: port,
+		}}
+		var err error
+		resolved, err = manager.Plan(connectionID, source)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		startErr = manager.Start(context.Background(), connectionID, source, resolved.URL)
+		if startErr == nil {
+			break
+		}
+		if !strings.Contains(startErr.Error(), "exited immediately") {
+			t.Fatalf("Start: %v", startErr)
+		}
 	}
-	if err := manager.Start(context.Background(), connectionID, source, resolved.URL); err != nil {
-		t.Fatalf("Start: %v", err)
+	if startErr != nil {
+		t.Fatalf("Start: lost the port race on every attempt: %v", startErr)
 	}
 	response, err := http.Get(resolved.URL)
 	if err != nil {

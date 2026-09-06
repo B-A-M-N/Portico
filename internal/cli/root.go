@@ -172,6 +172,15 @@ func addSourceFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("directory-allow-upload", false, "Allow uploads for a writable directory")
 	cmd.Flags().Bool("directory-allow-delete", false, "Allow deletion for a writable directory")
 	cmd.Flags().Bool("mcp-command", false, "Treat an MCP source as a Portico-owned command instead of an endpoint")
+	// createConnection reads these for existing-service sources. The removal of
+	// the legacy cmd/ subtree dropped their registration while the reader
+	// survived, so every documented invocation failed with "unknown flag".
+	// Defaults preserve the historical behavior: probing on, server-chosen
+	// path and timing.
+	cmd.Flags().Bool("health-enabled", true, "Probe an existing service's HTTP health")
+	cmd.Flags().String("health-path", "", "HTTP health check path (server default when empty)")
+	cmd.Flags().String("health-timeout", "", "HTTP health check timeout, e.g. 5s (server default when empty)")
+	cmd.Flags().String("health-interval", "", "HTTP health check interval, e.g. 30s (server default when empty)")
 }
 
 func newInspectCmd() *cobra.Command {
@@ -317,6 +326,20 @@ func newProviderCmd() *cobra.Command {
 			return handleProviderList(cmd)
 		},
 	})
+	// Key rotation existed end to end on the supervisor and in the TUI, with
+	// no command-line path. A headless host that needs to rotate must not have
+	// to open a terminal UI to do it.
+	rotateCmd := &cobra.Command{
+		Use:   "rotate-key",
+		Short: "Rotate the installation encryption key",
+		Long: "Re-encrypts every stored provider credential under a new installation-key " +
+			"version. The old key files are kept until every secret has been migrated.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return handleRotateSecretKey(cmd)
+		},
+	}
+	rotateCmd.Flags().Bool("yes", false, "Skip the confirmation prompt")
+	cmd.AddCommand(rotateCmd)
 	loginCmd := &cobra.Command{
 		Use:   "login <provider>",
 		Short: "Securely configure a provider",
@@ -358,13 +381,28 @@ func newDiscoverCmd() *cobra.Command {
 }
 
 func newDoctorCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Validate prerequisites and runtime environment",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return handleDoctor(cmd)
 		},
 	}
+	// The socket diagnostic's NextAction names this command exactly. A
+	// recovery instruction that does not parse when typed is worse than none:
+	// the user is already debugging something broken.
+	repair := &cobra.Command{
+		Use:   "repair",
+		Short: "Run an explicit repair action for a diagnosed problem",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return handleRepairStaleSocket(cmd)
+		},
+	}
+	repair.Flags().Bool("stale-socket", false,
+		"Remove a supervisor socket nothing is listening on")
+	repair.Flags().Bool("yes", false, "Skip confirmation prompt")
+	cmd.AddCommand(repair)
+	return cmd
 }
 
 func newRepairCmd() *cobra.Command {
