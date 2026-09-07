@@ -300,6 +300,18 @@ type CapabilitySetDTO struct {
 	TelemetrySupported bool     `json:"telemetry_supported"`
 	MaxConnectors      int      `json:"max_connectors"`
 	ExpirationMaxSecs  int      `json:"expiration_max_secs,omitempty"`
+	// Potential* fields declare what this provider could deliver after its
+	// declared setup flow completes. They come from the provider's definition
+	// (PotentialDefinition), never from the live adapter, and are omitted when
+	// the definition declares none — either because nothing widens after setup
+	// or because Portico ships no adapter. Current capability and potential
+	// capability are different facts about different moments; a client that
+	// needs the after-setup answer reads these rather than inferring it.
+	PotentialTemporaryAddresses bool     `json:"potential_temporary_addresses,omitempty"`
+	PotentialCustomHostnames    bool     `json:"potential_custom_hostnames,omitempty"`
+	PotentialPrivateExposure    bool     `json:"potential_private_exposure,omitempty"`
+	PotentialManagedDNS         bool     `json:"potential_managed_dns,omitempty"`
+	PotentialProtectionModes    []string `json:"potential_protection_modes,omitempty"`
 }
 
 // ProviderAccountDTO is a selectable, non-secret provider account summary.

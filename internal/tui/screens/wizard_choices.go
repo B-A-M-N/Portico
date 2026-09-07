@@ -158,7 +158,10 @@ func (c providerCapabilities) supporting(pred func(ipc.ProviderDTO) bool) []stri
 }
 
 // setupActionsFor collects what would make a capability available, from the
-// providers that declare it but are not ready.
+// providers whose potential includes it. The predicate is the potential
+// filter, not a readiness guess: advice must name only providers that could
+// deliver the capability after setup, never every provider that happens to be
+// unready.
 func (c providerCapabilities) setupActionsFor(pred func(ipc.ProviderDTO) bool) []string {
 	var actions []string
 	seen := map[string]bool{}
@@ -182,7 +185,10 @@ func (c providerCapabilities) hasCapability(pred func(ipc.ProviderDTO) bool) boo
 }
 
 // Capability predicates. Each reads the provider's declared capability set
-// rather than its identity.
+// rather than its identity. The supports* family answers what a provider can
+// do right now; the could* family answers what its definition declares it
+// could do after setup. They are different facts about different moments and
+// neither may be derived from the other.
 
 func supportsTemporary(p ipc.ProviderDTO) bool {
 	return p.Capabilities != nil && p.Capabilities.TemporaryAddresses
@@ -204,6 +210,44 @@ func supportsProtection(kind string) func(ipc.ProviderDTO) bool {
 		}
 		return false
 	}
+}
+
+// couldSupportCustomHostname reports whether a provider's definition declares
+// custom hostnames as achievable after setup, whatever its adapter can do now.
+func couldSupportCustomHostname(p ipc.ProviderDTO) bool {
+	return p.Capabilities != nil && p.Capabilities.PotentialCustomHostnames
+}
+
+// couldSupportProtection is the potential-capability analogue of
+// supportsProtection.
+func couldSupportProtection(kind string) func(ipc.ProviderDTO) bool {
+	return func(p ipc.ProviderDTO) bool {
+		if p.Capabilities == nil {
+			return false
+		}
+		for _, mode := range p.Capabilities.PotentialProtectionModes {
+			if mode == kind {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// setupAdvice appends the "one of these providers needs setting up" block for
+// the providers the potential predicate accepts, and returns whether there was
+// anything to advise.
+func (c providerCapabilities) setupAdvice(detail []string, pred func(ipc.ProviderDTO) bool) ([]string, bool) {
+	actions := c.setupActionsFor(pred)
+	if len(actions) == 0 {
+		return detail, false
+	}
+	detail = append(detail, "",
+		"To use this, one of these providers needs setting up:")
+	for _, action := range actions {
+		detail = append(detail, "  • "+action)
+	}
+	return detail, true
 }
 
 // exposureChoices lists every way a connection can be reachable.
@@ -238,19 +282,16 @@ func (c providerCapabilities) exposureChoices(sourceKind, mcpTransport string) [
 	}
 	permanent.Available = len(permanent.Providers) > 0
 	if !permanent.Available {
-		permanent.Reason = "needs a provider account"
-		actions := c.setupActionsFor(func(p ipc.ProviderDTO) bool {
-			return !usableProvider(p) || !supportsCustomHostname(p)
-		})
-		if len(actions) > 0 {
-			permanent.Detail = append(permanent.Detail, "",
-				"To use this, one of these providers needs setting up:")
-			for _, action := range actions {
-				permanent.Detail = append(permanent.Detail, "  • "+action)
-			}
+		// Advice is filtered by potential, not by unreadiness: naming every
+		// unready provider here sent users to configure providers that could
+		// never own a hostname, however well they were set up.
+		if detail, advised := c.setupAdvice(permanent.Detail, couldSupportCustomHostname); advised {
+			permanent.Reason = "needs a provider account"
+			permanent.Detail = detail
 		} else {
+			permanent.Reason = "no installed provider offers permanent hostnames"
 			permanent.Detail = append(permanent.Detail, "",
-				"No installed provider can own a hostname yet. Set one up from the",
+				"No installed provider can own a hostname. Set one up from the",
 				"provider screen, then come back.")
 		}
 	}
@@ -291,7 +332,14 @@ func (c providerCapabilities) protectionChoices(exposureMode string) []wizardCho
 	}
 	switch {
 	case len(otp.Providers) == 0:
-		otp.Reason = "no installed provider offers sign-in protection"
+		// Same potential filter as the exposure choices: only providers whose
+		// definition declares email OTP after setup belong in the advice.
+		if detail, advised := c.setupAdvice(otp.Detail, couldSupportProtection("email_otp")); advised {
+			otp.Reason = "needs a provider account"
+			otp.Detail = detail
+		} else {
+			otp.Reason = "no installed provider offers sign-in protection"
+		}
 	case exposureMode != "permanent_public":
 		// Not a provider limitation, so it is not phrased as one.
 		otp.Reason = "needs a permanent address"

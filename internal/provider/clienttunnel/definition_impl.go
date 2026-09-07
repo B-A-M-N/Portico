@@ -90,6 +90,15 @@ func (d *Definition) MissingBinaryEntry() provider.CatalogEntry {
 // stored credentials existed.
 func (d *Definition) SetupFlow() core.SetupFlow { return openAITunnelSetupFlow() }
 
+// PotentialCapabilities is the same static contract the adapter serves: the
+// tunnel is private by design and delivers no public address however it is
+// configured. It does not implement SetupDefinition — the client is
+// configured externally — so clients should read the answer as informational
+// rather than as an after-setup promise.
+func (d *Definition) PotentialCapabilities(ctx context.Context) (core.Capabilities, error) {
+	return (&Provider{}).Capabilities(ctx)
+}
+
 func openAITunnelSetupFlow() core.SetupFlow {
 	return core.SetupFlow{
 		Kind:        core.SetupAccount,

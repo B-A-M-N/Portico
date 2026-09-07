@@ -85,7 +85,11 @@ Wizard (wizard_choices_test.go):
 6. OTP guidance names only potential-OTP providers.
 7. Available-now still works when potential is also present (no advice).
 
-Extend quickTunnelOnlySnapshot with the potential fields.
+Extend quickTunnelOnlySnapshot with the potential fields. (As implemented:
+the potential-advice state uses its own fixture,
+accountlessCloudflareWithPotential, rather than extending
+quickTunnelOnlySnapshot — same coverage, and the old guard test keeps its
+original meaning.)
 
 ## Non-goals
 

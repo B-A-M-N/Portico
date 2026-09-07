@@ -1068,6 +1068,25 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 			dto.Capabilities.ExpirationMaxSecs = int(caps.Expiration.MaxDuration.Seconds())
 		}
 
+		// Potential capabilities ride beside the current ones: what setup
+		// could deliver is a definition-level fact the live adapter cannot
+		// report (an accountless Cloudflare is Quick-Tunnel-only now, yet can
+		// own hostnames after setup). Providers whose definition declares no
+		// potential contract simply leave the fields zero.
+		if potCaps, ok := h.sup.potentialCapabilitiesFor(string(p.ID)); ok {
+			dto.Capabilities.PotentialTemporaryAddresses = potCaps.TemporaryAddresses.Supported
+			dto.Capabilities.PotentialCustomHostnames = potCaps.CustomHostnames.Supported
+			dto.Capabilities.PotentialPrivateExposure = potCaps.PrivateExposure.Supported
+			dto.Capabilities.PotentialManagedDNS = potCaps.ManagedDNS.Supported
+			for _, prot := range potCaps.BuiltInProtection {
+				if prot.Supported {
+					dto.Capabilities.PotentialProtectionModes = append(
+						dto.Capabilities.PotentialProtectionModes, string(prot.Kind))
+				}
+			}
+			sort.Strings(dto.Capabilities.PotentialProtectionModes)
+		}
+
 		// Determine availability and readiness. The registry reports why a
 		// catalogued provider has no usable adapter; only fall back to
 		// account-based inference for entries that carry no verdict.

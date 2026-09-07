@@ -158,3 +158,143 @@ func TestTheWizardDoesNotReinterpretAvailability(t *testing.T) {
 		t.Fatalf("a selectable provider supplied no options: %v", values)
 	}
 }
+
+// accountlessCloudflareWithPotential is the truthful accountless Cloudflare:
+// current capability is Quick-Tunnel-only, potential capability is the full
+// account-scoped contract the definition knows about.
+func accountlessCloudflareWithPotential() []ipc.ProviderDTO {
+	return []ipc.ProviderDTO{{
+		ID: "cloudflare", DisplayName: "Cloudflare",
+		Availability: "unconfigured", Readiness: "needs_config", Selectable: false,
+		SetupActions: []string{"Add a Cloudflare account"},
+		Capabilities: &ipc.CapabilitySetDTO{
+			TemporaryAddresses:       true,
+			ProtectionModes:          []string{"none"},
+			Protocols:                []string{"http", "https"},
+			PotentialCustomHostnames: true,
+			PotentialProtectionModes: []string{"none", "email_otp"},
+		},
+	}}
+}
+
+// TestPermanentHostnameAdviceNamesOnlyPotentialProviders pins the P1-4 fix:
+// setup advice for a permanent hostname comes from providers whose definition
+// declares custom hostnames after setup, never from every unready provider.
+// The old predicate — not usable OR not supporting hostnames — matched every
+// unready provider at all, so the advice listed installing a tunnel client
+// and enabling ngrok for a capability neither can ever deliver.
+func TestPermanentHostnameAdviceNamesOnlyPotentialProviders(t *testing.T) {
+	providers := append(accountlessCloudflareWithPotential(),
+		ipc.ProviderDTO{
+			ID: "client_tunnel", DisplayName: "Client-mediated MCP transport",
+			Availability: "client_missing", Selectable: false,
+			SetupActions: []string{"Install tunnel-client from the OpenAI platform's tunnel settings"},
+			Capabilities: &ipc.CapabilitySetDTO{},
+		},
+		ipc.ProviderDTO{
+			ID: "ngrok", DisplayName: "ngrok",
+			Availability: "experimental", Selectable: false,
+			SetupActions: []string{"Set PORTICO_ENABLE_EXPERIMENTAL_NGROK=1 to enable it"},
+			Capabilities: &ipc.CapabilitySetDTO{},
+		},
+	)
+	caps := providerCapabilities{providers: providers}
+
+	choices := caps.exposureChoices("existing_service", "")
+	permanent, ok := choiceAt(choices, 1)
+	if !ok || permanent.Value != "permanent_public" {
+		t.Fatalf("the exposure menu lost its permanent choice: %+v", choices)
+	}
+	if permanent.Available {
+		t.Fatal("an accountless landscape offered a permanent hostname now")
+	}
+	for _, forbidden := range []string{
+		"Install tunnel-client",
+		"Set PORTICO_ENABLE_EXPERIMENTAL_NGROK",
+	} {
+		if strings.Contains(strings.Join(permanent.Detail, "\n"), forbidden) {
+			t.Errorf("permanent-hostname advice recommends %q, which cannot deliver one:\n%s",
+				forbidden, strings.Join(permanent.Detail, "\n"))
+		}
+	}
+	if !strings.Contains(strings.Join(permanent.Detail, "\n"), "Add a Cloudflare account") {
+		t.Errorf("permanent-hostname advice does not name the one provider that can deliver it:\n%s",
+			strings.Join(permanent.Detail, "\n"))
+	}
+	if permanent.Reason != "needs a provider account" {
+		t.Errorf("reason = %q, want the after-setup wording", permanent.Reason)
+	}
+}
+
+// TestPermanentHostnameUnsupportedWhenNoProviderCanDeliver pins the third
+// state: with no potential anywhere, the choice says so and offers no setup
+// advice at all.
+func TestPermanentHostnameUnsupportedWhenNoProviderCanDeliver(t *testing.T) {
+	providers := []ipc.ProviderDTO{{
+		ID: "portforward", DisplayName: "Local port forward",
+		Availability: "ready", Readiness: "ready", Selectable: true,
+		Capabilities: &ipc.CapabilitySetDTO{},
+	}}
+	caps := providerCapabilities{providers: providers}
+
+	permanent := caps.exposureChoices("existing_service", "")[1]
+	if permanent.Available {
+		t.Fatal("a port-forward-only landscape offered a permanent hostname")
+	}
+	if permanent.Reason != "no installed provider offers permanent hostnames" {
+		t.Errorf("reason = %q, want the unsupported wording", permanent.Reason)
+	}
+	if got := strings.Join(permanent.Detail, "\n"); strings.Contains(got, "setting up") {
+		t.Errorf("the unsupported state offers setup advice:\n%s", got)
+	}
+}
+
+// TestOTPGuidanceNamesOnlyPotentialProviders pins the same filter for the
+// protection choice: email-OTP advice names only providers whose definition
+// declares email OTP after setup.
+func TestOTPGuidanceNamesOnlyPotentialProviders(t *testing.T) {
+	providers := append(accountlessCloudflareWithPotential(),
+		ipc.ProviderDTO{
+			ID: "portforward", DisplayName: "Local port forward",
+			Availability: "ready", Selectable: true,
+			Capabilities: &ipc.CapabilitySetDTO{},
+		},
+	)
+	caps := providerCapabilities{providers: providers}
+
+	choices := caps.protectionChoices("permanent_public")
+	otp, ok := choiceAt(choices, 1)
+	if !ok || otp.Value != "email_otp" {
+		t.Fatalf("the protection menu lost its OTP choice: %+v", choices)
+	}
+	if otp.Available {
+		t.Fatal("OTP was offered with no provider able to apply it now")
+	}
+	got := strings.Join(otp.Detail, "\n")
+	if !strings.Contains(got, "Add a Cloudflare account") {
+		t.Errorf("OTP advice does not name the potential-capable provider:\n%s", got)
+	}
+	if otp.Reason != "needs a provider account" {
+		t.Errorf("reason = %q, want the after-setup wording", otp.Reason)
+	}
+}
+
+// TestAvailableNowNeedsNoAdvice pins that a provider that can deliver the
+// capability right now is offered it without setup advice, even though its
+// potential contract is also present.
+func TestAvailableNowNeedsNoAdvice(t *testing.T) {
+	caps := providerCapabilities{providers: fullCloudflareSnapshot()}
+
+	permanent := caps.exposureChoices("existing_service", "")[1]
+	if !permanent.Available {
+		t.Fatalf("a configured Cloudflare was not offered a permanent hostname: %+v", permanent)
+	}
+	if got := strings.Join(permanent.Detail, "\n"); strings.Contains(got, "setting up") {
+		t.Errorf("an available choice carries setup advice:\n%s", got)
+	}
+
+	otp := caps.protectionChoices("permanent_public")[1]
+	if !otp.Available {
+		t.Fatalf("a configured Cloudflare was not offered OTP: %+v", otp)
+	}
+}

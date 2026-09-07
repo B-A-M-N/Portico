@@ -108,6 +108,14 @@ func (d *Definition) PrepareAccount(map[string]string) (provider.PreparedAccount
 			"to save; run `tailscale up` instead")
 }
 
+// PotentialCapabilities is the same static contract the adapter serves: a
+// tailnet address is private and stable by Tailscale's own design, so nothing
+// Portico could configure would widen it. The guidance flow gets the machine
+// onto the tailnet; it does not change what the provider can deliver.
+func (d *Definition) PotentialCapabilities(ctx context.Context) (core.Capabilities, error) {
+	return New(nil).Capabilities(ctx)
+}
+
 // Activate builds the runtime, reporting what the machine's actual state allows.
 //
 // Availability is the machine's, not a constant. A client that is installed but signed

@@ -62,6 +62,14 @@ func (d *Definition) Enabled() bool { return d.cfg.Enabled }
 // RequiredBinary reports the client this provider cannot run without.
 func (d *Definition) RequiredBinary() string { return d.cfg.Bin }
 
+// PotentialCapabilities is the same static contract the adapter serves: ngrok
+// has no setup flow through Portico, so its capability set does not widen
+// after setup. It does not implement SetupDefinition, and clients should read
+// the answer as informational rather than as an after-setup promise.
+func (d *Definition) PotentialCapabilities(ctx context.Context) (core.Capabilities, error) {
+	return (&Provider{}).Capabilities(ctx)
+}
+
 // MissingBinaryEntry describes ngrok when its client is not installed.
 func (d *Definition) MissingBinaryEntry() provider.CatalogEntry {
 	entry := d.CatalogEntry()

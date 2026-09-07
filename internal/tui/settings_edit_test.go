@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	tea "charm.land/bubbletea/v2"
-
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
 
@@ -298,15 +296,5 @@ func TestRotationConfirmationOutranksTheEditor(t *testing.T) {
 	}
 }
 
-// pressActionKey drives the model the way the program does, through the action
-// dispatch — used where a test wants the keyboard boundary rather than the
-// internal method.
-func pressActionKey(t *testing.T, m Model, key string) (Model, tea.Cmd) {
-	t.Helper()
-	next, cmd := m.Update(keyMsg(key))
-	nm, ok := next.(Model)
-	if !ok {
-		t.Fatalf("Update returned %T, want Model", next)
-	}
-	return nm, cmd
-}
+// pressActionKey was removed with the test that used it; the keyboard
+// boundary is exercised by the settings PTY test.

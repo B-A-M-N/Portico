@@ -60,6 +60,14 @@ func (d *Definition) Activate(_ context.Context, req provider.ActivationRequest)
 // SetupFlow mirrors the adapter's declared flow so both paths agree.
 func (d *Definition) SetupFlow() core.SetupFlow { return New().SetupFlow() }
 
+// PotentialCapabilities mirrors the adapter's static contract, the same way
+// SetupFlow mirrors the flow: the mock's capabilities do not widen after
+// setup, but it declares them so test fixtures exercise the same shape the
+// real providers serve.
+func (d *Definition) PotentialCapabilities(ctx context.Context) (core.Capabilities, error) {
+	return New().Capabilities(ctx)
+}
+
 // PrepareAccount mirrors the adapter's account preparation.
 func (d *Definition) PrepareAccount(values map[string]string) (provider.PreparedAccount, error) {
 	return New().PrepareAccount(values)

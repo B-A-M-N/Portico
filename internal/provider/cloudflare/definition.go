@@ -69,6 +69,15 @@ func (d *Definition) MissingBinaryEntry() provider.CatalogEntry {
 // SetupFlow declares what Cloudflare needs in order to configure an account.
 func (d *Definition) SetupFlow() core.SetupFlow { return cloudflareSetupFlow() }
 
+// PotentialCapabilities declares what a fully configured Cloudflare account
+// delivers, independent of the adapter's current answer. An accountless
+// activation is Quick-Tunnel-only and reports no custom hostnames; that is a
+// statement about now, not about the provider, and clients advising on setup
+// need the after-setup contract.
+func (d *Definition) PotentialCapabilities(ctx context.Context) (core.Capabilities, error) {
+	return cloudflareIntrinsicCapabilities(ctx)
+}
+
 // PrepareAccount turns submitted setup values into Cloudflare's canonical
 // account.
 //

@@ -35,3 +35,11 @@ func (d *Definition) CatalogEntry() provider.CatalogEntry {
 func (d *Definition) Activate(context.Context, provider.ActivationRequest) (provider.Installation, error) {
 	return provider.Installation{Provider: New(), Catalog: d.CatalogEntry()}, nil
 }
+
+// PotentialCapabilities is the same static contract the adapter serves: a
+// local forward's reach is intrinsic, not something setup would widen. It has
+// no setup flow, so clients should treat the answer as informational rather
+// than as an after-setup promise.
+func (d *Definition) PotentialCapabilities(ctx context.Context) (core.Capabilities, error) {
+	return New().Capabilities(ctx)
+}

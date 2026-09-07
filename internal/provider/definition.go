@@ -52,6 +52,26 @@ type SetupVerifier interface {
 	VerifyAccount(ctx context.Context, account PreparedAccount) (core.SetupValidation, error)
 }
 
+// PotentialDefinition is an optional capability for a definition whose
+// provider can deliver more after its declared setup flow completes than its
+// current adapter reports.
+//
+// The answer must be static: derivable from the definition alone, with no
+// constructed adapter, no account, and no I/O. Cloudflare is the motivating
+// case — an accountless activation produces a Quick Tunnel adapter whose
+// Capabilities reports no custom hostnames, while the definition knows that
+// configuring an account delivers them. Deriving the after-setup answer from
+// the live adapter's current answer cannot see that gap, which is how the
+// wizard ended up recommending setup actions from providers that could never
+// deliver the capability being asked about.
+//
+// A provider whose capabilities do not change with setup, and a provider
+// Portico ships no adapter for, do not implement this.
+type PotentialDefinition interface {
+	Definition
+	PotentialCapabilities(ctx context.Context) (core.Capabilities, error)
+}
+
 // VerificationStrength states what a passing VerifyAccount actually proved.
 //
 // The distinction is load-bearing. A verifier that only checks value shape

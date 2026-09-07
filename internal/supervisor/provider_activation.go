@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider"
@@ -127,6 +128,35 @@ func (s *Supervisor) setupKindFor(id string) string {
 		return ""
 	}
 	return string(setup.SetupFlow().Kind)
+}
+
+// potentialCapabilitiesFor resolves a provider's static after-setup capability
+// set from its definition. It mirrors setupKindFor: the answer is a property
+// of the definition, not the adapter, and an error degrades to ok == false —
+// potential capability is advisory, so a failure must never fail the snapshot.
+func (s *Supervisor) potentialCapabilitiesFor(id string) (core.Capabilities, bool) {
+	id = string(core.NormalizeProviderID(core.ProviderID(id)))
+	var def provider.Definition
+	if s.activation != nil {
+		def = s.activation.definitionFor(core.ProviderID(id))
+	}
+	if def == nil {
+		return core.Capabilities{}, false
+	}
+	pot, ok := def.(provider.PotentialDefinition)
+	if !ok {
+		return core.Capabilities{}, false
+	}
+	// Bounded like every other definition-side capability query; the contract
+	// says the answer is static, and a definition that violates it must not
+	// hold the snapshot handler hostage.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	caps, err := pot.PotentialCapabilities(ctx)
+	if err != nil {
+		return core.Capabilities{}, false
+	}
+	return caps, true
 }
 
 // activateAll installs every known provider.
