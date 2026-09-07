@@ -120,10 +120,13 @@ func (m *Model) renderClone() string {
 	if m.clone.detail == nil {
 		if m.clone.err != "" {
 			b.WriteString(m.theme.Style("intervention").Render(m.clone.err))
-			b.WriteString("\n\n[esc] back\n")
+			b.WriteString("\n\n")
+			b.WriteString(m.actionsFor(ScreenClone).footer(m.theme, m.width))
 			return b.String()
 		}
 		b.WriteString("Loading " + m.clone.sourceName + "...\n")
+		b.WriteString("\n")
+		b.WriteString(m.actionsFor(ScreenClone).footer(m.theme, m.width))
 		return b.String()
 	}
 
@@ -173,11 +176,11 @@ func (m *Model) renderClone() string {
 		b.WriteString("\n")
 	}
 
-	if m.clone.fieldCount() > 1 {
-		b.WriteString("\n[tab] next field    [enter] create the copy    [esc] cancel\n")
-	} else {
-		b.WriteString("\n[enter] create the copy    [esc] cancel\n")
-	}
+	// The footer is the screen's action set. The tab action carries whether a
+	// second field exists at all, so the bar was the second copy of that answer
+	// and the one that could drift.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenClone).footer(m.theme, m.width))
 	return b.String()
 }
 

@@ -3157,7 +3157,10 @@ func (m *Model) renderInspect() string {
 		b.WriteString(m.theme.Style("intervention").Render(conn.Error))
 		b.WriteString("\n")
 	}
-	b.WriteString("\n[esc] back    [q] home\n")
+	// Even the fallback shows the screen's own action bar, so the two inspect
+	// renderings cannot describe different keyboards.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenInspect).footer(m.theme, m.width))
 	return b.String()
 }
 
@@ -3233,7 +3236,10 @@ func operationStatusLabel(state string) string {
 
 func (m *Model) renderOperationProgress() string {
 	if m.operation == nil {
-		return "No operation in progress"
+		// Even this degenerate state draws the action bar, so the screen never
+		// renders a shape the action set does not describe.
+		return "No operation in progress\n\n" +
+			m.actionsFor(ScreenOperationProgress).footer(m.theme, m.width)
 	}
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(fmt.Sprintf(" OPERATION: %s ", m.operation.State)))
@@ -3303,7 +3309,11 @@ func (m *Model) renderOperationProgress() string {
 		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
 		b.WriteString("\n")
 	}
-	b.WriteString("\n[esc] back\n")
+	// The footer is the screen's action set; the hand-written "[esc] back" was
+	// the only thing it said, while the refresh action the screen runs stayed
+	// unadvertised.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenOperationProgress).footer(m.theme, m.width))
 	return b.String()
 }
 
@@ -3461,15 +3471,15 @@ func (m *Model) renderProviders() string {
 		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
 		b.WriteString("\n\n")
 	}
-	if len(m.buildScreenRows()) > 0 {
-		// The cursor may sit on a provider row or an account row; selectedAccount
-		// deliberately returns nothing on a provider row so destructive account
-		// actions cannot implicitly target a child. The footer must not claim an
-		// account is selected when it may not be.
-		b.WriteString("[↑↓] select provider/account    [a] add account    [x] remove account    [esc] back\n")
-	} else {
-		b.WriteString("[a] add account    [esc] back    [q] quit\n")
-	}
+	// The footer is the screen's action set, not a hand-written line beside it.
+	// The hardcoded copy advertised three of the six actions the screen runs —
+	// Verify and Replace credential genuinely worked while the management
+	// screen said nothing about them. selectedAccount deliberately returns
+	// nothing on a provider row so destructive account actions cannot
+	// implicitly target a child; the action set's enablement is what keeps the
+	// footer from claiming an account is selected when it may not be.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenProviders).footer(m.theme, m.width))
 	return b.String()
 }
 
@@ -3491,10 +3501,13 @@ func (m *Model) renderProviderSetup() string {
 	if m.providerSetupFlow == nil {
 		if m.providerSetupError != "" {
 			b.WriteString(m.theme.Style("intervention").Render(m.providerSetupError))
-			b.WriteString("\n\n[esc] back\n")
+			b.WriteString("\n\n")
+			b.WriteString(m.actionsFor(ScreenProviderSetup).footer(m.theme, m.width))
 			return b.String()
 		}
 		b.WriteString("Asking " + m.providerSetupProviderID + " what it needs...\n")
+		b.WriteString("\n")
+		b.WriteString(m.actionsFor(ScreenProviderSetup).footer(m.theme, m.width))
 		return b.String()
 	}
 
@@ -3542,7 +3555,10 @@ func (m *Model) renderProviderSetup() string {
 				b.WriteString(m.theme.Style("muted").Render("  "+note) + "\n")
 			}
 		}
-		b.WriteString("\n[esc] back\n")
+		// Guidance's escape is the screen's own action set; the hand-written
+		// line and the h action it runs had already diverged.
+		b.WriteString("\n")
+		b.WriteString(m.actionsFor(ScreenProviderSetup).footer(m.theme, m.width))
 		return b.String()
 	}
 
@@ -3616,7 +3632,10 @@ func (m *Model) renderProviderSetup() string {
 				b.WriteString(m.theme.Style("intervention").Render("Error: " + m.providerSetupError))
 				b.WriteString("\n")
 			}
-			b.WriteString("\n[esc] back    [enter] select\n")
+			// The choice question's keys are the screen's action set for this
+			// step, so the bar cannot name keys the handler refuses.
+			b.WriteString("\n")
+			b.WriteString(m.actionsFor(ScreenProviderSetup).footer(m.theme, m.width))
 			return b.String()
 		}
 
@@ -3644,7 +3663,10 @@ func (m *Model) renderProviderSetup() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\n[esc] back    [enter] continue\n")
+	// The footer is the screen's action set for the current step, which is what
+	// keeps the advertised keys and the handler's keys one description.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenProviderSetup).footer(m.theme, m.width))
 	return b.String()
 }
 
@@ -3719,7 +3741,11 @@ func (m *Model) renderRepair() string {
 			}
 		}
 
-		b.WriteString("\n[r] run diagnostics again    [esc] back    [q] quit\n")
+		// The verification result is read-only; the actions are the screen's own
+		// set rather than a hand-written line that had already dropped the
+		// preview action.
+		b.WriteString("\n")
+		b.WriteString(m.actionsFor(ScreenRepair).footer(m.theme, m.width))
 		return b.String()
 	}
 
@@ -3736,11 +3762,11 @@ func (m *Model) renderRepair() string {
 			}
 		}
 	}
-	if len(m.diagnostics) > 0 {
-		b.WriteString("\n[enter] preview repair    [r] run diagnostics    [esc] cancel    [q] quit\n")
-	} else {
-		b.WriteString("\n[r] run diagnostics    [esc] cancel    [q] quit\n")
-	}
+	// The footer is the screen's action set: the preview action carries its own
+	// enabled state and reason, so the bar dims when there is nothing to repair
+	// rather than changing shape.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenRepair).footer(m.theme, m.width))
 	return b.String()
 }
 
@@ -3783,7 +3809,11 @@ func (m *Model) renderDiscovery() string {
 			}
 		}
 	}
-	b.WriteString("\n[enter] use selected service    [i] why this?    [esc] back    [q] quit\n")
+	// The footer is the screen's action set, so the scan-again and manual-entry
+	// actions the screen runs are advertised beside the ones it had already
+	// named.
+	b.WriteString("\n")
+	b.WriteString(m.actionsFor(ScreenDiscovery).footer(m.theme, m.width))
 	return b.String()
 }
 

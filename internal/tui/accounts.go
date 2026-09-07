@@ -253,7 +253,8 @@ func (m *Model) renderAccountRemoval() string {
 	var b strings.Builder
 
 	if m.accountRemovalTarget == nil {
-		b.WriteString("No account selected.\n\n[esc] back\n")
+		b.WriteString("No account selected.\n\n")
+		b.WriteString(m.actionsFor(ScreenAccountRemoval).footer(m.theme, m.width))
 		return b.String()
 	}
 
@@ -269,7 +270,11 @@ func (m *Model) renderAccountRemoval() string {
 			b.WriteString(m.theme.Style("muted").Render("  • " + dep))
 			b.WriteString("\n")
 		}
-		b.WriteString("\n[esc] back\n")
+		// The refusal's escape is the screen's own action set; the confirm
+		// action there is disabled with the reason, so the bar says blocked
+		// rather than offering a key that answers "the supervisor refused".
+		b.WriteString("\n")
+		b.WriteString(m.actionsFor(ScreenAccountRemoval).footer(m.theme, m.width))
 		return b.String()
 	}
 
@@ -281,7 +286,11 @@ func (m *Model) renderAccountRemoval() string {
 				b.WriteString(m.theme.Style("muted").Render("  • " + dep.Name))
 				b.WriteString("\n")
 			}
-			b.WriteString("\n[esc] back\n")
+			// The not-removable refusal is also the screen's action set: confirm
+			// is disabled there with the dependency as its reason, so the bar and
+			// the dependency list say the same thing.
+			b.WriteString("\n")
+			b.WriteString(m.actionsFor(ScreenAccountRemoval).footer(m.theme, m.width))
 			return b.String()
 		}
 		for _, line := range m.accountRemovalPreview.Consequences {
@@ -290,6 +299,9 @@ func (m *Model) renderAccountRemoval() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString("[enter] confirm   [esc] cancel\n")
+	// The footer is the screen's action set, so the confirm action's own
+	// enabled state — carrying the removal's removability — is what draws the
+	// bar, not a second copy of the answer beside it.
+	b.WriteString(m.actionsFor(ScreenAccountRemoval).footer(m.theme, m.width))
 	return b.String()
 }

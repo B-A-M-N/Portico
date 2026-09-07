@@ -226,14 +226,27 @@ func TestALateRemovalReplyDoesNotReportAgainstAnotherAccount(t *testing.T) {
 }
 
 // TestTheProvidersScreenSaysHowToRemoveAnAccount pins that the action is
-// discoverable, since an action nobody can find is not reachable.
+// discoverable, since an action nobody can find is not reachable. The footer
+// is the screen's action set, so this reads the action's own label rather than
+// a hand-written string that could drift from what dispatch runs.
 func TestTheProvidersScreenSaysHowToRemoveAnAccount(t *testing.T) {
 	m := readyModel(&fakeClient{}, accountSnapshot())
 	m.screen = ScreenProviders
+	// Removal targets an account; move the cursor off the provider row onto
+	// one, which is the state in which the action must be offered.
+	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
 
+	action, ok := m.actionsFor(ScreenProviders).Find(ActionRemoveAccount)
+	if !ok {
+		t.Fatal("the providers screen does not offer removal at all")
+	}
+	if !action.Enabled {
+		t.Fatalf("removal is disabled with an account listed: %s", action.DisabledReason)
+	}
 	view := m.renderProviders()
-	if !strings.Contains(view, "remove account") {
-		t.Fatalf("the providers screen does not offer removal:\n%s", view)
+	if !strings.Contains(view, action.Label) {
+		t.Fatalf("the providers screen does not advertise %q:\n%s", action.Label, view)
 	}
 }
 
@@ -374,7 +387,9 @@ func TestProviderSectionRendersExactlyOnce(t *testing.T) {
 // TestProviderRowSelectsNoAccount pins the deliberate safety rule: the cursor
 // can rest on a provider row, but that must never imply an account is
 // selected — destructive account actions would otherwise target a child the
-// user never chose. The footer was changed to match this model.
+// user never chose. The action set is the one description: on a provider row
+// every account action is disabled with that as its reason, so the footer
+// drawn from it cannot claim an account is selected.
 func TestProviderRowSelectsNoAccount(t *testing.T) {
 	m := readyModel(&fakeClient{}, accountSnapshot())
 	m.useASCII = false
@@ -384,18 +399,34 @@ func TestProviderRowSelectsNoAccount(t *testing.T) {
 	if _, ok := m.selectedAccount(); ok {
 		t.Fatal("a provider row must not select an account")
 	}
-	view := m.renderProviders()
-	if !strings.Contains(view, "select provider/account") {
-		t.Fatalf("footer must not claim an account is selected on a provider row:\n%s", view)
+	actions := m.actionsFor(ScreenProviders)
+	for _, id := range []ActionID{ActionVerifyAccount, ActionReplaceCredential, ActionRemoveAccount} {
+		action, ok := actions.Find(id)
+		if !ok {
+			t.Fatalf("the providers screen does not offer %s", id)
+		}
+		if action.Enabled {
+			t.Fatalf("%s is enabled on a provider row, which selects no account", id)
+		}
+		if action.DisabledReason == "" {
+			t.Fatalf("%s is disabled with no reason, so a dimmed action is a mystery", id)
+		}
 	}
 
-	// Moving onto an account row selects it.
+	// Moving onto an account row selects it — and the same actions must become
+	// enabled, so the bar reflects the selection it draws.
 	for range 1 {
 		next, _ := m.Update(keyMsg("down"))
 		m = next.(Model)
 	}
 	if _, ok := m.selectedAccount(); !ok {
 		t.Fatal("an account row must select that account")
+	}
+	actions = m.actionsFor(ScreenProviders)
+	for _, id := range []ActionID{ActionVerifyAccount, ActionReplaceCredential, ActionRemoveAccount} {
+		if action, ok := actions.Find(id); ok && !action.Enabled {
+			t.Fatalf("%s is still disabled on an account row: %s", id, action.DisabledReason)
+		}
 	}
 }
 

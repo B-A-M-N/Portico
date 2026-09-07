@@ -563,9 +563,12 @@ func TestTUIProvidersMultiProviderMultiAccount(t *testing.T) {
 	s.send("up")
 	s.send("up")
 	s.waitFor("Cloudflare")
-	if !strings.Contains(s.screen(), "select provider/account") {
-		t.Fatalf("footer must not claim an account is selected on a provider row:\n%s", s.debug())
-	}
+	// The cursor is back on a provider row, which selects no account. The
+	// footer is the screen's action set, so the account actions are drawn
+	// disabled there rather than the bar claiming a selection exists: pressing
+	// one names the refusal instead of targeting an account nobody chose.
+	s.send("x")
+	s.waitFor("Remove account is not available")
 	s.send("?")
 	s.waitFor("HELP")
 	s.send("esc")
