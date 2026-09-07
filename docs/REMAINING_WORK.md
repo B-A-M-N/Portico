@@ -5,11 +5,13 @@
 **Last reviewed against:** working tree, 2026-09-07. The release-audit P0s
 (wizard→provider-setup handoff, setup/Help navigation, canonical Staticcheck
 gate, prior-release upgrade selection) are fixed as of `bebd0f6`/`696d685`; the
-action-authority footers (`c80ef37`) and the editable tunnel-client path
-including the config-clear persistence defect (`ae3b2e3`) have also landed.
-Still open from that audit: provider setup semantics on the DTO (CanSetup /
-SetupKind), potential-vs-current capability guidance, and the verification
-matrices (mutation coverage, six terminal sizes, secret proof). Sections marked Done below were
+action-authority footers (`c80ef37`), the editable tunnel-client path including
+the config-clear persistence defect (`ae3b2e3`), provider setup semantics on
+the DTO (`9561493`), and declared potential capabilities with potential-filtered
+wizard advice (`ca4f434`) have also landed. Still open from that audit: the
+verification matrices (mutation coverage for account lifecycle, edit-apply,
+repair-apply, settings-restart; six terminal sizes across critical forms;
+secret proof) and the live Cloudflare TUI qualification. Sections marked Done below were
 verified against the tests named in them at this review; where a claim is only partly
 true, it says which part. Several entries were stale before that review — rotate-in-place and the
 429/5xx/malformed/timeout coverage were both listed as open after they had landed — so
