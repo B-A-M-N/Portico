@@ -101,6 +101,15 @@ func screenHelp(screen ScreenID) (title string, body []string) {
 			"that. Some connections need no account at all, so an unconfigured provider does not",
 			"necessarily block you.",
 		}
+	case ScreenProviderSetup:
+		return "Set up a provider", []string{
+			"The form is the provider's own: the fields, their order and which are secret are",
+			"what the provider declared, not something Portico invented. A credential is checked",
+			"before anything is stored.",
+			"",
+			"Guidance providers hold no credential here — the screen tells you what to do in the",
+			"provider's own tools instead. Press h to open its guide.",
+		}
 	case ScreenSettings:
 		return "How Portico behaves", []string{
 			"Choices that outlive this session and are not properties of any one connection. The",

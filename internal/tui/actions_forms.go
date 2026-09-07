@@ -112,6 +112,105 @@ func (m Model) cloneActions() ActionSet {
 	})
 }
 
+// providerSetupActions describes the provider setup form.
+//
+// Like the wizard, the form owns its keyboard (typed fields), so the set is
+// derived from what the current step accepts rather than offered for dispatch:
+// handleProviderSetupKey remains the keyboard's authority. The set exists so
+// the footer and Help describe the same keys the form actually handles — the
+// single-action-authority rule — and so Help can explain the screen.
+func (m Model) providerSetupActions() ActionSet {
+	if m.providerSetupFlow == nil {
+		// The flow is still loading. Esc leaves; there is nothing else to do.
+		return ActionSet{{
+			ID: ActionBack, Keys: []string{"esc"}, Label: "Back", Enabled: true,
+			Primary: true, Help: "Return to the screen you came from.",
+		}}
+	}
+	if !m.providerSetupFlow.StoresAccount() {
+		// A guidance flow reads but does not collect. Its escape is explicit.
+		return ActionSet{
+			{
+				ID: ActionBack, Keys: []string{"esc"}, Label: "Back", Enabled: true,
+				Primary: true, Help: "Leave this guide. Portico stores nothing for it.",
+			},
+			{
+				ID: ActionConfigureProvider, Keys: []string{"h"}, Label: "Provider guide",
+				Enabled: m.providerSetupFlow.HelpURL != "",
+				Help:    "Open the provider's own setup instructions in your browser.",
+			},
+		}
+	}
+	fields := m.providerSetupFields()
+	if len(fields) == 0 {
+		return ActionSet{{
+			ID: ActionBack, Keys: []string{"esc"}, Label: "Back", Enabled: true,
+			Primary: true, Help: "Return to the screen you came from.",
+		}}
+	}
+	if m.providerSetupIndex >= len(fields) {
+		// The confirmation step: enter saves, esc goes back to editing.
+		return ActionSet{
+			{
+				ID: ActionConfirm, Keys: []string{"enter"}, Label: "Save account",
+				Enabled: !m.providerSetupSubmitting, Primary: true,
+				DisabledReason: submittingReason(m.providerSetupSubmitting),
+				Help:           "Check and store this account. The credential is validated before anything is kept.",
+			},
+			{
+				ID: ActionBack, Keys: []string{"esc"}, Label: "Edit answers", Enabled: true,
+				Help: "Go back to the previous field.",
+			},
+			{
+				ID: ActionConfigureProvider, Keys: []string{"h"}, Label: "Provider guide",
+				Enabled: m.providerSetupFlow.HelpURL != "",
+				Help:    "Open the provider's own setup instructions in your browser.",
+			},
+		}
+	}
+	return ActionSet{
+		{
+			ID: ActionNextField, Keys: []string{"enter"}, Label: "Next", Enabled: true,
+			Primary: true, Help: "Accept this answer and move to the next field.",
+		},
+		{
+			ID: ActionBack, Keys: []string{"esc"},
+			Label:   backLabel(m.providerSetupIndex),
+			Enabled: true,
+			Help:    backHelp(m.providerSetupIndex),
+		},
+		{
+			ID: ActionConfigureProvider, Keys: []string{"h"}, Label: "Provider guide",
+			Enabled: m.providerSetupFlow.HelpURL != "",
+			Help:    "Open the provider's own setup instructions in your browser.",
+		},
+	}
+}
+
+// submittingReason explains a greyed-out save button.
+func submittingReason(submitting bool) string {
+	if submitting {
+		return "the credential is already being checked"
+	}
+	return ""
+}
+
+// backLabel names what esc does on a form field: out of the form entirely on
+// the first field, back one field otherwise.
+func backLabel(index int) string {
+	if index == 0 {
+		return "Cancel setup"
+	}
+	return "Previous field"
+}
+
+func backHelp(index int) string {
+	if index == 0 {
+		return "Leave setup. Nothing has been stored."
+	}
+	return "Go back and change the previous answer."
+}
+
 // wizardActions describes the new-connection wizard.
 //
 // The wizard owns its own keyboard and its steps differ, so the set is derived

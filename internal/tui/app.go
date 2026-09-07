@@ -40,6 +40,7 @@ const (
 	ScreenSettings          ScreenID = "settings"
 	ScreenHelp              ScreenID = "help"
 	ScreenSetup             ScreenID = "setup"
+	ScreenProviderSetup     ScreenID = "provider_setup"
 	ScreenAccountRemoval    ScreenID = "account_removal"
 	ScreenEdit              ScreenID = "edit"
 	ScreenClone             ScreenID = "clone"
@@ -199,10 +200,15 @@ type Model struct {
 	// Provider setup is driven by the provider's own declared fields rather
 	// than by Cloudflare's, which is what the screen used to hardcode.
 	//
-	// providerSetupStep is 0 when no setup is active and 1 while it is; the
-	// position within the form is providerSetupIndex, which runs over the
-	// declared fields and then one past the end to mean "confirming".
-	providerSetupStep       int
+	// Provider setup is active when screen == ScreenProviderSetup; the position
+	// within the form is providerSetupIndex, which runs over the declared
+	// fields and then one past the end to mean "confirming".
+	// providerSetupCaller records where setup was entered from, so leaving it —
+	// by finishing, cancelling, or Esc from the Help it opens — returns to the
+	// screen the user came from. It is the navigation-stack equivalent of the
+	// old providerSetupStep flag, which pre-empted keys globally while the
+	// rendered screen belonged to something else.
+	providerSetupCaller     providerSetupReturn
 	providerSetupProviderID string
 	providerSetupFlow       *ipc.SetupFlowDTO
 	setupHelpStatus         string
@@ -231,8 +237,9 @@ type Model struct {
 	// alter the form the user is now filling in.
 	providerSetupValidateRequests requestTracker
 	// resumeWizardAfterSetup names the provider the wizard asked to configure.
-	// When it is set, finishing setup returns to the wizard rather than to the
-	// providers screen, with every answer the user had given still in place.
+	// When it is set, finishing setup returns to the wizard's provider question
+	// (with the recommendation recomputed) rather than to the caller screen,
+	// with every answer the user had given still in place.
 	resumeWizardAfterSetup string
 
 	lastEventSeq int64
@@ -384,6 +391,17 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// field consume ctrl+c — which it did, appending the literal "ctrl+c"
 		// to whatever was being typed instead of shutting down.
 		if msg.String() == "ctrl+c" {
+			return m.handleKeyPress(msg)
+		}
+		// Provider setup treats ? as Help even on a field step: a user sitting
+		// on a credential field is exactly who needs the provider's context.
+		// The setup form never collects "?" as an answer — its fields are
+		// IDs, labels, zones and credentials — so the text-entry router must
+		// not have it. (The wizard's name field, by contrast, legitimately
+		// may.) Under the flag model this check sat behind text entry, so the
+		// help key worked on guidance screens and the confirm step but typed
+		// a literal "?" into an account form.
+		if msg.String() == "?" && m.screen == ScreenProviderSetup {
 			return m.handleKeyPress(msg)
 		}
 		// Otherwise a question answered by typing takes the keystroke first,
@@ -1068,6 +1086,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resumeWizardAfterSetup = resumeProvider
 			return m, m.finishProviderSetup()
 		}
+		// No wizard is waiting: the setup screen closes and the user is back
+		// where they opened it. Leaving ScreenProviderSetup current would keep
+		// rendering a form that no longer exists.
+		m.returnFromProviderSetup()
 		return m, m.requestSnapshot()
 
 	case screens.ProviderRecommendationMsg:
@@ -1255,6 +1277,8 @@ func (m Model) renderScreen() string {
 		return m.renderHome()
 	case ScreenNewConnection:
 		return m.renderNewConnection()
+	case ScreenProviderSetup:
+		return m.renderProviderSetup()
 	case ScreenInspect:
 		return m.renderInspect()
 	case ScreenHelp:
@@ -2048,10 +2072,13 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleCloneKey(key)
 	}
 
-	// While provider setup is active, handle it specially. Help still reaches
-	// the screen from here: a guidance form is exactly where a user needs
-	// explaining, and the form never treats ? as input.
-	if m.providerSetupStep > 0 {
+	// Provider setup owns its keyboard like the other text screens: it has
+	// typed fields, and its keys mean field input rather than screen actions.
+	// Help still reaches the screen — a guidance form is exactly where a user
+	// needs explaining — and because setup is the current screen while it is
+	// up, Escape from Help returns here rather than tearing the form down
+	// behind Help's back.
+	if m.screen == ScreenProviderSetup {
 		if key == "?" {
 			m.prevScreen = m.screen
 			m.transitionTo(ScreenHelp)
@@ -2233,6 +2260,11 @@ func (m *Model) clearProviderSetupSecret() {
 }
 
 // clearProviderSetup resets the whole setup flow, secret included.
+//
+// Navigation is deliberately not touched: where the user goes after the form
+// closes is the exit path's decision (finish, cancel, or the credential
+// replacement that stays on the Providers screen). Clearing used to imply
+// navigation, and the two concerns disagreed about the destination.
 func (m *Model) clearProviderSetup() {
 	m.providerSetupRequests.cancel()
 	m.providerSetupValidateRequests.cancel()
@@ -2241,7 +2273,6 @@ func (m *Model) clearProviderSetup() {
 	m.providerSetupChoices = nil
 	m.providerSetupChoiceCursor = 0
 	m.clearProviderSetupSecret()
-	m.providerSetupStep = 0
 	m.providerSetupIndex = 0
 	m.focusProviderSetupField()
 	m.providerSetupFlow = nil
@@ -2251,8 +2282,6 @@ func (m *Model) clearProviderSetup() {
 	// The rotation target is cleared with the form. Leaving it set would make the
 	// next account added rotate that account's credential instead.
 	m.replacingAccountID = ""
-	// A wizard waiting to be returned to is not: abandoning the setup form must
-	// still bring the user back to the question they left, with their answers.
 }
 
 // providerSetupFields returns the fields being collected, which come from the
@@ -2286,6 +2315,24 @@ func (m *Model) setProviderSetupValue(id, value string) {
 // sequence of Cloudflare's four inputs. Steps are: one per field, then a final
 // confirmation.
 func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
+	// The setup screen scrolls with the shared viewport mechanism and its
+	// footer advertises paging; a form taller than the terminal must be
+	// reachable, so the advertised keys have to work here too.
+	switch key {
+	case "pgup":
+		m.scroll.scrollBy(-m.scroll.page())
+		return m, nil
+	case "pgdown":
+		m.scroll.scrollBy(m.scroll.page())
+		return m, nil
+	case "home":
+		m.scroll.toTop()
+		return m, nil
+	case "end":
+		m.scroll.toBottom()
+		return m, nil
+	}
+
 	// A guidance flow describes what to do elsewhere. The screen already
 	// renders it as instructions, but the keyboard went on walking fields,
 	// accepting typed values and submitting them — so a credential could be
@@ -2293,7 +2340,7 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 	// refusal arrived from the server.
 	if m.providerSetupFlow != nil && !m.providerSetupFlow.StoresAccount() {
 		if key == "esc" || key == "enter" {
-			m.clearProviderSetup()
+			return m, m.cancelProviderSetup()
 		}
 		if key == "h" {
 			return m, m.openSetupHelp()
@@ -2306,7 +2353,7 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		// Nothing to collect: the flow either failed to load or declares no
 		// fields. Either way there is no form to drive.
 		if key == "esc" || key == "enter" {
-			m.clearProviderSetup()
+			return m, m.cancelProviderSetup()
 		}
 		if key == "h" {
 			return m, m.openSetupHelp()
@@ -2363,15 +2410,7 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		switch key {
 		case "esc":
 			if m.providerSetupIndex == 0 {
-				resume := m.resumeWizardAfterSetup
-				m.clearProviderSetup()
-				if resume != "" && m.wizard != nil {
-					m.resumeWizardAfterSetup = ""
-					m.transitionTo(ScreenNewConnection)
-					return m, m.wizard.ResumeAfterSetup(resume, m.providerSnapshot())
-				}
-				m.resumeWizardAfterSetup = ""
-				return m, nil
+				return m, m.cancelProviderSetup()
 			}
 			// Leaving a discovery question rewinds to the credential step and
 			// clears the discovery answers: a choice made from a validation of
@@ -2416,19 +2455,11 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		if m.providerSetupIndex == 0 {
 			// Leaving setup entirely: nothing collected may persist.
 			//
-			// A wizard is still waiting behind this form. Abandoning setup returns
+			// A wizard is still intact behind this form. Abandoning setup returns
 			// the user to the question they left rather than dropping them
 			// somewhere else with their answers stranded — the provider simply
 			// remains unconfigured, which the provider question already says.
-			resume := m.resumeWizardAfterSetup
-			m.clearProviderSetup()
-			if resume != "" && m.wizard != nil {
-				m.resumeWizardAfterSetup = ""
-				m.transitionTo(ScreenNewConnection)
-				return m, m.wizard.ResumeAfterSetup(resume, m.providerSnapshot())
-			}
-			m.resumeWizardAfterSetup = ""
-			return m, nil
+			return m, m.cancelProviderSetup()
 		}
 		// Moving back past a secret must not leave it resident while the user
 		// edits earlier answers.
@@ -2663,11 +2694,16 @@ func (m Model) selectedProviderID() string {
 //
 // Nothing is rendered until the flow arrives: the fields are the provider's to
 // declare, and inventing a form here is what confined setup to Cloudflare.
+//
+// Setup is pushed as a real screen. Rendering and key dispatch come from the
+// screen, not from a flag that pre-empts whichever screen happens to be
+// current — the wizard kept receiving keys under exactly that design.
 func (m Model) beginProviderSetup(providerID string) (Model, tea.Cmd) {
 	if providerID == "" {
 		return m, nil
 	}
-	m.providerSetupStep = 1
+	m.providerSetupCaller = providerSetupReturn{Screen: m.screen}
+	m.pushScreen(ScreenProviderSetup)
 	m.providerSetupProviderID = providerID
 	m.providerSetupFlow = nil
 	m.providerSetupIndex = 0
@@ -3298,11 +3334,6 @@ func providerStateLabel(availability string, stability string) (string, string) 
 }
 
 func (m *Model) renderProviders() string {
-	// If in provider setup mode, show the setup UI
-	if m.providerSetupStep > 0 {
-		return m.renderProviderSetup()
-	}
-
 	var b strings.Builder
 	b.WriteString(m.theme.Style("header").Render(" PROVIDERS "))
 	b.WriteString("\n\n")
@@ -4147,7 +4178,7 @@ func (m *Model) routeTextEntry(msg tea.Msg) (tea.Cmd, bool) {
 	if m.screen == ScreenNewConnection && m.wizard != nil {
 		return m.wizard.Update(msg)
 	}
-	if m.providerSetupStep > 0 {
+	if m.screen == ScreenProviderSetup {
 		return m.updateProviderSetupField(msg)
 	}
 	if m.screen == ScreenClone && m.clone != nil && screens.FieldAccepts(msg) {

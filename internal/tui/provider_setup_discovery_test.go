@@ -206,7 +206,7 @@ func TestSetupValidationFailureKeepsAnswersAndDropsSecret(t *testing.T) {
 // they are now in.
 func TestValidationAnswerForAbandonedAttemptIsIgnored(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "other-provider"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "other-provider", Kind: "account",

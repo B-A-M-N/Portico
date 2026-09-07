@@ -281,8 +281,8 @@ func TestWizardProviderSetupPreservesEveryAnswer(t *testing.T) {
 	if m.wizard == nil {
 		t.Fatal("provider setup tore down the wizard")
 	}
-	if m.providerSetupStep == 0 {
-		t.Fatal("provider setup did not begin")
+	if m.screen != ScreenProviderSetup {
+		t.Fatalf("provider setup did not begin: screen=%s", m.screen)
 	}
 	if m.resumeWizardAfterSetup != "cloudflare" {
 		t.Fatalf("the return path was not recorded: %q", m.resumeWizardAfterSetup)
@@ -297,7 +297,7 @@ func TestWizardProviderSetupPreservesEveryAnswer(t *testing.T) {
 	if m.screen != ScreenNewConnection {
 		t.Fatalf("finishing setup landed on %s, not the wizard", m.screen)
 	}
-	if m.providerSetupStep != 0 {
+	if m.screen == ScreenProviderSetup {
 		t.Fatal("the setup form is still open after finishing")
 	}
 	if m.resumeWizardAfterSetup != "" {

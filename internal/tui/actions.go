@@ -341,7 +341,7 @@ func keyLabel(key string) string {
 // actions, so no footer offers a quit that the field would swallow.
 func screenTakesTextInput(screen ScreenID) bool {
 	switch screen {
-	case ScreenNewConnection, ScreenEdit, ScreenClone:
+	case ScreenNewConnection, ScreenEdit, ScreenClone, ScreenProviderSetup:
 		return true
 	default:
 		return false

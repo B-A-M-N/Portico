@@ -149,7 +149,7 @@ func TestRepairIsVerifiedByWhichFindingsChanged(t *testing.T) {
 // store a credential does not then collect one.
 func TestAGuidanceFlowCollectsNothing(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "openai_tunnel"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "openai_tunnel", Kind: "guidance",
@@ -169,8 +169,8 @@ func TestAGuidanceFlowCollectsNothing(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("a guidance screen submitted an account configuration")
 	}
-	if m.providerSetupStep != 0 {
-		t.Fatalf("enter did not leave the guidance screen: step=%d", m.providerSetupStep)
+	if m.screen == ScreenProviderSetup {
+		t.Fatalf("enter did not leave the guidance screen: screen=%s", m.screen)
 	}
 }
 
@@ -184,7 +184,7 @@ func TestACredentialIsNotSubmittedTwice(t *testing.T) {
 		ProviderID: "cloudflare", Kind: "account",
 		Fields: []ipc.SetupFieldDTO{{ID: "account_id", Label: "Account"}},
 	}
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupIndex = 1 // the confirmation step
 
 	_, cmd := m.Update(keyMsg("enter"))
@@ -198,7 +198,7 @@ func TestACredentialIsNotSubmittedTwice(t *testing.T) {
 // and least likely to retype correctly, and paste did not reach the form at all.
 func TestACredentialCanBePasted(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "cloudflare"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "cloudflare", Kind: "account",
@@ -220,7 +220,7 @@ func TestACredentialCanBePasted(t *testing.T) {
 // "ctrl+c" to the credential being typed, instead of shutting down.
 func TestQuittingOutranksTyping(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "cloudflare"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "cloudflare", Kind: "account",
@@ -248,7 +248,7 @@ func TestQuittingOutranksTyping(t *testing.T) {
 // the paste path as well as the key path.
 func TestAGuidanceFlowStillCollectsNothingWhenPasted(t *testing.T) {
 	m := readyModel(&fakeClient{}, testSnapshot())
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "openai_tunnel"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "openai_tunnel", Kind: "guidance",

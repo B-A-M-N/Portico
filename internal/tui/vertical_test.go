@@ -211,7 +211,7 @@ func TestProviderValidationDetailsReachTheScreen(t *testing.T) {
 
 	m := readyModel(&fakeClient{}, testSnapshot())
 	m.client = client
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "cloudflare"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "cloudflare", Kind: "account",
@@ -245,7 +245,7 @@ func TestARejectedCredentialIsNotRetained(t *testing.T) {
 
 	m := readyModel(&fakeClient{}, testSnapshot())
 	m.client = client
-	m.providerSetupStep = 1
+	m.screen = ScreenProviderSetup
 	m.providerSetupProviderID = "cloudflare"
 	m.providerSetupFlow = &ipc.SetupFlowDTO{
 		ProviderID: "cloudflare", Kind: "account",

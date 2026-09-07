@@ -27,6 +27,8 @@ func (m Model) actionsFor(screen ScreenID) ActionSet {
 		set = m.providerActions()
 	case ScreenSetup:
 		set = m.setupActions()
+	case ScreenProviderSetup:
+		set = m.providerSetupActions()
 	case ScreenSettings:
 		set = m.settingsActions()
 	case ScreenDiscovery:

@@ -2036,8 +2036,8 @@ func TestCredentialIsClearedOnEveryExitPath(t *testing.T) {
 			next, _ := m.Update(keyMsg("esc"))
 			m = next.(Model)
 		}
-		if m.providerSetupStep != 0 {
-			t.Fatalf("setup step = %d, want 0 (exited)", m.providerSetupStep)
+		if m.screen == ScreenProviderSetup {
+			t.Fatalf("setup screen = %s, want it closed (exited)", m.screen)
 		}
 		if m.providerSetupValue("credential") != "" || m.providerSetupValue("account_id") != "" {
 			t.Fatalf("setup state survived cancellation: cred=%q id=%q", m.providerSetupValue("credential"), m.providerSetupValue("account_id"))

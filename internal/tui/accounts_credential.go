@@ -154,7 +154,9 @@ func (m *Model) applyCredentialReplaced(msg credentialReplacedMsg) tea.Cmd {
 	}
 
 	m.clearProviderSetupSecret()
-	m.providerSetupStep = 0
+	// A rotation ends back on the Providers screen it was launched from: the
+	// account the credential belongs to is listed there.
+	m.returnFromProviderSetup()
 	m.replacingAccountID = ""
 	switch {
 	case msg.Result == nil:
