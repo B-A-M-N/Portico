@@ -290,7 +290,24 @@ func wizardActionID(keys []string) ActionID {
 }
 
 // settingsActions is the operational settings screen.
+//
+// While the text editor for the tunnel-client path is open, those are the only
+// two answers: the field owns the keyboard, so a printable key is input, not a
+// command, and the screen's other actions would name keys the field consumes.
 func (m Model) settingsActions() ActionSet {
+	if m.settings != nil && m.settings.editing != nil {
+		return ActionSet{
+			{
+				ID: ActionConfirm, Keys: []string{"enter"}, Label: "Save path", Enabled: true,
+				Primary: true,
+				Help:    "Send the path to the supervisor. It is stored with the rest of the settings, so it survives a restart.",
+			},
+			{
+				ID: ActionBack, Keys: []string{"esc"}, Label: "Cancel", Enabled: true,
+				Help: "Close the field without sending anything.",
+			},
+		}
+	}
 	rows := m.settingsRows()
 	pending := m.settings != nil && m.settings.saving
 	cursorRow, hasRow := m.settingsCurrentRow()

@@ -429,6 +429,9 @@ func (f *fakeClient) UpdateSettings(_ context.Context, req ipc.SettingsRequest) 
 	if req.DefaultOnDisconnect != nil {
 		updated.DefaultOnDisconnect = *req.DefaultOnDisconnect
 	}
+	if req.ClientTunnelBin != nil {
+		updated.ClientTunnelBin = *req.ClientTunnelBin
+	}
 	f.settingsDTO = &updated
 	return &updated, nil
 }

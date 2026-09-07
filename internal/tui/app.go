@@ -2072,6 +2072,14 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (Model, tea.Cmd) {
 		return m.handleCloneKey(key)
 	}
 
+	// An open settings text editor owns esc and enter before the action set is
+	// consulted: they are commit and cancel, not screen actions.
+	if m.screen == ScreenSettings {
+		if next, cmd, handled := m.handleSettingsEditKey(key); handled {
+			return next, cmd
+		}
+	}
+
 	// Provider setup owns its keyboard like the other text screens: it has
 	// typed fields, and its keys mean field input rather than screen actions.
 	// Help still reaches the screen — a guidance form is exactly where a user
@@ -4220,6 +4228,14 @@ func (m *Model) routeTextEntry(msg tea.Msg) (tea.Cmd, bool) {
 	if m.screen == ScreenEdit && m.edit != nil && m.edit.typing && screens.FieldAccepts(msg) {
 		var cmd tea.Cmd
 		m.edit.field, cmd = m.edit.field.Update(msg)
+		return cmd, true
+	}
+	// The settings text editor owns its keys like every other field: while it
+	// is open, printable input goes to the field rather than to the action set
+	// — `q` in a path is the letter q.
+	if m.screen == ScreenSettings && m.settings != nil && m.settings.editing != nil && screens.FieldAccepts(msg) {
+		var cmd tea.Cmd
+		m.settings.editing.field, cmd = m.settings.editing.field.Update(msg)
 		return cmd, true
 	}
 	return nil, false

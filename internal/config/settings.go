@@ -68,10 +68,11 @@ func LoadOperationalSettings() (OperationalSettings, error) {
 	if !clientTunnelEnabled && viper.IsSet(KeyOpenAITunnelEnabled) && !viper.IsSet(KeyClientTunnelEnabled) {
 		clientTunnelEnabled = viper.GetBool(KeyOpenAITunnelEnabled)
 	}
-	clientTunnelBin, err := readSettingString(KeyClientTunnelBin, "")
-	if err != nil {
-		return OperationalSettings{}, err
-	}
+	// The path is an optional string, and empty is a meaningful answer —
+	// "resolve the name on PATH" — not a corrupt value. A written empty
+	// string is how a user's clear persists; rejecting it would make that
+	// clear fail the whole load.
+	clientTunnelBin := readOptionalString(KeyClientTunnelBin)
 	if clientTunnelBin == "" && viper.IsSet(KeyOpenAITunnelBin) && !viper.IsSet(KeyClientTunnelBin) {
 		clientTunnelBin = strings.TrimSpace(viper.GetString(KeyOpenAITunnelBin))
 	}
@@ -158,14 +159,12 @@ func applyOperationalSettings(settings OperationalSettings) {
 	viper.Set(KeyDefaultAutoStart, settings.DefaultAutoStart)
 	viper.Set(KeyDefaultOnDisconnect, strings.ToLower(strings.TrimSpace(settings.DefaultOnDisconnect)))
 	viper.Set(KeyClientTunnelEnabled, settings.ClientTunnelEnabled)
-	if settings.ClientTunnelBin != "" {
-		viper.Set(KeyClientTunnelBin, settings.ClientTunnelBin)
-	} else {
-		// An empty path means "resolve the name on PATH": the key is unset
-		// rather than written empty, because a written empty string would
-		// fail this same loader on the next read.
-		viper.Set(KeyClientTunnelBin, nil)
-	}
+	// The path is written even when empty, and the loader reads empty as
+	// "resolve the name on PATH". Setting nil does not clear a key viper has
+	// already read from the config file — the override is dropped and the old
+	// value is rewritten verbatim, so a clear silently never persisted.
+	// Writing the empty string is the one form whose round trip is honest.
+	viper.Set(KeyClientTunnelBin, settings.ClientTunnelBin)
 }
 
 func readSettingString(key, fallback string) (string, error) {
@@ -181,6 +180,20 @@ func readSettingString(key, fallback string) (string, error) {
 		return "", errors.New("setting " + key + " cannot be empty")
 	}
 	return s, nil
+}
+
+// readOptionalString reads a string setting whose empty value is a legitimate
+// answer rather than a corrupt file. It exists because a required-string read
+// rejects the empty value a cleared setting writes back.
+func readOptionalString(key string) string {
+	if !viper.IsSet(key) {
+		return ""
+	}
+	s, ok := viper.Get(key).(string)
+	if !ok {
+		return ""
+	}
+	return s
 }
 
 func readSettingBool(key string, fallback bool) (bool, error) {

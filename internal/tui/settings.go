@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
@@ -43,6 +44,21 @@ type settingsState struct {
 	// K previews what will happen and enter — only enter — starts it. The
 	// CLI asks the same question before its own rotation.
 	confirmingRotate bool
+	// editing is the free-text setting under edit, if any. The only one is the
+	// tunnel-client path: every other row is a small closed set of answers and
+	// steps on enter, but a path is typed, so the row opens a field rather
+	// than stepping through values nobody wants to cycle.
+	editing *settingsEditState
+}
+
+// settingsEditState is one open text editor on the settings screen.
+type settingsEditState struct {
+	// action is the row being edited; only ActionClientTunnelBin opens one.
+	action ActionID
+	field  textinput.Model
+	// row is the cursor position the editor was opened from, so cancel
+	// restores the cursor rather than leaving it wherever the field left it.
+	row int
 }
 
 // settingRow is one line on the settings screen.
@@ -107,9 +123,8 @@ func (m Model) settingsRows() []settingRow {
 			label: "tunnel-client path",
 			value: clientTunnelBinValue(s),
 			explain: "Where Portico finds the tunnel-client executable. " +
-				"Set it with PORTICO_CLIENT_TUNNEL_BIN or the config file; " +
-				"empty means the name is found on PATH.",
-			editable: false,
+				"Press enter to set it here; empty means the name is found on PATH.",
+			editable: !s.ClientTunnelBinPinned,
 			reason:   clientTunnelBinReason(s),
 		},
 	}
@@ -282,6 +297,14 @@ func (m *Model) renderSettings() string {
 				b.WriteString("\n")
 			}
 		}
+	}
+
+	if m.settings.editing != nil {
+		// The live field, so the cursor is where the user put it. It draws
+		// under the row being edited, which is the answer the field changes.
+		b.WriteString("\n")
+		b.WriteString(m.settings.editing.field.View())
+		b.WriteString("\n")
 	}
 
 	if m.settings.saving {
