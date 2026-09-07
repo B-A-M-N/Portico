@@ -1257,7 +1257,7 @@ func (m Model) View() tea.View {
 	// first version of this managed to render a scroll indicator while the
 	// live model never learned the viewport height and Page Down did nothing.
 	if scrollsFreely(m.screen) && m.height > 0 {
-		content = clipToViewport(content, m.height, m.scroll.offset)
+		content = clipToViewportPinned(content, m.height, m.scroll.offset, m.pinnedStatus())
 	}
 
 	v := tea.NewView(content)
@@ -2810,6 +2810,21 @@ func (m *Model) selectedConnectionIndex() int {
 
 // --------------- rendering ---------------
 
+// pinnedStatus is the one-line answer to the key just pressed, shown in place
+// of the scroll indicator — the one row visible at every offset — while a
+// freely-scrolling screen is up. A status written into a scrollable body was
+// rendered and then cut at ordinary terminal sizes, so a dimmed action looked
+// inert. Any screen that draws m.status in its own body must not be listed
+// here, or the line appears twice.
+func (m Model) pinnedStatus() string {
+	switch m.screen {
+	case ScreenProviders:
+		return m.status
+	default:
+		return ""
+	}
+}
+
 func (m *Model) renderLoading() string {
 	return lipgloss.NewStyle().
 		Foreground(m.theme.Muted).
@@ -3471,13 +3486,6 @@ func (m *Model) renderProviders() string {
 				"        "+reason) + "\n")
 		}
 		b.WriteString("\n")
-	}
-	if m.status != "" {
-		// A blocked action says why, in the same place its key was pressed. The
-		// status was set by the handler but never drawn on this screen, so a
-		// dimmed action looked inert rather than blocked.
-		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
-		b.WriteString("\n\n")
 	}
 	// The footer is the screen's action set, not a hand-written line beside it.
 	// The hardcoded copy advertised three of the six actions the screen runs —

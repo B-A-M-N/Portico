@@ -277,6 +277,14 @@ type ProviderDTO struct {
 	// They accompany an unavailable provider so the UI can offer a next step
 	// instead of only reporting a gap.
 	SetupActions []string `json:"setup_actions,omitempty"`
+	// SetupKind states what setting this provider up through Portico does:
+	// "account" stores a credential, "guidance" is instructions the user acts
+	// on elsewhere, and empty means the provider has no setup flow at all —
+	// nothing to configure, so a UI must not offer to configure it. It is
+	// derived from the provider's own declaration by the supervisor, because
+	// a client guessing from provider names was how "Add account" got offered
+	// for providers that cannot hold one.
+	SetupKind string `json:"setup_kind,omitempty"`
 }
 
 // CapabilitySetDTO describes provider capabilities in a versioned, serializable form.
@@ -1220,15 +1228,19 @@ type SettingsRequest struct {
 // ProviderReadinessDTO is one provider's position, with the credential sources
 // Portico found for it.
 type ProviderReadinessDTO struct {
-	ID           string                `json:"id"`
-	DisplayName  string                `json:"display_name"`
-	Availability string                `json:"availability"`
-	Summary      string                `json:"summary"`
-	Blocked      bool                  `json:"blocked"`
-	Reason       string                `json:"reason,omitempty"`
-	SetupActions []string              `json:"setup_actions,omitempty"`
-	Accounts     int                   `json:"accounts"`
-	Credentials  []CredentialSourceDTO `json:"credentials,omitempty"`
+	ID           string   `json:"id"`
+	DisplayName  string   `json:"display_name"`
+	Availability string   `json:"availability"`
+	Summary      string   `json:"summary"`
+	Blocked      bool     `json:"blocked"`
+	Reason       string   `json:"reason,omitempty"`
+	SetupActions []string `json:"setup_actions,omitempty"`
+	// SetupKind states what setting this provider up through Portico does —
+	// "account", "guidance", or empty for a provider with no setup flow. The
+	// readiness screen uses it to offer enter only where a flow exists.
+	SetupKind   string                `json:"setup_kind,omitempty"`
+	Accounts    int                   `json:"accounts"`
+	Credentials []CredentialSourceDTO `json:"credentials,omitempty"`
 }
 
 // CredentialSourceDTO is one place a credential can come from. It reports

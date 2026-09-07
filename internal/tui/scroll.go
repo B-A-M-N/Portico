@@ -125,12 +125,34 @@ func scrollsFreely(screen ScreenID) bool {
 // It is pure: it reads the offset and returns a string. Clamping is the
 // caller's job, done during Update where the result can be kept.
 func clipToViewport(content string, height, offset int) string {
+	return clipToViewportPinned(content, height, offset, "")
+}
+
+// clipToViewportPinned is clipToViewport with a pinned line: when pin is
+// non-empty it takes the indicator's own line — the one row that is visible at
+// every offset — instead of the "what was cut" text. A message answering the
+// key just pressed must survive scrolling; written into scrollable content,
+// a blocked action's explanation was rendered and then cut, so the dimmed
+// action looked inert. Replacing rather than appending keeps the frame exactly
+// as tall as before, so the renderer's line accounting does not change.
+func clipToViewportPinned(content string, height, offset int, pin string) string {
 	if height <= 0 {
 		return content
 	}
 	lines := strings.Split(content, "\n")
 	if len(lines) <= height {
-		return content
+		// Nothing is cut, so there is no indicator line to borrow. When the
+		// content leaves room the pin rides after it; when it does not, the
+		// pin displaces the last line rather than growing the frame past the
+		// terminal.
+		if pin == "" {
+			return content
+		}
+		if len(lines) < height {
+			return content + "\n" + pin
+		}
+		lines = lines[:height-1]
+		return strings.Join(lines, "\n") + "\n" + pin
 	}
 
 	visible := height - 1
@@ -143,7 +165,11 @@ func clipToViewport(content string, height, offset int) string {
 	}
 
 	window := lines[offset : offset+visible]
-	return strings.Join(window, "\n") + "\n" + scrollIndicator(offset, visible, len(lines))
+	indicator := scrollIndicator(offset, visible, len(lines))
+	if pin != "" {
+		indicator = pin
+	}
+	return strings.Join(window, "\n") + "\n" + indicator
 }
 
 // scrollIndicator says where the viewport is and how to move it. A user cannot

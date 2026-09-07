@@ -83,11 +83,22 @@ func (m Model) inspectActions() ActionSet {
 //
 // Removal was implemented and omitted from the help; verification and
 // credential replacement had no action at all.
+//
+// The configure action is gated by the provider's declared setup kind, not by
+// whether a provider row exists: every catalogued provider once showed a live
+// "Add account" whose submission the supervisor then refused, because
+// enabling on presence alone cannot distinguish a provider that stores
+// credentials from one that holds none.
 func (m Model) providerActions() ActionSet {
 	_, hasAccount := m.selectedAccount()
 	provider, hasProvider := m.selectedProvider()
 
-	configurable := hasProvider && provider.ID != ""
+	setupKind := ""
+	if hasProvider {
+		setupKind = provider.SetupKind
+	}
+
+	configureLabel, configureHelp, configureReason := describeConfigureAction(setupKind)
 
 	return ActionSet{
 		{
@@ -99,9 +110,9 @@ func (m Model) providerActions() ActionSet {
 			Help: "Move down the list of providers and their accounts.",
 		},
 		{
-			ID: ActionConfigureProvider, Keys: []string{"a"}, Label: "Add account", Enabled: configurable,
-			DisabledReason: "no provider is selected", Primary: true,
-			Help: "Give Portico a credential for this provider. It is stored encrypted and never displayed.",
+			ID: ActionConfigureProvider, Keys: []string{"a"}, Label: configureLabel, Enabled: setupKind != "",
+			DisabledReason: configureReason, Primary: true,
+			Help: configureHelp,
 		},
 		{
 			ID: ActionVerifyAccount, Keys: []string{"v"}, Label: "Verify", Enabled: hasAccount,
@@ -124,15 +135,49 @@ func (m Model) providerActions() ActionSet {
 	}
 }
 
+// describeConfigureAction names and explains the configure action in the terms
+// of what the flow actually does, and says why when there is nothing to run.
+func describeConfigureAction(setupKind string) (label, help, reason string) {
+	switch setupKind {
+	case "account":
+		return "Add account",
+			"Give Portico a credential for this provider. It is stored encrypted and never displayed.",
+			""
+	case "guidance":
+		return "Set up",
+			"Show this provider's setup guide. Portico cannot hold this provider's credential, " +
+				"so nothing is stored — the screen tells you what to do in the provider's own tools.",
+			""
+	default:
+		// No setup flow: the provider either needs nothing from the user or is
+		// not configurable through Portico at all. Advertising a key whose
+		// submission is guaranteed to be refused is the exact "looks broken"
+		// state this gate exists to prevent.
+		return "Set up",
+			"Configure this provider so Portico can use it.",
+			"this provider has nothing to configure here"
+	}
+}
+
 // setupActions is the readiness screen. `E` produced a support export and was
 // never advertised.
+//
+// Enter is offered only for a provider that declares a setup flow: pressing it
+// on a provider with nothing to configure used to fire a request the
+// supervisor was guaranteed to refuse.
 func (m Model) setupActions() ActionSet {
 	selected := m.setup != nil && m.setup.Selected() != nil
+	hasFlow := selected && m.setup.Selected().SetupKind != ""
 	pinned := m.setup != nil && m.setup.Readiness != nil && m.setup.Readiness.LaunchModePinned
 
 	launchHelp := "Switch between opening marked connections at startup and opening nothing by itself."
 	if pinned {
 		launchHelp = "Launch mode is fixed by an environment variable; unset it to change the mode here."
+	}
+
+	setupReason := "no provider is selected"
+	if selected && !hasFlow {
+		setupReason = "this provider has nothing to configure here"
 	}
 
 	return ActionSet{
@@ -145,8 +190,8 @@ func (m Model) setupActions() ActionSet {
 			Help: "Move down the list of providers.",
 		},
 		{
-			ID: ActionConfigureProvider, Keys: []string{"enter"}, Label: "Set up", Enabled: selected,
-			DisabledReason: "no provider is selected", Primary: true,
+			ID: ActionConfigureProvider, Keys: []string{"enter"}, Label: "Set up", Enabled: hasFlow,
+			DisabledReason: setupReason, Primary: true,
 			Help: "Configure the highlighted provider so Portico can use it.",
 		},
 		{

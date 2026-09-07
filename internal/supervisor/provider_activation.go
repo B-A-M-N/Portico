@@ -110,6 +110,25 @@ func (s *Supervisor) setupFlowFor(id string) (core.SetupFlow, error) {
 	return setup.SetupFlow(), nil
 }
 
+// setupKindFor reports what setting a provider up through Portico does:
+// "account" when completing the flow stores a credential, "guidance" when it
+// only describes what to do elsewhere, and empty when the provider declares no
+// setup flow at all. It reads the provider's own definition — the same source
+// the setup endpoint serves fields from — because the alternative was each
+// client inferring capability from provider names, which is how "Add account"
+// got offered for providers that cannot hold one.
+//
+// Setup capability is static, so this deliberately does not require a
+// constructed adapter: a provider whose client is missing is exactly the one a
+// user needs to set up.
+func (s *Supervisor) setupKindFor(id string) string {
+	setup, err := s.setupDefinitionFor(id)
+	if err != nil {
+		return ""
+	}
+	return string(setup.SetupFlow().Kind)
+}
+
 // activateAll installs every known provider.
 func (s *Supervisor) activateAll(ctx context.Context) {
 	if s.activation == nil {

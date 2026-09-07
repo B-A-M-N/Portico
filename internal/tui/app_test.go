@@ -530,7 +530,10 @@ func testSnapshot() ipc.SnapshotDTO {
 		Providers: []ipc.ProviderDTO{{
 			ID: "cloudflare", DisplayName: "Cloudflare",
 			Availability: "ready", Readiness: "ready", Selectable: true,
-			Accounts: []ipc.ProviderAccountDTO{{ID: "acct-1", Label: "Personal", Status: "authenticated"}},
+			// What the real supervisor derives from the provider's own
+			// declaration: Cloudflare stores an account.
+			SetupKind: "account",
+			Accounts:  []ipc.ProviderAccountDTO{{ID: "acct-1", Label: "Personal", Status: "authenticated"}},
 			Capabilities: &ipc.CapabilitySetDTO{
 				TemporaryAddresses: true,
 				CustomHostnames:    true,

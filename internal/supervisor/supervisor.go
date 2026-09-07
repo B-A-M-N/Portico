@@ -1074,6 +1074,7 @@ func (h *supervisorHandler) HandleSnapshot() (*ipc.SnapshotDTO, error) {
 		dto.Availability = string(p.Availability)
 		dto.LastError = p.Reason
 		dto.SetupActions = append([]string(nil), p.SetupActions...)
+		dto.SetupKind = h.sup.setupKindFor(string(p.ID))
 
 		switch p.Availability {
 		case provider.AvailabilityReady:

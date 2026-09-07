@@ -346,3 +346,54 @@ func TestHelpDoesNotStrandTheUser(t *testing.T) {
 		t.Fatalf("esc from help went to %q, want home", m.screen)
 	}
 }
+
+// TestAStatusSurvivesScrolling pins that the answer to the key just pressed is
+// visible however far the screen is scrolled.
+//
+// The providers screen scrolls at ordinary terminal sizes, and the status was
+// written into its scrollable body: rendered, then cut. At 120x40 the walk to
+// a provider below the fold had paged the status line off the top by the time
+// the blocked key was pressed — the compiled PTY test
+// TestTUIProvidersScreenRefusesSetupWhereThereIsNoFlow caught what nine green
+// unit tests had waved through, again.
+func TestAStatusSurvivesScrolling(t *testing.T) {
+	m := operationsModel(t, 20)
+	m.transitionTo(ScreenProviders)
+	m.measureViewport()
+
+	// Park the viewport at the bottom so nothing written into the body is
+	// visible at the top.
+	next, _ := m.Update(keyMsg("end"))
+	m = next.(Model)
+	m.status = "Set up is not available: nothing to configure"
+
+	view := m.View().Content
+	if !strings.Contains(view, "Set up is not available") {
+		t.Fatalf("a status answering the pressed key scrolled out of view:\n%s", view)
+	}
+	// The status replaces the scroll indicator, so the frame stays exactly as
+	// tall as the terminal and the renderer's line accounting does not change.
+	if lines := strings.Count(view, "\n") + 1; lines > 20 {
+		t.Fatalf("the pinned status grew the frame to %d lines in a 20 line terminal", lines)
+	}
+}
+
+// TestNoStatusLeavesTheScrollIndicatorAlone pins the unpinned contract: with
+// nothing to say the indicator reports what was cut as before.
+func TestNoStatusLeavesTheScrollIndicatorAlone(t *testing.T) {
+	m := operationsModel(t, 20)
+	m.transitionTo(ScreenProviders)
+	m.measureViewport()
+	// One provider does not overflow even a small terminal; shrink until the
+	// screen actually scrolls so the indicator exists at all.
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 8})
+	m = next.(Model)
+
+	view := m.View().Content
+	if !strings.Contains(view, "more below") {
+		t.Fatalf("a scrollable screen with no status lost its indicator:\n%s", view)
+	}
+	if strings.Contains(view, "Set up is not available") {
+		t.Fatalf("a stale status outlived the action that set it:\n%s", view)
+	}
+}

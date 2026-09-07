@@ -13,6 +13,7 @@ func accountSnapshot() ipc.SnapshotDTO {
 	snap.Providers = []ipc.ProviderDTO{
 		{
 			ID: "cloudflare", DisplayName: "Cloudflare", Authenticated: true,
+			SetupKind: "account",
 			Accounts: []ipc.ProviderAccountDTO{
 				{ID: "acct-work", Label: "Work", Status: "authenticated"},
 				{ID: "acct-personal", Label: "Personal", Status: "authenticated"},

@@ -39,6 +39,12 @@ type providerRow struct {
 	DisplayName  string
 	Accounts     []accountRow
 	HasSetupFlow bool
+	// SetupKind is the supervisor's answer to what setting this provider up
+	// does: "account", "guidance", or empty for a provider with no flow at
+	// all. It comes from the provider's own declaration, so an action whose
+	// label promises a stored account is one that stores one — not a guess
+	// from the provider's name that the supervisor then had to refuse.
+	SetupKind string
 	// NoAccounts is true when the provider has no accounts yet.
 	NoAccounts bool
 }
@@ -151,6 +157,7 @@ func (m *Model) providerRows() []providerRow {
 			Name:         p.Name,
 			DisplayName:  p.DisplayName,
 			HasSetupFlow: len(p.SetupActions) > 0,
+			SetupKind:    p.SetupKind,
 		}
 		for _, account := range p.Accounts {
 			row.Accounts = append(row.Accounts, accountRow{

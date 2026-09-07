@@ -39,6 +39,10 @@ func freshInstallClient() *fakeClient {
 				Summary:      "Needs an account before it can be used.",
 				Blocked:      true,
 				SetupActions: []string{"Add a Cloudflare API token"},
+				// What the real supervisor now derives from the provider's own
+				// declaration; without it the readiness screen would not offer
+				// enter for a provider that has nothing to configure.
+				SetupKind: "account",
 			}},
 		},
 		setupFlow: &ipc.SetupFlowDTO{

@@ -44,6 +44,7 @@ func (h *supervisorHandler) HandleReadiness() (*ipc.ReadinessDTO, error) {
 			Availability: string(snap.Availability),
 			Reason:       snap.Reason,
 			SetupActions: append([]string(nil), snap.SetupActions...),
+			SetupKind:    h.sup.setupKindFor(string(snap.ID)),
 			Accounts:     len(snap.Accounts),
 		}
 
