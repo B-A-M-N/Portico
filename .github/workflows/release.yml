@@ -44,7 +44,11 @@ jobs:
             goarch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
+      # fetch-depth: 0 — upgrade-check resolves and builds the previous
+      # release tag from git; a shallow checkout does not contain prior tags.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -67,8 +71,13 @@ jobs:
       - name: clean-user smoke (candidate archive)
         run: ./scripts/clean_user_smoke.sh "dist/portico-${{ github.ref_name }}-linux-${{ matrix.goarch }}.tar.gz"
 
+      - name: validate release tag
+        run: scripts/validate_release_tag.sh "${{ github.ref_name }}"
+
+      # CURRENT_RELEASE_TAG guarantees select_prior_release.sh excludes the
+      # candidate itself: "upgrade from vX to vX" is vacuous evidence.
       - name: upgrade check (candidate archive)
-        run: make upgrade-check PRIOR_BINARY= CANDIDATE_ARCHIVE="dist/portico-${{ github.ref_name }}-linux-${{ matrix.goarch }}.tar.gz"
+        run: make upgrade-check PRIOR_BINARY= CANDIDATE_ARCHIVE="dist/portico-${{ github.ref_name }}-linux-${{ matrix.goarch }}.tar.gz" CURRENT_RELEASE_TAG="${{ github.ref_name }}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

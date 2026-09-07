@@ -71,10 +71,25 @@ if [ -n "$current_tag" ] && ! is_release_tag "$current_tag"; then
   exit 1
 fi
 
+# Defensive: when called with no argument (as Makefile::upgrade-check did for a
+# while), infer the current tag from HEAD so an exactly-tagged HEAD can never
+# be selected as its own "previous release". Only the exact tag is excluded —
+# unlike an explicitly supplied current tag, the inference must not filter out
+# newer tags, because the no-argument contract is "latest release overall".
+# Callers that know their tag (release CI) should still pass it explicitly.
+exclude_tag=""
+if [ -z "$current_tag" ]; then
+  inferred=$(git describe --tags --exact-match 2>/dev/null || true)
+  if [ -n "$inferred" ] && is_release_tag "$inferred"; then
+    echo "No current tag supplied; HEAD is tagged $inferred — excluding it from prior selection" >&2
+    exclude_tag="$inferred"
+  fi
+fi
+
 prior=""
 while IFS= read -r tag; do
   [ -n "$tag" ] || continue
-  if [ "$tag" = "$current_tag" ]; then
+  if [ "$tag" = "$current_tag" ] || [ "$tag" = "$exclude_tag" ]; then
     continue
   fi
   if is_release_tag "$tag"; then

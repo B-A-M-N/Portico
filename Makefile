@@ -78,10 +78,16 @@ fmt-check:
 # validate is the gate a release must pass. It exists so the check is one
 # command rather than five that have to be remembered in the right order — the
 # way a step gets skipped is by it being a step someone has to remember.
+#
+# staticcheck is invoked through $(MAKE) staticcheck, never as a bare
+# `staticcheck ./...`: the pinned target is the only Staticcheck invocation
+# contract (same version locally, CI, and release). A bare call silently
+# depends on whatever binary happens to be installed — on a release runner,
+# nothing.
 validate: fmt-check
 	go build ./...
 	go vet ./...
-	staticcheck ./...
+	$(MAKE) staticcheck
 	go test ./... -count=1
 	go test -race ./... -count=1
 	@echo
@@ -119,16 +125,29 @@ clean-user-smoke: build
 # binary (database migration, encrypted credentials, managed resources,
 # runtime reconciliation). CANDIDATE_ARCHIVE selects a prebuilt archive (what
 # release CI verifies); without it the freshly built binary is archived.
-# PRIOR_BINARY selects the previous release; without it the immutable fallback
-# from select_prior_release.sh is built from git.
+# PRIOR_BINARY selects the previous release; without it the prior release is
+# resolved by select_prior_release.sh — always with CURRENT_RELEASE_TAG
+# supplied so an exactly-tagged candidate can never be picked as its own
+# "previous version". The candidate and prior identities are compared and the
+# check fails if they coincide.
+CURRENT_RELEASE_TAG ?=
 upgrade-check: build
 	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/portico-upgrade-check.XXXXXX"); trap 'rm -rf "$$tmp"' EXIT; \
 	if [ -n "$(CANDIDATE_ARCHIVE)" ]; then candidate="$(CANDIDATE_ARCHIVE)"; \
 	else tar -C . -czf "$$tmp/candidate.tar.gz" portico; candidate="$$tmp/candidate.tar.gz"; fi; \
+	candidate_commit=$$(git rev-parse HEAD); \
+	candidate_tag=$$(git describe --tags --exact-match 2>/dev/null || true); \
 	if [ -n "$(PRIOR_BINARY)" ]; then prior="$(PRIOR_BINARY)"; \
 	else \
-		prior_tag=$$(scripts/select_prior_release.sh); \
-		echo "upgrade-check: prior release = $$prior_tag"; \
+		prior_tag=$$(scripts/select_prior_release.sh "$(CURRENT_RELEASE_TAG)"); \
+		echo "upgrade-check: candidate = $(CURRENT_RELEASE_TAG) $${candidate_tag:-<untagged>} $$candidate_commit"; \
+		echo "upgrade-check: prior     = $$prior_tag ($$(git rev-parse "$$prior_tag"))"; \
+		if [ -n "$$(git describe --tags --exact-match "$$prior_tag" 2>/dev/null || true)" ] && \
+		   [ "$$(git describe --tags --exact-match "$$prior_tag" 2>/dev/null)" = "$$candidate_tag" ] && \
+		   [ -n "$$candidate_tag" ]; then \
+			echo "upgrade-check: refusing to upgrade-test the candidate against itself ($$candidate_tag)" >&2; \
+			exit 1; \
+		fi; \
 		git worktree add "$${tmp}/prior" "$$prior_tag" >/dev/null 2>&1 || git worktree add "$${tmp}/prior" "$$prior_tag"; \
 		(cd "$${tmp}/prior" && go build -buildvcs=false -o "$$tmp/prior-portico" .) || exit 1; \
 		git worktree remove --force "$${tmp}/prior"; \
