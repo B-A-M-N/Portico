@@ -88,3 +88,68 @@ func TestAPublishedServiceWithNoAddressIsStillAFault(t *testing.T) {
 		}
 	}
 }
+
+// TestARefusedClientTunnelCredentialIsDiagnosedAsTheCredential pins the
+// distinction the audit demanded: the client answers /readyz 200 while the
+// control plane refuses its key, so the first failing segment must be the
+// credential — not the connector a restart would target — and the repair must
+// be key replacement, not another restart of a healthy process.
+func TestARefusedClientTunnelCredentialIsDiagnosedAsTheCredential(t *testing.T) {
+	f := healthyFixture()
+	f.profile.Kind = core.ConnectionClientTunnel
+	f.profile.Spec = core.ConnectionSpec{ClientTunnel: &core.ClientTunnelSpec{
+		Client: core.ClientOpenAISecureMCPTunnel, TunnelID: "tun-abc",
+		MCP: core.MCPServiceSpec{Transport: core.MCPTransportStreamable, Endpoint: "http://127.0.0.1:3000/mcp"},
+	}}
+	f.runtime.Endpoint = core.EndpointRuntime{PrivateAddress: "private tunnel to OpenAI"}
+	f.provider.observed = &core.ObservedConnection{
+		ConnectionID: "conn-1", ProviderID: "client_tunnel",
+		Connector: &core.ObservedConnector{
+			PID: 100, Status: string(core.ConnectorStatusUnstable),
+			LastError: "the control plane rejected the stored credential (invalid_api_key); replace the runtime key",
+		},
+	}
+
+	findings := diagnose(t, f)
+	if len(findings) == 0 {
+		t.Fatal("a refused credential produced no finding")
+	}
+	finding := findings[0]
+	if finding.Summary != "The control plane rejected the stored credential" {
+		t.Fatalf("summary = %q, want the credential finding", finding.Summary)
+	}
+	if len(finding.RepairOptions) != 1 || finding.RepairOptions[0].Summary != "Replace the runtime key" {
+		t.Fatalf("repair options = %+v, want key replacement", finding.RepairOptions)
+	}
+	if finding.Evidence[0].Type != "control_plane_refusal" {
+		t.Fatalf("evidence = %+v, want the control plane's own refusal record", finding.Evidence[0])
+	}
+}
+
+// TestAnUnreadyClientWithoutRefusalEvidenceIsNotACredentialFinding guards the
+// boundary: a client that is merely not ready yet (startup, control plane
+// unreachable) must keep the ordinary connector finding, so a network outage
+// is never misreported as a rejected key.
+func TestAnUnreadyClientWithoutRefusalEvidenceIsNotACredentialFinding(t *testing.T) {
+	f := healthyFixture()
+	f.profile.Kind = core.ConnectionClientTunnel
+	f.profile.Spec = core.ConnectionSpec{ClientTunnel: &core.ClientTunnelSpec{
+		Client: core.ClientOpenAISecureMCPTunnel, TunnelID: "tun-abc",
+		MCP: core.MCPServiceSpec{Transport: core.MCPTransportStreamable, Endpoint: "http://127.0.0.1:3000/mcp"},
+	}}
+	f.runtime.Endpoint = core.EndpointRuntime{PrivateAddress: "private tunnel to OpenAI"}
+	f.provider.observed = &core.ObservedConnection{
+		ConnectionID: "conn-1", ProviderID: "client_tunnel",
+		Connector: &core.ObservedConnector{
+			PID: 100, Status: string(core.ConnectorStatusUnstable),
+			LastError: "the tunnel client is running but not ready (control plane unreachable or credential rejected)",
+		},
+	}
+
+	findings := diagnose(t, f)
+	for _, finding := range findings {
+		if finding.Summary == "The control plane rejected the stored credential" {
+			t.Fatalf("an unready client without refusal evidence was diagnosed as a refused credential: %+v", finding)
+		}
+	}
+}

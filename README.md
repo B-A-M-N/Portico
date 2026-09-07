@@ -212,9 +212,12 @@ process, but it does **not** create tunnels, enumerate MCP tools, or verify that
 the app has been registered in ChatGPT — those happen on OpenAI's platform and
 are reported as outstanding user actions rather than inferred.
 
-Enable it with `PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1` after installing
-`tunnel-client`, creating a tunnel in the OpenAI platform, and exporting
-`CONTROL_PLANE_API_KEY`. It has not been exercised against a live tunnel.
+Enable it with `PORTICO_ENABLE_CLIENT_TUNNEL=1` (the legacy
+`PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL` name is still accepted) after
+installing `tunnel-client`, creating a tunnel in the OpenAI platform, and
+running `portico provider login client_tunnel` to store the control-plane key
+(`CONTROL_PLANE_API_KEY` remains an environment fallback). It has not been
+exercised against a live tunnel.
 
 ## Development
 
@@ -257,7 +260,15 @@ portico supervisor run
 
   ```bash
   export CLOUDFLARE_API_TOKEN=...
-  portico provider login cloudflare --account-id <id>
+  portico provider login cloudflare        # discovers your accounts and zones
+  ```
+
+  For scripts, pass field values generically (`--set key=value`) and the
+  credential through stdin:
+
+  ```bash
+  printf '%s\n' "$CLOUDFLARE_API_TOKEN" |
+    portico provider login cloudflare --credential-stdin --set account_id=<id>
   ```
 
 - A **zone ID is optional**. Without one you get managed tunnels with temporary
@@ -275,7 +286,7 @@ Portico follows the [XDG Base Directory Specification](https://specifications.fr
 | `XDG_CONFIG_HOME` | `$HOME/.config` | Configuration file (`config.toml`) |
 | `XDG_STATE_HOME` | `$HOME/.local/state` | Logs, connector output |
 
-> **Note:** If `XDG_RUNTIME_DIR` is unset (common on non-systemd systems or some WSL configurations), the Unix socket will be created in `/tmp/portico-$UID/`. This directory is cleared on reboot, meaning clients must reconnect to the supervisor after restart. The supervisor daemon itself survives because it's managed by systemd user service or similar.
+> **Note:** If `XDG_RUNTIME_DIR` is unset (common on non-systemd systems or some WSL configurations), the Unix socket will be created in `/tmp/portico-$UID/`. This directory is cleared on reboot, so clients must reconnect to the supervisor after a machine restart. The supervisor runs on demand: any Portico client command bootstraps it detached, and closing the TUI does not stop it. The one-file installer does not install a boot-persistence unit; `scripts/portico-supervisor.service` is available if you want the supervisor to start at login via systemd, but connections still reconcile from durable state either way.
 
 ## Testing
 

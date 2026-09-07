@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
 )
@@ -350,5 +351,86 @@ func TestTheProductionLoginCommandRegistersTheSecureCredentialFlags(t *testing.T
 		if login.Flags().Lookup(flag) == nil {
 			t.Errorf("production provider login does not register --%s; the handler's own error text advertises it", flag)
 		}
+	}
+}
+
+// TestProviderLoginIsProviderNeutral pins audit item 7: the login command's
+// persistent vocabulary must not name one provider inside another provider's
+// help. Cloudflare terms hardcoded on the shared command previously meant
+// `portico provider login client_tunnel --help` presented Cloudflare
+// configuration to someone configuring ChatGPT's tunnel transport.
+func TestProviderLoginIsProviderNeutral(t *testing.T) {
+	root := NewCLI()
+	login, _, err := root.Find([]string{"provider", "login", "client_tunnel"})
+	if err != nil {
+		t.Fatalf("find provider login: %v", err)
+	}
+	if login == nil || login.Name() != "login" {
+		t.Fatalf("provider login not found in the production command tree")
+	}
+	help := login.Long + "\n" + login.Short
+	login.Flags().VisitAll(func(flag *pflag.Flag) {
+		help += "\n" + flag.Name + " " + flag.Usage
+	})
+	for _, term := range []string{"cloudflare", "Cloudflare", "account ID", "zone ID", "account-id", "zone-id"} {
+		if strings.Contains(help, term) {
+			t.Errorf("provider login help mentions %q; provider-specific vocabulary must come from each provider's own setup flow", term)
+		}
+	}
+	// The generic surface exists for every provider.
+	if login.Flags().Lookup("set") == nil {
+		t.Error("provider login does not register the generic --set flag")
+	}
+}
+
+// TestCollectSetupValuesRejectsUndeclaredAndSecretSets pins --set's contract:
+// keys must be declared by the provider, and a secret can never ride the
+// command line where shell history and process listings would record it.
+func TestCollectSetupValuesRejectsUndeclaredAndSecretSets(t *testing.T) {
+	flow := &ipc.SetupFlowDTO{
+		ProviderID: "acme",
+		Fields: []ipc.SetupFieldDTO{
+			{ID: "workspace", Label: "Workspace", Required: true},
+			{ID: "token", Label: "Token", Secret: true, Required: true},
+		},
+	}
+	cmd := &cobra.Command{Use: "login"}
+	cmd.Flags().StringArray("set", nil, "")
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+
+	// An undeclared key is rejected with the known fields named.
+	if err := cmd.Flags().Set("set", "region=eu-west"); err != nil {
+		t.Fatalf("set flag: %v", err)
+	}
+	_, err := collectSetupValues(cmd, flow)
+	if err == nil || !strings.Contains(err.Error(), `no field "region"`) {
+		t.Fatalf("undeclared --set = %v, want a named-fields error", err)
+	}
+
+	// A declared, non-secret key is accepted (fresh command: --set appends).
+	cmd2 := &cobra.Command{Use: "login"}
+	cmd2.Flags().StringArray("set", nil, "")
+	cmd2.SetOut(io.Discard)
+	cmd2.SetErr(io.Discard)
+	_ = cmd2.Flags().Set("set", "workspace=ws-1")
+	values, err := collectSetupValues(cmd2, flow)
+	if err == nil {
+		if values["workspace"] != "ws-1" {
+			t.Fatalf("values = %#v, want workspace carried", values)
+		}
+	} else if !strings.Contains(err.Error(), "Token is required") {
+		t.Fatalf("collect with declared sets failed unexpectedly: %v", err)
+	}
+
+	// A secret key is refused outright.
+	cmd3 := &cobra.Command{Use: "login"}
+	cmd3.Flags().StringArray("set", nil, "")
+	cmd3.SetOut(io.Discard)
+	cmd3.SetErr(io.Discard)
+	_ = cmd3.Flags().Set("set", "token=secret-value")
+	if _, err := collectSetupValues(cmd3, flow); err == nil ||
+		!strings.Contains(err.Error(), "--set cannot carry the secret") {
+		t.Fatalf("secret --set = %v, want refusal", err)
 	}
 }

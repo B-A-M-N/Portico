@@ -141,6 +141,11 @@ func newCreateCmd() *cobra.Command {
 	}
 	addSourceFlags(cmd)
 	cmd.Flags().String("provider", "cloudflare", "Provider to use")
+	// Binds the connection to one stored account. The wizard asks with human
+	// labels; this is the scriptable equivalent, and it is what makes the
+	// account-removal refusal (which names dependent connections) reachable
+	// from automation.
+	cmd.Flags().String("account-id", "", "Provider account to bind (optional)")
 	return cmd
 }
 
@@ -178,6 +183,8 @@ func newForwardCmd() *cobra.Command {
 	createCmd.Flags().String("remote-host", "127.0.0.1", "Remote host to forward to")
 	createCmd.Flags().Int("remote-port", 0, "Remote port to forward to (required)")
 	createCmd.Flags().String("protocol", "tcp", "Forward protocol: tcp or udp is refused; only tcp is supported")
+	createCmd.Flags().String("direction", "local", "Forward direction: only local is supported; remote is refused")
+	_ = createCmd.Flags().MarkHidden("direction")
 	createCmd.Flags().Bool("json", false, "Output JSON")
 	cmd.AddCommand(createCmd)
 	return cmd
@@ -368,13 +375,21 @@ func newProviderCmd() *cobra.Command {
 	loginCmd := &cobra.Command{
 		Use:   "login <provider>",
 		Short: "Securely configure a provider",
-		Args:  cobra.ExactArgs(1),
+		Long: "Configure any provider that declares a setup flow. The credential is read from a\n" +
+			"hidden TTY prompt, stdin (--credential-stdin) or a file descriptor (--credential-fd) —\n" +
+			"never a command argument. Non-interactive field values come from --set key=value\n" +
+			"pairs named after the provider's declared fields, or from the provider's declared\n" +
+			"environment variables.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return handleProviderLogin(cmd, args[0])
 		},
 	}
-	loginCmd.Flags().String("account-id", "", "Cloudflare account ID")
-	loginCmd.Flags().String("zone-id", "", "Cloudflare zone ID")
+	// The generic, provider-neutral surface. Field values arrive as key=value
+	// pairs the supervisor resolves against the provider's own declaration, so
+	// no provider's vocabulary leaks into another provider's help.
+	loginCmd.Flags().StringArray("set", nil,
+		"Set a non-secret field value as key=value (repeatable; keys are the provider's declared field IDs)")
 	loginCmd.Flags().String("label", "", "Friendly account label")
 	// Secure credential acquisition. The handler already refused a secret on
 	// the command line and its error text pointed at these flags; not
@@ -400,6 +415,22 @@ func newProviderCmd() *cobra.Command {
 	}
 	removeCmd.Flags().Bool("yes", false, "Skip the confirmation prompt")
 	cmd.AddCommand(removeCmd)
+
+	// Reverification existed end to end (supervisor, IPC route, TUI action)
+	// with no command-line path. Headless hosts rotate credentials from cron;
+	// after doing so they must be able to prove the new secret works without
+	// opening a TUI.
+	cmd.AddCommand(&cobra.Command{
+		Use:   "verify <provider> <account-id>",
+		Short: "Re-verify a stored account's credential",
+		Long: "Checks the stored credential against the provider without changing it. " +
+			"Accounts configured with only a local shape check stay provisional until " +
+			"the provider itself confirms the credential.",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return handleProviderVerify(cmd, args[0], args[1])
+		},
+	})
 	return cmd
 }
 

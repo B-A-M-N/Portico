@@ -205,6 +205,7 @@ type Model struct {
 	providerSetupStep       int
 	providerSetupProviderID string
 	providerSetupFlow       *ipc.SetupFlowDTO
+	setupHelpStatus         string
 	providerSetupIndex      int
 	providerSetupValues     map[string]string
 	// providerSetupField is the live editing surface for the field at
@@ -737,7 +738,28 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.providerSetupFlow = msg.Flow
 		m.providerSetupIndex = 0
+		// A credential replacement freezes the identity fields. The freeze
+		// cannot happen at begin-time because the flow arrives here,
+		// asynchronously — see beginCredentialReplacement.
+		if m.replacingAccountID != "" && m.providerSetupFlow != nil {
+			for i := range m.providerSetupFlow.Fields {
+				f := &m.providerSetupFlow.Fields[i]
+				switch f.ID {
+				case "account_id", "zone_id", "label":
+					f.Required = false
+					f.Description = "(unchanged during credential replacement) " + f.Description
+				}
+			}
+			// A rotation only asks for the secret: land on it instead of
+			// making the user page through the frozen identity questions
+			// they just declined to change.
+			m.providerSetupIndex = m.providerSetupSecretIndex()
+		}
 		m.focusProviderSetupField()
+		return m, nil
+
+	case setupHelpLaunchedMsg:
+		m.applySetupHelpLaunched(msg)
 		return m, nil
 
 	case launchModeMsg:
@@ -2273,6 +2295,9 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		if key == "esc" || key == "enter" {
 			m.clearProviderSetup()
 		}
+		if key == "h" {
+			return m, m.openSetupHelp()
+		}
 		return m, nil
 	}
 
@@ -2283,12 +2308,17 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		if key == "esc" || key == "enter" {
 			m.clearProviderSetup()
 		}
+		if key == "h" {
+			return m, m.openSetupHelp()
+		}
 		return m, nil
 	}
 
 	confirming := m.providerSetupIndex >= len(fields)
 	if confirming {
 		switch key {
+		case "h":
+			return m, m.openSetupHelp()
 		case "esc":
 			m.providerSetupIndex = len(fields) - 1
 			m.focusProviderSetupField()
@@ -2410,6 +2440,9 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "h":
+		return m, m.openSetupHelp()
+
 	case "enter":
 		if field.Required && strings.TrimSpace(m.providerSetupValue(field.ID)) == "" {
 			m.providerSetupError = field.Label + " cannot be empty"
@@ -2420,7 +2453,11 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 		// identity question entirely or returns the accounts to choose from.
 		// Confirming an unchecked credential is what produced accounts that
 		// were recorded as working and were not.
-		if field.Secret && m.providerSetupCanDiscover() {
+		// A credential REPLACEMENT never discovers: the account already
+		// exists, its identity is fixed, and the enter here must submit the
+		// rotation — otherwise the replacement was sent to the validation
+		// route, which only discovery-capable first-time flows support.
+		if field.Secret && m.replacingAccountID == "" && m.providerSetupCanDiscover() {
 			if m.providerSetupValidating {
 				return m, nil
 			}
@@ -2445,6 +2482,29 @@ func (m Model) handleProviderSetupKey(key string) (Model, tea.Cmd) {
 // single implicit account, so there is nothing to discover.
 func (m Model) providerSetupCanDiscover() bool {
 	return m.providerSetupFlow != nil && m.providerSetupFlow.IdentityField != ""
+}
+
+// openSetupHelp launches the provider-declared help URL, if one was declared.
+// The result is reported by setupHelpLaunchedMsg, so a machine without a
+// browser sees the address printed rather than a keystroke doing nothing.
+//
+// The value receiver is deliberate: the launch itself must not mutate state.
+// Clearing a stale status here was an assignment to a discarded copy, so the
+// stale text survived until the next message replaced it.
+func (m Model) openSetupHelp() tea.Cmd {
+	if m.providerSetupFlow == nil || m.providerSetupFlow.HelpURL == "" {
+		return nil
+	}
+	return openSetupHelpCmd(m.providerSetupFlow.HelpURL)
+}
+
+// applySetupHelpLaunched records what the help action did.
+func (m *Model) applySetupHelpLaunched(msg setupHelpLaunchedMsg) {
+	if msg.Opened {
+		m.setupHelpStatus = "Opened " + msg.URL + " in your browser."
+		return
+	}
+	m.setupHelpStatus = "No browser available — open this address yourself: " + msg.URL
 }
 
 // providerSetupIndexForField is the form position of one declared field, or
@@ -3265,7 +3325,13 @@ func (m *Model) renderProviders() string {
 		if !ok {
 			continue
 		}
-		if row.Kind == rowKindProvider {
+		// Account rows are selection coordinates only. Their section is
+		// emitted once, below, with the provider row — rendering it again per
+		// account row repeated the provider's whole payload N+1 times.
+		if row.Kind != rowKindProvider {
+			continue
+		}
+		{
 			// Emit each provider's header once, when its row is reached.
 			marker := "  "
 			if m.cursorIndex >= 0 && m.cursorIndex < len(rows) && rows[m.cursorIndex].Kind == rowKindProvider && rows[m.cursorIndex].Provider.ID == row.Provider.ID {
@@ -3365,7 +3431,11 @@ func (m *Model) renderProviders() string {
 		b.WriteString("\n\n")
 	}
 	if len(m.buildScreenRows()) > 0 {
-		b.WriteString("[↑↓] select account    [a] add account    [x] remove account    [esc] back\n")
+		// The cursor may sit on a provider row or an account row; selectedAccount
+		// deliberately returns nothing on a provider row so destructive account
+		// actions cannot implicitly target a child. The footer must not claim an
+		// account is selected when it may not be.
+		b.WriteString("[↑↓] select provider/account    [a] add account    [x] remove account    [esc] back\n")
 	} else {
 		b.WriteString("[a] add account    [esc] back    [q] quit\n")
 	}
@@ -3397,9 +3467,29 @@ func (m *Model) renderProviderSetup() string {
 		return b.String()
 	}
 
+	// A credential replacement says so. beginCredentialReplacement puts the
+	// context in m.status, but this screen never drew m.status, so the form
+	// rendered as an ordinary setup and the user was not told which account
+	// was being rotated or that its identity stays fixed.
+	if m.status != "" && m.replacingAccountID != "" {
+		b.WriteString(m.theme.Style("attention").Render(m.status))
+		b.WriteString("\n\n")
+	}
+
 	flow := m.providerSetupFlow
 	if flow.Summary != "" {
 		b.WriteString(flow.Summary + "\n\n")
+	}
+	// The provider's own instructions, offered where the user is about to be
+	// asked for the credential. The address is the provider's declaration; a
+	// machine without a browser is shown the URL rather than told nothing.
+	if flow.HelpURL != "" {
+		b.WriteString(m.theme.Style("muted").Render(
+			"Press h to open the provider's guide (" + flow.HelpURL + ") in your browser."))
+		if m.setupHelpStatus != "" {
+			b.WriteString("\n" + m.setupHelpStatus)
+		}
+		b.WriteString("\n\n")
 	}
 
 	// A guidance flow is read-only. Presenting a form here would collect
@@ -4247,9 +4337,14 @@ func isSelectedAccount(m *Model, providerID, accountID string) bool {
 }
 
 // accountMarker draws the cursor, so the account an action applies to is
-// visible before the action is taken.
+// visible before the action is taken. The selected marker is ASCII in ASCII
+// mode, matching the provider-row marker, so followSelectionIntoView can find
+// the selected account row in either mode.
 func accountMarker(m *Model, providerID, accountID string) string {
 	if isSelectedAccount(m, providerID, accountID) {
+		if m.useASCII {
+			return ">"
+		}
 		return "▸"
 	}
 	return "•"

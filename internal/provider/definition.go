@@ -52,6 +52,30 @@ type SetupVerifier interface {
 	VerifyAccount(ctx context.Context, account PreparedAccount) (core.SetupValidation, error)
 }
 
+// VerificationStrength states what a passing VerifyAccount actually proved.
+//
+// The distinction is load-bearing. A verifier that only checks value shape
+// locally — length, charset, no embedded whitespace — has not contacted the
+// provider, so a pass must never be recorded as authenticated: that would turn
+// "the key looks plausible" into "OpenAI accepted this key", which is false.
+// Implement this interface to declare local-only verification and receive a
+// provisional account that runtime evidence later promotes or demotes.
+type LocalShapeVerifier interface {
+	VerificationStrength() VerificationStrength
+}
+
+type VerificationStrength string
+
+const (
+	// VerificationAuthoritative means VerifyAccount consulted the real
+	// provider and its answer is a durable fact about the credential.
+	VerificationAuthoritative VerificationStrength = "authoritative"
+	// VerificationLocalShape means VerifyAccount checked only the value's
+	// plausibility. It rules out truncated pastes; it proves nothing about
+	// whether the provider accepts the credential.
+	VerificationLocalShape VerificationStrength = "local_shape"
+)
+
 // PreparedAccount is a provider's canonical account, built from submitted setup
 // values. The status is deliberately absent: assigning it is the supervisor's
 // job, and a provider cannot declare its own credential verified.

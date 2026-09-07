@@ -67,7 +67,10 @@ The current focused tests are in `internal/core/usability_test.go`,
 `internal/tui/edit_kinds_test.go`, `internal/cli/handler_test.go`,
 `internal/tui/selection_visibility_test.go`,
 `internal/tui/provider_setup_discovery_test.go`, and the
-provider/supervisor setup tests.
+provider/supervisor setup tests. (An earlier revision of this list named two
+test files that never existed in the repository; a coverage list that names
+files which do not run is claiming coverage it does not have, so this list is
+contract-tested — see `internal/docs/usability_doc_test.go`.)
 
 ## Cloudflare zone scope
 

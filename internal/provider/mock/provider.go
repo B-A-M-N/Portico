@@ -3,10 +3,12 @@ package mock
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/B-A-M-N/portico/internal/core"
+	"github.com/B-A-M-N/portico/internal/provider"
 )
 
 // Provider is a mock provider for testing the controller vertical slice.
@@ -264,5 +266,62 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 	return core.StepResult{
 		StepID:    step.ID,
 		Succeeded: true,
+	}, nil
+}
+
+// ScopedProvider wraps the base mock with core.AccountScopedProvider: every
+// named account resolves to the same adapter, so the account-scoped create
+// path (the path every real multi-account provider uses) is exercisable in
+// dev-mode and PTY tests. The base mock deliberately does NOT implement the
+// interface — controller tests wrap it the same way to pin strict-binding
+// rejection, and embedding would silently relax those tests.
+type ScopedProvider struct {
+	*Provider
+}
+
+// NewScoped builds an account-scoped mock provider.
+func NewScoped() *ScopedProvider { return &ScopedProvider{Provider: New()} }
+
+// ProviderForAccount implements core.AccountScopedProvider.
+func (p *ScopedProvider) ProviderForAccount(core.ProviderAccountID) (core.Provider, error) {
+	return p.Provider, nil
+}
+
+// SetupFlow implements provider.SetupDefinition: the mock is configurable with
+// an account ID and a secret, so tests can exercise the full setup → accounts
+// path — including the multi-account Providers screen — without live
+// credentials.
+func (p *Provider) SetupFlow() core.SetupFlow {
+	return core.SetupFlow{
+		Kind:          core.SetupAccount,
+		Summary:       "Configure the mock provider account used by tests.",
+		IdentityField: "account_id",
+		SecretField:   "secret",
+		Fields: []core.SetupField{
+			{ID: "account_id", Label: "Account ID", Required: true},
+			{ID: "secret", Label: "Secret", Secret: true, Required: true},
+		},
+	}
+}
+
+// PrepareAccount implements provider.SetupDefinition. The mock accepts any
+// identity: its account is whatever the caller says it is.
+func (p *Provider) PrepareAccount(values map[string]string) (provider.PreparedAccount, error) {
+	accountID := strings.TrimSpace(values["account_id"])
+	if accountID == "" {
+		return provider.PreparedAccount{}, fmt.Errorf("an account ID is required")
+	}
+	secret := strings.TrimSpace(values["secret"])
+	if secret == "" {
+		return provider.PreparedAccount{}, fmt.Errorf("a secret is required")
+	}
+	return provider.PreparedAccount{
+		Account: core.ProviderAccount{
+			ID:            core.ProviderAccountID(accountID),
+			Provider:      "mock",
+			Label:         accountID,
+			CredentialRef: fmt.Sprintf("mock:%s:secret", accountID),
+		},
+		Secret: []byte(secret),
 	}, nil
 }

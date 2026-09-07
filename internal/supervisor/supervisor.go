@@ -26,6 +26,7 @@ import (
 	"github.com/B-A-M-N/portico/internal/origin"
 	"github.com/B-A-M-N/portico/internal/process"
 	"github.com/B-A-M-N/portico/internal/provider"
+	provider_clienttunnel "github.com/B-A-M-N/portico/internal/provider/clienttunnel"
 	"github.com/B-A-M-N/portico/internal/store"
 )
 
@@ -543,6 +544,10 @@ func (s *Supervisor) checkClientTunnelTransport(ctx context.Context, rt *core.Co
 			LastChecked: time.Now().UTC(),
 		}
 	}
+	// A running client is the promotion/demotion moment for a provisional
+	// account: the runtime has now produced evidence about the credential, and
+	// the stored status must match it.
+	s.reconcileClientTunnelAccountStatus(ctx, rt, observed.Connector)
 	switch observed.Connector.Status {
 	case string(core.ConnectorStatusRunning):
 		return core.HealthCheck{
@@ -567,6 +572,77 @@ func (s *Supervisor) checkClientTunnelTransport(ctx context.Context, rt *core.Co
 			LastChecked: time.Now().UTC(),
 		}
 	}
+}
+
+// reconcileClientTunnelAccountStatus applies the runtime's credential verdict
+// to the stored account.
+//
+// The distinction matters because the client answers /readyz 200 while the
+// control plane refuses its key: observation alone would read as acceptance.
+// Two evidence sources disagree, and the refusing one wins — a key the control
+// plane rejects is refused, whatever the health endpoint says.
+//
+//   - Running + no control-plane refusal in the client's log: the control
+//     plane accepted the key. A provisional account is promoted to
+//     authenticated; the runtime has proven what setup could not.
+//   - Any control-plane authentication refusal (observed unstable with
+//     credential-rejection evidence, or a 401/invalid_api_key in the client's
+//     own log): the credential is rejected. The account is demoted to pending,
+//     which makes it unselectable, and diagnostics surface the targeted
+//     repair: replace the runtime key.
+//
+// Existing authenticated accounts are never demoted on absence of evidence:
+// only a positive refusal demotes. A client that has not run yet proves
+// nothing about a credential OpenAI previously accepted.
+func (s *Supervisor) reconcileClientTunnelAccountStatus(
+	ctx context.Context, rt *core.ConnectionRuntime, connector *core.ObservedConnector,
+) {
+	p, ok := s.controller.GetProfile(rt.ConnectionID)
+	if !ok || p.Kind != core.ConnectionClientTunnel {
+		return
+	}
+	accountID := p.GetProvider().AccountID
+	if accountID == "" {
+		// The client tunnel's single implicit account.
+		accountID = core.ProviderAccountID(provider_clienttunnel.ProviderID)
+	}
+	account, err := s.findStoredAccount(ctx, string(provider_clienttunnel.ProviderID), string(accountID))
+	if err != nil || account.Status != core.AccountProvisional {
+		return
+	}
+
+	refused := connector != nil && connector.Status != string(core.ConnectorStatusRunning) &&
+		connector.LastError != "" && containsCredentialRefusal(connector.LastError)
+	if refused {
+		account.Status = core.AccountPending
+		if err := s.store.UpsertProviderAccount(ctx, account); err != nil {
+			slog.Warn("could not record the credential refusal", "account", account.ID, "err", err)
+			return
+		}
+		slog.Info("client-tunnel credential was refused by the control plane; the account is no longer selectable",
+			"account", account.ID)
+		return
+	}
+	if connector.Status == string(core.ConnectorStatusRunning) {
+		account.Status = core.AccountAuthenticated
+		if err := s.store.UpsertProviderAccount(ctx, account); err != nil {
+			slog.Warn("could not record the credential acceptance", "account", account.ID, "err", err)
+			return
+		}
+		slog.Info("the control plane accepted the client-tunnel credential; the account is now authenticated",
+			"account", account.ID)
+	}
+}
+
+// containsCredentialRefusal matches the control plane's own refusal evidence
+// as the tunnel client records it: 401 status with an invalid-api-key error
+// code. It deliberately does not match generic failure wording, so a network
+// outage cannot demote an account that OpenAI has not refused.
+func containsCredentialRefusal(detail string) bool {
+	d := strings.ToLower(detail)
+	return strings.Contains(d, "invalid_api_key") ||
+		strings.Contains(d, "control plane rejected") ||
+		strings.Contains(d, "401 unauthorized")
 }
 
 // defaultServiceCheckFor performs the configured/default HTTP service check
@@ -1413,6 +1489,20 @@ func (h *supervisorHandler) HandleCreateConnection(req ipc.CreateConnectionReque
 	// connection.
 	if err := validateCreateRequest(req); err != nil {
 		return nil, err
+	}
+
+	// Lifecycle: a create request that does not state a lifecycle gets the
+	// machine's operational default, not the zero value. The zero value of
+	// AutoStart is false, so a CLI client that never mentions lifecycle (and
+	// every request body that simply omits the field) produced connections
+	// that were forbidden to restart after a supervisor restart — desired
+	// open, yet excluded from restartDesiredOpen. The TUI always sends an
+	// explicit lifecycle; this default restores parity for everyone else.
+	if !req.Lifecycle.AutoStart && req.Lifecycle.OnDisconnect == "" {
+		if settings, err := config.LoadOperationalSettings(); err == nil {
+			req.Lifecycle.AutoStart = settings.DefaultAutoStart
+			req.Lifecycle.OnDisconnect = settings.DefaultOnDisconnect
+		}
 	}
 
 	// The kind is no longer hardcoded. Kinds that cannot be executed are
@@ -2572,6 +2662,15 @@ func (h *supervisorHandler) HandleSettings() (*ipc.SettingsDTO, error) {
 		LaunchMode:          h.sup.launchMode(),
 		DefaultAutoStart:    stored.DefaultAutoStart,
 		DefaultOnDisconnect: stored.DefaultOnDisconnect,
+		ClientTunnelEnabled: stored.ClientTunnelEnabled,
+		ClientTunnelBin:     stored.ClientTunnelBin,
+	}
+	// An environment override decides the executable path, so the stored value
+	// is not in force and the screen must say whose setting is winning.
+	if pinned := os.Getenv("PORTICO_CLIENT_TUNNEL_BIN"); pinned != "" {
+		dto.ClientTunnelBinPinned = true
+		dto.ClientTunnelBinPinnedBy = "PORTICO_CLIENT_TUNNEL_BIN"
+		dto.ClientTunnelBin = pinned
 	}
 	if _, pinned := launchModeOverride(); pinned {
 		dto.LaunchModePinned = true
@@ -2618,6 +2717,43 @@ func (h *supervisorHandler) HandleUpdateSettings(req ipc.SettingsRequest) (*ipc.
 		}
 		if err := config.SaveDefaultOnDisconnect(policy); err != nil {
 			return nil, fmt.Errorf("could not save the disconnect default: %w", err)
+		}
+	}
+	if req.ClientTunnelEnabled != nil || req.ClientTunnelBin != nil {
+		// An environment pin beats a stored value: reporting the stored value
+		// as in-force would make the screen lie about what the supervisor does.
+		if pinned := os.Getenv("PORTICO_CLIENT_TUNNEL_BIN"); pinned != "" && req.ClientTunnelBin != nil && strings.TrimSpace(*req.ClientTunnelBin) != pinned {
+			return nil, core.ErrValidation(
+				"the tunnel-client path is pinned by PORTICO_CLIENT_TUNNEL_BIN; unset it to change it here")
+		}
+		stored, err := config.LoadOperationalSettings()
+		if err != nil {
+			return nil, fmt.Errorf("could not load operational settings: %w", err)
+		}
+		enabled := stored.ClientTunnelEnabled
+		if req.ClientTunnelEnabled != nil {
+			enabled = *req.ClientTunnelEnabled
+		}
+		bin := stored.ClientTunnelBin
+		if req.ClientTunnelBin != nil {
+			bin = strings.TrimSpace(*req.ClientTunnelBin)
+		}
+		if err := config.SaveClientTunnelSettings(enabled, bin); err != nil {
+			return nil, fmt.Errorf("could not save the client-tunnel settings: %w", err)
+		}
+		// Hot-apply: rebuild the definition and re-run the activation path so
+		// the transport registers or deregisters without a restart. This is
+		// the same sequence a restart would run, so the two paths cannot
+		// disagree about the result.
+		if h.sup.activation != nil {
+			if def := h.sup.activation.definitionFor(provider_clienttunnel.ProviderID); def != nil {
+				if refresh, ok := def.(interface{ RefreshConfig() }); ok {
+					refresh.RefreshConfig()
+				}
+				if err := h.sup.ActivateProvider(context.Background(), provider_clienttunnel.ProviderID); err != nil {
+					slog.Warn("client-tunnel reactivation failed", "err", err)
+				}
+			}
 		}
 	}
 	return h.HandleSettings()
@@ -2679,6 +2815,7 @@ func (h *supervisorHandler) HandleProviderSetupFlow(id string) (*ipc.SetupFlowDT
 		CapabilityNotes: flow.CapabilityNotes,
 		IdentityField:   flow.IdentityField,
 		SecretField:     flow.SecretField,
+		HelpURL:         flow.HelpURL,
 	}
 	if dto.Kind == "" {
 		dto.Kind = string(core.SetupAccount)
@@ -3117,9 +3254,24 @@ func (h *supervisorHandler) configureDeclaredAccount(
 			resp.MissingPermissions = validation.MissingPermissions
 			return resp, core.ErrValidation(err.Error())
 		}
-		account.Status = core.AccountAuthenticated
-		resp.Validated = true
-		resp.MissingPermissions = validation.MissingPermissions
+		// The provider states what its pass proved. A local shape check (a
+		// client-tunnel runtime key, whose authority only the control plane can
+		// establish) must not be recorded as authenticated: that would claim a
+		// verification that never happened. It gets the provisional status —
+		// usable, because activation only refuses pending accounts — and the
+		// runtime verdict promotes or demotes it from there.
+		if local, ok := verifier.(provider.LocalShapeVerifier); ok &&
+			local.VerificationStrength() == provider.VerificationLocalShape {
+			account.Status = core.AccountProvisional
+			resp.Validated = true
+			resp.MissingPermissions = validation.MissingPermissions
+			resp.VerificationUnavailable = fmt.Sprintf(
+				"The %s credential was checked for shape only. It is stored and usable; OpenAI accepts or refuses it when the tunnel client first runs, and the account's status updates from that evidence.", id)
+		} else {
+			account.Status = core.AccountAuthenticated
+			resp.Validated = true
+			resp.MissingPermissions = validation.MissingPermissions
+		}
 	} else {
 		// Saying it will be tested when a connection opens would be false: an
 		// unverified account is not usable, so the controller refuses it before

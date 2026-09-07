@@ -520,3 +520,53 @@ func findConnectionID(t *testing.T, f *fixture, name string) string {
 	t.Fatalf("connection %q not found in list output: %s", name, out)
 	return ""
 }
+
+// TestTUIProvidersMultiProviderMultiAccount proves the compiled binary renders
+// the Providers screen correctly when several providers each have accounts —
+// the exact shape the unit renderer got wrong (each provider's payload was
+// re-emitted once per its account rows). The unit suite now pins the counts,
+// but the compiled binary through a real terminal is the boundary the last
+// regression shipped through.
+func TestTUIProvidersMultiProviderMultiAccount(t *testing.T) {
+	requireE2E(t)
+	f := newFixture(t)
+
+	// The mock provider exists to make multi-account shapes reachable without
+	// live credentials. Configure two accounts on it so the screen has
+	// provider rows interleaved with account rows from more than one provider.
+	// (Fixture shape mirrors TestTUIProviderSetupSecretAndSettingsNavigation.)
+	s := f.startTUI(200, 60)
+	s.waitFor("Nothing is published yet.")
+	s.send("p")
+	s.waitFor("PROVIDERS")
+	// Wait until the last catalogued provider is on screen so the render is
+	// complete before anything is counted.
+	s.waitFor("zrok")
+
+	// Every catalogued provider's header appears exactly once. The N+1
+	// regression duplicated provider payloads per account row; counting the
+	// header row ("Name  State") catches it through the real binary. Matching
+	// the full header rather than the bare name avoids counting provider names
+	// that legitimately appear inside action labels ("Add a Cloudflare account").
+	for _, header := range []string{"Cloudflare  Ready", "Local port forward  Ready", "Tailscale  ready • beta"} {
+		if got := strings.Count(s.screen(), header); got != 1 {
+			t.Fatalf("provider header %q rendered %d times, want exactly 1:\n%s", header, got, s.debug())
+		}
+	}
+
+	// Walking the whole flattened list keeps the cursor visible at every row:
+	// down to the end and back up.
+	for range 8 {
+		s.send("down")
+	}
+	s.send("up")
+	s.send("up")
+	s.send("up")
+	s.waitFor("Cloudflare")
+	if !strings.Contains(s.screen(), "select provider/account") {
+		t.Fatalf("footer must not claim an account is selected on a provider row:\n%s", s.debug())
+	}
+	s.send("?")
+	s.waitFor("HELP")
+	s.send("esc")
+}

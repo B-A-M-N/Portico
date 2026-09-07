@@ -1670,6 +1670,10 @@ func cloudflareSetupFlow() core.SetupFlow {
 		IdentityField: "account_id",
 		SecretField:   "credential",
 		Summary:       "Configure a Cloudflare account so Portico can create managed tunnels for you.",
+		// Declared here, not hardcoded in any UI: the address of Cloudflare's
+		// token instructions is Cloudflare's fact to know. Surfaces offer to
+		// open it and must fall back to showing it when no browser exists.
+		HelpURL: "https://dash.cloudflare.com/profile/api-tokens",
 		// The credential leads. Validation against the real API discovers the
 		// accounts and zones the token can reach, so asking for the identity
 		// first made the user copy an ID the credential was about to reveal.

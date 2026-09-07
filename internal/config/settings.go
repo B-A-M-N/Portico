@@ -23,6 +23,15 @@ type OperationalSettings struct {
 	LaunchMode          string
 	DefaultAutoStart    bool
 	DefaultOnDisconnect string
+	// ClientTunnelEnabled opts the experimental client-mediated transport in.
+	// It is part of the operational settings because the provider-activation
+	// coordinator reads it through the definition config, and a setting that
+	// only an environment variable could change is not a setting users can
+	// reach.
+	ClientTunnelEnabled bool
+	// ClientTunnelBin is the tunnel-client executable path. Empty means the
+	// name on PATH.
+	ClientTunnelBin string
 }
 
 // LoadOperationalSettings reads the stored settings, falling back to the
@@ -49,10 +58,29 @@ func LoadOperationalSettings() (OperationalSettings, error) {
 	if disconnect != "keep_alive" && disconnect != "close" {
 		return OperationalSettings{}, fmt.Errorf("invalid disconnect policy %q", disconnect)
 	}
+	clientTunnelEnabled, err := readSettingBool(KeyClientTunnelEnabled, false)
+	if err != nil {
+		return OperationalSettings{}, err
+	}
+	// The legacy key remains a read fallback until its compatibility window
+	// closes; without this, saving an unrelated setting would silently
+	// downgrade a tunnel enabled through the old key.
+	if !clientTunnelEnabled && viper.IsSet(KeyOpenAITunnelEnabled) && !viper.IsSet(KeyClientTunnelEnabled) {
+		clientTunnelEnabled = viper.GetBool(KeyOpenAITunnelEnabled)
+	}
+	clientTunnelBin, err := readSettingString(KeyClientTunnelBin, "")
+	if err != nil {
+		return OperationalSettings{}, err
+	}
+	if clientTunnelBin == "" && viper.IsSet(KeyOpenAITunnelBin) && !viper.IsSet(KeyClientTunnelBin) {
+		clientTunnelBin = strings.TrimSpace(viper.GetString(KeyOpenAITunnelBin))
+	}
 	return OperationalSettings{
 		LaunchMode:          launchMode,
 		DefaultAutoStart:    autoStart,
 		DefaultOnDisconnect: disconnect,
+		ClientTunnelEnabled: clientTunnelEnabled,
+		ClientTunnelBin:     clientTunnelBin,
 	}, nil
 }
 
@@ -61,6 +89,8 @@ type SettingsPatch struct {
 	LaunchMode          *string
 	DefaultAutoStart    *bool
 	DefaultOnDisconnect *string
+	ClientTunnelEnabled *bool
+	ClientTunnelBin     *string
 }
 
 // UpdateOperationalSettings validates and persists a complete merged settings
@@ -79,6 +109,12 @@ func UpdateOperationalSettings(patch SettingsPatch) (OperationalSettings, error)
 	}
 	if patch.DefaultOnDisconnect != nil {
 		current.DefaultOnDisconnect = *patch.DefaultOnDisconnect
+	}
+	if patch.ClientTunnelEnabled != nil {
+		current.ClientTunnelEnabled = *patch.ClientTunnelEnabled
+	}
+	if patch.ClientTunnelBin != nil {
+		current.ClientTunnelBin = strings.TrimSpace(*patch.ClientTunnelBin)
 	}
 	if err := SaveOperationalSettings(current); err != nil {
 		return OperationalSettings{}, err
@@ -121,6 +157,15 @@ func applyOperationalSettings(settings OperationalSettings) {
 	viper.Set(KeyLaunchMode, strings.ToLower(strings.TrimSpace(settings.LaunchMode)))
 	viper.Set(KeyDefaultAutoStart, settings.DefaultAutoStart)
 	viper.Set(KeyDefaultOnDisconnect, strings.ToLower(strings.TrimSpace(settings.DefaultOnDisconnect)))
+	viper.Set(KeyClientTunnelEnabled, settings.ClientTunnelEnabled)
+	if settings.ClientTunnelBin != "" {
+		viper.Set(KeyClientTunnelBin, settings.ClientTunnelBin)
+	} else {
+		// An empty path means "resolve the name on PATH": the key is unset
+		// rather than written empty, because a written empty string would
+		// fail this same loader on the next read.
+		viper.Set(KeyClientTunnelBin, nil)
+	}
 }
 
 func readSettingString(key, fallback string) (string, error) {
@@ -172,6 +217,17 @@ func SaveLaunchMode(mode string) error {
 	}
 	current.LaunchMode = normalized
 	return SaveOperationalSettings(current)
+}
+
+// SaveClientTunnelSettings persists the client-tunnel opt-in and executable
+// path. The supervisor calls this from the settings handler; the transport
+// config is then rebuilt without a restart.
+func SaveClientTunnelSettings(enabled bool, bin string) error {
+	_, err := UpdateOperationalSettings(SettingsPatch{
+		ClientTunnelEnabled: &enabled,
+		ClientTunnelBin:     &bin,
+	})
+	return err
 }
 
 // SaveDefaultAutoStart persists whether a new connection is created armed.

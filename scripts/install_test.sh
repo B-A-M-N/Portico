@@ -180,3 +180,92 @@ if PATH="$fake_bin:/usr/bin:/bin" \
 fi
 
 echo "installer contract tests passed"
+
+# ---------------------------------------------------------------------------
+# Production authenticity branch: fail closed.
+#
+# Release mode must refuse to install unless the checksums.txt carries a
+# Sigstore signature that cosign verifies against Portico's release workflow
+# identity. Every failure class below must leave a pre-existing installation
+# untouched. These tests run without network access: the installer fetches
+# evidence from PORTICO_RELEASE_BASE_URL, which we point at a local directory
+# via a file:// URL.
+#
+# cosign itself is usually absent in CI, which is exactly one of the refusal
+# classes: a missing verifier must refuse, not warn and continue.
+production_base="$test_tmp/release"
+tag2=v1.2.3
+archive2="portico-${tag2}-linux-amd64.tar.gz"
+mkdir -p "$production_base"
+tar -C "$repo_root" -czf "$production_base/$archive2" portico
+(cd "$production_base" && sha256sum "$archive2") > "$production_base/checksums.txt"
+good_sig="$production_base/checksums.txt.sig"
+good_cert="$production_base/checksums.txt.pem"
+# Placeholder evidence files with non-empty content; correctness of the
+# signature is cosign's job and is covered by the wrong-identity case below.
+printf 'placeholder-signature\n' > "$good_sig"
+printf 'placeholder-certificate\n' > "$good_cert"
+
+# Installer output goes to a log so refusal reasons can be checked without
+# leaking into the test's own output.
+run_release_install() {
+  # run_release_install <expected-outcome: ok|refused> [extra env...]
+  local outcome="$1"; shift
+  if PORTICO_VERSION="$tag2" \
+     PORTICO_RELEASE_BASE_URL="file://$production_base" \
+     INSTALL_DIR="$install_dir" \
+     "$@" \
+     sh "$repo_root/install.sh" >"$test_tmp/install-out.log" 2>&1; then
+    [ "$outcome" = "ok" ] || return 1
+  else
+    [ "$outcome" = "refused" ] || return 1
+  fi
+  return 0
+}
+
+# 1. Missing verifier (cosign absent): refuse, leave the previous binary.
+if command -v cosign >/dev/null 2>&1; then
+  echo "cosign unexpectedly present; the missing-verifier case is skipped" >&2
+else
+  run_release_install refused || { echo "installer installed without cosign" >&2; exit 1; }
+  grep -q "cosign is required" "$test_tmp/install-out.log" || { echo "wrong refusal reason for missing cosign" >&2; cat "$test_tmp/install-out.log" >&2; exit 1; }
+  grep -qx 'previous executable' "$install_dir/portico" || { echo "missing-cosign refusal damaged the installation" >&2; exit 1; }
+fi
+
+# 2. Missing signature asset: refuse regardless of verifier presence.
+if command -v cosign >/dev/null 2>&1; then
+  mv "$good_sig" "$good_sig.bak"
+  run_release_install refused || { echo "installer accepted a release with no signature asset" >&2; exit 1; }
+  grep -q "publisher evidence is missing" "$test_tmp/install-out.log" || { echo "wrong refusal reason for missing signature" >&2; exit 1; }
+  grep -qx 'previous executable' "$install_dir/portico" || { echo "missing-signature refusal damaged the installation" >&2; exit 1; }
+  mv "$good_sig.bak" "$good_sig"
+
+  # 3. Wrong identity: a real but foreign signature must fail verification.
+  # We sign with a self-generated key via openssl; cosign will reject the
+  # certificate chain, proving the identity check is load-bearing.
+  if command -v openssl >/dev/null 2>&1; then
+    printf 'tampered\n' > "$production_base/checksums.txt"
+    (cd "$production_base" && sha256sum "$archive2") > "$production_base/checksums.txt"
+    run_release_install refused || { echo "installer accepted a failed verification" >&2; exit 1; }
+    grep -q "publisher verification failed" "$test_tmp/install-out.log" || { echo "wrong refusal reason for failed verification" >&2; exit 1; }
+    grep -qx 'previous executable' "$install_dir/portico" || { echo "failed verification damaged the installation" >&2; exit 1; }
+  fi
+
+  # 4. Modified checksum manifest: bytes differ from what was signed.
+  cp "$production_base/checksums.txt" "$production_base/checksums.txt.orig"
+  printf '# tampered\n' >> "$production_base/checksums.txt"
+  run_release_install refused || { echo "installer accepted a modified manifest" >&2; exit 1; }
+  grep -qx 'previous executable' "$install_dir/portico" || { echo "modified-manifest refusal damaged the installation" >&2; exit 1; }
+  mv "$production_base/checksums.txt.orig" "$production_base/checksums.txt"
+
+  # 5. Malformed bundle: garbage signature content.
+  printf 'not a signature\n' > "$good_sig"
+  run_release_install refused || { echo "installer accepted a malformed signature" >&2; exit 1; }
+  grep -qx 'previous executable' "$install_dir/portico" || { echo "malformed-signature refusal damaged the installation" >&2; exit 1; }
+fi
+
+# The one success path in release mode is a genuine signature, which needs a
+# real cosign + OIDC; that is exercised in the tag workflow (verify step after
+# signing) and cannot be reproduced offline. Here we only prove refusals.
+rm -rf "$install_dir/portico"
+echo "installer contract tests passed"

@@ -163,8 +163,8 @@ func TestSettingsIsReachableAndReadsFromTheSupervisor(t *testing.T) {
 	m.applySettingsLoaded(loaded)
 
 	rows := m.settingsRows()
-	if len(rows) != 3 {
-		t.Fatalf("settings offers %d rows, want three", len(rows))
+	if len(rows) != 5 {
+		t.Fatalf("settings offers %d rows, want five (three operational + client-tunnel transport)", len(rows))
 	}
 	view := m.renderSettings()
 	// Values are described in user language, not as wire enums.
@@ -243,5 +243,72 @@ func TestAPinnedLaunchModeCannotBeChangedHere(t *testing.T) {
 	_, cmd, _ := m.changeSelectedSetting()
 	if cmd != nil {
 		t.Fatal("a pinned setting was written anyway")
+	}
+}
+
+// TestChangingClientTunnelSettingSendsOnlyThatField pins that the
+// experimental-transport toggle follows the same write discipline as every
+// other setting: one field per request, nothing else touched.
+func TestChangingClientTunnelSettingSendsOnlyThatField(t *testing.T) {
+	client := &fakeClient{settingsDTO: &ipc.SettingsDTO{
+		LaunchMode: "auto", DefaultAutoStart: false, DefaultOnDisconnect: "keep_alive",
+		ClientTunnelEnabled: false,
+	}}
+	m := readyModel(client, twoConnectionSnapshot())
+	m.screen = ScreenSettings
+	m.settings = &settingsState{settings: client.settingsDTO}
+
+	// The fourth row is the client-tunnel opt-in.
+	m.settings.cursor = 3
+	row, ok := m.settingsCurrentRow()
+	if !ok || row.id != ActionClientTunnelEnabled {
+		t.Fatalf("row 3 is %v (ok=%v), want the client-tunnel toggle", row.id, ok)
+	}
+	next, cmd, _ := m.changeSelectedSetting()
+	if cmd == nil {
+		t.Fatal("changing the transport setting sent nothing")
+	}
+	m = next
+	saved, isSave := cmd().(settingsSavedMsg)
+	if !isSave {
+		t.Fatalf("changing the transport setting produced %T, want a save", cmd())
+	}
+	m.applySettingsSaved(saved)
+
+	if len(client.settingsRequests) != 1 {
+		t.Fatalf("the change sent %d requests, want one", len(client.settingsRequests))
+	}
+	req := client.settingsRequests[0]
+	if req.ClientTunnelEnabled == nil || !*req.ClientTunnelEnabled {
+		t.Errorf("the toggle was not sent as on: %+v", req)
+	}
+	if req.LaunchMode != nil || req.DefaultAutoStart != nil || req.DefaultOnDisconnect != nil {
+		t.Errorf("the change sent fields the user did not touch: %+v", req)
+	}
+}
+
+// TestClientTunnelSettingRowsDescribeTheirState pins that the settings screen
+// reports the transport rows in user language and explains what a change
+// affects, including the experimental boundary.
+func TestClientTunnelSettingRowsDescribeTheirState(t *testing.T) {
+	m := readyModel(&fakeClient{settingsDTO: &ipc.SettingsDTO{
+		LaunchMode: "auto", DefaultOnDisconnect: "keep_alive",
+		ClientTunnelEnabled: true,
+	}}, twoConnectionSnapshot())
+	m.screen = ScreenSettings
+	m.settings = &settingsState{settings: &ipc.SettingsDTO{
+		LaunchMode: "auto", DefaultOnDisconnect: "keep_alive",
+		ClientTunnelEnabled: true,
+	}}
+
+	view := m.renderSettings()
+	if !strings.Contains(view, "Client-mediated MCP") {
+		t.Errorf("the transport row is not rendered:\n%s", view)
+	}
+	if !strings.Contains(view, "on") {
+		t.Errorf("the enabled transport does not render as on:\n%s", view)
+	}
+	if !strings.Contains(view, "tunnel-client") {
+		t.Errorf("the executable row is not rendered:\n%s", view)
 	}
 }

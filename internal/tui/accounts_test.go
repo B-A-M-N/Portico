@@ -276,6 +276,9 @@ func TestAddingAnAccountUsesTheSelectedProvider(t *testing.T) {
 // the target was invisible until the confirmation appeared.
 func TestTheSelectedAccountIsVisible(t *testing.T) {
 	m := readyModel(&fakeClient{}, accountSnapshot())
+	// newModel derives useASCII from TERM; pin it so the test asserts the
+	// Unicode rendering regardless of the shell that invoked `go test`.
+	m.useASCII = false
 	m.transitionTo(ScreenProviders)
 
 	view := m.renderProviders()
@@ -311,6 +314,7 @@ func TestProviderMarkerSurvivesPrecedingAccounts(t *testing.T) {
 		},
 	}
 	m := readyModel(&fakeClient{}, snap)
+	m.useASCII = false
 	m.transitionTo(ScreenProviders)
 
 	// Cursor starts on Provider A (flat index 0).
@@ -329,5 +333,86 @@ func TestProviderMarkerSurvivesPrecedingAccounts(t *testing.T) {
 	}
 	if strings.Contains(view, "▸ Provider A") {
 		t.Fatalf("Provider A kept the marker after the cursor moved to B:\\n%s", view)
+	}
+}
+
+// TestProviderSectionRendersExactlyOnce pins the N+1 regression the 14fcaaf
+// renderer had: the rowKindProvider guard protected only the header, so the
+// provider detail and its account list were re-emitted for every account row
+// of that provider. A provider with three accounts drew its accounts four
+// times. Marker tests passed anyway because they assert Contains, not counts —
+// this test counts.
+func TestProviderSectionRendersExactlyOnce(t *testing.T) {
+	snap := accountSnapshot()
+	// Capabilities are declared so the renderer's capability block is also
+	// under the once-only contract.
+	snap.Providers[0].Capabilities = &ipc.CapabilitySetDTO{
+		TemporaryAddresses: true,
+		CustomHostnames:    true,
+		ProtectionModes:    []string{"email_otp"},
+	}
+	m := readyModel(&fakeClient{}, snap)
+	m.useASCII = false
+	m.transitionTo(ScreenProviders)
+
+	view := m.renderProviders()
+	// Cloudflare has 2 configured + 1 pending account: each must appear once.
+	if got := strings.Count(view, "Work — authenticated"); got != 1 {
+		t.Fatalf("account row rendered %d times, want 1:\n%s", got, view)
+	}
+	if got := strings.Count(view, "Personal — authenticated"); got != 1 {
+		t.Fatalf("account row rendered %d times, want 1:\n%s", got, view)
+	}
+	if got := strings.Count(view, "Old token — unverified"); got != 1 {
+		t.Fatalf("pending account row rendered %d times, want 1:\n%s", got, view)
+	}
+	if got := strings.Count(view, "Permanent hostnames"); got != 1 {
+		t.Fatalf("capability line rendered %d times, want 1:\n%s", got, view)
+	}
+}
+
+// TestProviderRowSelectsNoAccount pins the deliberate safety rule: the cursor
+// can rest on a provider row, but that must never imply an account is
+// selected — destructive account actions would otherwise target a child the
+// user never chose. The footer was changed to match this model.
+func TestProviderRowSelectsNoAccount(t *testing.T) {
+	m := readyModel(&fakeClient{}, accountSnapshot())
+	m.useASCII = false
+	m.transitionTo(ScreenProviders)
+
+	// The initial cursor sits on the provider row.
+	if _, ok := m.selectedAccount(); ok {
+		t.Fatal("a provider row must not select an account")
+	}
+	view := m.renderProviders()
+	if !strings.Contains(view, "select provider/account") {
+		t.Fatalf("footer must not claim an account is selected on a provider row:\n%s", view)
+	}
+
+	// Moving onto an account row selects it.
+	for range 1 {
+		next, _ := m.Update(keyMsg("down"))
+		m = next.(Model)
+	}
+	if _, ok := m.selectedAccount(); !ok {
+		t.Fatal("an account row must select that account")
+	}
+}
+
+// TestProviderMarkerSurvivesInASCIITerminal pins the ASCII rendering path:
+// TERM=dumb flips newModel to useASCII, so a test that hardcodes ▸ is
+// environment-dependent. The ASCII marker is `>`; it must behave identically.
+func TestProviderMarkerSurvivesInASCIITerminal(t *testing.T) {
+	m := readyModel(&fakeClient{}, accountSnapshot())
+	m.useASCII = true
+	m.transitionTo(ScreenProviders)
+
+	if view := m.renderProviders(); !strings.Contains(view, "> Cloudflare") {
+		t.Fatalf("ASCII mode must draw the provider cursor:\n%s", view)
+	}
+	next, _ := m.Update(keyMsg("down"))
+	m = next.(Model)
+	if _, ok := m.selectedAccount(); !ok {
+		t.Fatal("ASCII mode must still move the cursor onto accounts")
 	}
 }

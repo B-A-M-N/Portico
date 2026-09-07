@@ -102,12 +102,18 @@ func (m *Model) applyAccountVerified(msg accountVerifiedMsg) tea.Cmd {
 func (m Model) beginCredentialReplacement(row accountRow) (Model, tea.Cmd, bool) {
 	next, cmd := m.beginProviderSetup(row.ProviderID)
 	next.replacingAccountID = row.AccountID
-	for i := range next.providerSetupFlow.Fields {
-		f := &next.providerSetupFlow.Fields[i]
-		switch f.ID {
-		case "account_id", "zone_id", "label":
-			f.Required = false
-			f.Description = "(unchanged during credential replacement) " + f.Description
+	// The flow is fetched asynchronously: beginProviderSetup nils it and the
+	// reply populates it later. Freezing the identity fields has to happen
+	// when the declaration arrives, not here — dereferencing it immediately
+	// panicked the whole TUI the moment a user pressed [c] on an account.
+	if next.providerSetupFlow != nil {
+		for i := range next.providerSetupFlow.Fields {
+			f := &next.providerSetupFlow.Fields[i]
+			switch f.ID {
+			case "account_id", "zone_id", "label":
+				f.Required = false
+				f.Description = "(unchanged during credential replacement) " + f.Description
+			}
 		}
 	}
 	next.status = "Replace the credential for " + row.Label +

@@ -60,7 +60,7 @@ Storing an unverified credential is acceptable; *claiming* it works is not.
 
 ### 3. Providers whose credential Portico cannot deliver — the OpenAI tunnel
 
-Verified in `internal/provider/openaitunnel/adapter.go`: `validateClient` and
+Verified in `internal/provider/clienttunnel/adapter.go`: `validateClient` and
 `clientProcessSpec` both read `CONTROL_PLANE_API_KEY` from the supervisor's own
 process environment. Nothing reads the account store. The client receives the
 key because the supervisor already has it in its environment.

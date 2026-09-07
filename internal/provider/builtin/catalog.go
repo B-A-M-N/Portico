@@ -12,9 +12,9 @@ package builtin
 
 import (
 	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/clienttunnel"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/ngrok"
-	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
 	"github.com/B-A-M-N/portico/internal/provider/portforward"
 	"github.com/B-A-M-N/portico/internal/provider/tailscale"
 )
@@ -37,7 +37,7 @@ func Definitions(cfg Config) []provider.Definition {
 	return []provider.Definition{
 		cloudflare.NewDefinition(cloudflare.DefinitionConfig{Bin: cfg.CloudflaredBin}),
 		ngrok.NewDefinition(ngrok.DefinitionConfig{Bin: cfg.NgrokBin, Enabled: cfg.NgrokEnabled}),
-		openaitunnel.NewDefinition(openaitunnel.DefinitionConfig{
+		clienttunnel.NewDefinition(clienttunnel.DefinitionConfig{
 			Bin: cfg.OpenAITunnelBin, Enabled: cfg.OpenAITunnelEnabled,
 		}),
 		portforward.NewDefinition(),

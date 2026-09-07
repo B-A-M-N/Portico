@@ -111,7 +111,7 @@ func RunSupervisor(ctx context.Context) error {
 		// mock is genuinely usable with no account at all. A bare registration
 		// left it "unconfigured", so the TUI could not create the connections
 		// the CLI could.
-		mp := mock.New()
+		mp := mock.NewScoped()
 		if err := reg.Add(mp); err != nil {
 			slog.Warn("mock provider register failed", "err", err)
 		} else {
@@ -124,6 +124,11 @@ func RunSupervisor(ctx context.Context) error {
 					Stability:    core.StabilityStable,
 				},
 			})
+			// Setup resolves through definitions, so the mock's declared setup
+			// flow must be present there too — otherwise `provider login mock`
+			// fails with "cannot be configured through Portico" even though the
+			// adapter fully implements the capability.
+			definitions = append(definitions, mock.NewDefinition())
 		}
 	}
 	sup.SetProviderDefinitions(definitions, services)

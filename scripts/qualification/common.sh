@@ -47,6 +47,9 @@ start_artifacts() {
 
 record() {
     # record <label> <command...> — run, capture stdout/stderr/exit to artifacts.
+    # The command line is displayed verbatim in the artifact. NEVER pass a
+    # secret-bearing argument here; use record_redacted for anything that
+    # would place a credential in argv.
     local label="$1"; shift
     local out
     if out=$("$@" 2>&1); then
@@ -65,6 +68,44 @@ record() {
         } >> "${QUAL_DIR}/commands.log"
         fail "$label failed (exit $rc); see ${QUAL_DIR}/commands.log"
     fi
+}
+
+record_redacted() {
+    # record_redacted <label> <env-var-name> <command...> — like record, but
+    # the log shows a placeholder instead of the secret-bearing argument list,
+    # and the output is scanned against the ACTUAL secret value afterwards.
+    # The secret reaches the command only through the environment.
+    local label="$1" secret_var="$2"; shift 2
+    local out rc=0
+    if out=$(env "$secret_var=${!secret_var}" "$@" 2>&1); then :; else rc=$?; fi
+    {
+        echo "### $label (exit $rc)"
+        echo "\$ $* [argv redacted; credential passed via env $secret_var]"
+        echo "$out"
+    } >> "${QUAL_DIR}/commands.log"
+    if [ "$rc" -ne 0 ]; then
+        fail "$label failed (exit $rc); see ${QUAL_DIR}/commands.log"
+    fi
+    printf '%s' "$out"
+}
+
+scan_artifacts_for_secrets() {
+    # scan_artifacts_for_secrets <var>... — fail if the ACTUAL value of any
+    # named variable appears anywhere in the artifacts. This catches the real
+    # leak, not the word "token": a grep for vocabulary passes while the
+    # credential itself sits in the log.
+    local var leaked=""
+    for var in "$@"; do
+        local value="${!var:-}"
+        [ -n "$value" ] || continue
+        if grep -rqF -- "$value" "$QUAL_DIR" 2>/dev/null; then
+            leaked="$leaked $var"
+        fi
+    done
+    if [ -n "$leaked" ]; then
+        fail "SECRET MATERIAL APPEARS IN ARTIFACTS ($leaked); delete ${QUAL_DIR} and fix the harness before any rerun"
+    fi
+    log "artifact secret scan clean (${#@} secrets checked against bytes, not words)"
 }
 
 record_expect_fail() {

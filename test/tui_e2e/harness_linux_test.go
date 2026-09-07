@@ -463,6 +463,22 @@ func runCLI(t *testing.T, f *fixture, args ...string) string {
 	return stdout.String()
 }
 
+// runCLIWithStdin runs the CLI with the given bytes on stdin. Secure-credential
+// acquisition through --credential-stdin is a production contract, so the PTY
+// suite must be able to exercise it the way a script would.
+func runCLIWithStdin(t *testing.T, f *fixture, stdin string, args ...string) string {
+	t.Helper()
+	stdout, stderr := &strings.Builder{}, &strings.Builder{}
+	cmd := exec.Command(f.binary, args...)
+	cmd.Env = f.env
+	cmd.Stdin = strings.NewReader(stdin)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("portico %s: %v\n%s\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
+	}
+	return stdout.String()
+}
+
 func freeTCPPort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

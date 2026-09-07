@@ -93,7 +93,57 @@ func (m Model) settingsRows() []settingRow {
 				"Leaving them running is why the supervisor outlives the interface.",
 			editable: true,
 		},
+		{
+			id:    ActionClientTunnelEnabled,
+			label: "Client-mediated MCP",
+			value: onOffValue(s.ClientTunnelEnabled),
+			explain: "The experimental transport that connects a local MCP server " +
+				"to ChatGPT. Needs tunnel-client installed and a platform tunnel.",
+			editable: true,
+			reason:   clientTunnelReason(s),
+		},
+		{
+			id:    ActionClientTunnelBin,
+			label: "tunnel-client path",
+			value: clientTunnelBinValue(s),
+			explain: "Where Portico finds the tunnel-client executable. " +
+				"Set it with PORTICO_CLIENT_TUNNEL_BIN or the config file; " +
+				"empty means the name is found on PATH.",
+			editable: false,
+			reason:   clientTunnelBinReason(s),
+		},
 	}
+}
+
+// clientTunnelReason explains why the opt-in row may not change, or what the
+// current state depends on.
+func clientTunnelReason(s *ipc.SettingsDTO) string {
+	if s.ClientTunnelBinPinned {
+		return "the executable path is fixed by " + s.ClientTunnelBinPinnedBy
+	}
+	return ""
+}
+
+func clientTunnelBinReason(s *ipc.SettingsDTO) string {
+	if s.ClientTunnelBinPinned {
+		return "fixed by " + s.ClientTunnelBinPinnedBy + "; unset it to change this here"
+	}
+	return ""
+}
+
+// clientTunnelBinValue shows the effective path, including an environment pin.
+func clientTunnelBinValue(s *ipc.SettingsDTO) string {
+	if s.ClientTunnelBin == "" {
+		return "find on PATH"
+	}
+	return s.ClientTunnelBin
+}
+
+func onOffValue(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
 }
 
 // settingsCurrentRow returns the row under the cursor.

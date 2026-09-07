@@ -193,6 +193,8 @@ func (r *DoctorResult) finalize() {
 
 func doctorCheckIsBlocker(check DoctorCheck) bool {
 	switch check.State {
+	case "ok":
+		return false
 	case "problem", "unknown":
 		return true
 	case "attention":

@@ -1,6 +1,6 @@
 //go:build live
 
-package openaitunnel
+package clienttunnel
 
 import (
 	"context"

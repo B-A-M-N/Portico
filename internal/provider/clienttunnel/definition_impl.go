@@ -1,4 +1,4 @@
-package openaitunnel
+package clienttunnel
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/B-A-M-N/portico/internal/config"
 	"github.com/B-A-M-N/portico/internal/core"
 	"github.com/B-A-M-N/portico/internal/provider"
 )
@@ -52,13 +53,24 @@ func (d *Definition) CatalogEntry() provider.CatalogEntry {
 	}
 	if !d.cfg.Enabled {
 		entry.SetupActions = append(entry.SetupActions,
-			"Set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1 to register the provider")
+			"Set PORTICO_ENABLE_CLIENT_TUNNEL=1 to register the provider")
 	}
 	return entry
 }
 
 // Enabled reports whether the operator opted in.
 func (d *Definition) Enabled() bool { return d.cfg.Enabled }
+
+// RefreshConfig re-reads the durable settings so a settings change made while
+// the supervisor is running can take effect without restarting it. The
+// supervisor calls this through the activation coordinator before rebuilding
+// the provider.
+func (d *Definition) RefreshConfig() {
+	d.cfg.Enabled = config.ClientTunnelEnabled()
+	if bin := config.ClientTunnelBin(); bin != "" {
+		d.cfg.Bin = bin
+	}
+}
 
 // RequiredBinary reports the client this provider cannot run without.
 func (d *Definition) RequiredBinary() string { return d.cfg.Bin }
@@ -157,6 +169,15 @@ func (d *Definition) VerifyAccount(_ context.Context, account provider.PreparedA
 	}, nil
 }
 
+// VerificationStrength declares what a passing VerifyAccount proved: nothing
+// more than the key's shape. Declaring it is what keeps setup from recording
+// this credential as authenticated — a live probe of the real client showed
+// /readyz answering 200 while the control plane was actively refusing the key
+// with 401 invalid_api_key, so no local check can speak for OpenAI.
+func (d *Definition) VerificationStrength() provider.VerificationStrength {
+	return provider.VerificationLocalShape
+}
+
 // validateRuntimeKeyShape rules out values no real key could be: empty,
 // whitespace-padded pastes, embedded whitespace, or absurd lengths.
 func validateRuntimeKeyShape(key string) error {
@@ -190,7 +211,7 @@ func (d *Definition) Activate(ctx context.Context, req provider.ActivationReques
 			}
 			if !d.cfg.Enabled {
 				entry.SetupActions = append(entry.SetupActions,
-					"Set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1 to register the provider")
+					"Set PORTICO_ENABLE_CLIENT_TUNNEL=1 to register the provider")
 			}
 			return provider.Installation{Catalog: entry}, nil
 		}
@@ -219,7 +240,7 @@ func (d *Definition) Activate(ctx context.Context, req provider.ActivationReques
 		}
 		if !d.cfg.Enabled {
 			entry.SetupActions = append(entry.SetupActions,
-				"Set PORTICO_ENABLE_EXPERIMENTAL_OPENAI_TUNNEL=1 to register the provider")
+				"Set PORTICO_ENABLE_CLIENT_TUNNEL=1 to register the provider")
 		}
 		return provider.Installation{Catalog: entry}, nil
 	}

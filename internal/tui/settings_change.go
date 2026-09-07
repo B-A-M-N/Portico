@@ -47,6 +47,9 @@ func (m Model) changeSelectedSetting() (Model, tea.Cmd, bool) {
 			policy = "close"
 		}
 		req.DefaultOnDisconnect = &policy
+	case ActionClientTunnelEnabled:
+		next := !current.ClientTunnelEnabled
+		req.ClientTunnelEnabled = &next
 	default:
 		return m, nil, true
 	}

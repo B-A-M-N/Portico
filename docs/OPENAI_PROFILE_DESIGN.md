@@ -1,8 +1,15 @@
 # OpenAI Profile + Portico Gateway Design Contract
 
-**Status:** Implementation contract
+**Status:** Implementation contract; partially superseded
 **Created:** 2026-08-15
 **Author:** Portico development policy (corrected from user review)
+
+> **Update:** The transport identity migration this document anticipated has
+> landed differently: `internal/provider/clienttunnel/` is now the canonical
+> transport package (the `openaitunnel` package no longer exists), with the
+> workload/transport split carried by `core.ProfileKind` and the
+> `NormalizeProviderID` legacy-name resolution. The full profile-wraps-transport
+> refactor described below remains future design work, not current code.
 
 ## 1. Architectural correction
 

@@ -1,4 +1,4 @@
-package openaitunnel
+package clienttunnel
 
 import (
 	"os"

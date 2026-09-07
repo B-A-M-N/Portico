@@ -185,15 +185,19 @@ func (m *Model) followSelectionIntoView() {
 	lines := strings.Split(content, "\n")
 	m.scroll.setContentLines(len(lines))
 
+	// The providers screen draws its selected ACCOUNT row with the same
+	// marker family as the provider row ("> "), so one scan finds either.
+	// Account rows previously drew only "▸", which this scan never matched —
+	// so moving the cursor onto an account left the follow-scroll blind and
+	// the selection could sit below the visible window while the screen
+	// showed it nowhere. The LAST marked line wins: a screen renders at most
+	// one selection marker, so the scan tolerates provider rows that quote
+	// "> " inside help text above the selection.
 	marker := "> "
 	row := -1
-	// The selected row is the one the selection index says it is; finding the
-	// marker in the rendered content proves the renderer drew it and gives its
-	// physical position.
 	for i, line := range lines {
 		if strings.Contains(line, marker) {
 			row = i
-			break
 		}
 	}
 	if row < 0 {

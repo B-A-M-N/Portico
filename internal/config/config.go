@@ -362,24 +362,6 @@ func SaveConfig() error {
 	return nil
 }
 
-// SaveCloudflareSetup stores non-secret Cloudflare routing identifiers in the
-// XDG config file and persists the token through the encrypted credential
-// store. Callers must have obtained the token without placing it in argv.
-func SaveCloudflareSetup(accountID, zoneID, token string) error {
-	if accountID == "" || zoneID == "" || token == "" {
-		return fmt.Errorf("cloudflare account ID, zone ID, and token are required")
-	}
-	if err := SaveCredential(token); err != nil {
-		return err
-	}
-	viper.Set(KeyAccountID, accountID)
-	viper.Set(KeyZoneID, zoneID)
-	if err := SaveConfig(); err != nil {
-		return err
-	}
-	return nil
-}
-
 // APIToken retrieves the Cloudflare API token from the standard environment
 // variable, the Portico-scoped environment variable, or encrypted local
 // credentials created by the legacy login flow.

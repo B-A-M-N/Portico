@@ -8,7 +8,7 @@ LDFLAGS  = -s -w \
 
 SHELL := /bin/bash
 
-.PHONY: build build-race install test test-race test-e2e tui-e2e tui-e2e-live vet staticcheck fmt-check validate acceptance release-check artifact-check installer-contract release-tag-contract qualify-local qualify-cloudflare qualify-tailscale qualify-ngrok run-qual clean
+.PHONY: build build-race install test test-race test-e2e tui-e2e tui-e2e-live vet staticcheck fmt-check validate acceptance release-check artifact-check installer-contract release-tag-contract clean-user-smoke upgrade-check qualify-local qualify-cloudflare qualify-tailscale qualify-ngrok run-qual clean
 
 build:
 	go build -ldflags '$(LDFLAGS)' -o portico .
@@ -105,6 +105,36 @@ installer-contract:
 
 release-tag-contract:
 	./scripts/release_tag_test.sh
+
+# clean-user-smoke runs the packaged archive through the real installer in a
+# pristine environment and drives a full local-forward lifecycle. It needs
+# only the artifact; release CI runs it against every candidate before
+# publishing.
+clean-user-smoke: build
+	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/portico-clean-user-smoke.XXXXXX"); trap 'rm -rf "$$tmp"' EXIT; \
+	tar -C . -czf "$$tmp/portico.tar.gz" portico; \
+	./scripts/clean_user_smoke.sh "$$tmp/portico.tar.gz"
+
+# upgrade-check proves a candidate install preserves state created by a prior
+# binary (database migration, encrypted credentials, managed resources,
+# runtime reconciliation). CANDIDATE_ARCHIVE selects a prebuilt archive (what
+# release CI verifies); without it the freshly built binary is archived.
+# PRIOR_BINARY selects the previous release; without it the immutable fallback
+# from select_prior_release.sh is built from git.
+upgrade-check: build
+	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/portico-upgrade-check.XXXXXX"); trap 'rm -rf "$$tmp"' EXIT; \
+	if [ -n "$(CANDIDATE_ARCHIVE)" ]; then candidate="$(CANDIDATE_ARCHIVE)"; \
+	else tar -C . -czf "$$tmp/candidate.tar.gz" portico; candidate="$$tmp/candidate.tar.gz"; fi; \
+	if [ -n "$(PRIOR_BINARY)" ]; then prior="$(PRIOR_BINARY)"; \
+	else \
+		prior_tag=$$(scripts/select_prior_release.sh); \
+		echo "upgrade-check: prior release = $$prior_tag"; \
+		git worktree add "$${tmp}/prior" "$$prior_tag" >/dev/null 2>&1 || git worktree add "$${tmp}/prior" "$$prior_tag"; \
+		(cd "$${tmp}/prior" && go build -buildvcs=false -o "$$tmp/prior-portico" .) || exit 1; \
+		git worktree remove --force "$${tmp}/prior"; \
+		prior="$$tmp/prior-portico"; \
+	fi; \
+	./scripts/verify_release_upgrade.sh "$$prior" "$$candidate"
 
 # qualify-* run the provider qualification scripts (scripts/qualification/).
 # Every one is opt-in so a plain `make` never touches a live provider.

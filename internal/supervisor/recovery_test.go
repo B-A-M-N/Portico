@@ -16,9 +16,9 @@ import (
 	"github.com/B-A-M-N/portico/internal/ipc"
 	"github.com/B-A-M-N/portico/internal/process"
 	"github.com/B-A-M-N/portico/internal/provider"
+	"github.com/B-A-M-N/portico/internal/provider/clienttunnel"
 	"github.com/B-A-M-N/portico/internal/provider/cloudflare"
 	"github.com/B-A-M-N/portico/internal/provider/mock"
-	"github.com/B-A-M-N/portico/internal/provider/openaitunnel"
 	"github.com/B-A-M-N/portico/internal/provider/portforward"
 	"github.com/B-A-M-N/portico/internal/store"
 )
@@ -1440,7 +1440,7 @@ func TestAGuidanceFlowCannotBeSubmitted(t *testing.T) {
 // which is the whole point of the change: setup that only printed instructions
 // left the provider unconfigured no matter what the user did on screen.
 func TestTheOpenAITunnelStoresItsRuntimeCredential(t *testing.T) {
-	flow := openaitunnel.New("", nil).SetupFlow()
+	flow := clienttunnel.New("", nil).SetupFlow()
 	if !flow.StoresAccount() {
 		t.Fatal("the OpenAI tunnel still refuses to store its runtime credential")
 	}
@@ -1614,7 +1614,7 @@ func TestAnUnstatedAccountStatusIsPending(t *testing.T) {
 func TestTheStoredRuntimeKeyIsDeliveredToTheAdapter(t *testing.T) {
 	ctx := context.Background()
 	st := newRecoveryTestStore(t)
-	sup, _ := activationTestSupervisor(t, st, openaitunnel.NewDefinition(openaitunnel.DefinitionConfig{Enabled: true}))
+	sup, _ := activationTestSupervisor(t, st, clienttunnel.NewDefinition(clienttunnel.DefinitionConfig{Enabled: true}))
 	handler := &supervisorHandler{sup: sup}
 
 	resp, err := handler.HandleConfigureProviderAccount(string(core.ProviderIDClientTunnel),
@@ -1994,6 +1994,19 @@ func activationTestSupervisor(t *testing.T, st *store.Store, defs ...provider.De
 		LookPath:          func(name string) (string, error) { return name, nil },
 		Getenv:            func(string) string { return "" },
 	})
+	return sup, registry
+}
+
+// activationTestSupervisorWithEnv is activationTestSupervisor with the
+// runtime environment visible to provider definitions replaceable, so a test
+// can pin what the definitions see without touching the machine running the
+// test.
+func activationTestSupervisorWithEnv(t *testing.T, st *store.Store, getenv func(string) string, defs ...provider.Definition) (*Supervisor, provider.Registry) {
+	t.Helper()
+	sup, registry := activationTestSupervisor(t, st, defs...)
+	services := sup.activation.services
+	services.Getenv = getenv
+	sup.SetProviderDefinitions(sup.activation.definitions, services)
 	return sup, registry
 }
 

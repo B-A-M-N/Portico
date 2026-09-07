@@ -881,14 +881,56 @@ func collectSetupValues(cmd *cobra.Command, flow *ipc.SetupFlowDTO) (map[string]
 		return nil, fmt.Errorf("choose only one of --credential-stdin and --credential-fd")
 	}
 
+	// The provider-neutral generic surface: --set key=value pairs. Keys are
+	// validated against the flow's declared field IDs, so a typo is rejected
+	// here rather than stored as unknown metadata. Secrets are refused: they
+	// have their own secure channels, and a secret on the command line is
+	// shell history and a process listing.
+	setPairs := make(map[string]string)
+	if f := cmd.Flags().Lookup("set"); f != nil {
+		pairs, _ := cmd.Flags().GetStringArray("set")
+		declared := map[string]bool{}
+		for _, field := range flow.Fields {
+			declared[field.ID] = true
+		}
+		for _, pair := range pairs {
+			key, val, found := strings.Cut(pair, "=")
+			key = strings.TrimSpace(key)
+			if !found || key == "" {
+				return nil, fmt.Errorf("--set expects key=value, got %q", pair)
+			}
+			if !declared[key] {
+				known := make([]string, 0, len(flow.Fields))
+				for _, field := range flow.Fields {
+					known = append(known, field.ID)
+				}
+				return nil, fmt.Errorf("--set %s: this provider declares no field %q (fields: %s)",
+					pair, key, strings.Join(known, ", "))
+			}
+			for _, field := range flow.Fields {
+				if field.ID == key && field.Secret {
+					return nil, fmt.Errorf("--set cannot carry the secret %q; use --credential-stdin, --credential-fd, or the TTY prompt", key)
+				}
+			}
+			setPairs[key] = strings.TrimSpace(val)
+		}
+	}
+
 	for _, field := range flow.Fields {
 		var value string
 
 		if !field.Secret {
-			// A flag named after the field, so --account-id still works.
-			flagName := strings.ReplaceAll(field.ID, "_", "-")
-			if f := cmd.Flags().Lookup(flagName); f != nil {
-				value = strings.TrimSpace(f.Value.String())
+			// Generic key=value first, then a field-named flag when the command
+			// registers one (tests and callers may add these), then declared
+			// environment variables.
+			if v, ok := setPairs[field.ID]; ok {
+				value = v
+			}
+			if value == "" {
+				flagName := strings.ReplaceAll(field.ID, "_", "-")
+				if f := cmd.Flags().Lookup(flagName); f != nil {
+					value = strings.TrimSpace(f.Value.String())
+				}
 			}
 		}
 		if value == "" {
@@ -1024,6 +1066,7 @@ func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, erro
 	directoryDelete, _ := cmd.Flags().GetBool("directory-allow-delete")
 	mcpCommand, _ := cmd.Flags().GetBool("mcp-command")
 	providerID, _ := cmd.Flags().GetString("provider")
+	accountID, _ := cmd.Flags().GetString("account-id")
 	sourceDTO := ipc.SourceDTO{Kind: sourceType}
 	switch sourceType {
 	case "existing_service":
@@ -1062,6 +1105,7 @@ func createConnection(cmd *cobra.Command, name string) (*ipc.ConnectionDTO, erro
 		},
 		Provider: ipc.ProviderSelectionDTO{
 			ProviderID: providerID,
+			AccountID:  accountID,
 		},
 	})
 	if err != nil {
@@ -1127,8 +1171,12 @@ func handleForwardCreate(cmd *cobra.Command, name string) error {
 	remoteHost, _ := cmd.Flags().GetString("remote-host")
 	remotePort, _ := cmd.Flags().GetInt("remote-port")
 	protocol, _ := cmd.Flags().GetString("protocol")
+	direction, _ := cmd.Flags().GetString("direction")
 	if protocol != "" && protocol != "tcp" {
 		return fmt.Errorf("port forwards carry tcp only; udp and remote forwards are refused")
+	}
+	if direction != "" && direction != "local" {
+		return fmt.Errorf("remote port forwarding is not supported")
 	}
 	if remotePort <= 0 {
 		return fmt.Errorf("--remote-port is required")
@@ -1313,6 +1361,38 @@ func handleProviderRemoveAccount(cmd *cobra.Command, providerID, accountID strin
 	fmt.Printf("Removed account %s from %s.\n", accountID, providerID)
 	if response.RestartRequired {
 		fmt.Println("Restart the supervisor to finish applying it.")
+	}
+	return nil
+}
+
+// handleProviderVerify re-verifies a stored credential against its provider
+// without changing it. The verdict is the supervisor's, so the CLI states only
+// what the response states — including the provisional case, where a
+// local-shape-only verifier can honestly say nothing stronger.
+func handleProviderVerify(cmd *cobra.Command, providerID, accountID string) error {
+	client, err := getClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	response, err := client.ReverifyProviderAccount(cmd.Context(), providerID, accountID)
+	if err != nil {
+		return err
+	}
+
+	jsonFlag, _ := cmd.Flags().GetBool("json")
+	if jsonFlag {
+		return json.NewEncoder(os.Stdout).Encode(response)
+	}
+
+	if response.VerificationUnavailable != "" {
+		fmt.Printf("Could not verify %s/%s: %s\n", providerID, accountID, response.VerificationUnavailable)
+		return nil
+	}
+	if response.Validated {
+		fmt.Printf("Verified: the credential for %s on %s was confirmed by the provider.\n", accountID, providerID)
+	} else {
+		fmt.Printf("Checked: the credential for %s on %s passed the provider's declared checks.\n", accountID, providerID)
 	}
 	return nil
 }

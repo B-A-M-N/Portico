@@ -904,6 +904,9 @@ type SetupFlowDTO struct {
 	// and masking without hardcoding provider field IDs.
 	IdentityField string `json:"identity_field,omitempty"`
 	SecretField   string `json:"secret_field,omitempty"`
+	// HelpURL is the provider-declared address of its credential instructions.
+	// Empty means the provider declares none; the UI then has nothing to offer.
+	HelpURL string `json:"help_url,omitempty"`
 }
 
 // StoresAccount reports whether submitting this flow persists anything.
@@ -1186,6 +1189,19 @@ type SettingsDTO struct {
 	// connection when the client that created it goes away. The wizard
 	// hardcoded keep_alive.
 	DefaultOnDisconnect string `json:"default_on_disconnect"`
+
+	// ClientTunnelEnabled reports whether the experimental client-mediated
+	// transport is opted in. It is a settings field, not a catalog fact, so
+	// the same surface that changes it can report the change.
+	ClientTunnelEnabled bool `json:"client_tunnel_enabled"`
+	// ClientTunnelBin is the configured tunnel-client executable. Empty means
+	// the name is resolved on PATH.
+	ClientTunnelBin string `json:"client_tunnel_bin,omitempty"`
+	// ClientTunnelBinPinned reports that the executable path is fixed by an
+	// environment override, so the stored value is not in force.
+	ClientTunnelBinPinned bool `json:"client_tunnel_bin_pinned,omitempty"`
+	// ClientTunnelBinPinnedBy names the overriding environment variable.
+	ClientTunnelBinPinnedBy string `json:"client_tunnel_bin_pinned_by,omitempty"`
 }
 
 // SettingsRequest changes operational settings.
@@ -1197,6 +1213,8 @@ type SettingsRequest struct {
 	LaunchMode          *string `json:"launch_mode,omitempty"`
 	DefaultAutoStart    *bool   `json:"default_auto_start,omitempty"`
 	DefaultOnDisconnect *string `json:"default_on_disconnect,omitempty"`
+	ClientTunnelEnabled *bool   `json:"client_tunnel_enabled,omitempty"`
+	ClientTunnelBin     *string `json:"client_tunnel_bin,omitempty"`
 }
 
 // ProviderReadinessDTO is one provider's position, with the credential sources

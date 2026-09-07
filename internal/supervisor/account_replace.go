@@ -64,6 +64,12 @@ func (h *supervisorHandler) HandleReplaceProviderAccountCredential(
 	updated.Status = core.AccountPending
 	if result.validated {
 		updated.Status = core.AccountAuthenticated
+		// Same rule as re-verification: a local shape check cannot produce an
+		// authenticated account, so the replacement of a provisional account
+		// stays provisional rather than being recorded as provider-confirmed.
+		if account.Status == core.AccountProvisional && h.sup.verifierIsLocalShape(providerID) {
+			updated.Status = core.AccountProvisional
+		}
 		resp.Validated = true
 	}
 	if result.unavailable != "" {

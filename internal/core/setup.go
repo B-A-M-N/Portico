@@ -76,6 +76,11 @@ type SetupFlow struct {
 	// CapabilityNotes explain what becomes available at each level of
 	// configuration, so a user can decide how far to go.
 	CapabilityNotes []string
+	// HelpURL points at the provider's own instructions for obtaining the
+	// credential, declared by the provider rather than hardcoded in any UI.
+	// The UI should offer to open it in a browser and must fall back to
+	// printing it when no browser is available.
+	HelpURL string
 }
 
 // StoresAccount reports whether submitting this flow persists anything.

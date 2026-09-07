@@ -1,4 +1,4 @@
-// Package openaitunnel implements core.Provider for OpenAI's Secure MCP Tunnel.
+// Package clienttunnel implements core.Provider for OpenAI's Secure MCP Tunnel.
 //
 // The tunnel is client-mediated: a local `tunnel-client` binary opens an
 // outbound HTTPS connection to OpenAI, receives MCP requests, forwards them to
@@ -10,7 +10,7 @@
 // OpenAI's published documentation. Behaviour that could not be verified from
 // documentation is deliberately absent rather than stubbed; see
 // docs/CLIENT_TUNNEL_DESIGN.md.
-package openaitunnel
+package clienttunnel
 
 import (
 	"context"
@@ -73,6 +73,12 @@ type Provider struct {
 	// one another's endpoints.
 	healthMu    sync.Mutex
 	healthFiles map[core.ConnectionID]string
+	// refusalMu guards refusalFiles. Each connection's client writes its own
+	// stderr capture, which is where the control plane's credential refusals
+	// are recorded. The client answers /readyz 200 while refusing its key, so
+	// the log — not the health endpoint — is the credential's verdict.
+	refusalMu    sync.Mutex
+	refusalFiles map[core.ConnectionID]string
 	// lookPath is injectable so tests do not depend on the binary being
 	// installed on the machine running them.
 	lookPath func(string) (string, error)
@@ -112,6 +118,7 @@ func NewWithGateway(binPath string, procMgr core.ConnectorProcessService, gatewa
 		gateways:      gateways,
 		lookPath:      exec.LookPath,
 		healthFiles:   make(map[core.ConnectionID]string),
+		refusalFiles:  make(map[core.ConnectionID]string),
 	}
 	p.probe = p.httpProbe
 	return p
@@ -459,7 +466,7 @@ func (p *Provider) clientProcessSpec(step core.PlanStep) core.ProcessSpec {
 		args = append(args, "--health.url-file", urlFile)
 	}
 
-	return core.ProcessSpec{
+	spec := core.ProcessSpec{
 		Executable: p.binPath,
 		Args:       args,
 		Env:        []string{CredentialEnvVar + "=" + p.credential()},
@@ -471,6 +478,16 @@ func (p *Provider) clientProcessSpec(step core.PlanStep) core.ProcessSpec {
 		// whole chain — gateway, credential, client, /readyz.
 		Restart: core.RestartNever,
 	}
+	// The client's own log is the credential's verdict channel: it answers
+	// /readyz 200 while the control plane refuses its key, and the refusal is
+	// recorded only in its output (status_code=401, error_code=invalid_api_key).
+	// Capturing stderr per connection lets Observe read that evidence; the
+	// secret never appears there because the client redacts it, and Portico's
+	// process layer redacts again by flag name.
+	if refusalFile := step.Technical.Parameters["refusal_capture_file"]; refusalFile != "" {
+		spec.StderrPath = refusalFile
+	}
+	return spec
 }
 
 // healthDir returns the 0700 directory holding per-connection health URL
@@ -513,6 +530,68 @@ func (p *Provider) forgetHealthFile(id core.ConnectionID) {
 	if path, ok := p.healthFiles[id]; ok {
 		_ = os.Remove(path)
 		delete(p.healthFiles, id)
+	}
+}
+
+// refusalCaptureFileFor registers the per-connection stderr capture the client
+// writes alongside its health URL file, in the same 0700 directory. Refusal
+// evidence must be attributable to exactly one connection, like health state.
+func (p *Provider) refusalCaptureFileFor(id core.ConnectionID) (string, error) {
+	p.refusalMu.Lock()
+	defer p.refusalMu.Unlock()
+	if path, ok := p.refusalFiles[id]; ok {
+		_ = os.Remove(path)
+		return path, nil
+	}
+	if p.runtimeDir == "" {
+		return "", nil // capture is best-effort; without a runtime dir there is no verdict channel
+	}
+	dir := p.healthDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create tunnel-health directory: %w", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s.log", id))
+	_ = os.Remove(path)
+	p.refusalFiles[id] = path
+	return path, nil
+}
+
+// refusalEvidence reads the connection's captured client output for the
+// control plane's own credential-refusal records. Only positive refusals
+// count: a missing or unreadable log proves nothing about the credential.
+func (p *Provider) refusalEvidence(id core.ConnectionID) bool {
+	p.refusalMu.Lock()
+	path := p.refusalFiles[id]
+	p.refusalMu.Unlock()
+	if path == "" {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	// Bounded tail: refusals repeat every poll cycle, so the tail of the log
+	// is where they live. 256 KiB is far more than several poll cycles.
+	const tailLimit = 256 << 10
+	data, err := io.ReadAll(io.LimitReader(f, tailLimit))
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(data))
+	return strings.Contains(text, "invalid_api_key") ||
+		strings.Contains(text, "status_code=401")
+}
+
+// forgetRefusalCapture drops and removes the connection's stderr capture.
+// Called on stop so a stopped connection leaves no verdict channel behind and
+// a future open starts with clean evidence.
+func (p *Provider) forgetRefusalCapture(id core.ConnectionID) {
+	p.refusalMu.Lock()
+	defer p.refusalMu.Unlock()
+	if path, ok := p.refusalFiles[id]; ok {
+		_ = os.Remove(path)
+		delete(p.refusalFiles, id)
 	}
 }
 
@@ -601,6 +680,11 @@ func (p *Provider) startClient(ctx context.Context, connectionID core.Connection
 		gatewayStarted = true
 	}
 	effectiveStep.Technical.Parameters["health_url_file"] = urlFile
+	captureFile, captureErr := p.refusalCaptureFileFor(connectionID)
+	if captureErr != nil {
+		return core.StepResult{StepID: step.ID, Succeeded: false, Error: captureErr}
+	}
+	effectiveStep.Technical.Parameters["refusal_capture_file"] = captureFile
 	handle, err := p.connectorProc.Start(ctx, core.ProcessConfig{
 		ConnectionID: connectionID,
 		Spec:         p.clientProcessSpec(effectiveStep),
@@ -672,6 +756,7 @@ const clientReadyTimeout = 30 * time.Second
 
 func (p *Provider) stopClient(connectionID core.ConnectionID, step core.PlanStep) core.StepResult {
 	defer p.forgetHealthFile(connectionID)
+	defer p.forgetRefusalCapture(connectionID)
 	if p.connectorProc != nil {
 		if err := p.connectorProc.Stop(connectionID, 5*time.Second); err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}
@@ -723,6 +808,18 @@ func (p *Provider) Observe(ctx context.Context, id core.ConnectionID) (*core.Obs
 		// refused. The transport is down even though the process is not.
 		connector.Status = string(core.ConnectorStatusUnstable)
 		connector.LastError = "the tunnel client is running but not ready (control plane unreachable or credential rejected)"
+	default:
+		// A ready answer is not an accepted credential: the client answers
+		// /readyz 200 while the control plane refuses its key, and the refusal
+		// appears only in the client's own output. If that evidence says the
+		// credential was rejected, the transport is NOT healthy — reporting it
+		// as such would converge reconciliation toward a healthy-looking state
+		// over a tunnel that cannot authenticate, and the supervisor's account
+		// promotion would record a verification that never happened.
+		if p.refusalEvidence(id) {
+			connector.Status = string(core.ConnectorStatusUnstable)
+			connector.LastError = "the control plane rejected the stored credential (invalid_api_key); replace the runtime key"
+		}
 	}
 	observed.Connector = connector
 	return observed, nil

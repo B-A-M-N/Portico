@@ -45,6 +45,16 @@ const (
 	AccountPending       ProviderAccountStatus = "pending"
 	AccountExpired       ProviderAccountStatus = "expired"
 	AccountRevoked       ProviderAccountStatus = "revoked"
+	// AccountProvisional marks a credential Portico checked only for shape —
+	// not against the provider. It exists because some credentials cannot be
+	// confirmed without first using them: a client-tunnel runtime key proves
+	// itself only when the client reaches the control plane. Recording such a
+	// credential as pending would make it permanently unselectable (activation
+	// refuses pending accounts), and recording it as authenticated would claim
+	// a verification that never happened. Provisional means: usable now,
+	// authoritative verdict pending at runtime. The runtime verdict promotes
+	// it to authenticated or demotes it to pending, per connection health.
+	AccountProvisional ProviderAccountStatus = "provisional"
 )
 
 // --------------- Diagnostics types ---------------

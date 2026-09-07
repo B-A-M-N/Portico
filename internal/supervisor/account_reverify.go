@@ -63,9 +63,17 @@ func (h *supervisorHandler) HandleReverifyProviderAccount(
 	// The durable status is updated either way. An account that has stopped
 	// working must stop being selectable, and one that has started working again
 	// must become selectable without being re-entered.
+	//
+	// The pass status honors the verifier's declared strength: a local shape
+	// check never upgrades a provisional account to authenticated, because it
+	// never contacted the provider. The account stays provisional — still
+	// usable, still awaiting the runtime verdict.
 	next := core.AccountPending
 	if result.validated {
 		next = core.AccountAuthenticated
+		if account.Status == core.AccountProvisional && h.sup.verifierIsLocalShape(providerID) {
+			next = core.AccountProvisional
+		}
 	}
 	if result.unavailable != "" {
 		resp.VerificationUnavailable = result.unavailable
@@ -148,6 +156,21 @@ func (s *Supervisor) verifyAccountCredential(
 		return verificationResult{}, err
 	}
 	return verificationResult{validated: true}, nil
+}
+
+// verifierIsLocalShape reports whether the provider's declared verifier checks
+// only credential shape. Re-verification and replacement consult it so a pass
+// from a shape-only check never upgrades an account's status to authenticated.
+func (s *Supervisor) verifierIsLocalShape(providerID string) bool {
+	if s.activation == nil {
+		return false
+	}
+	def := s.activation.definitionFor(core.ProviderID(providerID))
+	if def == nil {
+		return false
+	}
+	local, ok := def.(provider.LocalShapeVerifier)
+	return ok && local.VerificationStrength() == provider.VerificationLocalShape
 }
 
 // findStoredAccount locates one account by its durable identity.

@@ -52,6 +52,15 @@ echo "Detected platform: ${GOOS}/${GOARCH}"
 
 fetch() {
   # fetch <url> <output-file>
+  # file:// URLs (contract tests, offline mirrors) go through cp; curl cannot
+  # be assumed to support them and wget's file support differs by build.
+  case "$1" in
+    file://*)
+      src="${1#file://}"
+      cp "$src" "$2"
+      return
+      ;;
+  esac
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$1" -o "$2"
   elif command -v wget >/dev/null 2>&1; then
@@ -222,26 +231,42 @@ else
   fi
   echo "Checksum verified."
 
-  # Publisher authentication: the checksums file must carry a Sigstore bundle
-  # produced by Portico's own release workflow. Without it the checksum file
-  # proves nothing beyond accidental corruption, since it comes from the same
-  # location as the archive.
-  if command -v cosign >/dev/null 2>&1; then
-    if ! cosign verify-blob \
-        --certificate-identity-regexp "^${EXPECTED_SAN}.*$" \
-        --certificate-oidc-issuer "$EXPECTED_ISSUER" \
-        --signature "${BASE_URL}/checksums.txt.sig" \
-        --certificate "${BASE_URL}/checksums.txt.pem" \
-        "${TMPDIR}/checksums.txt" >/dev/null 2>&1; then
-      echo "Error: publisher verification failed for release ${TAG}." >&2
-      echo "The checksums file is not signed by ${REPO}'s release workflow." >&2
-      exit 1
-    fi
-    echo "Publisher verified: ${REPO} release workflow."
-  else
-    echo "Warning: cosign is not installed; publisher identity was NOT verified." >&2
-    echo "Install cosign (https://docs.sigstore.dev) for authenticated installs." >&2
+  # Publisher authentication: fail closed. The checksums file must carry a
+  # Sigstore signature produced by Portico's own release workflow over the
+  # exact bytes being trusted. A missing verifier, missing evidence, or a
+  # failed verification all refuse the install — there is no production path
+  # that proceeds unverified, because checksums.txt from the same location as
+  # the archive proves nothing beyond accidental corruption.
+  SIG_PATH="${TMPDIR}/checksums.txt.sig"
+  CERT_PATH="${TMPDIR}/checksums.txt.pem"
+  echo "Downloading checksums.txt.sig..."
+  if ! fetch "${BASE_URL}/checksums.txt.sig" "$SIG_PATH"; then
+    echo "Error: checksums.txt.sig asset not found for release ${TAG}." >&2
+    echo "Refusing to install: publisher evidence is missing." >&2
+    exit 1
   fi
+  echo "Downloading checksums.txt.pem..."
+  if ! fetch "${BASE_URL}/checksums.txt.pem" "$CERT_PATH"; then
+    echo "Error: checksums.txt.pem asset not found for release ${TAG}." >&2
+    echo "Refusing to install: publisher evidence is missing." >&2
+    exit 1
+  fi
+  if ! command -v cosign >/dev/null 2>&1; then
+    echo "Error: cosign is required to verify the publisher of release ${TAG}." >&2
+    echo "Install cosign (https://docs.sigstore.dev) and retry." >&2
+    exit 1
+  fi
+  if ! cosign verify-blob \
+      --certificate-identity-regexp "^${EXPECTED_SAN}.*$" \
+      --certificate-oidc-issuer "$EXPECTED_ISSUER" \
+      --signature "$SIG_PATH" \
+      --certificate "$CERT_PATH" \
+      "${TMPDIR}/checksums.txt" >/dev/null 2>&1; then
+    echo "Error: publisher verification failed for release ${TAG}." >&2
+    echo "The checksums file is not signed by ${REPO}'s release workflow." >&2
+    exit 1
+  fi
+  echo "Publisher verified: ${REPO} release workflow."
 
   verify_archive_members "$ARCHIVE_PATH"
 

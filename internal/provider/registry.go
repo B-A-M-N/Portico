@@ -131,11 +131,14 @@ type ProviderSnapshot struct {
 // Usable reports whether an account may be selected, planned against or opened.
 //
 // The check is an allowlist. "authenticated" is an account whose credential was
-// confirmed against the provider; "configured" is the registry's own marker for
-// an adapter that reported its own accounts, which exist only because a working
-// credential built that adapter. Every other value — pending, expired, revoked,
-// or anything unrecognised — is not usable, so a status Portico does not
-// understand fails closed rather than being presented as working.
+// confirmed against the provider; "provisional" is one whose shape was checked
+// locally and whose authority is proven (or refuted) at first use — a
+// client-tunnel runtime key, which no local check can authenticate;
+// "configured" is the registry's own marker for an adapter that reported its
+// own accounts, which exist only because a working credential built that
+// adapter. Every other value — pending, expired, revoked, or anything
+// unrecognised — is not usable, so a status Portico does not understand fails
+// closed rather than being presented as working.
 func (a AccountInfo) Usable() bool {
 	// A reason recorded at activation time overrides the durable status: an
 	// account can be authenticated and still unusable, because its credential
@@ -144,7 +147,7 @@ func (a AccountInfo) Usable() bool {
 		return false
 	}
 	switch a.Status {
-	case string(core.AccountAuthenticated), accountStatusConfigured:
+	case string(core.AccountAuthenticated), string(core.AccountProvisional), accountStatusConfigured:
 		return true
 	}
 	return false

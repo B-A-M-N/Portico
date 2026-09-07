@@ -156,6 +156,38 @@ func (e *Engine) checkConnector(ctx context.Context, profile *core.ConnectionPro
 		IsSafe:      true,
 	}
 
+	// A credential the control plane refused is not a connector defect: the
+	// process is alive, its transport is up, and restarting it cannot help.
+	// The finding must point at the credential and its targeted repair, so the
+	// user replaces the key instead of restarting a healthy client forever.
+	if e.deps.Provider != nil {
+		if observed, err := e.deps.Provider.ObserveProvider(ctx, profile.ID); err == nil &&
+			observed != nil && observed.Connector != nil && observed.Connector.LastError != "" {
+			detail := strings.ToLower(observed.Connector.LastError)
+			if strings.Contains(detail, "invalid_api_key") || strings.Contains(detail, "rejected the stored credential") {
+				return &core.DiagnosticFinding{
+					ID:           core.FindingID(fmt.Sprintf("find-%s-credential", profile.ID)),
+					ConnectionID: profile.ID,
+					Segment:      core.SegmentConnector,
+					Severity:     core.SeverityError,
+					Summary:      "The control plane rejected the stored credential",
+					Explanation:  "The tunnel client is running, but the control plane refuses its API key (invalid_api_key). The connection cannot authenticate until the key is replaced; restarting the client will not change the answer.",
+					Evidence: []core.Evidence{
+						{Type: "control_plane_refusal", Source: "tunnel client", Message: observed.Connector.LastError},
+					},
+					RepairOptions: []core.RepairOption{
+						{
+							Summary:     "Replace the runtime key",
+							Explanation: "Store a new runtime key for this provider. The client picks it up on its next start; the tunnel ID and local service are unchanged.",
+							IsSafe:      true,
+						},
+					},
+					ObservedAt: time.Now().UTC(),
+				}
+			}
+		}
+	}
+
 	switch status {
 	case core.ConnectorStatusCrashed:
 		return &core.DiagnosticFinding{
