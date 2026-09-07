@@ -2,7 +2,14 @@
 
 **Baseline:** `da0667e` (`feat: harden Portico connection lifecycle`)
 
-**Last reviewed against:** working tree, 2026-08-25. Sections marked Done below were
+**Last reviewed against:** working tree, 2026-09-07. The release-audit P0s
+(wizard→provider-setup handoff, setup/Help navigation, canonical Staticcheck
+gate, prior-release upgrade selection) are fixed as of `bebd0f6`/`696d685`; the
+action-authority footers (`c80ef37`) and the editable tunnel-client path
+including the config-clear persistence defect (`ae3b2e3`) have also landed.
+Still open from that audit: provider setup semantics on the DTO (CanSetup /
+SetupKind), potential-vs-current capability guidance, and the verification
+matrices (mutation coverage, six terminal sizes, secret proof). Sections marked Done below were
 verified against the tests named in them at this review; where a claim is only partly
 true, it says which part. Several entries were stale before that review — rotate-in-place and the
 429/5xx/malformed/timeout coverage were both listed as open after they had landed — so
