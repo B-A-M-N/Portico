@@ -3443,7 +3443,14 @@ func (m *Model) renderProviders() string {
 				b.WriteString("\n")
 			}
 			renderCapability(p.Capabilities.CustomHostnames, "Permanent hostnames")
-			renderCapability(len(p.Capabilities.ProtectionModes) > 0, "Access protection")
+			// Protection is rendered from its classification, not from the
+			// mode list's length: a local forward, a private network, an open
+			// public tunnel and a policy-applying provider are four different
+			// truths, and one of them used to be written as "account setup
+			// required" for all of them.
+			protection := protectionSemanticsFor(p)
+			b.WriteString(m.theme.Style(protection.Style).Render("    " + protection.Symbol + " " + protection.Text))
+			b.WriteString("\n")
 		}
 
 		// Configured accounts, with the cursor visible. The screen offered
