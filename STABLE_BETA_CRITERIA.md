@@ -6,14 +6,25 @@ matrices are evidence indexes; and [`docs/REMAINING_WORK.md`](docs/REMAINING_WOR
 is only the residual backlog. None of those documents is a second release
 checklist.
 
-**Review basis:** current working tree, 2026-08-26. A checkbox is checked only
+**Review basis:** current working tree, 2026-09-07. A checkbox is checked only
 when the cited evidence was run against the same revision being released.
 Source inspection, a historical pass, or a test that cannot currently compile
 is not a stable-beta pass.
 
+**Gate evidence, revision `e882a905649af04f8bc4ac5f0725f2aede27f231`
+(branch `remediation/phase0-connection-model`), recorded 2026-09-07:**
+Go `go1.25.13` linux/amd64. `make release-check` passed (format, build,
+vet, pinned staticcheck 2025.1.1, `go test ./...`, `make acceptance`
+(147 matrix commands, none missing or failing), `make artifact-check`,
+`make installer-contract`, `make release-tag-contract`, `make tui-e2e`
+(compiled-binary PTY suite), `govulncheck@v1.1.4` (no reachable
+vulnerabilities), `go mod tidy -diff` clean). `go test -race ./...`
+passed on this revision. This evidence is revision-specific: a new
+candidate re-runs it and re-records it here.
+
 **Current decision:** **NOT READY — external qualification evidence is
-incomplete.** The current working-tree gate passed after the final hardening
-edits. Remaining evidence includes the controlled live Cloudflare
+incomplete.** The current working-tree gate passed after the second-audit
+blockers were fixed. Remaining evidence includes the controlled live Cloudflare
 qualification with its `cloudflared` version recorded, a tagged candidate run
 through the CI release workflow (both-architecture build, signed release
 assets, clean-user smoke under root, and prior-version installer upgrade), and

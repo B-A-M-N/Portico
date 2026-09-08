@@ -8,10 +8,17 @@ gate, prior-release upgrade selection) are fixed as of `bebd0f6`/`696d685`; the
 action-authority footers (`c80ef37`), the editable tunnel-client path including
 the config-clear persistence defect (`ae3b2e3`), provider setup semantics on
 the DTO (`9561493`), and declared potential capabilities with potential-filtered
-wizard advice (`ca4f434`) have also landed. Still open from that audit: the
-verification matrices (mutation coverage for account lifecycle, edit-apply,
-repair-apply, settings-restart; six terminal sizes across critical forms;
-secret proof) and the live Cloudflare TUI qualification. Sections marked Done below were
+wizard advice (`ca4f434`) have also landed. The second audit's five release
+blockers are fixed as of `5b6ceee` (account-removal pending state, PTY-safe TUI
+logging, race-free E2E waits), `cb5a574` (one meaning per key —
+`ActionSet.ValidateUniqueBindings` and per-state coverage), `3a9d3fe` (semantic
+protection classification from the capability DTO), and `e882a90` (one
+cell-aware wrap facility; six-size sentence-reconstruction tests for Home,
+Providers and the wizard). Still open: the physical mutation matrix
+(edit→apply→restart→verify, repair→apply with independent proof, credential and
+key rotation→restart), SSE reconnect/resync PTY evidence, `/proc` canary secret
+proof, the true TUI-driven Cloudflare live qualification, and the Cloudflare
+zone model moved from account-scoped to connection-scoped. Sections marked Done below were
 verified against the tests named in them at this review; where a claim is only partly
 true, it says which part. Several entries were stale before that review — rotate-in-place and the
 429/5xx/malformed/timeout coverage were both listed as open after they had landed — so
