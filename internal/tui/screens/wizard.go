@@ -1761,6 +1761,19 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 			Mode:             s.ExposureMode,
 			RequestedAddress: s.Hostname,
 		}
+		// A permanent Cloudflare connection carries its own DNS zone on the
+		// connection (finding 7) rather than inheriting a zone bound to the
+		// account. Selecting it here means a later account-default or
+		// credential change cannot silently retarget this connection. A
+		// temporary connection never carries a zone.
+		if s.ExposureMode == "permanent_public" && s.Provider == "cloudflare" {
+			if zoneID := m.selectedAccountZone(); zoneID != "" {
+				if req.Provider.Options == nil {
+					req.Provider.Options = map[string]string{}
+				}
+				req.Provider.Options["zone_id"] = zoneID
+			}
+		}
 		req.Protection = ipc.ProtectionDTO{
 			Kind:           s.Protection,
 			AllowedEmails:  append([]string(nil), s.AllowedEmails...),
@@ -2604,6 +2617,20 @@ func (m *WizardModel) hostnameChoiceRows() []string {
 	}
 	rows = append(rows, "Type a different hostname")
 	return rows
+}
+
+// selectedAccountZone returns the DNS zone bound to the currently selected
+// account of the selected provider, empty when the selection or account has no
+// zone. It is used to stamp a permanent Cloudflare connection with its own
+// zone (finding 7), so the connection stops inheriting — and later stops being
+// retargeted by — the account-default zone.
+func (m *WizardModel) selectedAccountZone() string {
+	for _, account := range m.accountsFor(m.state.Provider) {
+		if account.ID == m.state.AccountID {
+			return account.ZoneID
+		}
+	}
+	return ""
 }
 
 // hostnameRowValue maps a choice row back to the hostname it stores; the

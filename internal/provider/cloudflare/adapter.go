@@ -481,7 +481,17 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 			if profile.GetExposure().RequestedAddress == "" {
 				return nil, fmt.Errorf("permanent exposure requires a requested hostname")
 			}
-			if p.zoneID == "" {
+			// The zone is a connection property first: a connection bears its
+			// own `Options["zone_id"]` when the wizard selected a zone for it
+			// (finding 7), and otherwise falls back to the account-default zone
+			// the adapter was built with. The connection's choice must win, so
+			// a permanent connection on an account whose default is empty (a
+			// Quick-Tunnel-only account) can still plan against its own zone.
+			zoneID := strings.TrimSpace(profile.GetProvider().Options["zone_id"])
+			if zoneID == "" {
+				zoneID = p.zoneID
+			}
+			if zoneID == "" {
 				return nil, fmt.Errorf("permanent exposure requires a configured Cloudflare zone")
 			}
 
@@ -505,7 +515,8 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 
 			plan.Steps = append(plan.Steps,
 				core.PlanStep{ID: "cf-validate", Kind: core.StepValidateAccount, Summary: "Validate Cloudflare account and zone",
-					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "validate_account"}},
+					Technical: core.TechnicalOperation{Provider: "cloudflare", Type: "validate_account",
+						Parameters: map[string]string{"zone_id": zoneID}}},
 				// The origin is probed before the first provider mutation.
 				// Tunnels, DNS records and Access policies are externally
 				// visible and survive a failed operation, so none of them may
@@ -545,7 +556,7 @@ func (p *Provider) Plan(ctx context.Context, desired core.DesiredConnection) (*c
 					// DNS destruction belongs to StepCreateDNSRecord.
 				},
 				core.PlanStep{ID: "cf-dns", Kind: core.StepCreateDNSRecord, Summary: fmt.Sprintf("Create DNS CNAME for %s", hostname),
-					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "create_dns", Parameters: map[string]string{"hostname": hostname}},
+					Technical:   core.TechnicalOperation{Provider: "cloudflare", Type: "create_dns", Parameters: map[string]string{"hostname": hostname, "zone_id": zoneID}},
 					Destructive: false, Irreversible: false,
 					Ownership: core.OwnershipManaged,
 					Compensation: &core.CompensationStep{
@@ -813,7 +824,15 @@ func (p *Provider) ObserveWithResources(ctx context.Context, id core.ConnectionI
 				status.Status, status.Detail = core.ObservationTransient, "DNS API unavailable (quick-only provider)"
 				break
 			}
-			state, err := p.dns.GetRecord(ctx, p.zoneID, res.ExternalID)
+			// Reconcile against the zone the record was created in (carried in
+			// the durable resource metadata, finding 7), not the account
+			// default, so a connection in a non-default zone stays correct
+			// across a supervisor restart.
+			zone := res.Metadata["zone_id"]
+			if zone == "" {
+				zone = p.zoneID
+			}
+			state, err := p.dns.GetRecord(ctx, zone, res.ExternalID)
 			switch {
 			case err != nil:
 				status.Status, status.Detail = classifyObservationError(err)
@@ -1105,6 +1124,18 @@ func verifyProcessIdentity(handle core.ConnectorHandle) error {
 	return nil
 }
 
+// stepZone resolves the zone a DNS step targets. The plan step carries its own
+// `zone_id` from the connection's selected zone (finding 7); a step planned
+// before connections carried a zone has none, so it falls back to the
+// adapter's account-default zone — which is exactly the legacy behavior, so no
+// migration is required.
+func stepZone(p *Provider, step core.PlanStep) string {
+	if z := strings.TrimSpace(step.Technical.Parameters["zone_id"]); z != "" {
+		return z
+	}
+	return p.zoneID
+}
+
 // ExecuteStep executes a single plan step for Cloudflare.
 func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.ConnectionID, step core.PlanStep) (core.StepResult, error) {
 	p.mu.Lock()
@@ -1227,7 +1258,8 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		if tunnelID == "" {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("no tunnel available")}, nil
 		}
-		dnsID, err := p.dns.CreateCNAME(ctx, p.zoneID, hostname, tunnelID)
+		zoneID := stepZone(p, step)
+		dnsID, err := p.dns.CreateCNAME(ctx, zoneID, hostname, tunnelID)
 		if err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
 		}
@@ -1243,6 +1275,10 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 				ExternalID:   dnsID,
 				ProviderID:   "cloudflare",
 				Ownership:    core.OwnershipManaged,
+				// The zone this record lives in must survive so post-restart
+				// observation reconciles against the connection's zone, not the
+				// account default.
+				Metadata: map[string]string{"zone_id": zoneID},
 			}},
 		}, nil
 
@@ -1361,10 +1397,11 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 		dnsID := step.Technical.ResourceID
 		hostname := step.Technical.Parameters["hostname"]
 		tunnelID := step.Technical.Parameters["tunnel_id"]
+		zoneID := stepZone(p, step)
 		if dnsID == "" || hostname == "" || tunnelID == "" {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("DNS update requires exact record ID, hostname, and tunnel ID")}, nil
 		}
-		if err := p.dns.UpdateCNAME(ctx, p.zoneID, dnsID, hostname, tunnelID); err != nil {
+		if err := p.dns.UpdateCNAME(ctx, zoneID, dnsID, hostname, tunnelID); err != nil {
 			return core.StepResult{StepID: step.ID, Succeeded: false, Error: err}, nil
 		}
 		p.mu.Lock()
@@ -1487,7 +1524,7 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			}
 		}
 
-		if hostname != "" && p.zoneID != "" {
+		if hostname != "" && stepZone(p, step) != "" {
 			if err := p.verifyDNSResolutionWithRetry(ctx, hostname); err != nil {
 				return core.StepResult{StepID: step.ID, Succeeded: false, Error: fmt.Errorf("endpoint not reachable: DNS verification failed: %w", err)}, nil
 			}
@@ -1566,7 +1603,7 @@ func (p *Provider) ExecuteStep(ctx context.Context, connectionID core.Connection
 			p.mu.RUnlock()
 		}
 		if dnsID != "" {
-			err := p.dns.DeleteRecord(ctx, p.zoneID, dnsID)
+			err := p.dns.DeleteRecord(ctx, stepZone(p, step), dnsID)
 			if err == nil {
 				p.mu.Lock()
 				if conn.dnsID == dnsID {
