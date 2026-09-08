@@ -1133,6 +1133,15 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case screens.WizardZoneMsg:
+		// The wizard lists the DNS zones a permanent Cloudflare account can
+		// serve, so each connection selects the zone it targets instead of
+		// inheriting the account-default one (finding 7).
+		if m.wizard != nil {
+			m.wizard.HandleZones(msg)
+		}
+		return m, nil
+
 	case screens.ConnectionCreatedMsg:
 		if m.wizard != nil {
 			cmd := m.wizard.HandleCreated(msg)

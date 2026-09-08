@@ -194,6 +194,11 @@ func (h *verticalHandler) HandleReverifyProviderAccount(providerID, accountID st
 	return nil, nil
 }
 
+func (h *verticalHandler) HandleListProviderAccountZones(providerID, accountID string) (
+	*ipc.ListProviderAccountZonesResponse, error) {
+	return nil, nil
+}
+
 func (h *verticalHandler) HandleTelemetry(id string) (*ipc.TelemetryDTO, error) {
 	return nil, nil
 }

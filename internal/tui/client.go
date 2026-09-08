@@ -30,6 +30,10 @@ type SupervisorClient interface {
 	// without exposing or changing it.
 	ReverifyProviderAccount(ctx context.Context, providerID, accountID string) (
 		*ipc.ReverifyProviderAccountResponse, error)
+	// ListProviderAccountZones returns every zone an account's stored
+	// credential can see, for the per-connection Cloudflare zone picker.
+	ListProviderAccountZones(ctx context.Context, providerID, accountID string) (
+		*ipc.ListProviderAccountZonesResponse, error)
 	// ReplaceProviderAccountCredential rotates the secret behind an existing
 	// account, keeping its identity so connections using it keep working.
 	ReplaceProviderAccountCredential(ctx context.Context, providerID, accountID, credential string) (

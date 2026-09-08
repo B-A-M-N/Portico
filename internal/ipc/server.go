@@ -78,6 +78,10 @@ type RequestHandler interface {
 	HandleRemoveProviderAccount(providerID, accountID string, req RemoveProviderAccountRequest) (*RemoveProviderAccountResponse, error)
 	HandleAccountRemovalPreview(providerID, accountID string) (*AccountRemovalPreviewDTO, error)
 	HandleProviderSetupFlow(id string) (*SetupFlowDTO, error)
+	// HandleListProviderAccountZones returns every DNS zone an account's stored
+	// credential can see, so the wizard can offer a per-connection zone for a
+	// permanent Cloudflare connection rather than only the account default.
+	HandleListProviderAccountZones(providerID, accountID string) (*ListProviderAccountZonesResponse, error)
 	HandleGetOperation(id string) (*OperationDTO, error)
 	HandleGetOperationEvents(id string) ([]EventDTO, error)
 	HandleOperationHistory() (*OperationHistoryDTO, error)
@@ -874,6 +878,27 @@ func (s *Server) handleProviderByID(w http.ResponseWriter, r *http.Request) {
 		response, err := s.handler.HandleReverifyProviderAccount(id, parts[2], req)
 		if err != nil {
 			writeHandlerError(w, "PROV-010", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	// Zone listing: GET /v1/providers/{id}/accounts/{accountID}/zones
+	// Returns every DNS zone the account's stored credential can see, so the
+	// wizard can offer a per-connection zone for a permanent Cloudflare
+	// connection rather than only the account default. Read-only, never
+	// exposes the credential.
+	if len(parts) >= 4 && action == "accounts" && parts[2] != "" && parts[3] == "zones" {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "PROV-002", "method not allowed")
+			return
+		}
+		response, err := s.handler.HandleListProviderAccountZones(id, parts[2])
+		if err != nil {
+			writeHandlerError(w, "PROV-012", err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

@@ -52,6 +52,9 @@ func (NullHandler) HandleRemoveProviderAccount(string, string, RemoveProviderAcc
 	return nil, nil
 }
 func (NullHandler) HandleProviderSetupFlow(string) (*SetupFlowDTO, error)         { return nil, nil }
+func (NullHandler) HandleListProviderAccountZones(string, string) (*ListProviderAccountZonesResponse, error) {
+	return nil, nil
+}
 func (NullHandler) HandleGetOperation(string) (*OperationDTO, error)              { return nil, nil }
 func (NullHandler) HandleGetOperationEvents(string) ([]EventDTO, error)           { return nil, nil }
 func (NullHandler) HandleOperationHistory() (*OperationHistoryDTO, error)         { return nil, nil }

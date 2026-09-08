@@ -102,6 +102,9 @@ func (nullHandler) HandleReadiness() (*ReadinessDTO, error) {
 func (nullHandler) HandleProviderSetupFlow(id string) (*SetupFlowDTO, error) {
 	return &SetupFlowDTO{ProviderID: id}, nil
 }
+func (nullHandler) HandleListProviderAccountZones(string, string) (*ListProviderAccountZonesResponse, error) {
+	return &ListProviderAccountZonesResponse{}, nil
+}
 func (nullHandler) HandleSetLaunchMode(mode string) (*LaunchModeDTO, error) {
 	return &LaunchModeDTO{Mode: mode}, nil
 }

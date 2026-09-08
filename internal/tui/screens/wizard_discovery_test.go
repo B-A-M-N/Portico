@@ -61,6 +61,9 @@ func (nullCreator) ApplyPlanWithIdempotency(context.Context, string, string) (*i
 func (nullCreator) GetOperation(context.Context, string) (*ipc.OperationDTO, error) {
 	return &ipc.OperationDTO{ID: "op-1", State: "succeeded"}, nil
 }
+func (nullCreator) ListProviderAccountZones(context.Context, string, string) (*ipc.ListProviderAccountZonesResponse, error) {
+	return &ipc.ListProviderAccountZonesResponse{}, nil
+}
 
 // discoveredServices are two plausible scan results, one identified and one
 // not. The grades are the discovery engine's own (internal/discovery); a test

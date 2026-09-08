@@ -446,6 +446,10 @@ type fakeWizardClient struct {
 	recommendErr         error
 	recommendCalls       int
 	lastRecommendRequest ipc.ProviderRecommendationRequest
+
+	zones        []ipc.ZoneDTO
+	zonesErr     error
+	zoneListCalls int
 }
 
 func (f *fakeWizardClient) CreateConnection(ctx context.Context, req ipc.CreateConnectionRequest) (*ipc.ConnectionDTO, error) {
@@ -483,6 +487,14 @@ func (f *fakeWizardClient) GetOperation(ctx context.Context, operationID string)
 		return nil, f.getOpErr
 	}
 	return f.operation, nil
+}
+
+func (f *fakeWizardClient) ListProviderAccountZones(_ context.Context, _, _ string) (*ipc.ListProviderAccountZonesResponse, error) {
+	f.zoneListCalls++
+	if f.zonesErr != nil {
+		return nil, f.zonesErr
+	}
+	return &ipc.ListProviderAccountZonesResponse{Zones: f.zones}, nil
 }
 
 func TestWizardOpenAfterCreateRequestsPlan(t *testing.T) {

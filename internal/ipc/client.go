@@ -645,6 +645,25 @@ func (c *Client) RemoveProviderAccount(ctx context.Context, providerID, accountI
 
 // ReverifyProviderAccount asks the supervisor to verify an existing account's
 // credential against the provider without changing it.
+// ListProviderAccountZones returns every DNS zone an account's stored
+// credential can see. The wizard uses it to offer a per-connection zone for a
+// permanent Cloudflare connection rather than only the account default.
+func (c *Client) ListProviderAccountZones(ctx context.Context, providerID, accountID string) (*ListProviderAccountZonesResponse, error) {
+	resp, err := c.doRequest(ctx, "GET", "/v1/providers/"+url.PathEscape(providerID)+"/accounts/"+url.PathEscape(accountID)+"/zones", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+	var result ListProviderAccountZonesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 func (c *Client) ReverifyProviderAccount(ctx context.Context, providerID, accountID string) (*ReverifyProviderAccountResponse, error) {
 	body, err := json.Marshal(ReverifyProviderAccountRequest{AccountID: accountID})
 	if err != nil {

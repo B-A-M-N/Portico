@@ -29,6 +29,11 @@ type stubValidator struct {
 	// credential is one that can print it in a failure message.
 	seenLen int
 	calls   int
+	// zones is what ListZones returns, and zoneCalls records how often the
+	// supervisor asked for the account's zone list.
+	zones      []ZoneSummary
+	zoneCalls  int
+	zonesErr   error
 }
 
 func (v *stubValidator) Validate(_ context.Context, _, _, credential string) (*AccountValidation, error) {
@@ -44,6 +49,16 @@ func (v *stubValidator) Validate(_ context.Context, _, _, credential string) (*A
 // stub do not exercise zone verification, so it verifies nothing.
 func (v *stubValidator) VerifyZone(_ context.Context, _, _ string) ([]ZoneSummary, error) {
 	return nil, nil
+}
+
+// ListZones satisfies the widened AccountValidator interface.
+func (v *stubValidator) ListZones(ctx context.Context, credential string) ([]ZoneSummary, error) {
+	v.zoneCalls++
+	v.seenLen = len(credential)
+	if v.zonesErr != nil {
+		return nil, v.zonesErr
+	}
+	return v.zones, nil
 }
 
 // storedAccount puts one account and its credential in the store.

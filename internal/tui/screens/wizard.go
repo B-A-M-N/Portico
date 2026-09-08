@@ -33,6 +33,10 @@ type ConnectionCreator interface {
 	ApplyPlan(ctx context.Context, planID string) (*ipc.OperationDTO, error)
 	ApplyPlanWithIdempotency(ctx context.Context, planID, idempotencyKey string) (*ipc.OperationDTO, error)
 	GetOperation(ctx context.Context, operationID string) (*ipc.OperationDTO, error)
+	// ListProviderAccountZones returns every zone an account's stored
+	// credential can see, so the wizard can offer a per-connection zone for a
+	// permanent Cloudflare connection rather than only the account default.
+	ListProviderAccountZones(ctx context.Context, providerID, accountID string) (*ipc.ListProviderAccountZonesResponse, error)
 }
 
 // ConnectionCreatedMsg is delivered when the async create command finishes.
@@ -121,6 +125,17 @@ type WizardModel struct {
 	discovered      []ipc.DiscoveredServiceDTO
 	discoverPending bool
 	discoverErr     error
+
+	// zones holds the DNS zones a permanent Cloudflare account's credential can
+	// see, loaded asynchronously when the hostname step opens (finding 7). Each
+	// connection selects its own zone rather than inheriting — and later being
+	// retargeted by — the account-default zone. nil means not asked yet; empty
+	// slice means asked and found none. zoneSelected is the zone the user chose
+	// for this connection; dropped when the connection is not permanent-CF.
+	zones         []ipc.ZoneDTO
+	zonesPending  bool
+	zonesErr      error
+	zoneSelected  *ipc.ZoneDTO
 
 	// streamConnected reports whether the root model's event stream is live.
 	// When it is, operation progress arrives as events and polling is only a
@@ -1234,10 +1249,15 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				m.state.Step = WizardStepHostname
 				m.hostnameManual = false
 				m.selected = 0
+				m.zoneSelected = nil
 				if zoneSuggestions(m.hostnameChoiceRows()) > 0 {
 					m.setInput("")
 				} else {
 					m.setInput(m.state.Hostname)
+				}
+				cmd := m.zoneCmd()
+				if cmd != nil {
+					return cmd
 				}
 			} else {
 				m.state.Hostname = ""
@@ -1264,6 +1284,7 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				}
 				m.err = nil
 				m.state.Hostname = strings.TrimSpace(m.inputValue())
+				m.zoneSelected = nil
 				m.state.Step = WizardStepProtection
 				m.selected = firstAvailable(m.protectionChoices())
 			default:
@@ -1288,6 +1309,9 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 				}
 				m.err = nil
 				m.state.Hostname = strings.TrimSpace(m.inputValue())
+				// A hostname typed by hand may end in any zone; it carries no
+				// connection-scoped zone selection of its own.
+				m.zoneSelected = nil
 				m.state.Step = WizardStepProtection
 				m.selected = firstAvailable(m.protectionChoices())
 				return nil
@@ -1306,6 +1330,10 @@ func (m *WizardModel) HandleKey(key string) tea.Cmd {
 			}
 			m.err = nil
 			m.state.Hostname = value
+			// Recording the zone is what makes the selection connection-scoped
+			// (finding 7): the chosen zone travels on the connection, so a later
+			// account-default or credential change cannot silently retarget it.
+			m.zoneSelected = m.zoneForRow(value)
 			m.state.Step = WizardStepProtection
 			m.selected = firstAvailable(m.protectionChoices())
 		case "up", "k":
@@ -1767,7 +1795,17 @@ func (m *WizardModel) buildRequest() (ipc.CreateConnectionRequest, error) {
 		// credential change cannot silently retarget this connection. A
 		// temporary connection never carries a zone.
 		if s.ExposureMode == "permanent_public" && s.Provider == "cloudflare" {
-			if zoneID := m.selectedAccountZone(); zoneID != "" {
+			// Prefer the zone the user explicitly chose for this connection
+			// (finding 7); fall back to the account-default zone only when no
+			// per-connection selection was made.
+			zoneID := ""
+			if m.zoneSelected != nil {
+				zoneID = m.zoneSelected.ID
+			}
+			if zoneID == "" {
+				zoneID = m.selectedAccountZone()
+			}
+			if zoneID != "" {
 				if req.Provider.Options == nil {
 					req.Provider.Options = map[string]string{}
 				}
@@ -2046,6 +2084,11 @@ func (m *WizardModel) View() string {
 	case WizardStepExposure:
 		return m.renderExposure()
 	case WizardStepHostname:
+		if m.zonesPending {
+			width := m.contentWidth()
+			lines := WrapText("Looking up the DNS zones this account can use", width)
+			return strings.Join(lines, "\n")
+		}
 		if m.hostnameManual || len(m.hostnameChoiceRows()) <= 1 {
 			return m.withError(m.renderField("Enter the hostname to use:"))
 		}
@@ -2599,16 +2642,25 @@ func (m *WizardModel) outcomeMenuLength() int {
 	return count
 }
 
-// hostnameChoiceRows returns the hostname suggestions: one per account zone
-// bound to the selected provider, spelled `<connection>.<zone>`, plus the
-// manual-entry row. When the provider has no zone, the wizard falls back to
-// the text field alone.
+// hostnameChoiceRows returns the hostname suggestions: `<connection>.<zone>`
+// per zone the connection can target, plus the manual-entry row. When the
+// wizard has loaded the account's zone list (finding 7) the rows are all the
+// zones the credential can see, the account's default first; otherwise they
+// fall back to the single zone bound to the selected account. When nothing is
+// known yet it returns nil, and the step renders as a text field until the
+// picker loads.
 func (m *WizardModel) hostnameChoiceRows() []string {
-	rows := make([]string, 0)
-	name := m.state.Name
-	if name == "" {
-		name = "app"
+	if len(m.zones) > 0 {
+		rows := make([]string, 0, len(m.zones)+1)
+		name := m.hostnamePrefix()
+		for _, z := range m.zones {
+			rows = append(rows, name+"."+z.Name)
+		}
+		rows = append(rows, "Type a different hostname")
+		return rows
 	}
+	rows := make([]string, 0)
+	name := m.hostnamePrefix()
 	for _, account := range m.accountsFor(m.state.Provider) {
 		if account.ZoneName == "" {
 			continue

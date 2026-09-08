@@ -390,6 +390,16 @@ type ZoneDTO struct {
 	Name string `json:"name"`
 }
 
+// ListProviderAccountZonesResponse is every zone a provider account's stored
+// credential can see. The wizard uses it to offer a per-connection zone for a
+// permanent Cloudflare connection (finding 7); without it a connection cannot
+// target any zone but the account's single selected default.
+type ListProviderAccountZonesResponse struct {
+	ProviderID string    `json:"provider_id"`
+	AccountID  string    `json:"account_id"`
+	Zones      []ZoneDTO `json:"zones"`
+}
+
 // SelectProviderAccountZoneRequest selects a verified provider zone for an
 // account without carrying the account credential again.
 type SelectProviderAccountZoneRequest struct {

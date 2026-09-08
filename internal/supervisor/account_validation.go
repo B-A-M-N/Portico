@@ -57,6 +57,11 @@ type AccountValidator interface {
 	// ID. It is separate from Validate because zones are optional for tunnels
 	// but must be proven exact before any DNS capability is granted.
 	VerifyZone(ctx context.Context, credential, zoneID string) ([]ZoneSummary, error)
+	// ListZones returns every zone the credential can see. The wizard uses it
+	// to offer a per-connection zone choice for a permanent Cloudflare
+	// connection (finding 7), which the account's single selected default zone
+	// alone cannot express.
+	ListZones(ctx context.Context, credential string) ([]ZoneSummary, error)
 }
 
 // cloudflareAccountValidator validates against the real Cloudflare API using
@@ -116,6 +121,16 @@ func (devAccountValidator) VerifyZone(_ context.Context, credential, zoneID stri
 		return nil, errors.New("a zone ID is required")
 	}
 	return []ZoneSummary{{ID: zoneID, Name: "dev.example"}}, nil
+}
+
+func (devAccountValidator) ListZones(_ context.Context, credential string) ([]ZoneSummary, error) {
+	if strings.TrimSpace(credential) == "" {
+		return nil, errors.New("a Cloudflare API token is required")
+	}
+	return []ZoneSummary{
+		{ID: "zone-default", Name: "default.dev.example"},
+		{ID: "zone-other", Name: "other.dev.example"},
+	}, nil
 }
 
 func (cloudflareAccountValidator) Validate(ctx context.Context, providerID, accountID, credential string) (*AccountValidation, error) {
@@ -200,4 +215,31 @@ func summarizeZones(zones []cf.Zone) []ZoneSummary {
 		out = append(out, ZoneSummary{ID: z.ID, Name: z.Name})
 	}
 	return out
+}
+
+// ListZones returns every zone the credential can see, so the wizard can offer
+// a per-connection zone for a permanent Cloudflare connection. VerifyZone still
+// does the mandatory exact-zone check when a specific zone is selected for DNS;
+// this is discovery, gate-checked when the chosen zone is used.
+func (cloudflareAccountValidator) ListZones(ctx context.Context, credential string) ([]ZoneSummary, error) {
+	if strings.TrimSpace(credential) == "" {
+		return nil, errors.New("a Cloudflare API token is required")
+	}
+	api, err := cf.NewWithAPIToken(credential)
+	if err != nil {
+		return nil, fmt.Errorf("the API token was rejected: %w", err)
+	}
+	zones, err := api.ListZones(ctx, "")
+	if err != nil {
+		var cfErr *cf.Error
+		switch {
+		case errors.As(err, &cfErr) && (cfErr.StatusCode == http.StatusForbidden || cfErr.StatusCode == http.StatusNotFound):
+			return nil, fmt.Errorf("the token cannot list zones; verify it has Zone: Read")
+		case errors.As(err, &cfErr) && cfErr.StatusCode == http.StatusTooManyRequests:
+			return nil, fmt.Errorf("the request was rate limited by Cloudflare; retry shortly")
+		default:
+			return nil, fmt.Errorf("could not reach Cloudflare to list zones: %w", err)
+		}
+	}
+	return summarizeZones(zones), nil
 }

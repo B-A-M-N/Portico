@@ -221,6 +221,10 @@ func (s *stubAccountValidator) VerifyZone(_ context.Context, _, zoneID string) (
 	return s.zoneResults[zoneID], nil
 }
 
+func (s *stubAccountValidator) ListZones(ctx context.Context, credential string) ([]ZoneSummary, error) {
+	return s.VerifyZone(ctx, credential, "listed-zone")
+}
+
 func TestConfigureCloudflareAccountPersistsEncryptedAccountForRestart(t *testing.T) {
 	st := newRecoveryTestStore(t)
 	validator := &stubAccountValidator{result: &AccountValidation{

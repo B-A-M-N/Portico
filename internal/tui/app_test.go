@@ -22,6 +22,9 @@ import (
 type fakeClient struct {
 	mu sync.Mutex
 
+	zones       []ipc.ZoneDTO
+	listZonesErr error
+
 	snapshot    ipc.SnapshotDTO
 	snapshotErr error
 	plan        *ipc.PlanDTO
@@ -481,6 +484,16 @@ func (f *fakeClient) ReverifyProviderAccount(_ context.Context, providerID, acco
 		return f.reverifyResponse, nil
 	}
 	return &ipc.ReverifyProviderAccountResponse{Validated: true, Status: "usable"}, nil
+}
+
+func (f *fakeClient) ListProviderAccountZones(_ context.Context, providerID, accountID string) (
+	*ipc.ListProviderAccountZonesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listZonesErr != nil {
+		return nil, f.listZonesErr
+	}
+	return &ipc.ListProviderAccountZonesResponse{ProviderID: providerID, AccountID: accountID, Zones: f.zones}, nil
 }
 
 // --------------- helpers ---------------
