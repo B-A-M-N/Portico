@@ -20,7 +20,19 @@ vet, pinned staticcheck 2025.1.1, `go test ./...`, `make acceptance`
 (compiled-binary PTY suite), `govulncheck@v1.1.4` (no reachable
 vulnerabilities), `go mod tidy -diff` clean). `go test -race ./...`
 passed on this revision. This evidence is revision-specific: a new
-candidate re-runs it and re-records it here.
+candidate re-runs it and re-records it here. A release candidate's
+record must also carry its tag, its binary SHA256, the exact test
+command, a pass/fail, and the qualification timestamp — not a settled
+`[x]` — because each of those answers is specific to one revision.
+
+Post-`e882a90` compiled-binary PTY matrix, committed and green on
+working-tree HEAD `733c63e` (binary SHA256
+`1b9a7bb3c0534f8382bb6db22546cea4e2ccbf3656d3ad44f378a67d44148a75`):
+edit→apply→restart→verify (`5ede8ec`), repair→apply with independent byte
+proof (`c7ac6f2`), credential and encryption-key rotation→restart
+(`007cc68`), the `/proc` canary argv/log/export proof (`a0e1e23`), and the
+six-size critical-screen sentence-reconstruction matrix (`733c63e`). These
+extend the second audit's release-blocker evidence on the same branch.
 
 **Current decision:** **NOT READY — external qualification evidence is
 incomplete.** The current working-tree gate passed after the second-audit

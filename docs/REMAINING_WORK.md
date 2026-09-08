@@ -14,11 +14,21 @@ logging, race-free E2E waits), `cb5a574` (one meaning per key —
 `ActionSet.ValidateUniqueBindings` and per-state coverage), `3a9d3fe` (semantic
 protection classification from the capability DTO), and `e882a90` (one
 cell-aware wrap facility; six-size sentence-reconstruction tests for Home,
-Providers and the wizard). Still open: the physical mutation matrix
-(edit→apply→restart→verify, repair→apply with independent proof, credential and
-key rotation→restart), SSE reconnect/resync PTY evidence, `/proc` canary secret
-proof, the true TUI-driven Cloudflare live qualification, and the Cloudflare
-zone model moved from account-scoped to connection-scoped. Sections marked Done below were
+Providers and the wizard). The compiled-binary PTY mutation matrix has since
+been driven through the real terminal: edit→apply→restart→verify and
+toggle-open→reconcile (`5ede8ec`), repair→apply with an independent byte-level
+proof that the freed port carries the origin's canary again (`c7ac6f2`),
+credential and encryption-key rotation both surviving a supervisor restart
+(`007cc68`), the `/proc` canary proof that a stored credential never reaches a
+process argv or any log/export (`a0e1e23`), and the six-size critical-screen
+matrix with full-sentence reconstruction at 200×60 through 60×18 (`733c63e`).
+SSE disconnect→reconnect→gap-free-replay→snapshot evidence is covered at the
+supervisor/SSE integration layer by
+`internal/ipc/event_stream_integration_test.go`. Still open: the true
+TUI-driven Cloudflare live qualification (needs a live account; the CLI/provider
+path is qualified by `scripts/qualification/cloudflare.sh`, the beginner-facing
+TUI path is not), and the Cloudflare zone model still bound to the provider
+account rather than the connection. Sections marked Done below were
 verified against the tests named in them at this review; where a claim is only partly
 true, it says which part. Several entries were stale before that review — rotate-in-place and the
 429/5xx/malformed/timeout coverage were both listed as open after they had landed — so

@@ -48,6 +48,12 @@ detached supervisor behind. When a test fails, artifacts are written below
 | Failure and recovery | `TestTUIFailedCommandOperationAndDiagnosisNavigation`, `TestTUIMalformedSupervisorSocketRecovery` | Real failed owned-command operation, error/repair/help navigation, malformed supervisor socket recovery and retry after fixture removal |
 | PTY reconstruction | `TestTerminalParserRejectsImpossibleDimensions` | ANSI clear/cursor semantics used by the black-box screen assertions |
 | Back-stack regression | `TestBackFromCompletedOperationSkipsClearedPlanPreview` | Completed operation returns to Inspect instead of a stale “Loading the plan…” screen |
+| Edit applies and survives restart | `TestTUIEditAppliesAndSurvivesRestart` | Edit→preview→apply→supervisor restart→verify final durable state, plus toggle-open→apply→reconcile |
+| Repair applies with independent proof | `TestTUIRepairAppliesAndRestoresTransport` | Physical fault (squatter claims the forward port after supervisor restart), diagnose, preview, apply through the TUI, and a byte-level proof the same port relays the origin's canary again |
+| Account mutation boundary | `TestTUIAccountRemovalRefusalThenSuccess` | Dependency-named removal refusal, dependency removal, then confirmed removal; the CLI's independent view agrees |
+| Credential and key rotation across restart | `TestTUICredentialReplacementThroughRealSurface`, `TestTUIInstallationKeyRotationKeepsOldSecretsUsable` | Replacement and installation-key rotation both prove the re-encrypted credential stays usable after a supervisor restart |
+| Process-level secret proof | `TestTUISecretNeverEntersProcessCommandLines` | `/proc` scan asserts a canary credential never reaches supervisor or connector argv, supervisor.log, or a support export |
+| Six-size critical screens | `TestTUICriticalScreensSurviveEveryNarrowSize` | Fresh Home and Providers at 200×60, 120×40, 100×30, 80×24, 70×20 and 60×18: no row overflows the real inner width and critical instructional prose (a sentence ending in `CONTROL_PLANE_API_KEY`) reconstructs unamputated |
 
 The lifecycle scenario deliberately seeds one profile through the CLI only to
 establish durable fixture state; the behavior being accepted afterward is
@@ -100,21 +106,28 @@ provider's dedicated live contract is supplied.
 ## Remaining acceptance work
 
 The deterministic gate is now a real compiled-binary PTY gate and covers the
-creation paths named above plus the currently implemented plan and account
-surfaces. It is still not a claim that every item in the external acceptance
-mandate is complete. Before stable-beta, extend the same harness with:
+creation paths named above plus the currently implemented plan, account,
+mutation, rotation and process-level surfaces. It is still not a claim that
+every item in the external acceptance mandate is complete. The edit/repair/
+removal/rotation final-state matrix, the six-size critical-screen sentence
+matrix, and the `/proc` argv/log/export secret proof have all been driven
+through the compiled binary. SSE disconnect→reconnect→gap-free-replay→snapshot
+evidence lives at the supervisor/SSE integration layer in
+`internal/ipc/event_stream_integration_test.go` rather than as a PTY visual,
+which is the correct boundary for transport-level resynchronization.
 
-- live provider qualification with real credentials and provider-side cleanup;
-- an actual SSE workload, progress stream, reconnect and resynchronization
-  exercise;
-- connector/origin kill, supervisor restart during operations, malformed-fixture
+Before stable-beta, extend the same harness with what remains genuinely open:
+
+- live provider qualification with real credentials and provider-side cleanup
+  (the beginner-facing TUI path, not just the CLI/provider path that
+  `scripts/qualification/cloudflare.sh` qualifies);
+- connector/origin kill, supervisor death during an operation, malformed-fixture
   and reconciliation scenarios across every provider;
-- physical plan cancel/apply/final-state coverage for edit, close, delete,
-  repair, account removal and key rotation;
-- all six supported terminal sizes during every form, preview and operation,
-  with every advertised action driven at least once on each applicable screen;
-- argv/process-list checks alongside the existing PTY, log, support-export and
-  state checks; and
+- all six supported sizes during every form, preview and operation, with every
+  advertised action driven at least once on each applicable screen (the current
+  six-size matrix covers fresh Home and Providers, not every form/preview);
+- repairing and re-verifying the other providers' paths with the same
+  independent byte-level proof the local-forward repair now has; and
 - the required manual exploratory pass on the release candidate.
 
 Those remain explicit gaps rather than being represented by model-only tests or
