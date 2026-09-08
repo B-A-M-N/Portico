@@ -23,6 +23,10 @@ func TestTUIProtectionLinesMatchDeclarations(t *testing.T) {
 	s.waitFor("Local port forward")
 	s.waitFor("Tailscale")
 	s.assertNoOverflow()
+	// The catalog is taller than the viewport now that no instructional line
+	// is truncated; jump to the end so the tail providers' lines are visible.
+	s.send("end")
+	s.waitForScreenChange(s.screen())
 
 	screen := s.screen()
 	// Provider sections run in catalog order; split on the header lines so

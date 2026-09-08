@@ -53,7 +53,17 @@ func (m *Model) moveSelection(delta int) {
 		if count == 0 {
 			return
 		}
-		m.setSelectionIndex(clampIndex(m.selectionIndex()+delta, count))
+		before := m.selectionIndex()
+		m.setSelectionIndex(clampIndex(before+delta, count))
+		if m.selectionIndex() != before {
+			// The status answers the key just pressed for the row just under
+			// the cursor; once the cursor moves it describes a row the user
+			// has left, and — being identical for the same action on a
+			// different row — can also stop a redraw that would otherwise
+			// carry it. Dropping it on movement keeps the answer attached to
+			// the moment it answered.
+			m.status = ""
+		}
 		m.followSelectionIntoView()
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
+	"github.com/B-A-M-N/portico/internal/tui/screens"
 )
 
 // The first thing a new user sees.
@@ -98,19 +99,28 @@ func (m *Model) setupRequired() (bool, string) {
 }
 
 // renderEmptyHome draws the first-run state.
+//
+// Every prose row is wrapped to the cells that remain after its own indent,
+// through the one wrap facility — not written as single physical lines and
+// left to the terminal's wrap, which moved the overflow onto rows the
+// renderer counted as other lines and amputated the sentence at 80x24.
 func (m *Model) renderEmptyHome() string {
 	var b strings.Builder
 	b.WriteString(renderHeader(m.width, m.theme, m.useASCII))
 	b.WriteString("\n\n")
 
+	const indent = 2
+	intro := screens.WrapProse(
+		"Portico makes something on this machine reachable from somewhere else, "+
+			"and keeps it that way after you close this window.",
+		m.width, indent)
 	b.WriteString(m.theme.Style("title").Render("  Nothing is published yet."))
 	b.WriteString("\n\n")
-	b.WriteString(m.theme.Style("muted").Render(
-		"  Portico makes something on this machine reachable from somewhere else, and keeps"))
+	for _, line := range intro {
+		b.WriteString(m.theme.Style("muted").Render(line))
+		b.WriteString("\n")
+	}
 	b.WriteString("\n")
-	b.WriteString(m.theme.Style("muted").Render(
-		"  it that way after you close this window."))
-	b.WriteString("\n\n")
 
 	actions := m.actionsFor(ScreenHome)
 	for _, task := range m.emptyHomeTasks() {
@@ -124,12 +134,21 @@ func (m *Model) renderEmptyHome() string {
 		}
 		b.WriteString("  " + m.theme.Style("selected").Render("["+keyLabel(key)+"]") +
 			"  " + task.title + "\n")
-		b.WriteString(m.theme.Style("muted").Render("       "+task.body) + "\n\n")
+		// The body hangs under the title at seven cells: wrapped to
+		// width - 7, then drawn with the indent restored on every row.
+		for _, line := range screens.WrapProse(task.body, m.width, 7) {
+			b.WriteString(m.theme.Style("muted").Render(line))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
 	}
 
 	if m.status != "" {
-		b.WriteString(m.theme.Style("intervention").Render("  " + m.status))
-		b.WriteString("\n\n")
+		for _, line := range screens.WrapProse(m.status, m.width, indent) {
+			b.WriteString(m.theme.Style("intervention").Render(line))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
 	}
 	if m.err != nil {
 		b.WriteString(m.renderUserFacingError())

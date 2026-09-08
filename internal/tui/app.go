@@ -3416,14 +3416,21 @@ func (m *Model) renderProviders() string {
 		// one of its accounts: the detail belongs to the provider either way,
 		// and the flattened walk has already reached its section.
 		// A provider that cannot be used must say why and what to do about it,
-		// rather than being omitted or shown as merely unconfigured.
+		// rather than being omitted or shown as merely unconfigured. Every
+		// instructional line wraps with a hanging indent: this is exactly the
+		// screen where clipping is most damaging, and CONTROL_PLANE_API_KEY
+		// once lost its tail to a physical line the renderer never broke.
 		if p.LastError != "" {
-			b.WriteString(m.theme.Style("muted").Render("    " + p.LastError))
-			b.WriteString("\n")
+			for _, line := range screens.WrapProse(p.LastError, m.width, 4) {
+				b.WriteString(m.theme.Style("muted").Render(line))
+				b.WriteString("\n")
+			}
 		}
 		for _, action := range p.SetupActions {
-			b.WriteString(m.theme.Style("muted").Render("    → " + action))
-			b.WriteString("\n")
+			for _, line := range screens.WrapProse("→ "+action, m.width, 4) {
+				b.WriteString(m.theme.Style("muted").Render(line))
+				b.WriteString("\n")
+			}
 		}
 
 		// Capabilities are only meaningful for a provider with a live adapter.
@@ -3489,8 +3496,10 @@ func (m *Model) renderProviders() string {
 			if reason == "" {
 				reason = "Its credential was never confirmed. Set the provider up again to replace it."
 			}
-			b.WriteString(m.theme.Style("muted").Render(
-				"        "+reason) + "\n")
+			for _, line := range screens.WrapProse(reason, m.width, 8) {
+				b.WriteString(m.theme.Style("muted").Render(line))
+				b.WriteString("\n")
+			}
 		}
 		b.WriteString("\n")
 	}

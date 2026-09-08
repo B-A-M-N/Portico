@@ -1,7 +1,6 @@
 package screens
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/B-A-M-N/portico/internal/ipc"
@@ -69,8 +68,9 @@ func firstAvailable(choices []wizardChoice) int {
 // The footer describes only the keys that do something here: a one-item menu
 // used to advertise navigation that had nowhere to go.
 func (m *WizardModel) renderChoices(title string, choices []wizardChoice, selected int) string {
+	width := m.contentWidth()
 	var b strings.Builder
-	b.WriteString(title)
+	b.WriteString(wizardOneLine(title, width))
 	b.WriteString("\n\n")
 
 	for i, choice := range choices {
@@ -81,11 +81,16 @@ func (m *WizardModel) renderChoices(title string, choices []wizardChoice, select
 				prefix = "> "
 			}
 		}
-		mark := ""
-		if !choice.Available {
-			mark = "  —  " + choice.Reason
+		b.WriteString(wizardOneLine(prefix+choice.Label, width) + "\n")
+		// The reason is explanatory prose, not part of the label: appending it
+		// to a truncated line amputated the "why" — exactly the information an
+		// unavailable option exists to carry. It wraps on its own line, hanging
+		// under the label.
+		if !choice.Available && choice.Reason != "" {
+			for _, row := range WrapProse("— "+choice.Reason, m.width, 4) {
+				b.WriteString(row + "\n")
+			}
 		}
-		b.WriteString(prefix + choice.Label + mark + "\n")
 	}
 
 	// Only the highlighted choice expands, so the list stays readable.
@@ -97,17 +102,30 @@ func (m *WizardModel) renderChoices(title string, choices []wizardChoice, select
 					b.WriteString("\n")
 					continue
 				}
-				b.WriteString("    " + line + "\n")
+				// Detail prose hangs four cells in and wraps to the width
+				// that remains: hand-broken source strings amputated their
+				// tails at narrow terminals exactly where a beginner needed
+				// them. Labels stay single lines truncated with an ellipsis,
+				// because this expanded detail carries the full text.
+				for _, row := range WrapProse(strings.Join(strings.Fields(line), " "), m.width, wizardDetailIndent) {
+					b.WriteString(row + "\n")
+				}
 			}
 		}
 		if len(choice.Providers) > 0 {
-			b.WriteString(fmt.Sprintf("\n    Provided by: %s\n", strings.Join(choice.Providers, ", ")))
+			provided := "Provided by: " + strings.Join(choice.Providers, ", ")
+			for _, row := range WrapProse(provided, m.width, wizardDetailIndent) {
+				b.WriteString(row + "\n")
+			}
 		}
 	}
 
-	b.WriteString("\n" + choiceFooter(choices))
+	b.WriteString("\n" + wizardOneLine(choiceFooter(choices), width))
 	return b.String()
 }
+
+// wizardDetailIndent is how far an expanded choice's detail hangs in.
+const wizardDetailIndent = 4
 
 // choiceFooter describes the keys that actually do something on this menu.
 func choiceFooter(choices []wizardChoice) string {

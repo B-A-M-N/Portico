@@ -2344,9 +2344,13 @@ func (m *WizardModel) renderMenu(title string, options []string, selected int, w
 }
 
 // renderField draws a question answered by typing, showing the live field with
-// its cursor rather than a snapshot of the value.
+// its cursor rather than a snapshot of the value. The prompt is wrapped
+// through the shared facility: the multi-line environment prompt was
+// hand-broken to a width nobody guarantees, and its tails clipped at narrow
+// terminals.
 func (m *WizardModel) renderField(prompt string) string {
-	lines := []string{prompt, "", m.field.View(), "", "Enter to continue  Esc Back"}
+	wrapped := WrapProse(prompt, m.width, 0)
+	lines := append(wrapped, "", m.field.View(), "", "Enter to continue  Esc Back")
 	return strings.Join(lines, "\n")
 }
 

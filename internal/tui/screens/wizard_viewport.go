@@ -134,12 +134,23 @@ func wizardMenuRows(height int) int {
 	return rows
 }
 
-// contentWidth returns the available character width for content.
+// wizardFrameIndent is the fixed indentation the wizard's own rows reserve at
+// their deepest: an expanded choice's detail hangs four cells in. The
+// container's inner width is the terminal minus that reservation, and every
+// prose renderer in the wizard consumes this one answer — a row that wrapped
+// to the full terminal width and was then drawn under an indent is the defect
+// that amputated explanation text at narrow sizes.
+const wizardFrameIndent = 4
+
+// contentWidth returns the inner width wizard content may occupy. It is the
+// one width calculation for the wizard: menus, titles, field prompts and
+// detail prose all wrap or truncate against it, so no produced line exceeds
+// it in terminal cells.
 func (m *WizardModel) contentWidth() int {
 	if m.width < 1 {
 		return 80
 	}
-	return m.width
+	return InnerWidth(m.width, wizardFrameIndent)
 }
 
 func (m *WizardModel) MenuStep() bool {
