@@ -1,6 +1,9 @@
 package tui
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // One authoritative action model.
 //
@@ -184,6 +187,25 @@ func (s ActionSet) Advertised() []Action {
 		out = append(out, a)
 	}
 	return out
+}
+
+// ValidateUniqueBindings reports the first key two actions in this set both
+// claim. A key with two advertised meanings is the failure mode that put
+// "[esc] Cancel setup" and "[esc] Back" on the same footer: whichever one the
+// reader believed, the other was a lie. The screen's own set is composed before
+// navigation, so the composition in actionsFor prevents this — this check is
+// the invariant that composition must hold, testable per screen and per state.
+func (s ActionSet) ValidateUniqueBindings() error {
+	claimed := map[string]ActionID{}
+	for _, a := range s {
+		for _, k := range a.Keys {
+			if prev, dup := claimed[k]; dup {
+				return fmt.Errorf("key %q is bound to both %s and %s", k, prev, a.ID)
+			}
+			claimed[k] = a.ID
+		}
+	}
+	return nil
 }
 
 // footerIndent is the leading space before the action bar. It is part of the

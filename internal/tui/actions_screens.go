@@ -61,7 +61,29 @@ func (m Model) actionsFor(screen ScreenID) ActionSet {
 			Primary: true, Help: "Return to the screen you came from.",
 		}}
 	}
-	return append(set, navigationActions(screen, scrollsFreely(screen))...)
+	return append(set, navigationActions(screen, scrollsFreely(screen)).notClaimedBy(set)...)
+}
+
+// notClaimedBy filters out every action whose advertised key the screen's own
+// set already binds. A key must have exactly one meaning on a screen: when
+// provider setup owns Escape as "Cancel setup", global navigation must not
+// also advertise "[esc] Back" beside it — the form owns the keyboard, and a
+// second advertised interpretation is the drift this composition exists to
+// prevent. Lookup already prefers the screen's own entry, so this changes what
+// is drawn, never what runs.
+func (s ActionSet) notClaimedBy(own ActionSet) ActionSet {
+	out := make(ActionSet, 0, len(s))
+	for _, a := range s {
+		key := a.primaryKey()
+		if key == "" {
+			continue
+		}
+		if _, taken := own.FindByKey(key); taken {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // homeActions is the connection list. When there are no connections the
