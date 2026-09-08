@@ -24,11 +24,15 @@ process argv or any log/export (`a0e1e23`), and the six-size critical-screen
 matrix with full-sentence reconstruction at 200×60 through 60×18 (`733c63e`).
 SSE disconnect→reconnect→gap-free-replay→snapshot evidence is covered at the
 supervisor/SSE integration layer by
-`internal/ipc/event_stream_integration_test.go`. Still open: the true
+`internal/ipc/event_stream_integration_test.go`. The Cloudflare zone model is
+now connection-scoped: a permanent connection selects its own DNS zone from
+every zone the account's credential can see (wizard zone picker +
+`ListProviderAccountZones`), so an account-default or credential change cannot
+silently retarget it; legacy account-bound zones still work via a per-account
+fallback. Still open: the true
 TUI-driven Cloudflare live qualification (needs a live account; the CLI/provider
 path is qualified by `scripts/qualification/cloudflare.sh`, the beginner-facing
-TUI path is not), and the Cloudflare zone model still bound to the provider
-account rather than the connection. Sections marked Done below were
+TUI path is not). Sections marked Done below were
 verified against the tests named in them at this review; where a claim is only partly
 true, it says which part. Several entries were stale before that review — rotate-in-place and the
 429/5xx/malformed/timeout coverage were both listed as open after they had landed — so
