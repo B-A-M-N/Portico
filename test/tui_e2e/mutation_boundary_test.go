@@ -202,4 +202,15 @@ func TestTUICredentialReplacementThroughRealSurface(t *testing.T) {
 	if !contains(strings.ToLower(out), "verified") && !contains(strings.ToLower(out), "checked") {
 		t.Fatalf("re-verification failed after replacement:\n%s", out)
 	}
+
+	// A rotated credential must survive a supervisor restart: the secret is
+	// stored encrypted, so a restart that cannot decrypt it makes the account
+	// unusable no matter what was replaced. The restarted supervisor resolves
+	// the stored credential and the same re-verification must still pass.
+	runCLI(t, f, "supervisor", "stop")
+	runCLI(t, f, "supervisor", "start")
+	out = runCLI(t, f, "provider", "verify", "mock", "acct-replace")
+	if !contains(strings.ToLower(out), "verified") && !contains(strings.ToLower(out), "checked") {
+		t.Fatalf("re-verification failed after replacement and supervisor restart:\n%s", out)
+	}
 }
