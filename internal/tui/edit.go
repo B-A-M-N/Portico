@@ -234,6 +234,36 @@ func (s *editState) dirty() bool {
 	return false
 }
 
+// clearPending drops every pending delta without dropping the edit itself.
+//
+// An applied edit's changes are no longer proposals: they are the connection's
+// committed values, and the snapshot that follows the apply refreshes the
+// detail they were measured against. Clearing them keeps dirty() honest — the
+// alternative was a discard prompt that claimed changes were unsaved seconds
+// after an operation completed saving them.
+func (s *editState) clearPending() {
+	s.name = nil
+	s.hostname = nil
+	s.protection = nil
+	s.protectionRules = nil
+	s.allowedEmails = nil
+	s.allowedDomains = nil
+	s.autoStart = nil
+	s.onDisconnect = nil
+	s.accountID = nil
+	s.sourceAddress = nil
+	s.sourceProtocol = nil
+	s.exposureMode = nil
+	s.localPort = nil
+	s.remoteHost = nil
+	s.remotePort = nil
+	s.forwardProtocol = nil
+	s.tunnelID = nil
+	s.tunnelMCP = nil
+	s.networkMode = nil
+	s.networkAddress = nil
+}
+
 // request builds the update from the pending values only.
 //
 // Sending the unchanged values back would make every edit a full overwrite, so

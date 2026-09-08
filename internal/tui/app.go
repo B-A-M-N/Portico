@@ -673,6 +673,15 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.operation = msg.Operation
 		m.opEvents = nil
 		m.plan = nil
+		// An applied edit's pending deltas are no longer pending: they are the
+		// connection's committed values, and the snapshot this apply already
+		// requests will carry them into the edit's detail. Leaving the deltas
+		// set made dirty() stay true, so leaving the edit then asked whether
+		// to discard "unsaved changes" that had just been saved — and a
+		// confirmed discard threw away nothing while telling the user it had.
+		if m.edit != nil && m.planConnectionID == m.edit.connectionID {
+			m.edit.clearPending()
+		}
 		m.pushScreen(ScreenOperationProgress)
 		return m, tea.Batch(m.requestSnapshot(), m.getOperationCmd(msg.Operation.ID))
 
@@ -691,6 +700,18 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.operation = msg.Operation
 
+		// An open edit whose operation just finished: its pending values were
+		// cleared at apply, and the durable result is the connection's
+		// committed state. Refresh the edit's detail so it shows what was
+		// saved rather than the pre-edit snapshot it was opened with — the
+		// alternative is a screen that cleared "unsaved changes" while still
+		// displaying the old values, a revert nobody asked for.
+		var editRefreshCmd tea.Cmd
+		if m.operation != nil && ipc.OperationTerminal(m.operation.State) &&
+			m.edit != nil && m.operation.ConnectionID == m.edit.connectionID && !m.edit.dirty() {
+			editRefreshCmd = m.connectionDetailCmd(m.edit.connectionID)
+		}
+
 		// Check if operation completed and we need post-repair verification
 		if m.operation != nil && m.awaitingRepairVerification {
 			// An operation reaches "completed", never "succeeded" — that is a
@@ -701,11 +722,11 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.awaitingRepairVerification = false
 				if m.repairConnectionID != "" {
 					m.status = "Verifying repair..."
-					return m, m.diagnosticsCmd(m.repairConnectionID)
+					return m, tea.Batch(m.diagnosticsCmd(m.repairConnectionID), editRefreshCmd)
 				}
 			}
 		}
-		return m, nil
+		return m, editRefreshCmd
 
 	case readinessMsg:
 		if m.setup == nil {
