@@ -50,9 +50,16 @@ func TestTUIAccountRemovalRefusalThenSuccess(t *testing.T) {
 	s.waitFor("PROVIDERS")
 	s.waitFor("acct-removal")
 	walkToAccount(s, "acct-removal")
-	// The refusal: x previews the removal and names the dependency.
+	// The refusal: x previews the removal and names the dependency. The
+	// preview is asynchronous, so the first frame says it is still checking;
+	// waiting for the settled answer — never a sleep — is what makes the
+	// assertion about the answer rather than about a frame that happened to
+	// render first. The pending wording is deliberately not in the set: a
+	// frame can lag the model under redraw coalescing, so only a settled
+	// answer proves the preview arrived.
 	s.send("x")
 	s.waitFor("REMOVE ACCOUNT")
+	s.waitForEither("cannot be removed", "Portico will forget the credential")
 	if !contains(s.screen(), "removal-dep") {
 		t.Fatalf("removal preview does not name the dependent connection:\n%s", s.debug())
 	}
@@ -77,16 +84,27 @@ func TestTUIAccountRemovalRefusalThenSuccess(t *testing.T) {
 	s.send("esc")
 	s.waitFor("Nothing is published yet.")
 
-	// The identical removal now succeeds and the row disappears.
+	// The identical removal now succeeds and the row disappears. Enter is
+	// pressed only once the preview has settled, and the confirmation is
+	// waited for by its own status — the providers frame that first follows
+	// can still show the pre-removal snapshot, so asserting absence there
+	// raced the refetch.
 	s.send("p")
 	s.waitFor("PROVIDERS")
 	s.waitFor("acct-removal")
 	walkToAccount(s, "acct-removal")
 	s.send("x")
 	s.waitFor("REMOVE ACCOUNT")
+	s.waitForEither("cannot be removed", "Portico will forget the credential")
 	s.send("enter")
-	s.waitFor("PROVIDERS")
-	if contains(s.screen(), "acct-removal") {
+	s.waitFor("Removed acct-removal")
+	s.waitForEither("Nothing is published yet.", "PROVIDERS")
+	// The absence check targets the row form ("acct-removal — status"), not
+	// the bare substring: the success status "Removed acct-removal." itself
+	// contains the account id and legitimately stays on screen. The row would
+	// render with an em-dash separator the status line never carries.
+	s.waitForNot("acct-removal —")
+	if contains(s.screen(), "acct-removal —") {
 		t.Fatalf("the account survived a confirmed removal:\n%s", s.debug())
 	}
 	s.send("ctrl-c")

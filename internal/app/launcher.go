@@ -222,6 +222,26 @@ func (l *Launcher) RunTUI(ctx context.Context) error {
 		return fmt.Errorf("TUI requires an interactive terminal")
 	}
 
+	// The TUI's bring-up and its runtime both log through slog, whose default
+	// handler writes stderr — the same terminal the renderer paints. A log
+	// line landing between two render frames shifted every later frame:
+	// the header row was overwritten by list rows and the screen showed a
+	// state that no longer existed in the model. While the TUI owns the
+	// terminal, logs go to the supervisor's log file instead, the same place
+	// the supervisor's own diagnostics land.
+	logFile := filepath.Join(l.Paths.LogDir, "supervisor.log")
+	if err := os.MkdirAll(l.Paths.LogDir, 0700); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+	logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+	defer logF.Close()
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logF, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(previous)
+
 	client := ipc.NewClient(l.Paths.SocketPath)
 	rootModel := tui.New(client, l)
 

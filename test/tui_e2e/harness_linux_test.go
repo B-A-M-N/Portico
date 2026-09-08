@@ -274,6 +274,55 @@ func (s *session) waitFor(needle string) {
 	}
 }
 
+// waitForEither returns as soon as any of the needles is on screen, for
+// asynchronous states with more than one settled answer. Waiting for one
+// specific answer can pass on a stale frame or fail on a race; naming every
+// terminal state of the transition makes the wait about the transition.
+func (s *session) waitForEither(needles ...string) {
+	s.t.Helper()
+	deadline := time.NewTimer(defaultTimeout)
+	defer deadline.Stop()
+	for {
+		screen := strings.ToLower(s.screen())
+		for _, needle := range needles {
+			if strings.Contains(screen, strings.ToLower(needle)) {
+				return
+			}
+		}
+		select {
+		case <-s.chunks:
+		case <-s.done:
+			s.t.Fatalf("TUI exited while waiting for one of %q\n%s", needles, s.debug())
+		case <-deadline.C:
+			s.t.Fatalf("timed out waiting for one of %q\n%s", needles, s.debug())
+		}
+	}
+}
+
+// waitForNot returns once the needle is absent. Absence is checked on the
+// current screen first and only then against incoming frames: the caller is
+// expected to have already waited for the transition that should remove the
+// needle (a status, a new screen), so a frame that predates the transition is
+// not what this returns on — but a redraw that already happened and will not
+// repeat must not deadlock the check.
+func (s *session) waitForNot(needle string) {
+	s.t.Helper()
+	deadline := time.NewTimer(defaultTimeout)
+	defer deadline.Stop()
+	for {
+		if !strings.Contains(strings.ToLower(s.screen()), strings.ToLower(needle)) {
+			return
+		}
+		select {
+		case <-s.chunks:
+		case <-s.done:
+			s.t.Fatalf("TUI exited while waiting for %q to disappear\n%s", needle, s.debug())
+		case <-deadline.C:
+			s.t.Fatalf("timed out waiting for %q to disappear\n%s", needle, s.debug())
+		}
+	}
+}
+
 // waitForScreenChange proves a navigation key caused a new terminal frame to
 // be rendered. Waiting for a string that was already on screen can pass even
 // when the key was ignored, which is how a broken page-down path escaped the

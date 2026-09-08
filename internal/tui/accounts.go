@@ -248,8 +248,13 @@ func (m *Model) removeAccountCmd(row accountRow, fingerprint string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(rootCtx, 20*time.Second)
 		defer cancel()
 		response, err := client.RemoveProviderAccount(ctx, row.ProviderID, row.AccountID, fingerprint)
+		name := row.Label
+		if name == "" {
+			name = row.AccountID
+		}
 		return accountRemovedMsg{
 			Generation: generation, ProviderID: row.ProviderID, AccountID: row.AccountID,
+			Name:     name,
 			Response: response, Err: err,
 		}
 	}
@@ -269,6 +274,21 @@ func (m *Model) renderAccountRemoval() string {
 	b.WriteString(m.theme.Style("header").Render(" REMOVE ACCOUNT "))
 	b.WriteString("\n\n")
 	b.WriteString(fmt.Sprintf("Remove %s from %s?\n\n", target.Label, target.ProviderName))
+
+	// The preview is asynchronous: between pushing this screen and its arrival
+	// the screen asked its question with nothing saying the answer did not
+	// exist yet — so a frame that looks like a decision being offered was in
+	// fact a decision that could not yet be made, and the only trace of that
+	// was a dimmed confirm in the bar. Say what is happening, and offer no
+	// confirmation until the check has answered.
+	if m.accountRemovalError == "" && m.accountRemovalPreview == nil {
+		b.WriteString(m.theme.Style("muted").Render("Checking what still depends on this account…"))
+		b.WriteString("\n\n")
+		b.WriteString(m.actionsFor(ScreenAccountRemoval).footer(m.theme, m.width))
+		return b.String()
+	}
+
+	// From here a settled answer exists: either a preview or a refusal.
 
 	if m.accountRemovalError != "" {
 		b.WriteString(m.theme.Style("intervention").Render(m.accountRemovalError))
